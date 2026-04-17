@@ -1,0 +1,25 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: unified-ephemeral-runner-broker
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: ghcr.io/josh-archer/unified-ephemeral-runner-broker
+    chart: unified-ephemeral-runner-broker
+    targetRevision: 0.1.0
+    helm:
+      values: |
+        config:
+          github:
+            scope:
+              organization: my-org
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: arc-systems
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: true
+
