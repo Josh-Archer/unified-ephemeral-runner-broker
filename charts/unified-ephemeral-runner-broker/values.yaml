@@ -1,0 +1,98 @@
+nameOverride: ""
+fullnameOverride: ""
+
+replicaCount: 1
+
+image:
+  repository: ghcr.io/josh-archer/unified-ephemeral-runner-broker/broker
+  tag: latest
+  pullPolicy: IfNotPresent
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+service:
+  type: ClusterIP
+  port: 8080
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+config:
+  allowUnauthenticated: false
+  github:
+    auth:
+      mode: github-app
+      secretRef: uecb-github-app
+    scope:
+      type: organization
+      organization: my-org
+      runnerGroupPrefix: uecb
+  broker:
+    defaultPool: full
+    defaultJobTimeout: 15m
+    api:
+      oidcAudience: uecb-broker
+  pools:
+    - name: full
+      labels:
+        - self-hosted
+        - linux
+        - x64
+        - uecb
+        - uecb-full
+      scheduler: round-robin
+      capabilityProfile: full
+      backends:
+        arc:
+          enabled: true
+          healthy: true
+          maxRunners: 4
+          template: arc-full
+    - name: lite
+      labels:
+        - self-hosted
+        - linux
+        - x64
+        - uecb
+        - uecb-lite
+      scheduler: round-robin
+      capabilityProfile: lite
+      backends:
+        arc:
+          enabled: true
+          healthy: true
+          maxRunners: 2
+          template: arc-lite
+        lambda:
+          enabled: false
+          healthy: true
+          maxRunners: 3
+          maxJobDuration: 14m
+          secretRef: uecb-lambda
+        cloud-run:
+          enabled: false
+          healthy: true
+          maxRunners: 2
+          maxJobDuration: 30m
+          secretRef: uecb-cloud-run
+        azure-functions:
+          enabled: false
+          healthy: true
+          maxRunners: 2
+          maxJobDuration: 25m
+          secretRef: uecb-azure-functions
+
