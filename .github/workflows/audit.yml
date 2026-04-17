@@ -1,0 +1,22 @@
+name: Public Audit
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - codex/**
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enforce public denylist
+        shell: bash
+        run: bash scripts/audit_public_repo.sh
+
