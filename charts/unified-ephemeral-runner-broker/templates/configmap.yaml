@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "uecb.fullname" . }}-config
+data:
+  broker.yaml: |
+    github:
+      auth:
+        mode: {{ .Values.config.github.auth.mode }}
+        secretRef: {{ .Values.config.github.auth.secretRef }}
+      scope:
+        type: {{ .Values.config.github.scope.type }}
+        organization: {{ .Values.config.github.scope.organization }}
+        runnerGroupPrefix: {{ .Values.config.github.scope.runnerGroupPrefix }}
+    broker:
+      defaultPool: {{ .Values.config.broker.defaultPool }}
+      defaultJobTimeout: {{ .Values.config.broker.defaultJobTimeout }}
+      allowUnauthenticated: {{ .Values.config.allowUnauthenticated }}
+      api:
+        oidcAudience: {{ .Values.config.broker.api.oidcAudience }}
+    pools:
+{{ toYaml .Values.config.pools | indent 6 }}
+
