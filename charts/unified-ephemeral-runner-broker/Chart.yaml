@@ -1,0 +1,7 @@
+apiVersion: v2
+name: unified-ephemeral-runner-broker
+description: Unified ephemeral runner capacity broker for ARC and selected external backends.
+type: application
+version: 0.1.0
+appVersion: 0.1.0
+
