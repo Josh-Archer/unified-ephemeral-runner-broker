@@ -1,0 +1,100 @@
+name: allocate-runner
+description: Allocate an ephemeral runner from the unified broker and return the unique runner label.
+
+inputs:
+  broker_url:
+    description: Base URL for the broker API
+    required: true
+  pool:
+    description: Target pool name
+    required: true
+  backend:
+    description: Optional backend pin
+    required: false
+  job_timeout:
+    description: Requested job timeout duration, for example 15m
+    required: false
+    default: 15m
+  labels:
+    description: Optional comma-separated labels to attach to the allocation request
+    required: false
+    default: ""
+  oidc_audience:
+    description: OIDC audience expected by the broker
+    required: false
+    default: uecb-broker
+  allow_unauthenticated:
+    description: Skip OIDC and call the broker without a bearer token
+    required: false
+    default: "false"
+
+outputs:
+  allocation_id:
+    description: Broker allocation ID
+    value: ${{ steps.allocate.outputs.allocation_id }}
+  runner_label:
+    description: Unique runner label returned by the broker
+    value: ${{ steps.allocate.outputs.runner_label }}
+  selected_backend:
+    description: Backend selected by the broker
+    value: ${{ steps.allocate.outputs.selected_backend }}
+  expires_at:
+    description: Allocation expiry timestamp
+    value: ${{ steps.allocate.outputs.expires_at }}
+
+runs:
+  using: composite
+  steps:
+    - id: allocate
+      shell: bash
+      env:
+        INPUT_BROKER_URL: ${{ inputs.broker_url }}
+        INPUT_POOL: ${{ inputs.pool }}
+        INPUT_BACKEND: ${{ inputs.backend }}
+        INPUT_JOB_TIMEOUT: ${{ inputs.job_timeout }}
+        INPUT_LABELS: ${{ inputs.labels }}
+        INPUT_OIDC_AUDIENCE: ${{ inputs.oidc_audience }}
+        INPUT_ALLOW_UNAUTHENTICATED: ${{ inputs.allow_unauthenticated }}
+      run: |
+        set -euo pipefail
+
+        auth_args=()
+        if [ "${INPUT_ALLOW_UNAUTHENTICATED}" != "true" ]; then
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "GitHub OIDC environment variables are not available." >&2
+            exit 1
+          fi
+
+          oidc_response="$(curl -fsSL -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${INPUT_OIDC_AUDIENCE}")"
+          id_token="$(printf '%s' "${oidc_response}" | python -c "import json,sys; print(json.load(sys.stdin)['value'])")"
+          auth_args=(-H "Authorization: Bearer ${id_token}")
+        fi
+
+        request_body="$(python - <<'PY'
+import json
+import os
+
+payload = {
+    "pool": os.environ["INPUT_POOL"],
+    "job_timeout": os.environ["INPUT_JOB_TIMEOUT"],
+}
+
+backend = os.environ.get("INPUT_BACKEND", "").strip()
+if backend:
+    payload["backend"] = backend
+
+labels = [item.strip() for item in os.environ.get("INPUT_LABELS", "").split(",") if item.strip()]
+if labels:
+    payload["labels"] = labels
+
+print(json.dumps(payload))
+PY
+)"
+
+        response="$(curl -fsSL "${auth_args[@]}" -H "Content-Type: application/json" -d "${request_body}" "${INPUT_BROKER_URL%/}/v1/allocations")"
+
+        echo "allocation_id=$(printf '%s' "${response}" | python -c "import json,sys; print(json.load(sys.stdin)['allocation_id'])")" >> "${GITHUB_OUTPUT}"
+        echo "runner_label=$(printf '%s' "${response}" | python -c "import json,sys; print(json.load(sys.stdin)['runner_label'])")" >> "${GITHUB_OUTPUT}"
+        echo "selected_backend=$(printf '%s' "${response}" | python -c "import json,sys; print(json.load(sys.stdin)['selected_backend'])")" >> "${GITHUB_OUTPUT}"
+        echo "expires_at=$(printf '%s' "${response}" | python -c "import json,sys; print(json.load(sys.stdin)['expires_at'])")" >> "${GITHUB_OUTPUT}"
+

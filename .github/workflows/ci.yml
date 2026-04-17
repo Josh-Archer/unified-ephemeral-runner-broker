@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - codex/**
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Go test
+        run: go test ./...
+
+      - name: Broker config sanity
+        run: |
+          test -f charts/unified-ephemeral-runner-broker/Chart.yaml
+          test -f actions/allocate-runner/action.yml
+          test -f examples/gitops/kustomize/base/kustomization.yaml
+

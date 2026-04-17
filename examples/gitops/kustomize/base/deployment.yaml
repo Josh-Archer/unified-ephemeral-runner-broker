@@ -1,0 +1,33 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: unified-ephemeral-runner-broker
+  namespace: arc-systems
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: unified-ephemeral-runner-broker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: unified-ephemeral-runner-broker
+    spec:
+      serviceAccountName: unified-ephemeral-runner-broker
+      containers:
+        - name: broker
+          image: ghcr.io/josh-archer/unified-ephemeral-runner-broker/broker:latest
+          env:
+            - name: UECB_CONFIG_PATH
+              value: /etc/uecb/broker.yaml
+          ports:
+            - name: http
+              containerPort: 8080
+          volumeMounts:
+            - name: config
+              mountPath: /etc/uecb
+      volumes:
+        - name: config
+          configMap:
+            name: unified-ephemeral-runner-broker-config
+
