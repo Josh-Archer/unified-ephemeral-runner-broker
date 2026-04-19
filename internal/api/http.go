@@ -42,7 +42,11 @@ func (s *Server) Handler() http.Handler {
 	return mux
 }
 
-func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	if err := s.service.Health(r.Context()); err != nil {
+		s.writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
 	s.writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 

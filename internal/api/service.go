@@ -21,20 +21,29 @@ type Service struct {
 	registry *backend.Registry
 	sched    *scheduler.RoundRobin
 	store    *store.Memory
+	health   func(context.Context) error
 	now      func() time.Time
 }
 
-func NewService(cfg model.BrokerConfig, registry *backend.Registry) *Service {
+func NewService(cfg model.BrokerConfig, registry *backend.Registry, health func(context.Context) error) *Service {
+	if health == nil {
+		health = func(context.Context) error { return nil }
+	}
 	return &Service{
 		cfg:      cfg,
 		registry: registry,
 		sched:    scheduler.NewRoundRobin(),
 		store:    store.NewMemory(),
+		health:   health,
 		now:      time.Now,
 	}
 }
 
 func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest) (model.AllocationStatus, error) {
+	if err := s.health(ctx); err != nil {
+		return model.AllocationStatus{}, err
+	}
+
 	pool, err := s.resolvePool(request.Pool)
 	if err != nil {
 		return model.AllocationStatus{}, err
@@ -91,6 +100,10 @@ func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest)
 	s.store.Save(allocation)
 
 	return allocation, nil
+}
+
+func (s *Service) Health(ctx context.Context) error {
+	return s.health(ctx)
 }
 
 func (s *Service) Get(id string) (model.AllocationStatus, bool) {

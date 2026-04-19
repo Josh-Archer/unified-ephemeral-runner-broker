@@ -28,4 +28,7 @@ jobs:
           test -f charts/unified-ephemeral-runner-broker/Chart.yaml
           test -f actions/allocate-runner/action.yml
           test -f examples/gitops/kustomize/base/kustomization.yaml
-
+          grep -q "UECB_POD_NAMESPACE" examples/gitops/kustomize/base/deployment.yaml
+          grep -q "resources: \\[\"secrets\"\\]" examples/gitops/kustomize/base/role.yaml
+          grep -q "UECB_POD_NAMESPACE" charts/unified-ephemeral-runner-broker/templates/deployment.yaml
+          grep -q "resources: \\[\"secrets\"\\]" charts/unified-ephemeral-runner-broker/templates/role.yaml

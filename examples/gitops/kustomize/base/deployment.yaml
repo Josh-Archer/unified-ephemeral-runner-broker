@@ -20,14 +20,23 @@ spec:
           env:
             - name: UECB_CONFIG_PATH
               value: /etc/uecb/broker.yaml
+            - name: UECB_POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           ports:
             - name: http
               containerPort: 8080
           volumeMounts:
             - name: config
               mountPath: /etc/uecb
+            - name: uecb-github-app
+              mountPath: /etc/uecb/github-app
+              readOnly: true
       volumes:
         - name: config
           configMap:
             name: unified-ephemeral-runner-broker-config
-
+        - name: uecb-github-app
+          secret:
+            secretName: uecb-github-app

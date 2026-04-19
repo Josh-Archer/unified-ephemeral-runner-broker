@@ -23,6 +23,10 @@ spec:
           env:
             - name: UECB_CONFIG_PATH
               value: /etc/uecb/broker.yaml
+            - name: UECB_POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           ports:
             - name: http
               containerPort: 8080
@@ -39,14 +43,23 @@ spec:
           volumeMounts:
             - name: config
               mountPath: /etc/uecb
+{{- if .Values.config.github.auth.secretRef }}
+            - name: github-app-secret
+              mountPath: /etc/uecb/github-app
+              readOnly: true
+{{- end }}
       volumes:
         - name: config
           configMap:
             name: {{ include "uecb.fullname" . }}-config
+{{- if .Values.config.github.auth.secretRef }}
+        - name: github-app-secret
+          secret:
+            secretName: {{ .Values.config.github.auth.secretRef }}
+{{- end }}
       nodeSelector:
 {{ toYaml .Values.nodeSelector | indent 8 }}
       tolerations:
 {{ toYaml .Values.tolerations | indent 8 }}
       affinity:
 {{ toYaml .Values.affinity | indent 8 }}
-

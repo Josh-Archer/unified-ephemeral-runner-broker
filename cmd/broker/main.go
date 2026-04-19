@@ -13,6 +13,7 @@ import (
 	cloudbackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/cloudrun"
 	lambdabackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/lambda"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/config"
+	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/runtime"
 )
 
 func main() {
@@ -27,7 +28,12 @@ func main() {
 		cloudbackend.New(),
 		azurebackend.New(),
 	)
-	service := api.NewService(cfg, registry)
+	healthChecker, err := runtime.NewSecretRefCheckerFromEnv(cfg)
+	if err != nil {
+		log.Fatalf("configure runtime dependencies: %v", err)
+	}
+
+	service := api.NewService(cfg, registry, healthChecker.Check)
 	server := api.NewServer(
 		service,
 		[]string{"https://token.actions.githubusercontent.com"},

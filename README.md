@@ -61,7 +61,8 @@ See [docs/architecture.md](docs/architecture.md) and [docs/security-boundary.md]
 ## Quick Start
 
 1. Install the Helm chart with external backends disabled.
-2. Configure GitHub App credentials and backend secret refs through Kubernetes Secrets.
+2. Create the GitHub auth secret and any enabled backend secrets in the same namespace as the broker.
+   The broker validates referenced `secretRef` objects via the Kubernetes API and stays unready until they exist.
 3. Point the `allocate-runner` action at the broker URL.
 4. Start with the `full` pool or ARC-only `lite` pool, then enable external backends one by one.
 

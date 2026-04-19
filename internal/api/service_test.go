@@ -34,6 +34,7 @@ func newService() *Service {
 			cloudbackend.New(),
 			azurebackend.New(),
 		),
+		nil,
 	)
 }
 
@@ -117,5 +118,17 @@ func TestSweepExpiredMarksReadyAllocationsExpired(t *testing.T) {
 
 	if updated.State != model.StateExpired {
 		t.Fatalf("expected expired state, got %s", updated.State)
+	}
+}
+
+func TestAllocateFailsWhenHealthCheckFails(t *testing.T) {
+	service := NewService(
+		config.Default(),
+		backend.NewRegistry(arcbackend.New()),
+		func(context.Context) error { return context.DeadlineExceeded },
+	)
+
+	if _, err := service.Allocate(context.Background(), model.AllocationRequest{Pool: model.PoolFull}); err != context.DeadlineExceeded {
+		t.Fatalf("expected health check failure, got %v", err)
 	}
 }
