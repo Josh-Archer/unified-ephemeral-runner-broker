@@ -66,6 +66,7 @@ type BackendConfig struct {
 	Enabled        bool          `yaml:"enabled" json:"enabled"`
 	Healthy        bool          `yaml:"healthy" json:"healthy"`
 	MaxRunners     int           `yaml:"maxRunners" json:"maxRunners"`
+	Weight         int           `yaml:"weight,omitempty" json:"weight,omitempty"`
 	MaxJobDuration time.Duration `yaml:"maxJobDuration,omitempty" json:"maxJobDuration,omitempty"`
 	Template       string        `yaml:"template,omitempty" json:"template,omitempty"`
 	SecretRef      string        `yaml:"secretRef,omitempty" json:"secretRef,omitempty"`
