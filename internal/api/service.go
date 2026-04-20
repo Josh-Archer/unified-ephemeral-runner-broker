@@ -19,8 +19,9 @@ var ErrUnknownPool = errors.New("pool is not configured")
 type Service struct {
 	cfg      model.BrokerConfig
 	registry *backend.Registry
-	sched    *scheduler.RoundRobin
+	scheds   *scheduler.Registry
 	store    *store.Memory
+	initErr  error
 	health   func(context.Context) error
 	now      func() time.Time
 }
@@ -29,17 +30,22 @@ func NewService(cfg model.BrokerConfig, registry *backend.Registry, health func(
 	if health == nil {
 		health = func(context.Context) error { return nil }
 	}
+	schedulerRegistry := scheduler.NewRegistry()
 	return &Service{
 		cfg:      cfg,
 		registry: registry,
-		sched:    scheduler.NewRoundRobin(),
+		scheds:   schedulerRegistry,
 		store:    store.NewMemory(),
+		initErr:  validateSchedulers(cfg.Pools, schedulerRegistry),
 		health:   health,
 		now:      time.Now,
 	}
 }
 
 func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest) (model.AllocationStatus, error) {
+	if s.initErr != nil {
+		return model.AllocationStatus{}, s.initErr
+	}
 	if err := s.health(ctx); err != nil {
 		return model.AllocationStatus{}, err
 	}
@@ -64,7 +70,8 @@ func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest)
 		}
 	}
 
-	selected, err := s.sched.Reserve(pool, request.Backend)
+	poolScheduler := s.schedulerForPool(pool)
+	selected, err := poolScheduler.Reserve(pool, request.Backend)
 	if err != nil {
 		return model.AllocationStatus{}, err
 	}
@@ -82,14 +89,14 @@ func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest)
 
 	backendImpl, ok := s.registry.Get(selected)
 	if !ok {
-		s.sched.Release(pool.Name, selected)
+		poolScheduler.Release(pool.Name, selected)
 		s.store.MarkState(allocation.ID, model.StateFailed, s.now(), "backend not registered")
 		return model.AllocationStatus{}, fmt.Errorf("backend implementation missing: %s", selected)
 	}
 
 	provisioned, err := backendImpl.Provision(ctx, request, allocation)
 	if err != nil {
-		s.sched.Release(pool.Name, selected)
+		poolScheduler.Release(pool.Name, selected)
 		s.store.MarkState(allocation.ID, model.StateFailed, s.now(), err.Error())
 		return model.AllocationStatus{}, err
 	}
@@ -103,6 +110,9 @@ func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest)
 }
 
 func (s *Service) Health(ctx context.Context) error {
+	if s.initErr != nil {
+		return s.initErr
+	}
 	return s.health(ctx)
 }
 
@@ -115,7 +125,9 @@ func (s *Service) Cancel(id string) (model.AllocationStatus, bool) {
 	if !ok {
 		return model.AllocationStatus{}, false
 	}
-	s.sched.Release(status.Pool, status.SelectedBackend)
+	if pool, err := s.resolvePool(status.Pool); err == nil {
+		s.schedulerForPool(pool).Release(status.Pool, status.SelectedBackend)
+	}
 	return status, true
 }
 
@@ -129,7 +141,9 @@ func (s *Service) SweepExpired(now time.Time) int {
 			continue
 		}
 		if _, ok := s.store.MarkState(status.ID, model.StateExpired, now, "allocation expired"); ok {
-			s.sched.Release(status.Pool, status.SelectedBackend)
+			if pool, err := s.resolvePool(status.Pool); err == nil {
+				s.schedulerForPool(pool).Release(status.Pool, status.SelectedBackend)
+			}
 			expired++
 		}
 	}
@@ -146,6 +160,22 @@ func (s *Service) resolvePool(name model.PoolName) (model.PoolConfig, error) {
 		}
 	}
 	return model.PoolConfig{}, ErrUnknownPool
+}
+
+func (s *Service) schedulerForPool(pool model.PoolConfig) scheduler.Scheduler {
+	if s.scheds == nil {
+		return scheduler.NewRoundRobin()
+	}
+	return s.scheds.ForPool(pool)
+}
+
+func validateSchedulers(pools []model.PoolConfig, registry *scheduler.Registry) error {
+	for _, pool := range pools {
+		if err := registry.ValidateName(pool.Scheduler); err != nil {
+			return fmt.Errorf("pool %q: %w", pool.Name, err)
+		}
+	}
+	return nil
 }
 
 func newID() string {

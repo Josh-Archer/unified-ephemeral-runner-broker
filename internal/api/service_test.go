@@ -12,18 +12,26 @@ import (
 	lambdabackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/lambda"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/config"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
+	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/scheduler"
 )
 
 func newService() *Service {
-	cfg := config.Default()
-	for index, pool := range cfg.Pools {
+	return newServiceWithConfig(func(pool *model.PoolConfig) {
 		if pool.Name != model.PoolLite {
-			continue
+			return
 		}
 		lambdaCfg := pool.Backends[model.BackendLambda]
 		lambdaCfg.Enabled = true
 		pool.Backends[model.BackendLambda] = lambdaCfg
-		cfg.Pools[index] = pool
+	})
+}
+
+func newServiceWithConfig(mutator func(*model.PoolConfig)) *Service {
+	cfg := config.Default()
+	for index := range cfg.Pools {
+		if mutator != nil {
+			mutator(&cfg.Pools[index])
+		}
 	}
 
 	return NewService(
@@ -36,6 +44,62 @@ func newService() *Service {
 		),
 		nil,
 	)
+}
+
+func TestAllocateUsesWeightedSchedulerForPool(t *testing.T) {
+	service := newServiceWithConfig(func(pool *model.PoolConfig) {
+		if pool.Name != model.PoolLite {
+			return
+		}
+		pool.Scheduler = scheduler.NameWeightedRoundRobin
+
+		lambdaCfg := pool.Backends[model.BackendLambda]
+		lambdaCfg.Enabled = true
+		lambdaCfg.Weight = 3
+		lambdaCfg.MaxRunners = 1
+		pool.Backends[model.BackendLambda] = lambdaCfg
+
+		arcCfg := pool.Backends[model.BackendARC]
+		arcCfg.Weight = 1
+		arcCfg.MaxRunners = 1
+		pool.Backends[model.BackendARC] = arcCfg
+	})
+
+	want := []model.BackendName{
+		model.BackendARC,
+		model.BackendLambda,
+		model.BackendLambda,
+		model.BackendLambda,
+	}
+
+	for index, expected := range want {
+		allocation, err := service.Allocate(context.Background(), model.AllocationRequest{Pool: model.PoolLite})
+		if err != nil {
+			t.Fatalf("allocate #%d failed: %v", index+1, err)
+		}
+		if allocation.SelectedBackend != expected {
+			t.Fatalf("allocate #%d selected %s, want %s", index+1, allocation.SelectedBackend, expected)
+		}
+		if _, ok := service.Cancel(allocation.ID); !ok {
+			t.Fatalf("cancel #%d failed", index+1)
+		}
+	}
+}
+
+func TestAllocateFailsForUnknownScheduler(t *testing.T) {
+	service := newServiceWithConfig(func(pool *model.PoolConfig) {
+		if pool.Name == model.PoolLite {
+			pool.Scheduler = "not-a-real-scheduler"
+		}
+	})
+
+	if _, err := service.Allocate(context.Background(), model.AllocationRequest{Pool: model.PoolLite}); err == nil {
+		t.Fatal("expected invalid scheduler configuration to fail")
+	}
+
+	if err := service.Health(context.Background()); err == nil {
+		t.Fatal("expected health check to fail for invalid scheduler configuration")
+	}
 }
 
 func TestAllocateReturnsRunnerLabel(t *testing.T) {

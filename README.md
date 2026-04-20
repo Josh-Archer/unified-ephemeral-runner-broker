@@ -16,6 +16,11 @@ It is intentionally split into two capability pools:
 
 Default multi-backend scheduling is `round-robin`.
 
+Built-in schedulers:
+
+- `round-robin`
+- `weighted-round-robin`
+
 ## What This Repo Ships
 
 - A Kubernetes broker service with a small REST API
@@ -65,6 +70,33 @@ See [docs/architecture.md](docs/architecture.md) and [docs/security-boundary.md]
    The broker validates referenced `secretRef` objects via the Kubernetes API and stays unready until they exist.
 3. Point the `allocate-runner` action at the broker URL.
 4. Start with the `full` pool or ARC-only `lite` pool, then enable external backends one by one.
+
+## Scheduler Configuration
+
+Each pool selects its scheduler with `pools[].scheduler`.
+
+- `round-robin` is the default and ignores backend weights.
+- `weighted-round-robin` uses `pools[].backends.<name>.weight`.
+- Omitted or non-positive weights are treated as `1`.
+
+Example:
+
+```yaml
+pools:
+  - name: lite
+    scheduler: weighted-round-robin
+    backends:
+      arc:
+        enabled: true
+        maxRunners: 2
+        weight: 3
+      lambda:
+        enabled: true
+        maxRunners: 3
+        weight: 1
+```
+
+Rollback is just a config change: set `scheduler` back to `round-robin` for the pool and redeploy. Leaving `weight` values in place is safe because the default scheduler ignores them.
 
 ## License
 

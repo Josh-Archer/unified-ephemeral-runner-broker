@@ -54,6 +54,7 @@ config:
         - x64
         - uecb
         - uecb-full
+      # Built-ins: round-robin, weighted-round-robin
       scheduler: round-robin
       capabilityProfile: full
       backends:
@@ -61,6 +62,7 @@ config:
           enabled: true
           healthy: true
           maxRunners: 4
+          weight: 1
           template: arc-full
     - name: lite
       labels:
@@ -69,6 +71,7 @@ config:
         - x64
         - uecb
         - uecb-lite
+      # Built-ins: round-robin, weighted-round-robin
       scheduler: round-robin
       capabilityProfile: lite
       backends:
@@ -76,23 +79,27 @@ config:
           enabled: true
           healthy: true
           maxRunners: 2
+          weight: 1
           template: arc-lite
         lambda:
           enabled: false
           healthy: true
           maxRunners: 3
+          weight: 1
           maxJobDuration: 14m
           secretRef: uecb-lambda
         cloud-run:
           enabled: false
           healthy: true
           maxRunners: 2
+          weight: 1
           maxJobDuration: 30m
           secretRef: uecb-cloud-run
         azure-functions:
           enabled: false
           healthy: true
           maxRunners: 2
+          weight: 1
           maxJobDuration: 25m
           secretRef: uecb-azure-functions
 

@@ -24,3 +24,5 @@
 
 Within a selected pool, backends use `round-robin` across healthy backends with available slots.
 
+Pools can opt into `weighted-round-robin` instead. Backend weights are configured per pool and only affect selection when that scheduler is enabled.
+
