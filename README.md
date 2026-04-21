@@ -98,6 +98,80 @@ pools:
 
 Rollback is just a config change: set `scheduler` back to `round-robin` for the pool and redeploy. Leaving `weight` values in place is safe because the default scheduler ignores them.
 
+## Capability-Aware Routing
+
+Jobs can further narrow backend selection with optional capability filters on the allocation request:
+
+- `required_capabilities`: every listed tag must be advertised by the backend
+- `excluded_capabilities`: none of the listed tags may be advertised by the backend
+- Capability matching is case-insensitive and uses normalized string tags
+- If neither field is set, broker behavior is unchanged
+
+Capability filtering happens before the pool scheduler runs. The scheduler registry stays unchanged and only sees the eligible backends that remain after filtering.
+
+Backend capability tags are configured per pool:
+
+```yaml
+pools:
+  - name: lite
+    scheduler: weighted-round-robin
+    backends:
+      arc:
+        enabled: true
+        maxRunners: 2
+        capabilities:
+          - cluster-local
+          - docker
+          - region:local
+      lambda:
+        enabled: true
+        maxRunners: 3
+        capabilities:
+          - region:aws-us-east-1
+      cloud-run:
+        enabled: true
+        maxRunners: 2
+        capabilities:
+          - region:gcp-us-central1
+```
+
+Examples:
+
+- Cluster-local routing:
+
+```yaml
+- uses: ./actions/allocate-runner
+  with:
+    broker_url: https://broker.example.com
+    pool: lite
+    required_capabilities: cluster-local
+```
+
+- GPU routing:
+
+```yaml
+- uses: ./actions/allocate-runner
+  with:
+    broker_url: https://broker.example.com
+    pool: lite
+    required_capabilities: gpu
+```
+
+This requires at least one backend in the selected pool to advertise `gpu`, for example an ARC template or cloud backend dedicated to GPU jobs.
+
+- Region-specific routing:
+
+```yaml
+- uses: ./actions/allocate-runner
+  with:
+    broker_url: https://broker.example.com
+    pool: lite
+    required_capabilities: region:aws-us-east-1
+    excluded_capabilities: cluster-local
+```
+
+If no backend matches the requested capability filters, the broker rejects the allocation request before scheduling.
+
 ## License
 
 Apache-2.0

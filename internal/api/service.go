@@ -15,6 +15,7 @@ import (
 )
 
 var ErrUnknownPool = errors.New("pool is not configured")
+var ErrNoMatchingBackendCapabilities = errors.New("no backend matches the requested capabilities")
 
 type Service struct {
 	cfg      model.BrokerConfig
@@ -51,6 +52,10 @@ func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest)
 	}
 
 	pool, err := s.resolvePool(request.Pool)
+	if err != nil {
+		return model.AllocationStatus{}, err
+	}
+	pool, err = filterEligibleBackends(pool, request)
 	if err != nil {
 		return model.AllocationStatus{}, err
 	}
@@ -102,7 +107,7 @@ func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest)
 	}
 
 	allocation.RunnerLabel = provisioned.RunnerLabel
-	allocation.Metadata = provisioned.Metadata
+	allocation.Metadata = backend.WithCapabilitiesMetadata(pool.Backends[selected], provisioned.Metadata)
 	allocation.State = model.StateReady
 	s.store.Save(allocation)
 
@@ -176,6 +181,58 @@ func validateSchedulers(pools []model.PoolConfig, registry *scheduler.Registry) 
 		}
 	}
 	return nil
+}
+
+func filterEligibleBackends(pool model.PoolConfig, request model.AllocationRequest) (model.PoolConfig, error) {
+	required := backend.NormalizeCapabilities(request.RequiredCapabilities)
+	excluded := backend.NormalizeCapabilities(request.ExcludedCapabilities)
+	if len(required) == 0 && len(excluded) == 0 {
+		return pool, nil
+	}
+
+	filtered := pool
+	filtered.Backends = make(map[model.BackendName]model.BackendConfig, len(pool.Backends))
+
+	for name, cfg := range pool.Backends {
+		cfg.Capabilities = backend.NormalizeCapabilities(cfg.Capabilities)
+		if backendMatchesCapabilities(cfg, required, excluded) {
+			filtered.Backends[name] = cfg
+		}
+	}
+
+	if request.Backend != nil {
+		if _, ok := pool.Backends[*request.Backend]; !ok {
+			return model.PoolConfig{}, scheduler.ErrUnknownBackend
+		}
+		if _, ok := filtered.Backends[*request.Backend]; !ok {
+			return model.PoolConfig{}, fmt.Errorf("pinned backend %q does not match the requested capabilities: %w", *request.Backend, ErrNoMatchingBackendCapabilities)
+		}
+		return filtered, nil
+	}
+
+	if len(filtered.Backends) == 0 {
+		return model.PoolConfig{}, fmt.Errorf("%w for pool %q", ErrNoMatchingBackendCapabilities, pool.Name)
+	}
+
+	return filtered, nil
+}
+
+func backendMatchesCapabilities(cfg model.BackendConfig, required, excluded []string) bool {
+	capabilities := backend.CapabilitySet(cfg.Capabilities)
+
+	for _, capability := range required {
+		if _, ok := capabilities[capability]; !ok {
+			return false
+		}
+	}
+
+	for _, capability := range excluded {
+		if _, ok := capabilities[capability]; ok {
+			return false
+		}
+	}
+
+	return true
 }
 
 func newID() string {

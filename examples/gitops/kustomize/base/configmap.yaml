@@ -30,6 +30,7 @@ data:
             healthy: true
             maxRunners: 4
             weight: 1
+            capabilities: [cluster-local, docker, region:local]
             template: arc-full
       - name: lite
         labels: [self-hosted, linux, x64, uecb, uecb-lite]
@@ -41,6 +42,7 @@ data:
             healthy: true
             maxRunners: 2
             weight: 1
+            capabilities: [cluster-local, docker, region:local]
             template: arc-lite
           lambda:
             enabled: false
@@ -48,6 +50,7 @@ data:
             maxRunners: 3
             weight: 1
             maxJobDuration: 14m
+            capabilities: [region:aws-us-east-1]
             secretRef: uecb-lambda
           cloud-run:
             enabled: false
@@ -55,6 +58,7 @@ data:
             maxRunners: 2
             weight: 1
             maxJobDuration: 30m
+            capabilities: [region:gcp-us-central1]
             secretRef: uecb-cloud-run
           azure-functions:
             enabled: false
@@ -62,5 +66,6 @@ data:
             maxRunners: 2
             weight: 1
             maxJobDuration: 25m
+            capabilities: [region:azure-eastus]
             secretRef: uecb-azure-functions
 

@@ -26,3 +26,15 @@ Within a selected pool, backends use `round-robin` across healthy backends with 
 
 Pools can opt into `weighted-round-robin` instead. Backend weights are configured per pool and only affect selection when that scheduler is enabled.
 
+## Capability Filtering
+
+Capability-aware routing is evaluated before scheduler selection.
+
+- Jobs may send `required_capabilities` and `excluded_capabilities` string arrays on the allocation request.
+- Each backend advertises a normalized capability set through `pools[].backends.<name>.capabilities`.
+- The broker filters the pool down to eligible backends first, then passes only that reduced backend set into the configured scheduler.
+- Pinned backend requests still honor capability filters. If the pinned backend is configured for the pool but excluded by the request, the broker returns a clear rejection instead of falling through to another backend.
+- Missing backend capability metadata means that backend advertises no extra capabilities.
+
+This keeps scheduling policy isolated in the scheduler registry while making capability eligibility deterministic at the API layer.
+

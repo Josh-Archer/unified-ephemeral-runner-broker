@@ -19,6 +19,14 @@ inputs:
     description: Optional comma-separated labels to attach to the allocation request
     required: false
     default: ""
+  required_capabilities:
+    description: Optional comma-separated capability tags that the selected backend must advertise
+    required: false
+    default: ""
+  excluded_capabilities:
+    description: Optional comma-separated capability tags that the selected backend must not advertise
+    required: false
+    default: ""
   oidc_audience:
     description: OIDC audience expected by the broker
     required: false
@@ -53,6 +61,8 @@ runs:
         INPUT_BACKEND: ${{ inputs.backend }}
         INPUT_JOB_TIMEOUT: ${{ inputs.job_timeout }}
         INPUT_LABELS: ${{ inputs.labels }}
+        INPUT_REQUIRED_CAPABILITIES: ${{ inputs.required_capabilities }}
+        INPUT_EXCLUDED_CAPABILITIES: ${{ inputs.excluded_capabilities }}
         INPUT_OIDC_AUDIENCE: ${{ inputs.oidc_audience }}
         INPUT_ALLOW_UNAUTHENTICATED: ${{ inputs.allow_unauthenticated }}
       run: |
@@ -86,6 +96,14 @@ if backend:
 labels = [item.strip() for item in os.environ.get("INPUT_LABELS", "").split(",") if item.strip()]
 if labels:
     payload["labels"] = labels
+
+required_capabilities = [item.strip() for item in os.environ.get("INPUT_REQUIRED_CAPABILITIES", "").split(",") if item.strip()]
+if required_capabilities:
+    payload["required_capabilities"] = required_capabilities
+
+excluded_capabilities = [item.strip() for item in os.environ.get("INPUT_EXCLUDED_CAPABILITIES", "").split(",") if item.strip()]
+if excluded_capabilities:
+    payload["excluded_capabilities"] = excluded_capabilities
 
 print(json.dumps(payload))
 PY
