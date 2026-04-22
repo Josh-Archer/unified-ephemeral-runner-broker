@@ -2,12 +2,14 @@
 
 `unified-ephemeral-runner-broker` is a public control plane for allocating one-shot GitHub Actions runners across a unified ephemeral capacity pool.
 
-V1 supports exactly four backends:
+V1 models exactly four backends:
 
 - `arc`
 - `lambda`
 - `cloud-run`
 - `azure-functions`
+
+The public repo ships ARC provisioning plus backend-specific external launcher placeholders. External backends should stay disabled until you provide a real launcher integration for the selected platform.
 
 It is intentionally split into two capability pools:
 
@@ -40,9 +42,10 @@ Built-in schedulers:
 
 1. A lightweight workflow step calls `allocate-runner`.
 2. The broker selects an eligible backend from the chosen pool.
-3. The backend provisions an ephemeral runner and returns a unique runner label.
-4. The heavy workflow job runs on that exact label.
-5. The runner executes one job and exits.
+3. The broker sends the request to the selected backend integration; `lambda`, `cloud-run`, and `azure-functions` currently return a clear "not implemented" error when selected without a real launcher integration.
+4. `job_timeout` is accepted as duration strings like `15m`, with numeric nanoseconds still accepted for backward compatibility.
+5. The heavy workflow job runs on that exact label.
+6. The runner executes one job and exits.
 
 ## Project Layout
 
@@ -68,8 +71,8 @@ See [docs/architecture.md](docs/architecture.md) and [docs/security-boundary.md]
 1. Install the Helm chart with external backends disabled.
 2. Create the GitHub auth secret and any enabled backend secrets in the same namespace as the broker.
    The broker validates referenced `secretRef` objects via the Kubernetes API and stays unready until they exist.
-3. Point the `allocate-runner` action at the broker URL.
-4. Start with the `full` pool or ARC-only `lite` pool, then enable external backends one by one.
+3. Point the `allocate-runner` action at the broker URL. The broker accepts `job_timeout` in the same duration-string format used by the action, for example `15m`.
+4. Start with the `full` pool or ARC-only `lite` pool. Only enable an external backend after you have supplied a real launcher integration for that platform.
 
 ## Scheduler Configuration
 

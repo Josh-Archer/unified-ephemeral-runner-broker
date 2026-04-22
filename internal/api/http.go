@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -58,8 +57,8 @@ func (s *Server) handleAllocations(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodPost:
-		var request model.AllocationRequest
-		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		request, err := decodeAllocationRequest(r.Body)
+		if err != nil {
 			s.writeError(w, http.StatusBadRequest, err)
 			return
 		}
