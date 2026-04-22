@@ -2,11 +2,12 @@ package api
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend"
-	arcbackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/arc"
 	azurebackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/azurefunctions"
 	cloudbackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/cloudrun"
 	lambdabackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/lambda"
@@ -14,6 +15,24 @@ import (
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/scheduler"
 )
+
+type testBackend struct {
+	name model.BackendName
+}
+
+func (b testBackend) Name() model.BackendName {
+	return b.name
+}
+
+func (b testBackend) Provision(_ context.Context, request model.AllocationRequest, allocation model.AllocationStatus) (backend.ProvisionedRunner, error) {
+	return backend.ProvisionedRunner{
+		RunnerLabel: backend.DefaultRunnerLabel(b.name, allocation.ID),
+		Metadata: map[string]string{
+			"pool":        string(request.Pool),
+			"provisioner": fmt.Sprintf("test-%s", b.name),
+		},
+	}, nil
+}
 
 func newService() *Service {
 	return newServiceWithConfig(func(pool *model.PoolConfig) {
@@ -37,10 +56,10 @@ func newServiceWithConfig(mutator func(*model.PoolConfig)) *Service {
 	return NewService(
 		cfg,
 		backend.NewRegistry(
-			arcbackend.New(),
-			lambdabackend.New(),
-			cloudbackend.New(),
-			azurebackend.New(),
+			testBackend{name: model.BackendARC},
+			testBackend{name: model.BackendLambda},
+			testBackend{name: model.BackendCloudRun},
+			testBackend{name: model.BackendAzureFunctions},
 		),
 		nil,
 	)
@@ -132,9 +151,57 @@ func TestAllocateRespectsPinnedBackendTimeoutLimit(t *testing.T) {
 	}
 }
 
+func TestAllocateFailsWithStubbedExternalBackend(t *testing.T) {
+	cfg := config.Default()
+	for index := range cfg.Pools {
+		if cfg.Pools[index].Name != model.PoolLite {
+			continue
+		}
+		lambdaCfg := cfg.Pools[index].Backends[model.BackendLambda]
+		lambdaCfg.Enabled = true
+		cfg.Pools[index].Backends[model.BackendLambda] = lambdaCfg
+		cloudCfg := cfg.Pools[index].Backends[model.BackendCloudRun]
+		cloudCfg.Enabled = true
+		cfg.Pools[index].Backends[model.BackendCloudRun] = cloudCfg
+		azureCfg := cfg.Pools[index].Backends[model.BackendAzureFunctions]
+		azureCfg.Enabled = true
+		cfg.Pools[index].Backends[model.BackendAzureFunctions] = azureCfg
+	}
+
+	service := NewService(
+		cfg,
+		backend.NewRegistry(
+			testBackend{name: model.BackendARC},
+			lambdabackend.New(),
+			cloudbackend.New(),
+			azurebackend.New(),
+		),
+		nil,
+	)
+
+	for _, backend := range []model.BackendName{
+		model.BackendLambda,
+		model.BackendCloudRun,
+		model.BackendAzureFunctions,
+	} {
+		backend := backend
+		_, err := service.Allocate(context.Background(), model.AllocationRequest{
+			Pool:       model.PoolLite,
+			Backend:    &backend,
+			JobTimeout: 5 * time.Minute,
+		})
+		if err == nil {
+			t.Fatalf("expected %s allocation to fail", backend)
+		}
+		if !strings.Contains(err.Error(), "not implemented yet") {
+			t.Fatalf("expected not implemented error for %s, got %v", backend, err)
+		}
+	}
+}
+
 func TestCancelReleasesCapacity(t *testing.T) {
 	service := newService()
-	backend := model.BackendLambda
+	backend := model.BackendARC
 
 	first, err := service.Allocate(context.Background(), model.AllocationRequest{
 		Pool:       model.PoolLite,
@@ -188,7 +255,7 @@ func TestSweepExpiredMarksReadyAllocationsExpired(t *testing.T) {
 func TestAllocateFailsWhenHealthCheckFails(t *testing.T) {
 	service := NewService(
 		config.Default(),
-		backend.NewRegistry(arcbackend.New()),
+		backend.NewRegistry(testBackend{name: model.BackendARC}),
 		func(context.Context) error { return context.DeadlineExceeded },
 	)
 

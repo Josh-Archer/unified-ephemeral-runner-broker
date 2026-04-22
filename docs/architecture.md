@@ -12,7 +12,7 @@
 ## Data Plane
 
 - `arc` provisions in-cluster runners.
-- `lambda`, `cloud-run`, and `azure-functions` provision lite-profile external runners.
+- `lambda`, `cloud-run`, and `azure-functions` are configured here as lite-profile external runners; if no launcher integration exists they return explicit errors instead of reporting a runner as ready.
 - Each runner handles one job and exits.
 
 ## Pools
