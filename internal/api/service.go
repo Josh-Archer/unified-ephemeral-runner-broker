@@ -59,6 +59,7 @@ func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest)
 	if timeout <= 0 {
 		timeout = s.cfg.Broker.DefaultJobTimeout
 	}
+	request.JobTimeout = timeout
 
 	if request.Backend != nil {
 		backendCfg, ok := pool.Backends[*request.Backend]

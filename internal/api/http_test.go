@@ -2,7 +2,9 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,6 +17,12 @@ import (
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 	"github.com/prometheus/client_golang/prometheus"
 )
+
+type httpMissingSecretReader struct{}
+
+func (httpMissingSecretReader) ReadSecret(context.Context, string) (map[string]string, error) {
+	return nil, errors.New("secret not found")
+}
 
 func newTestServer(t *testing.T, service *Service) *Server {
 	t.Helper()
@@ -60,7 +68,7 @@ func TestHandleAllocationsAcceptsStringJobTimeout(t *testing.T) {
 	}
 }
 
-func TestHandleAllocationsRejectsStubBackend(t *testing.T) {
+func TestHandleAllocationsRejectsMissingExternalBackendSecret(t *testing.T) {
 	cfg := config.Default()
 	for index := range cfg.Pools {
 		if cfg.Pools[index].Name != model.PoolLite {
@@ -75,7 +83,7 @@ func TestHandleAllocationsRejectsStubBackend(t *testing.T) {
 		cfg,
 		backend.NewRegistry(
 			testBackend{name: model.BackendARC},
-			lambdabackend.New(),
+			lambdabackend.New(cfg, httpMissingSecretReader{}),
 		),
 		nil,
 	)
@@ -89,7 +97,7 @@ func TestHandleAllocationsRejectsStubBackend(t *testing.T) {
 		t.Fatalf("expected 400, got %d: %s", recorder.Code, recorder.Body.String())
 	}
 
-	if !strings.Contains(recorder.Body.String(), "not implemented yet") {
-		t.Fatalf("expected not implemented error, got %s", recorder.Body.String())
+	if !strings.Contains(recorder.Body.String(), "secret not found") {
+		t.Fatalf("expected secret error, got %s", recorder.Body.String())
 	}
 }

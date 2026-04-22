@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -18,6 +19,12 @@ import (
 
 type testBackend struct {
 	name model.BackendName
+}
+
+type missingSecretReader struct{}
+
+func (missingSecretReader) ReadSecret(context.Context, string) (map[string]string, error) {
+	return nil, errors.New("secret not found")
 }
 
 func (b testBackend) Name() model.BackendName {
@@ -151,7 +158,7 @@ func TestAllocateRespectsPinnedBackendTimeoutLimit(t *testing.T) {
 	}
 }
 
-func TestAllocateFailsWithStubbedExternalBackend(t *testing.T) {
+func TestAllocateFailsWhenExternalBackendSecretIsMissing(t *testing.T) {
 	cfg := config.Default()
 	for index := range cfg.Pools {
 		if cfg.Pools[index].Name != model.PoolLite {
@@ -172,8 +179,8 @@ func TestAllocateFailsWithStubbedExternalBackend(t *testing.T) {
 		cfg,
 		backend.NewRegistry(
 			testBackend{name: model.BackendARC},
-			lambdabackend.New(),
-			cloudbackend.New(),
+			lambdabackend.New(cfg, missingSecretReader{}),
+			cloudbackend.New(cfg, missingSecretReader{}),
 			azurebackend.New(),
 		),
 		nil,
@@ -193,8 +200,14 @@ func TestAllocateFailsWithStubbedExternalBackend(t *testing.T) {
 		if err == nil {
 			t.Fatalf("expected %s allocation to fail", backend)
 		}
-		if !strings.Contains(err.Error(), "not implemented yet") {
-			t.Fatalf("expected not implemented error for %s, got %v", backend, err)
+		if backend == model.BackendAzureFunctions {
+			if !strings.Contains(err.Error(), "not implemented yet") {
+				t.Fatalf("expected stub error for %s, got %v", backend, err)
+			}
+			continue
+		}
+		if !strings.Contains(err.Error(), "secret not found") {
+			t.Fatalf("expected secret error for %s, got %v", backend, err)
 		}
 	}
 }

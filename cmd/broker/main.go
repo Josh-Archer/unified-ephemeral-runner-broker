@@ -22,10 +22,15 @@ func main() {
 		log.Fatalf("load config: %v", err)
 	}
 
+	secretReader, err := runtime.NewSecretReaderFromEnv()
+	if err != nil {
+		log.Fatalf("configure kubernetes secret reader: %v", err)
+	}
+
 	registry := backend.NewRegistry(
 		arcbackend.New(),
-		lambdabackend.New(),
-		cloudbackend.New(),
+		lambdabackend.New(cfg, secretReader),
+		cloudbackend.New(cfg, secretReader),
 		azurebackend.New(),
 	)
 	healthChecker, err := runtime.NewSecretRefCheckerFromEnv(cfg)
