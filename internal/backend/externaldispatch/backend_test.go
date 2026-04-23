@@ -30,8 +30,8 @@ func (s staticSecrets) ReadSecret(_ context.Context, name string) (map[string]st
 func newRepoScopedConfig() model.BrokerConfig {
 	cfg := config.Default()
 	cfg.GitHub.Scope.Type = model.GitHubScopeRepository
-	cfg.GitHub.Scope.Owner = "Josh-Archer"
-	cfg.GitHub.Scope.Repository = "home"
+	cfg.GitHub.Scope.Owner = "example-org"
+	cfg.GitHub.Scope.Repository = "example-repo"
 	cfg.GitHub.Scope.Organization = ""
 	for index := range cfg.Pools {
 		if cfg.Pools[index].Name != model.PoolLite {
@@ -59,7 +59,7 @@ func TestProvisionDispatchesRunnerLaunch(t *testing.T) {
 		if payload.GitHub.ScopeType != model.GitHubScopeRepository {
 			t.Fatalf("expected repository scope, got %q", payload.GitHub.ScopeType)
 		}
-		if payload.GitHub.TargetURL != "https://github.com/Josh-Archer/home" {
+		if payload.GitHub.TargetURL != "https://github.com/example-org/example-repo" {
 			t.Fatalf("unexpected target url %q", payload.GitHub.TargetURL)
 		}
 		if payload.JobTimeout != "12m0s" {
