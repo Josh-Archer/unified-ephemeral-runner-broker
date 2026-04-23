@@ -13,7 +13,7 @@
 ## Data Plane
 
 - `arc` provisions in-cluster runners.
-- `codebuild` and `cloud-run` are lite-profile external runners that dispatch into provider-owned launcher controllers.
+- `codebuild`, `lambda`, and `cloud-run` are lite-profile external runners that dispatch into provider-owned launcher controllers.
 - `azure-functions` remains a placeholder backend until a real launcher integration is supplied.
 - Each runner handles one job and exits.
 
