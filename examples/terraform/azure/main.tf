@@ -8,6 +8,5 @@ variable "functions_image" {
 }
 
 output "next_step" {
-  value = "Create the Azure Functions lite launcher resources, wire a backend secret ref, and point the broker config at the published launcher image."
+  value = "Create a Linux custom-container Function App on a Premium or Dedicated plan, point it at the published azure-functions image, wire the backend secret ref, and enable the azure-functions backend in broker config."
 }
-

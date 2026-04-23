@@ -1,0 +1,34 @@
+FROM mcr.microsoft.com/azure-functions/python:4-python3.11
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    AzureFunctionsJobHost__Logging__Console__IsEnabled=true \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN set -eux; \
+  apt-get update; \
+  libicu_pkg="$(apt-cache search '^libicu[0-9]+$' | awk '{print $1}' | sort -V | tail -n 1)"; \
+  if [ -z "${libicu_pkg}" ]; then echo "unable to resolve libicu package" >&2; exit 1; fi; \
+  apt-get install -y --no-install-recommends \
+    bash \
+    ca-certificates \
+    curl \
+    git \
+    gzip \
+    jq \
+    tar \
+    unzip \
+    "${libicu_pkg}"; \
+  rm -rf /var/lib/apt/lists/*
+
+WORKDIR /home/site/wwwroot
+
+COPY docker/launcher/entrypoint.sh /opt/uecb/runner-entrypoint.sh
+RUN chmod +x /opt/uecb/runner-entrypoint.sh
+
+COPY docker/azure-functions/requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt \
+  && rm -f /tmp/requirements.txt
+
+COPY docker/azure-functions/host.json /home/site/wwwroot/host.json
+COPY docker/azure-functions/function_app.py /home/site/wwwroot/function_app.py

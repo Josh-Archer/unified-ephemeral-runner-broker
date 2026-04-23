@@ -33,7 +33,7 @@ func main() {
 		codebuildbackend.New(cfg, secretReader),
 		lambdabackend.New(cfg, secretReader),
 		cloudbackend.New(cfg, secretReader),
-		azurebackend.New(),
+		azurebackend.New(cfg, secretReader),
 	)
 	healthChecker, err := runtime.NewSecretRefCheckerFromEnv(cfg)
 	if err != nil {
