@@ -5,11 +5,11 @@
 V1 models exactly four backends:
 
 - `arc`
-- `lambda`
+- `codebuild`
 - `cloud-run`
 - `azure-functions`
 
-The public repo ships ARC provisioning plus generic secret-backed external launcher dispatch for `lambda` and `cloud-run`. Each enabled external backend must point at a real launcher controller through a Kubernetes secret in the broker namespace.
+The public repo ships ARC provisioning plus generic secret-backed external launcher dispatch for `codebuild` and `cloud-run`. Each enabled external backend must point at a real launcher controller through a Kubernetes secret in the broker namespace.
 
 It is intentionally split into two capability pools:
 
@@ -42,7 +42,7 @@ Built-in schedulers:
 
 1. A lightweight workflow step calls `allocate-runner`.
 2. The broker selects an eligible backend from the chosen pool.
-3. The broker sends the request to the selected backend integration. `lambda` and `cloud-run` dispatch through a secret-backed HTTP controller contract; `azure-functions` remains a placeholder until a real launcher integration is supplied.
+3. The broker sends the request to the selected backend integration. `codebuild` and `cloud-run` dispatch through a secret-backed HTTP controller contract; `azure-functions` remains a placeholder until a real launcher integration is supplied.
 4. `job_timeout` is accepted as duration strings like `15m`, with numeric nanoseconds still accepted for backward compatibility.
 5. The heavy workflow job runs on that exact label.
 6. The runner executes one job and exits.
@@ -105,10 +105,12 @@ pools:
         enabled: true
         maxRunners: 2
         weight: 3
-      lambda:
+      codebuild:
         enabled: true
         maxRunners: 3
         weight: 1
+
+`lambda` remains a compatibility alias for `codebuild` in request/body parsing and config normalization, and will continue to route to the CodeBuild-backed external dispatcher.
 ```
 
 Rollback is just a config change: set `scheduler` back to `round-robin` for the pool and redeploy. Leaving `weight` values in place is safe because the default scheduler ignores them.

@@ -1,10 +1,11 @@
 package runtime
 
 import (
-	"encoding/base64"
 	"context"
+	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"testing"
 
@@ -15,14 +16,15 @@ import (
 func TestRequiredSecretRefsSkipsDisabledBackends(t *testing.T) {
 	cfg := config.Default()
 	pool := cfg.Pools[1]
-	lambdaCfg := pool.Backends[model.BackendLambda]
-	lambdaCfg.Enabled = true
-	pool.Backends[model.BackendLambda] = lambdaCfg
+	codebuildCfg := pool.Backends[model.BackendCodeBuild]
+	codebuildCfg.Enabled = true
+	pool.Backends[model.BackendCodeBuild] = codebuildCfg
 	cfg.Pools[1] = pool
 
 	refs := requiredSecretRefs(cfg)
+	sort.Strings(refs)
 	got := strings.Join(refs, ",")
-	want := "uecb-github-app,uecb-lambda"
+	want := "uecb-codebuild,uecb-github-app"
 	if got != want {
 		t.Fatalf("expected %s, got %s", want, got)
 	}

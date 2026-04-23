@@ -37,10 +37,10 @@ func newRepoScopedConfig() model.BrokerConfig {
 		if cfg.Pools[index].Name != model.PoolLite {
 			continue
 		}
-		lambdaCfg := cfg.Pools[index].Backends[model.BackendLambda]
-		lambdaCfg.Enabled = true
-		lambdaCfg.SecretRef = "uecb-lambda"
-		cfg.Pools[index].Backends[model.BackendLambda] = lambdaCfg
+		codebuildCfg := cfg.Pools[index].Backends[model.BackendCodeBuild]
+		codebuildCfg.Enabled = true
+		codebuildCfg.SecretRef = "uecb-codebuild"
+		cfg.Pools[index].Backends[model.BackendCodeBuild] = codebuildCfg
 	}
 	return cfg
 }
@@ -78,8 +78,8 @@ func TestProvisionDispatchesRunnerLaunch(t *testing.T) {
 	defer server.Close()
 
 	cfg := newRepoScopedConfig()
-	backend := New(model.BackendLambda, cfg, staticSecrets{
-		"uecb-lambda": {
+	backend := New(model.BackendCodeBuild, cfg, staticSecrets{
+		"uecb-codebuild": {
 			secretKeyDispatchURL:   server.URL,
 			secretKeyDispatchToken: "broker-secret",
 		},
@@ -98,7 +98,7 @@ func TestProvisionDispatchesRunnerLaunch(t *testing.T) {
 		t.Fatalf("provision failed: %v", err)
 	}
 
-	if provisioned.RunnerLabel != "uecb-lambda-abc123" {
+	if provisioned.RunnerLabel != "uecb-codebuild-abc123" {
 		t.Fatalf("unexpected runner label %q", provisioned.RunnerLabel)
 	}
 	if provisioned.Metadata["provider"] != "cloud-run" {
@@ -111,8 +111,8 @@ func TestProvisionDispatchesRunnerLaunch(t *testing.T) {
 
 func TestProvisionFailsWhenSecretMissesDispatchURL(t *testing.T) {
 	cfg := newRepoScopedConfig()
-	backend := New(model.BackendLambda, cfg, staticSecrets{
-		"uecb-lambda": {
+	backend := New(model.BackendCodeBuild, cfg, staticSecrets{
+		"uecb-codebuild": {
 			secretKeyDispatchToken: "broker-secret",
 		},
 	})
@@ -136,8 +136,8 @@ func TestProvisionSurfacesRemoteErrors(t *testing.T) {
 	defer server.Close()
 
 	cfg := newRepoScopedConfig()
-	backend := New(model.BackendLambda, cfg, staticSecrets{
-		"uecb-lambda": {
+	backend := New(model.BackendCodeBuild, cfg, staticSecrets{
+		"uecb-codebuild": {
 			secretKeyDispatchURL: server.URL,
 		},
 	})

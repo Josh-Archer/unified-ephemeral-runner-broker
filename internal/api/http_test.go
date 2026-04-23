@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend"
-	lambdabackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/lambda"
+	codebuildbackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/codebuild"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/config"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 	"github.com/prometheus/client_golang/prometheus"
@@ -74,22 +74,22 @@ func TestHandleAllocationsRejectsMissingExternalBackendSecret(t *testing.T) {
 		if cfg.Pools[index].Name != model.PoolLite {
 			continue
 		}
-		lambdaCfg := cfg.Pools[index].Backends[model.BackendLambda]
-		lambdaCfg.Enabled = true
-		cfg.Pools[index].Backends[model.BackendLambda] = lambdaCfg
+		codebuildCfg := cfg.Pools[index].Backends[model.BackendCodeBuild]
+		codebuildCfg.Enabled = true
+		cfg.Pools[index].Backends[model.BackendCodeBuild] = codebuildCfg
 	}
 
 	service := NewService(
 		cfg,
 		backend.NewRegistry(
 			testBackend{name: model.BackendARC},
-			lambdabackend.New(cfg, httpMissingSecretReader{}),
+			codebuildbackend.New(cfg, httpMissingSecretReader{}),
 		),
 		nil,
 	)
 	server := newTestServer(t, service)
 
-	request := httptest.NewRequest(http.MethodPost, "/v1/allocations", bytes.NewBufferString(`{"pool":"lite","backend":"lambda","job_timeout":"5m"}`))
+	request := httptest.NewRequest(http.MethodPost, "/v1/allocations", bytes.NewBufferString(`{"pool":"lite","backend":"codebuild","job_timeout":"5m"}`))
 	recorder := httptest.NewRecorder()
 	server.Handler().ServeHTTP(recorder, request)
 

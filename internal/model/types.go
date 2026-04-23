@@ -6,6 +6,7 @@ type BackendName string
 
 const (
 	BackendARC            BackendName = "arc"
+	BackendCodeBuild      BackendName = "codebuild"
 	BackendLambda         BackendName = "lambda"
 	BackendCloudRun       BackendName = "cloud-run"
 	BackendAzureFunctions BackendName = "azure-functions"

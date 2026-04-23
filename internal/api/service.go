@@ -60,6 +60,7 @@ func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest)
 		timeout = s.cfg.Broker.DefaultJobTimeout
 	}
 	request.JobTimeout = timeout
+	request.Backend = s.resolveRequestedBackend(pool, request.Backend)
 
 	if request.Backend != nil {
 		backendCfg, ok := pool.Backends[*request.Backend]
@@ -161,6 +162,23 @@ func (s *Service) resolvePool(name model.PoolName) (model.PoolConfig, error) {
 		}
 	}
 	return model.PoolConfig{}, ErrUnknownPool
+}
+
+func (s *Service) resolveRequestedBackend(pool model.PoolConfig, requested *model.BackendName) *model.BackendName {
+	if requested == nil {
+		return nil
+	}
+	if *requested != model.BackendLambda {
+		return requested
+	}
+
+	lambdaCfg, hasLambda := pool.Backends[model.BackendLambda]
+	codebuildCfg, hasCodebuild := pool.Backends[model.BackendCodeBuild]
+	if (!hasLambda || !lambdaCfg.Enabled) && hasCodebuild && codebuildCfg.Enabled {
+		backend := model.BackendCodeBuild
+		return &backend
+	}
+	return requested
 }
 
 func (s *Service) schedulerForPool(pool model.PoolConfig) scheduler.Scheduler {
