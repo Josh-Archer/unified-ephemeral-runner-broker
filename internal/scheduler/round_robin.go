@@ -36,6 +36,7 @@ func (r *RoundRobin) Active(pool model.PoolName, backend model.BackendName) int 
 func orderedBackends(pool model.PoolConfig) []model.BackendName {
 	preferred := []model.BackendName{
 		model.BackendARC,
+		model.BackendCodeBuild,
 		model.BackendLambda,
 		model.BackendCloudRun,
 		model.BackendAzureFunctions,

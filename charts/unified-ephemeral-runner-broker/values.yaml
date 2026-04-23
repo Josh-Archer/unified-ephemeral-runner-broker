@@ -81,13 +81,13 @@ config:
           maxRunners: 2
           weight: 1
           template: arc-lite
-        lambda:
+        codebuild:
           enabled: false
           healthy: true
           maxRunners: 3
           weight: 1
           maxJobDuration: 14m
-          secretRef: uecb-lambda
+          secretRef: uecb-codebuild
         cloud-run:
           enabled: false
           healthy: true
@@ -102,4 +102,3 @@ config:
           weight: 1
           maxJobDuration: 25m
           secretRef: uecb-azure-functions
-

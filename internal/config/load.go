@@ -57,6 +57,14 @@ func Default() model.BrokerConfig {
 						Weight:     1,
 						Template:   "arc-lite",
 					},
+					model.BackendCodeBuild: {
+						Enabled:        false,
+						Healthy:        true,
+						MaxRunners:     3,
+						Weight:         1,
+						MaxJobDuration: 14 * time.Minute,
+						SecretRef:      "uecb-codebuild",
+					},
 					model.BackendLambda: {
 						Enabled:        false,
 						Healthy:        true,

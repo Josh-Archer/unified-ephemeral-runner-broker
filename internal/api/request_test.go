@@ -36,6 +36,16 @@ func TestDecodeAllocationRequestRejectsInvalidDuration(t *testing.T) {
 }
 
 func TestDecodeAllocationRequestParsesBackendAsString(t *testing.T) {
+	request, err := decodeAllocationRequest(bytes.NewReader([]byte(`{"pool":"lite","backend":"codebuild","job_timeout":"1m"}`)))
+	if err != nil {
+		t.Fatalf("decode failed: %v", err)
+	}
+	if request.Backend == nil || *request.Backend != model.BackendCodeBuild {
+		t.Fatalf("expected backend codebuild, got %#v", request.Backend)
+	}
+}
+
+func TestDecodeAllocationRequestParsesLambdaBackendAsString(t *testing.T) {
 	request, err := decodeAllocationRequest(bytes.NewReader([]byte(`{"pool":"lite","backend":"lambda","job_timeout":"1m"}`)))
 	if err != nil {
 		t.Fatalf("decode failed: %v", err)

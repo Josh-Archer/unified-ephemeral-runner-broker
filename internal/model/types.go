@@ -6,6 +6,7 @@ type BackendName string
 
 const (
 	BackendARC            BackendName = "arc"
+	BackendCodeBuild      BackendName = "codebuild"
 	BackendLambda         BackendName = "lambda"
 	BackendCloudRun       BackendName = "cloud-run"
 	BackendAzureFunctions BackendName = "azure-functions"
@@ -38,6 +39,8 @@ const (
 type GitHubScope struct {
 	Type              string `yaml:"type" json:"type"`
 	Organization      string `yaml:"organization" json:"organization"`
+	Owner             string `yaml:"owner,omitempty" json:"owner,omitempty"`
+	Repository        string `yaml:"repository,omitempty" json:"repository,omitempty"`
 	RunnerGroupPrefix string `yaml:"runnerGroupPrefix" json:"runnerGroupPrefix"`
 }
 

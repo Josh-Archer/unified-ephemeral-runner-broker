@@ -2,7 +2,9 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,11 +12,17 @@ import (
 	"time"
 
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend"
-	lambdabackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/lambda"
+	codebuildbackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/codebuild"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/config"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 	"github.com/prometheus/client_golang/prometheus"
 )
+
+type httpMissingSecretReader struct{}
+
+func (httpMissingSecretReader) ReadSecret(context.Context, string) (map[string]string, error) {
+	return nil, errors.New("secret not found")
+}
 
 func newTestServer(t *testing.T, service *Service) *Server {
 	t.Helper()
@@ -60,28 +68,28 @@ func TestHandleAllocationsAcceptsStringJobTimeout(t *testing.T) {
 	}
 }
 
-func TestHandleAllocationsRejectsStubBackend(t *testing.T) {
+func TestHandleAllocationsRejectsMissingExternalBackendSecret(t *testing.T) {
 	cfg := config.Default()
 	for index := range cfg.Pools {
 		if cfg.Pools[index].Name != model.PoolLite {
 			continue
 		}
-		lambdaCfg := cfg.Pools[index].Backends[model.BackendLambda]
-		lambdaCfg.Enabled = true
-		cfg.Pools[index].Backends[model.BackendLambda] = lambdaCfg
+		codebuildCfg := cfg.Pools[index].Backends[model.BackendCodeBuild]
+		codebuildCfg.Enabled = true
+		cfg.Pools[index].Backends[model.BackendCodeBuild] = codebuildCfg
 	}
 
 	service := NewService(
 		cfg,
 		backend.NewRegistry(
 			testBackend{name: model.BackendARC},
-			lambdabackend.New(),
+			codebuildbackend.New(cfg, httpMissingSecretReader{}),
 		),
 		nil,
 	)
 	server := newTestServer(t, service)
 
-	request := httptest.NewRequest(http.MethodPost, "/v1/allocations", bytes.NewBufferString(`{"pool":"lite","backend":"lambda","job_timeout":"5m"}`))
+	request := httptest.NewRequest(http.MethodPost, "/v1/allocations", bytes.NewBufferString(`{"pool":"lite","backend":"codebuild","job_timeout":"5m"}`))
 	recorder := httptest.NewRecorder()
 	server.Handler().ServeHTTP(recorder, request)
 
@@ -89,7 +97,7 @@ func TestHandleAllocationsRejectsStubBackend(t *testing.T) {
 		t.Fatalf("expected 400, got %d: %s", recorder.Code, recorder.Body.String())
 	}
 
-	if !strings.Contains(recorder.Body.String(), "not implemented yet") {
-		t.Fatalf("expected not implemented error, got %s", recorder.Body.String())
+	if !strings.Contains(recorder.Body.String(), "secret not found") {
+		t.Fatalf("expected secret error, got %s", recorder.Body.String())
 	}
 }
