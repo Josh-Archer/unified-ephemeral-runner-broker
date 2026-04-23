@@ -13,8 +13,8 @@
 ## Data Plane
 
 - `arc` provisions in-cluster runners.
-- `codebuild`, `lambda`, and `cloud-run` are lite-profile external runners that dispatch into provider-owned launcher controllers.
-- `azure-functions` remains a placeholder backend until a real launcher integration is supplied.
+- `codebuild`, `lambda`, `cloud-run`, and `azure-functions` are lite-profile external runners that dispatch into provider-owned launcher controllers using the shared external dispatch contract.
+- The public Azure Functions launcher uses an HTTP dispatch endpoint only for admission and status. Actual runner execution happens on a queue-triggered function inside the same container so the HTTP trigger does not have to stay open for the whole job.
 - Each runner handles one job and exits.
 
 ## Pools

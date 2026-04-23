@@ -229,7 +229,7 @@ func TestAllocateFailsWhenExternalBackendSecretIsMissing(t *testing.T) {
 			codebuildbackend.New(cfg, missingSecretReader{}),
 			lambdabackend.New(cfg, missingSecretReader{}),
 			cloudbackend.New(cfg, missingSecretReader{}),
-			azurebackend.New(),
+			azurebackend.New(cfg, missingSecretReader{}),
 		),
 		nil,
 	)
@@ -248,12 +248,6 @@ func TestAllocateFailsWhenExternalBackendSecretIsMissing(t *testing.T) {
 		})
 		if err == nil {
 			t.Fatalf("expected %s allocation to fail", backend)
-		}
-		if backend == model.BackendAzureFunctions {
-			if !strings.Contains(err.Error(), "not implemented yet") {
-				t.Fatalf("expected stub error for %s, got %v", backend, err)
-			}
-			continue
 		}
 		if !strings.Contains(err.Error(), "secret not found") {
 			t.Fatalf("expected secret error for %s, got %v", backend, err)

@@ -10,7 +10,7 @@ V1 models exactly five backends:
 - `cloud-run`
 - `azure-functions`
 
-The public repo ships ARC provisioning plus generic secret-backed external launcher dispatch for `codebuild`, `lambda`, and `cloud-run`. Each enabled external backend must point at a real launcher controller through a Kubernetes secret in the broker namespace.
+The public repo ships ARC provisioning plus generic secret-backed external launcher dispatch for `codebuild`, `lambda`, `cloud-run`, and `azure-functions`. Each enabled external backend must point at a real launcher controller through a Kubernetes secret in the broker namespace.
 
 It is intentionally split into two capability pools:
 
@@ -43,7 +43,7 @@ Built-in schedulers:
 
 1. A lightweight workflow step calls `allocate-runner`.
 2. The broker selects an eligible backend from the chosen pool.
-3. The broker sends the request to the selected backend integration. `codebuild`, `lambda`, and `cloud-run` dispatch through a secret-backed HTTP controller contract; `azure-functions` remains a placeholder until a real launcher integration is supplied.
+3. The broker sends the request to the selected backend integration. `codebuild`, `lambda`, `cloud-run`, and `azure-functions` dispatch through a secret-backed HTTP controller contract.
 4. `job_timeout` is accepted as duration strings like `15m`, with numeric nanoseconds still accepted for backward compatibility.
 5. The heavy workflow job runs on that exact label.
 6. The runner executes one job and exits.
@@ -52,6 +52,7 @@ Built-in schedulers:
 
 - `cmd/broker`: broker entrypoint
 - `internal/`: broker, scheduler, backend, GitHub, and config packages
+- `docker/azure-functions`: published Azure Functions controller and runner container
 - `charts/unified-ephemeral-runner-broker`: Helm chart
 - `actions/allocate-runner`: public workflow integration surface
 - `examples/`: generic Terraform and GitOps consumption examples
@@ -77,6 +78,14 @@ See [docs/architecture.md](docs/architecture.md) and [docs/security-boundary.md]
    `dispatch_token`: optional bearer token sent to that endpoint.
 3. Point the `allocate-runner` action at the broker URL. The broker accepts `job_timeout` in the same duration-string format used by the action, for example `15m`.
 4. Start with the `full` pool or ARC-only `lite` pool. Only enable an external backend after you have supplied a real launcher integration for that platform and the matching `secretRef`.
+
+## Azure Functions Launcher
+
+The published Azure Functions launcher image lives in `docker/azure-functions` and is designed for a Linux custom-container Function App.
+
+- The HTTP dispatch endpoint returns quickly and enqueues the allocation.
+- A queue-triggered function execution runs the ephemeral GitHub runner inside the same Function App container.
+- Use a hosting plan that supports long-running non-HTTP executions, such as Premium or Dedicated with `alwaysOn` enabled. The HTTP request still needs to finish quickly even when the runner job itself can run longer.
 
 ## GitHub Scope
 
