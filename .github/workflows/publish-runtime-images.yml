@@ -20,10 +20,13 @@ jobs:
       matrix:
         image:
           - name: cloud-run
+            package: uecb-cloud-run
             dockerfile: Dockerfile.cloud-run
           - name: lambda
+            package: uecb-lambda
             dockerfile: Dockerfile.lambda
           - name: azure-functions
+            package: uecb-azure-functions
             dockerfile: Dockerfile.azure-functions
     steps:
       - uses: actions/checkout@v4
@@ -42,4 +45,4 @@ jobs:
           file: ${{ matrix.image.dockerfile }}
           platforms: linux/amd64
           push: true
-          tags: ghcr.io/josh-archer/unified-ephemeral-runner-broker/${{ matrix.image.name }}:${{ inputs.tag }}
+          tags: ghcr.io/josh-archer/${{ matrix.image.package }}:${{ inputs.tag }}
