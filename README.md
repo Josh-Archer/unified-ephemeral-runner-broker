@@ -29,6 +29,7 @@ Built-in schedulers:
 - A Kubernetes broker service with a small REST API
 - A reusable GitHub Action, `allocate-runner`
 - An OCI Helm chart for installation
+- Generic provider runner images for `launcher`, `lambda`, `cloud-run`, and `azure-functions`
 - A generic Kustomize-facing GitOps consumption path
 - Generic infrastructure examples for AWS, GCP, and Azure
 
@@ -53,6 +54,7 @@ Built-in schedulers:
 - `cmd/broker`: broker entrypoint
 - `internal/`: broker, scheduler, backend, GitHub, and config packages
 - `docker/azure-functions`: published Azure Functions controller and runner container
+- `docker/lambda`: published AWS Lambda runner container handler
 - `charts/unified-ephemeral-runner-broker`: Helm chart
 - `actions/allocate-runner`: public workflow integration surface
 - `examples/`: generic Terraform and GitOps consumption examples
@@ -87,6 +89,18 @@ The published Azure Functions launcher image lives in `docker/azure-functions` a
 - The broker waits up to 90 seconds for the Azure Functions dispatch controller so a cold-started Function App can return its admission response.
 - A queue-triggered function execution runs the ephemeral GitHub runner inside the same Function App container.
 - Use a hosting plan that supports long-running non-HTTP executions, such as Premium or Dedicated with `alwaysOn` enabled. The HTTP request still needs to finish quickly even when the runner job itself can run longer.
+
+## Provider Runner Images
+
+The private release lane should publish these OCI images from one immutable source ref:
+
+- `broker`: Kubernetes broker API
+- `launcher`: generic one-shot runner launcher
+- `cloud-run`: Cloud Run Job runner image built from the generic launcher
+- `lambda`: AWS Lambda container runner image with the Lambda runtime handler
+- `azure-functions`: Azure Functions dispatch controller and runner image
+
+Environment-specific repositories can mirror images when a provider requires it. For example, AWS Lambda requires the function image to live in ECR, so a private consumer may mirror the published `lambda` image into its own ECR repository while still treating this repo as the image source of truth.
 
 ## GitHub Scope
 

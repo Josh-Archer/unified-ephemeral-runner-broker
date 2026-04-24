@@ -1,0 +1,25 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    RUNNER_ALLOW_RUNASROOT=1 \
+    UECB_PROVIDER=cloud-run
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    bash \
+    ca-certificates \
+    curl \
+    git \
+    gzip \
+    jq \
+    libicu74 \
+    python3 \
+    tar \
+    unzip \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /bootstrap
+COPY docker/launcher/entrypoint.sh /bootstrap/entrypoint.sh
+RUN chmod +x /bootstrap/entrypoint.sh
+
+ENTRYPOINT ["/bootstrap/entrypoint.sh"]

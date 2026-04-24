@@ -1,0 +1,35 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    RUNNER_ALLOW_RUNASROOT=1 \
+    UECB_PROVIDER=lambda
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    bash \
+    ca-certificates \
+    curl \
+    git \
+    gzip \
+    jq \
+    libicu74 \
+    python3 \
+    python3-pip \
+    tar \
+    unzip \
+  && python3 -m pip install --break-system-packages --no-cache-dir awslambdaric boto3 \
+  && mkdir -p /bootstrap /opt/uecb /var/task \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY docker/launcher/entrypoint.sh /bootstrap/entrypoint.sh
+COPY docker/lambda/handler.py /var/task/handler.py
+
+RUN chmod +x /bootstrap/entrypoint.sh \
+  && ln -sf /bootstrap/entrypoint.sh /opt/uecb/runner-entrypoint.sh
+
+WORKDIR /var/task
+
+ENTRYPOINT ["/usr/bin/python3", "-m", "awslambdaric"]
+CMD ["handler.lambda_handler"]
