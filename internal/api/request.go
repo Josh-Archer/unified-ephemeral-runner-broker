@@ -42,10 +42,12 @@ func (d *durationRequestValue) UnmarshalJSON(data []byte) error {
 
 func decodeAllocationRequest(reader io.Reader) (model.AllocationRequest, error) {
 	var request struct {
-		Pool       model.PoolName       `json:"pool"`
-		Backend    *model.BackendName   `json:"backend,omitempty"`
-		JobTimeout durationRequestValue `json:"job_timeout"`
-		Labels     []string             `json:"labels,omitempty"`
+		Pool                 model.PoolName       `json:"pool"`
+		Backend              *model.BackendName   `json:"backend,omitempty"`
+		JobTimeout           durationRequestValue `json:"job_timeout"`
+		Labels               []string             `json:"labels,omitempty"`
+		RequiredCapabilities []string             `json:"required_capabilities,omitempty"`
+		ExcludedCapabilities []string             `json:"excluded_capabilities,omitempty"`
 	}
 
 	decoder := json.NewDecoder(reader)
@@ -60,9 +62,11 @@ func decodeAllocationRequest(reader io.Reader) (model.AllocationRequest, error) 
 	}
 
 	return model.AllocationRequest{
-		Pool:       request.Pool,
-		Backend:    backend,
-		JobTimeout: time.Duration(request.JobTimeout),
-		Labels:     append([]string(nil), request.Labels...),
+		Pool:                 request.Pool,
+		Backend:              backend,
+		JobTimeout:           time.Duration(request.JobTimeout),
+		Labels:               append([]string(nil), request.Labels...),
+		RequiredCapabilities: append([]string(nil), request.RequiredCapabilities...),
+		ExcludedCapabilities: append([]string(nil), request.ExcludedCapabilities...),
 	}, nil
 }
