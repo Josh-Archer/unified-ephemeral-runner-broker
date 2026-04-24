@@ -45,4 +45,7 @@ jobs:
           file: ${{ matrix.image.dockerfile }}
           platforms: linux/amd64
           push: true
+          provenance: false
+          sbom: false
+          outputs: type=image,push=true,oci-mediatypes=false
           tags: ghcr.io/josh-archer/${{ matrix.image.package }}:${{ inputs.tag }}
