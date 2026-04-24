@@ -1,4 +1,4 @@
-package azurefunctions
+package codebuild
 
 import (
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/externaldispatch"
@@ -9,5 +9,5 @@ import (
 type Backend = externaldispatch.Backend
 
 func New(cfg model.BrokerConfig, secrets runtime.SecretReader) *Backend {
-	return externaldispatch.New(model.BackendAzureFunctions, cfg, secrets)
+	return externaldispatch.New(model.BackendCodeBuild, cfg, secrets)
 }

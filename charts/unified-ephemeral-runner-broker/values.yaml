@@ -89,7 +89,7 @@ config:
             - docker
             - region:local
           template: arc-lite
-        lambda:
+        codebuild:
           enabled: false
           healthy: true
           maxRunners: 3
@@ -97,7 +97,7 @@ config:
           maxJobDuration: 14m
           capabilities:
             - region:aws-us-east-1
-          secretRef: uecb-lambda
+          secretRef: uecb-codebuild
         cloud-run:
           enabled: false
           healthy: true
@@ -116,4 +116,3 @@ config:
           capabilities:
             - region:azure-eastus
           secretRef: uecb-azure-functions
-

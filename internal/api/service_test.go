@@ -3,28 +3,53 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend"
-	arcbackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/arc"
 	azurebackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/azurefunctions"
 	cloudbackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/cloudrun"
+	codebuildbackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/codebuild"
 	lambdabackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/lambda"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/config"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/scheduler"
 )
 
+type testBackend struct {
+	name model.BackendName
+}
+
+type missingSecretReader struct{}
+
+func (missingSecretReader) ReadSecret(context.Context, string) (map[string]string, error) {
+	return nil, errors.New("secret not found")
+}
+
+func (b testBackend) Name() model.BackendName {
+	return b.name
+}
+
+func (b testBackend) Provision(_ context.Context, request model.AllocationRequest, allocation model.AllocationStatus) (backend.ProvisionedRunner, error) {
+	return backend.ProvisionedRunner{
+		RunnerLabel: backend.DefaultRunnerLabel(b.name, allocation.ID),
+		Metadata: map[string]string{
+			"pool":        string(request.Pool),
+			"provisioner": fmt.Sprintf("test-%s", b.name),
+		},
+	}, nil
+}
+
 func newService() *Service {
 	return newServiceWithConfig(func(pool *model.PoolConfig) {
 		if pool.Name != model.PoolLite {
 			return
 		}
-		lambdaCfg := pool.Backends[model.BackendLambda]
-		lambdaCfg.Enabled = true
-		pool.Backends[model.BackendLambda] = lambdaCfg
+		codebuildCfg := pool.Backends[model.BackendCodeBuild]
+		codebuildCfg.Enabled = true
+		pool.Backends[model.BackendCodeBuild] = codebuildCfg
 	})
 }
 
@@ -39,10 +64,11 @@ func newServiceWithConfig(mutator func(*model.PoolConfig)) *Service {
 	return NewService(
 		cfg,
 		backend.NewRegistry(
-			arcbackend.New(),
-			lambdabackend.New(),
-			cloudbackend.New(),
-			azurebackend.New(),
+			testBackend{name: model.BackendARC},
+			testBackend{name: model.BackendCodeBuild},
+			testBackend{name: model.BackendLambda},
+			testBackend{name: model.BackendCloudRun},
+			testBackend{name: model.BackendAzureFunctions},
 		),
 		nil,
 	)
@@ -55,11 +81,11 @@ func TestAllocateUsesWeightedSchedulerForPool(t *testing.T) {
 		}
 		pool.Scheduler = scheduler.NameWeightedRoundRobin
 
-		lambdaCfg := pool.Backends[model.BackendLambda]
-		lambdaCfg.Enabled = true
-		lambdaCfg.Weight = 3
-		lambdaCfg.MaxRunners = 1
-		pool.Backends[model.BackendLambda] = lambdaCfg
+		codebuildCfg := pool.Backends[model.BackendCodeBuild]
+		codebuildCfg.Enabled = true
+		codebuildCfg.Weight = 3
+		codebuildCfg.MaxRunners = 1
+		pool.Backends[model.BackendCodeBuild] = codebuildCfg
 
 		arcCfg := pool.Backends[model.BackendARC]
 		arcCfg.Weight = 1
@@ -69,9 +95,9 @@ func TestAllocateUsesWeightedSchedulerForPool(t *testing.T) {
 
 	want := []model.BackendName{
 		model.BackendARC,
-		model.BackendLambda,
-		model.BackendLambda,
-		model.BackendLambda,
+		model.BackendCodeBuild,
+		model.BackendCodeBuild,
+		model.BackendCodeBuild,
 	}
 
 	for index, expected := range want {
@@ -123,7 +149,7 @@ func TestAllocateReturnsRunnerLabel(t *testing.T) {
 
 func TestAllocateRespectsPinnedBackendTimeoutLimit(t *testing.T) {
 	service := newService()
-	backend := model.BackendLambda
+	backend := model.BackendCodeBuild
 
 	if _, err := service.Allocate(context.Background(), model.AllocationRequest{
 		Pool:       model.PoolLite,
@@ -134,9 +160,104 @@ func TestAllocateRespectsPinnedBackendTimeoutLimit(t *testing.T) {
 	}
 }
 
-func TestCancelReleasesCapacity(t *testing.T) {
+func TestAllocateTreatsLegacyPinnedLambdaAsCodeBuildWhenLambdaBackendIsDisabled(t *testing.T) {
 	service := newService()
 	backend := model.BackendLambda
+
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolLite,
+		Backend:    &backend,
+		JobTimeout: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("expected legacy lambda pin to fall back to codebuild: %v", err)
+	}
+	if allocation.SelectedBackend != model.BackendCodeBuild {
+		t.Fatalf("expected legacy lambda pin to select codebuild, got %s", allocation.SelectedBackend)
+	}
+}
+
+func TestAllocateUsesLambdaWhenLambdaBackendIsEnabled(t *testing.T) {
+	service := newServiceWithConfig(func(pool *model.PoolConfig) {
+		if pool.Name != model.PoolLite {
+			return
+		}
+		lambdaCfg := pool.Backends[model.BackendLambda]
+		lambdaCfg.Enabled = true
+		lambdaCfg.MaxRunners = 1
+		pool.Backends[model.BackendLambda] = lambdaCfg
+	})
+	backend := model.BackendLambda
+
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolLite,
+		Backend:    &backend,
+		JobTimeout: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("expected lambda pin to select lambda when enabled: %v", err)
+	}
+	if allocation.SelectedBackend != model.BackendLambda {
+		t.Fatalf("expected lambda backend, got %s", allocation.SelectedBackend)
+	}
+}
+
+func TestAllocateFailsWhenExternalBackendSecretIsMissing(t *testing.T) {
+	cfg := config.Default()
+	for index := range cfg.Pools {
+		if cfg.Pools[index].Name != model.PoolLite {
+			continue
+		}
+		codebuildCfg := cfg.Pools[index].Backends[model.BackendCodeBuild]
+		codebuildCfg.Enabled = true
+		cfg.Pools[index].Backends[model.BackendCodeBuild] = codebuildCfg
+		lambdaCfg := cfg.Pools[index].Backends[model.BackendLambda]
+		lambdaCfg.Enabled = true
+		cfg.Pools[index].Backends[model.BackendLambda] = lambdaCfg
+		cloudCfg := cfg.Pools[index].Backends[model.BackendCloudRun]
+		cloudCfg.Enabled = true
+		cfg.Pools[index].Backends[model.BackendCloudRun] = cloudCfg
+		azureCfg := cfg.Pools[index].Backends[model.BackendAzureFunctions]
+		azureCfg.Enabled = true
+		cfg.Pools[index].Backends[model.BackendAzureFunctions] = azureCfg
+	}
+
+	service := NewService(
+		cfg,
+		backend.NewRegistry(
+			testBackend{name: model.BackendARC},
+			codebuildbackend.New(cfg, missingSecretReader{}),
+			lambdabackend.New(cfg, missingSecretReader{}),
+			cloudbackend.New(cfg, missingSecretReader{}),
+			azurebackend.New(cfg, missingSecretReader{}),
+		),
+		nil,
+	)
+
+	for _, backend := range []model.BackendName{
+		model.BackendCodeBuild,
+		model.BackendLambda,
+		model.BackendCloudRun,
+		model.BackendAzureFunctions,
+	} {
+		backend := backend
+		_, err := service.Allocate(context.Background(), model.AllocationRequest{
+			Pool:       model.PoolLite,
+			Backend:    &backend,
+			JobTimeout: 5 * time.Minute,
+		})
+		if err == nil {
+			t.Fatalf("expected %s allocation to fail", backend)
+		}
+		if !strings.Contains(err.Error(), "secret not found") {
+			t.Fatalf("expected secret error for %s, got %v", backend, err)
+		}
+	}
+}
+
+func TestCancelReleasesCapacity(t *testing.T) {
+	service := newService()
+	backend := model.BackendARC
 
 	first, err := service.Allocate(context.Background(), model.AllocationRequest{
 		Pool:       model.PoolLite,
@@ -190,7 +311,7 @@ func TestSweepExpiredMarksReadyAllocationsExpired(t *testing.T) {
 func TestAllocateFailsWhenHealthCheckFails(t *testing.T) {
 	service := NewService(
 		config.Default(),
-		backend.NewRegistry(arcbackend.New()),
+		backend.NewRegistry(testBackend{name: model.BackendARC}),
 		func(context.Context) error { return context.DeadlineExceeded },
 	)
 
@@ -221,10 +342,10 @@ func TestAllocateFiltersBackendsByRequiredCapabilities(t *testing.T) {
 		if pool.Name != model.PoolLite {
 			return
 		}
-		lambdaCfg := pool.Backends[model.BackendLambda]
-		lambdaCfg.Enabled = true
-		lambdaCfg.Capabilities = []string{"gpu", "region:aws-us-east-1"}
-		pool.Backends[model.BackendLambda] = lambdaCfg
+		codebuildCfg := pool.Backends[model.BackendCodeBuild]
+		codebuildCfg.Enabled = true
+		codebuildCfg.Capabilities = []string{"gpu", "region:aws-us-east-1"}
+		pool.Backends[model.BackendCodeBuild] = codebuildCfg
 	})
 
 	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
@@ -235,8 +356,8 @@ func TestAllocateFiltersBackendsByRequiredCapabilities(t *testing.T) {
 		t.Fatalf("allocate failed: %v", err)
 	}
 
-	if allocation.SelectedBackend != model.BackendLambda {
-		t.Fatalf("expected lambda backend, got %s", allocation.SelectedBackend)
+	if allocation.SelectedBackend != model.BackendCodeBuild {
+		t.Fatalf("expected codebuild backend, got %s", allocation.SelectedBackend)
 	}
 
 	if got := allocation.Metadata[backend.MetadataCapabilitiesKey]; got != "gpu,region:aws-us-east-1" {
@@ -255,8 +376,8 @@ func TestAllocateFiltersBackendsByExcludedCapabilities(t *testing.T) {
 		t.Fatalf("allocate failed: %v", err)
 	}
 
-	if allocation.SelectedBackend != model.BackendLambda {
-		t.Fatalf("expected lambda backend, got %s", allocation.SelectedBackend)
+	if allocation.SelectedBackend != model.BackendCodeBuild {
+		t.Fatalf("expected codebuild backend, got %s", allocation.SelectedBackend)
 	}
 }
 
@@ -285,10 +406,14 @@ func TestAllocateTreatsMissingCapabilityMetadataAsEmptySet(t *testing.T) {
 		if pool.Name != model.PoolLite {
 			return
 		}
-		lambdaCfg := pool.Backends[model.BackendLambda]
-		lambdaCfg.Enabled = true
-		lambdaCfg.Capabilities = nil
-		pool.Backends[model.BackendLambda] = lambdaCfg
+		for name, cfg := range pool.Backends {
+			cfg.Capabilities = nil
+			pool.Backends[name] = cfg
+		}
+		codebuildCfg := pool.Backends[model.BackendCodeBuild]
+		codebuildCfg.Enabled = true
+		codebuildCfg.Capabilities = nil
+		pool.Backends[model.BackendCodeBuild] = codebuildCfg
 	})
 
 	_, err := service.Allocate(context.Background(), model.AllocationRequest{

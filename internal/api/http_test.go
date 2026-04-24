@@ -1,0 +1,103 @@
+package api
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend"
+	codebuildbackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/codebuild"
+	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/config"
+	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
+	"github.com/prometheus/client_golang/prometheus"
+)
+
+type httpMissingSecretReader struct{}
+
+func (httpMissingSecretReader) ReadSecret(context.Context, string) (map[string]string, error) {
+	return nil, errors.New("secret not found")
+}
+
+func newTestServer(t *testing.T, service *Service) *Server {
+	t.Helper()
+
+	previousRegisterer := prometheus.DefaultRegisterer
+	previousGatherer := prometheus.DefaultGatherer
+	registry := prometheus.NewRegistry()
+	prometheus.DefaultRegisterer = registry
+	prometheus.DefaultGatherer = registry
+	t.Cleanup(func() {
+		prometheus.DefaultRegisterer = previousRegisterer
+		prometheus.DefaultGatherer = previousGatherer
+	})
+
+	return NewServer(service, nil, "", true)
+}
+
+func TestHandleAllocationsAcceptsStringJobTimeout(t *testing.T) {
+	service := newServiceWithConfig(nil)
+	service.now = func() time.Time { return time.Unix(1000, 0) }
+	server := newTestServer(t, service)
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/allocations", bytes.NewBufferString(`{"pool":"full","job_timeout":"15m"}`))
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+
+	var allocation model.AllocationStatus
+	if err := json.NewDecoder(recorder.Body).Decode(&allocation); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	if allocation.SelectedBackend != model.BackendARC {
+		t.Fatalf("expected ARC backend, got %s", allocation.SelectedBackend)
+	}
+
+	wantExpiry := time.Unix(1000, 0).Add(15 * time.Minute)
+	if !allocation.ExpiresAt.Equal(wantExpiry) {
+		t.Fatalf("expected expiry %s, got %s", wantExpiry, allocation.ExpiresAt)
+	}
+}
+
+func TestHandleAllocationsRejectsMissingExternalBackendSecret(t *testing.T) {
+	cfg := config.Default()
+	for index := range cfg.Pools {
+		if cfg.Pools[index].Name != model.PoolLite {
+			continue
+		}
+		codebuildCfg := cfg.Pools[index].Backends[model.BackendCodeBuild]
+		codebuildCfg.Enabled = true
+		cfg.Pools[index].Backends[model.BackendCodeBuild] = codebuildCfg
+	}
+
+	service := NewService(
+		cfg,
+		backend.NewRegistry(
+			testBackend{name: model.BackendARC},
+			codebuildbackend.New(cfg, httpMissingSecretReader{}),
+		),
+		nil,
+	)
+	server := newTestServer(t, service)
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/allocations", bytes.NewBufferString(`{"pool":"lite","backend":"codebuild","job_timeout":"5m"}`))
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+
+	if !strings.Contains(recorder.Body.String(), "secret not found") {
+		t.Fatalf("expected secret error, got %s", recorder.Body.String())
+	}
+}

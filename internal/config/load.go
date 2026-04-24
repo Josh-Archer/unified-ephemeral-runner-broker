@@ -59,6 +59,15 @@ func Default() model.BrokerConfig {
 						Capabilities: []string{"cluster-local", "docker", "region:local"},
 						Template:     "arc-lite",
 					},
+					model.BackendCodeBuild: {
+						Enabled:        false,
+						Healthy:        true,
+						MaxRunners:     3,
+						Weight:         1,
+						MaxJobDuration: 14 * time.Minute,
+						Capabilities:   []string{"region:aws-us-east-1"},
+						SecretRef:      "uecb-codebuild",
+					},
 					model.BackendLambda: {
 						Enabled:        false,
 						Healthy:        true,

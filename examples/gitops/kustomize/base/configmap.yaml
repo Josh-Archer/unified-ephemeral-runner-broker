@@ -44,14 +44,14 @@ data:
             weight: 1
             capabilities: [cluster-local, docker, region:local]
             template: arc-lite
-          lambda:
+          codebuild:
             enabled: false
             healthy: true
             maxRunners: 3
             weight: 1
             maxJobDuration: 14m
             capabilities: [region:aws-us-east-1]
-            secretRef: uecb-lambda
+            secretRef: uecb-codebuild
           cloud-run:
             enabled: false
             healthy: true
@@ -68,4 +68,3 @@ data:
             maxJobDuration: 25m
             capabilities: [region:azure-eastus]
             secretRef: uecb-azure-functions
-

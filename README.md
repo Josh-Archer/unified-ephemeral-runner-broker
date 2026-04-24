@@ -2,12 +2,15 @@
 
 `unified-ephemeral-runner-broker` is a public control plane for allocating one-shot GitHub Actions runners across a unified ephemeral capacity pool.
 
-V1 supports exactly four backends:
+V1 models exactly five backends:
 
 - `arc`
+- `codebuild`
 - `lambda`
 - `cloud-run`
 - `azure-functions`
+
+The public repo ships ARC provisioning plus generic secret-backed external launcher dispatch for `codebuild`, `lambda`, `cloud-run`, and `azure-functions`. Each enabled external backend must point at a real launcher controller through a Kubernetes secret in the broker namespace.
 
 It is intentionally split into two capability pools:
 
@@ -26,6 +29,7 @@ Built-in schedulers:
 - A Kubernetes broker service with a small REST API
 - A reusable GitHub Action, `allocate-runner`
 - An OCI Helm chart for installation
+- Generic provider runner images for `launcher`, `lambda`, `cloud-run`, and `azure-functions`
 - A generic Kustomize-facing GitOps consumption path
 - Generic infrastructure examples for AWS, GCP, and Azure
 
@@ -40,14 +44,17 @@ Built-in schedulers:
 
 1. A lightweight workflow step calls `allocate-runner`.
 2. The broker selects an eligible backend from the chosen pool.
-3. The backend provisions an ephemeral runner and returns a unique runner label.
-4. The heavy workflow job runs on that exact label.
-5. The runner executes one job and exits.
+3. The broker sends the request to the selected backend integration. `codebuild`, `lambda`, `cloud-run`, and `azure-functions` dispatch through a secret-backed HTTP controller contract.
+4. `job_timeout` is accepted as duration strings like `15m`, with numeric nanoseconds still accepted for backward compatibility.
+5. The heavy workflow job runs on that exact label.
+6. The runner executes one job and exits.
 
 ## Project Layout
 
 - `cmd/broker`: broker entrypoint
 - `internal/`: broker, scheduler, backend, GitHub, and config packages
+- `docker/azure-functions`: published Azure Functions controller and runner container
+- `docker/lambda`: published AWS Lambda runner container handler
 - `charts/unified-ephemeral-runner-broker`: Helm chart
 - `actions/allocate-runner`: public workflow integration surface
 - `examples/`: generic Terraform and GitOps consumption examples
@@ -68,8 +75,41 @@ See [docs/architecture.md](docs/architecture.md) and [docs/security-boundary.md]
 1. Install the Helm chart with external backends disabled.
 2. Create the GitHub auth secret and any enabled backend secrets in the same namespace as the broker.
    The broker validates referenced `secretRef` objects via the Kubernetes API and stays unready until they exist.
-3. Point the `allocate-runner` action at the broker URL.
-4. Start with the `full` pool or ARC-only `lite` pool, then enable external backends one by one.
+   External backend secrets should provide:
+   `dispatch_url`: the controller endpoint the broker should call.
+   `dispatch_token`: optional bearer token sent to that endpoint.
+3. Point the `allocate-runner` action at the broker URL. The broker accepts `job_timeout` in the same duration-string format used by the action, for example `15m`.
+4. Start with the `full` pool or ARC-only `lite` pool. Only enable an external backend after you have supplied a real launcher integration for that platform and the matching `secretRef`.
+
+## Azure Functions Launcher
+
+The published Azure Functions launcher image lives in `docker/azure-functions` and is designed for a Linux custom-container Function App.
+
+- The HTTP dispatch endpoint returns quickly and enqueues the allocation.
+- The broker waits up to 90 seconds for the Azure Functions dispatch controller so a cold-started Function App can return its admission response.
+- A queue-triggered function execution runs the ephemeral GitHub runner inside the same Function App container.
+- Use a hosting plan that supports long-running non-HTTP executions, such as Premium or Dedicated with `alwaysOn` enabled. The HTTP request still needs to finish quickly even when the runner job itself can run longer.
+
+## Provider Runner Images
+
+The private release lane should publish these OCI images from one immutable source ref:
+
+- `broker`: Kubernetes broker API
+- `launcher`: generic one-shot runner launcher
+- `cloud-run`: Cloud Run Job runner image built from the generic launcher
+- `lambda`: AWS Lambda container runner image with the Lambda runtime handler
+- `azure-functions`: Azure Functions dispatch controller and runner image
+
+Environment-specific repositories can mirror images when a provider requires it. For example, AWS Lambda requires the function image to live in ECR, so a private consumer may mirror the published `lambda` image into its own ECR repository while still treating this repo as the image source of truth.
+
+## GitHub Scope
+
+`github.scope.type` supports:
+
+- `organization`
+- `repository`
+
+Repository scope requires `github.scope.owner` and `github.scope.repository`. Organization scope requires `github.scope.organization`.
 
 ## Scheduler Configuration
 
@@ -90,11 +130,13 @@ pools:
         enabled: true
         maxRunners: 2
         weight: 3
-      lambda:
+      codebuild:
         enabled: true
         maxRunners: 3
         weight: 1
 ```
+
+`lambda` remains backward-compatible with older pinned requests: if the real `lambda` backend is disabled for a pool but `codebuild` is enabled, the broker treats a pinned `lambda` request as `codebuild`.
 
 Rollback is just a config change: set `scheduler` back to `round-robin` for the pool and redeploy. Leaving `weight` values in place is safe because the default scheduler ignores them.
 
@@ -123,7 +165,7 @@ pools:
           - cluster-local
           - docker
           - region:local
-      lambda:
+      codebuild:
         enabled: true
         maxRunners: 3
         capabilities:

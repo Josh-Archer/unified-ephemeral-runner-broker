@@ -1,6 +1,8 @@
 package runtime
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -30,24 +32,38 @@ type HealthChecker interface {
 	Check(ctx context.Context) error
 }
 
+type SecretReader interface {
+	ReadSecret(ctx context.Context, name string) (map[string]string, error)
+}
+
 type noopChecker struct{}
 
 func (noopChecker) Check(context.Context) error {
 	return nil
 }
 
-type SecretRefChecker struct {
+type noopSecretReader struct{}
+
+func (noopSecretReader) ReadSecret(context.Context, string) (map[string]string, error) {
+	return nil, errors.New("kubernetes secret reader is not configured")
+}
+
+type kubernetesSecretClient struct {
 	namespace string
 	baseURL   string
 	client    *http.Client
-	refs      []string
 	token     string
 }
 
-func NewSecretRefCheckerFromEnv(cfg model.BrokerConfig) (HealthChecker, error) {
+type SecretRefChecker struct {
+	client *kubernetesSecretClient
+	refs   []string
+}
+
+func NewSecretReaderFromEnv() (SecretReader, error) {
 	namespace := strings.TrimSpace(os.Getenv("UECB_POD_NAMESPACE"))
 	if namespace == "" {
-		return noopChecker{}, nil
+		return noopSecretReader{}, nil
 	}
 
 	host := strings.TrimSpace(os.Getenv("KUBERNETES_SERVICE_HOST"))
@@ -71,7 +87,6 @@ func NewSecretRefCheckerFromEnv(cfg model.BrokerConfig) (HealthChecker, error) {
 		return nil, errors.New("append kubernetes service account CA cert")
 	}
 
-	refs := requiredSecretRefs(cfg)
 	client := &http.Client{
 		Timeout: 5 * time.Second,
 		Transport: &http.Transport{
@@ -82,19 +97,35 @@ func NewSecretRefCheckerFromEnv(cfg model.BrokerConfig) (HealthChecker, error) {
 		},
 	}
 
-	return &SecretRefChecker{
+	return &kubernetesSecretClient{
 		namespace: namespace,
 		baseURL:   fmt.Sprintf("https://%s:%s", host, port),
 		client:    client,
-		refs:      refs,
 		token:     strings.TrimSpace(string(tokenBytes)),
+	}, nil
+}
+
+func NewSecretRefCheckerFromEnv(cfg model.BrokerConfig) (HealthChecker, error) {
+	client, err := NewSecretReaderFromEnv()
+	if err != nil {
+		return nil, err
+	}
+
+	kubeClient, ok := client.(*kubernetesSecretClient)
+	if !ok {
+		return noopChecker{}, nil
+	}
+
+	return &SecretRefChecker{
+		client: kubeClient,
+		refs:   requiredSecretRefs(cfg),
 	}, nil
 }
 
 func (c *SecretRefChecker) Check(ctx context.Context) error {
 	missing := make([]string, 0)
 	for _, ref := range c.refs {
-		ok, err := c.secretExists(ctx, ref)
+		ok, err := c.client.secretExists(ctx, ref)
 		if err != nil {
 			return err
 		}
@@ -104,13 +135,41 @@ func (c *SecretRefChecker) Check(ctx context.Context) error {
 	}
 
 	if len(missing) > 0 {
-		return fmt.Errorf("missing required kubernetes secrets in namespace %s: %s", c.namespace, strings.Join(missing, ", "))
+		return fmt.Errorf("missing required kubernetes secrets in namespace %s: %s", c.client.namespace, strings.Join(missing, ", "))
 	}
 
 	return nil
 }
 
-func (c *SecretRefChecker) secretExists(ctx context.Context, name string) (bool, error) {
+func (c *kubernetesSecretClient) ReadSecret(ctx context.Context, name string) (map[string]string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.secretURL(name), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("query kubernetes secret %s: %w", name, err)
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		payload, err := decodeSecretResponse(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("decode kubernetes secret %s: %w", name, err)
+		}
+		return payload, nil
+	case http.StatusNotFound:
+		return nil, fmt.Errorf("kubernetes secret %s not found", name)
+	default:
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8*1024))
+		return nil, fmt.Errorf("query kubernetes secret %s: unexpected status %d: %s", name, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+}
+
+func (c *kubernetesSecretClient) secretExists(ctx context.Context, name string) (bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.secretURL(name), nil)
 	if err != nil {
 		return false, err
@@ -134,10 +193,29 @@ func (c *SecretRefChecker) secretExists(ctx context.Context, name string) (bool,
 	}
 }
 
-func (c *SecretRefChecker) secretURL(name string) string {
+func (c *kubernetesSecretClient) secretURL(name string) string {
 	escapedNamespace := url.PathEscape(c.namespace)
 	escapedName := url.PathEscape(name)
 	return fmt.Sprintf("%s/api/v1/namespaces/%s/secrets/%s", c.baseURL, escapedNamespace, escapedName)
+}
+
+func decodeSecretResponse(reader io.Reader) (map[string]string, error) {
+	var payload struct {
+		Data map[string]string `json:"data"`
+	}
+	if err := json.NewDecoder(reader).Decode(&payload); err != nil {
+		return nil, err
+	}
+
+	decoded := make(map[string]string, len(payload.Data))
+	for key, value := range payload.Data {
+		raw, err := base64.StdEncoding.DecodeString(value)
+		if err != nil {
+			return nil, fmt.Errorf("decode key %q: %w", key, err)
+		}
+		decoded[key] = string(raw)
+	}
+	return decoded, nil
 }
 
 func requiredSecretRefs(cfg model.BrokerConfig) []string {

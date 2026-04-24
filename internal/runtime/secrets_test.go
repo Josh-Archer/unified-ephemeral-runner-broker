@@ -2,8 +2,10 @@ package runtime
 
 import (
 	"context"
+	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"testing"
 
@@ -14,14 +16,15 @@ import (
 func TestRequiredSecretRefsSkipsDisabledBackends(t *testing.T) {
 	cfg := config.Default()
 	pool := cfg.Pools[1]
-	lambdaCfg := pool.Backends[model.BackendLambda]
-	lambdaCfg.Enabled = true
-	pool.Backends[model.BackendLambda] = lambdaCfg
+	codebuildCfg := pool.Backends[model.BackendCodeBuild]
+	codebuildCfg.Enabled = true
+	pool.Backends[model.BackendCodeBuild] = codebuildCfg
 	cfg.Pools[1] = pool
 
 	refs := requiredSecretRefs(cfg)
+	sort.Strings(refs)
 	got := strings.Join(refs, ",")
-	want := "uecb-github-app,uecb-lambda"
+	want := "uecb-codebuild,uecb-github-app"
 	if got != want {
 		t.Fatalf("expected %s, got %s", want, got)
 	}
@@ -34,11 +37,13 @@ func TestSecretRefCheckerReportsMissingSecret(t *testing.T) {
 	defer server.Close()
 
 	checker := &SecretRefChecker{
-		namespace: "arc-systems",
-		baseURL:   server.URL,
-		client:    server.Client(),
-		refs:      []string{"uecb-github-app"},
-		token:     "test",
+		client: &kubernetesSecretClient{
+			namespace: "arc-systems",
+			baseURL:   server.URL,
+			client:    server.Client(),
+			token:     "test",
+		},
+		refs: []string{"uecb-github-app"},
 	}
 
 	err := checker.Check(context.Background())
@@ -55,5 +60,31 @@ func TestNewSecretRefCheckerFromEnvReturnsNoopWithoutNamespace(t *testing.T) {
 	}
 	if _, ok := checker.(noopChecker); !ok {
 		t.Fatalf("expected noopChecker, got %T", checker)
+	}
+}
+
+func TestSecretReaderDecodesSecretData(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":{"dispatch_url":"` + base64.StdEncoding.EncodeToString([]byte("https://example.invalid")) + `","dispatch_token":"` + base64.StdEncoding.EncodeToString([]byte("shh")) + `"}}`))
+	}))
+	defer server.Close()
+
+	reader := &kubernetesSecretClient{
+		namespace: "arc-systems",
+		baseURL:   server.URL,
+		client:    server.Client(),
+		token:     "test",
+	}
+
+	values, err := reader.ReadSecret(context.Background(), "uecb-cloud-run")
+	if err != nil {
+		t.Fatalf("read secret failed: %v", err)
+	}
+
+	if values["dispatch_url"] != "https://example.invalid" {
+		t.Fatalf("expected dispatch_url to decode, got %q", values["dispatch_url"])
+	}
+	if values["dispatch_token"] != "shh" {
+		t.Fatalf("expected dispatch_token to decode, got %q", values["dispatch_token"])
 	}
 }

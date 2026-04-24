@@ -19,7 +19,7 @@ func poolByName(name model.PoolName) model.PoolConfig {
 func TestRoundRobinSkipsUnhealthyBackend(t *testing.T) {
 	scheduler := NewRoundRobin()
 	pool := poolByName(model.PoolLite)
-	pool.Backends[model.BackendLambda] = model.BackendConfig{Enabled: true, Healthy: false, MaxRunners: 1}
+	pool.Backends[model.BackendCodeBuild] = model.BackendConfig{Enabled: true, Healthy: false, MaxRunners: 1}
 	pool.Backends[model.BackendCloudRun] = model.BackendConfig{Enabled: true, Healthy: true, MaxRunners: 1}
 
 	first, err := scheduler.Reserve(pool, nil)
@@ -40,7 +40,7 @@ func TestRoundRobinSkipsFullBackend(t *testing.T) {
 	scheduler := NewRoundRobin()
 	pool := poolByName(model.PoolLite)
 	pool.Backends[model.BackendARC] = model.BackendConfig{Enabled: true, Healthy: true, MaxRunners: 1}
-	pool.Backends[model.BackendLambda] = model.BackendConfig{Enabled: true, Healthy: true, MaxRunners: 1}
+	pool.Backends[model.BackendCodeBuild] = model.BackendConfig{Enabled: true, Healthy: true, MaxRunners: 1}
 	pool.Backends[model.BackendCloudRun] = model.BackendConfig{Enabled: true, Healthy: true, MaxRunners: 1}
 
 	first, err := scheduler.Reserve(pool, nil)
@@ -52,7 +52,7 @@ func TestRoundRobinSkipsFullBackend(t *testing.T) {
 		t.Fatalf("reserve #2 failed: %v", err)
 	}
 
-	if first != model.BackendARC || second != model.BackendLambda {
+	if first != model.BackendARC || second != model.BackendCodeBuild {
 		t.Fatalf("expected full backend to be skipped, got %s %s", first, second)
 	}
 }
@@ -60,15 +60,15 @@ func TestRoundRobinSkipsFullBackend(t *testing.T) {
 func TestRoundRobinPinnedBackendUsesCapacity(t *testing.T) {
 	scheduler := NewRoundRobin()
 	pool := poolByName(model.PoolLite)
-	pool.Backends[model.BackendLambda] = model.BackendConfig{Enabled: true, Healthy: true, MaxRunners: 1}
+	pool.Backends[model.BackendCodeBuild] = model.BackendConfig{Enabled: true, Healthy: true, MaxRunners: 1}
 
-	pinned := model.BackendLambda
+	pinned := model.BackendCodeBuild
 	selected, err := scheduler.Reserve(pool, &pinned)
 	if err != nil {
 		t.Fatalf("reserve failed: %v", err)
 	}
-	if selected != model.BackendLambda {
-		t.Fatalf("expected lambda, got %s", selected)
+	if selected != model.BackendCodeBuild {
+		t.Fatalf("expected codebuild, got %s", selected)
 	}
 
 	if _, err := scheduler.Reserve(pool, &pinned); err == nil {
@@ -79,13 +79,13 @@ func TestRoundRobinPinnedBackendUsesCapacity(t *testing.T) {
 func TestRoundRobinReleaseReturnsCapacity(t *testing.T) {
 	scheduler := NewRoundRobin()
 	pool := poolByName(model.PoolLite)
-	pool.Backends[model.BackendLambda] = model.BackendConfig{Enabled: true, Healthy: true, MaxRunners: 1}
+	pool.Backends[model.BackendCodeBuild] = model.BackendConfig{Enabled: true, Healthy: true, MaxRunners: 1}
 
-	pinned := model.BackendLambda
+	pinned := model.BackendCodeBuild
 	if _, err := scheduler.Reserve(pool, &pinned); err != nil {
 		t.Fatalf("reserve failed: %v", err)
 	}
-	scheduler.Release(pool.Name, model.BackendLambda)
+	scheduler.Release(pool.Name, model.BackendCodeBuild)
 	if _, err := scheduler.Reserve(pool, &pinned); err != nil {
 		t.Fatalf("expected capacity to be available after release: %v", err)
 	}
@@ -96,13 +96,13 @@ func TestWeightedRoundRobinUsesWeights(t *testing.T) {
 	pool := poolByName(model.PoolLite)
 	pool.Scheduler = NameWeightedRoundRobin
 	pool.Backends[model.BackendARC] = model.BackendConfig{Enabled: true, Healthy: true, MaxRunners: 1, Weight: 1}
-	pool.Backends[model.BackendLambda] = model.BackendConfig{Enabled: true, Healthy: true, MaxRunners: 1, Weight: 3}
+	pool.Backends[model.BackendCodeBuild] = model.BackendConfig{Enabled: true, Healthy: true, MaxRunners: 1, Weight: 3}
 
 	want := []model.BackendName{
 		model.BackendARC,
-		model.BackendLambda,
-		model.BackendLambda,
-		model.BackendLambda,
+		model.BackendCodeBuild,
+		model.BackendCodeBuild,
+		model.BackendCodeBuild,
 	}
 
 	for index, expected := range want {
@@ -122,7 +122,7 @@ func TestWeightedRoundRobinSkipsUnhealthyBackendDeterministically(t *testing.T) 
 	pool := poolByName(model.PoolLite)
 	pool.Scheduler = NameWeightedRoundRobin
 	pool.Backends[model.BackendARC] = model.BackendConfig{Enabled: false, Healthy: true, MaxRunners: 1, Weight: 1}
-	pool.Backends[model.BackendLambda] = model.BackendConfig{Enabled: true, Healthy: false, MaxRunners: 1, Weight: 3}
+	pool.Backends[model.BackendCodeBuild] = model.BackendConfig{Enabled: true, Healthy: false, MaxRunners: 1, Weight: 3}
 	pool.Backends[model.BackendCloudRun] = model.BackendConfig{Enabled: true, Healthy: true, MaxRunners: 1, Weight: 2}
 
 	selected, err := scheduler.Reserve(pool, nil)
@@ -139,15 +139,15 @@ func TestWeightedRoundRobinSkipsFullBackendDeterministically(t *testing.T) {
 	pool := poolByName(model.PoolLite)
 	pool.Scheduler = NameWeightedRoundRobin
 	pool.Backends[model.BackendARC] = model.BackendConfig{Enabled: false, Healthy: true, MaxRunners: 1, Weight: 1}
-	pool.Backends[model.BackendLambda] = model.BackendConfig{Enabled: true, Healthy: true, MaxRunners: 1, Weight: 3}
+	pool.Backends[model.BackendCodeBuild] = model.BackendConfig{Enabled: true, Healthy: true, MaxRunners: 1, Weight: 3}
 	pool.Backends[model.BackendCloudRun] = model.BackendConfig{Enabled: true, Healthy: true, MaxRunners: 1, Weight: 2}
 
 	first, err := scheduler.Reserve(pool, nil)
 	if err != nil {
 		t.Fatalf("reserve #1 failed: %v", err)
 	}
-	if first != model.BackendLambda {
-		t.Fatalf("expected lambda first, got %s", first)
+	if first != model.BackendCodeBuild {
+		t.Fatalf("expected codebuild first, got %s", first)
 	}
 
 	second, err := scheduler.Reserve(pool, nil)

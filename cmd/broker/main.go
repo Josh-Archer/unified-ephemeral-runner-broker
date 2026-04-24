@@ -11,6 +11,7 @@ import (
 	arcbackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/arc"
 	azurebackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/azurefunctions"
 	cloudbackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/cloudrun"
+	codebuildbackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/codebuild"
 	lambdabackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/lambda"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/config"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/runtime"
@@ -22,11 +23,17 @@ func main() {
 		log.Fatalf("load config: %v", err)
 	}
 
+	secretReader, err := runtime.NewSecretReaderFromEnv()
+	if err != nil {
+		log.Fatalf("configure kubernetes secret reader: %v", err)
+	}
+
 	registry := backend.NewRegistry(
 		arcbackend.New(),
-		lambdabackend.New(),
-		cloudbackend.New(),
-		azurebackend.New(),
+		codebuildbackend.New(cfg, secretReader),
+		lambdabackend.New(cfg, secretReader),
+		cloudbackend.New(cfg, secretReader),
+		azurebackend.New(cfg, secretReader),
 	)
 	healthChecker, err := runtime.NewSecretRefCheckerFromEnv(cfg)
 	if err != nil {

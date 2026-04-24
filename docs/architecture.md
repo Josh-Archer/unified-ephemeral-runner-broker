@@ -8,11 +8,13 @@
 - GitHub workflows call the `allocate-runner` action.
 - The action exchanges OIDC identity for a broker allocation request.
 - The broker selects a backend, reserves capacity, provisions a runner, and returns a unique label.
+- External backends read `dispatch_url` and optional `dispatch_token` from their configured `secretRef` and hand off provisioning to a provider-owned controller.
 
 ## Data Plane
 
 - `arc` provisions in-cluster runners.
-- `lambda`, `cloud-run`, and `azure-functions` provision lite-profile external runners.
+- `codebuild`, `lambda`, `cloud-run`, and `azure-functions` are lite-profile external runners that dispatch into provider-owned launcher controllers using the shared external dispatch contract.
+- The public Azure Functions launcher uses an HTTP dispatch endpoint only for admission and status. Actual runner execution happens on a queue-triggered function inside the same container so the HTTP trigger does not have to stay open for the whole job.
 - Each runner handles one job and exits.
 
 ## Pools
@@ -37,4 +39,9 @@ Capability-aware routing is evaluated before scheduler selection.
 - Missing backend capability metadata means that backend advertises no extra capabilities.
 
 This keeps scheduling policy isolated in the scheduler registry while making capability eligibility deterministic at the API layer.
+
+## GitHub Targeting
+
+- `github.scope.type=organization` targets an org runner registration surface and can derive per-pool runner groups from `runnerGroupPrefix`.
+- `github.scope.type=repository` targets a single repository registration surface and ignores runner groups.
 
