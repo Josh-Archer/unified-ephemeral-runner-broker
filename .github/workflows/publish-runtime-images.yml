@@ -1,0 +1,45 @@
+name: Publish Runtime Images
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Runtime image tag to publish.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - name: cloud-run
+            dockerfile: Dockerfile.cloud-run
+          - name: lambda
+            dockerfile: Dockerfile.lambda
+          - name: azure-functions
+            dockerfile: Dockerfile.azure-functions
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.image.dockerfile }}
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/${{ github.repository }}/${{ matrix.image.name }}:${{ inputs.tag }}
