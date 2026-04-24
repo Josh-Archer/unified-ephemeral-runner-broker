@@ -113,3 +113,29 @@ func TestAzureFunctionsHostConfigUsesPlainTextQueueMessages(t *testing.T) {
 		t.Fatalf("expected queue messageEncoding to be %q, got %q", "none", got)
 	}
 }
+
+func TestAzureFunctionsRunnerWrapperCapturesFailureContext(t *testing.T) {
+	_, filename, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+
+	wrapperPath := filepath.Join(filepath.Dir(filename), "..", "..", "..", "docker", "azure-functions", "function_app.py")
+	content, err := os.ReadFile(wrapperPath)
+	if err != nil {
+		t.Fatalf("read function_app.py: %v", err)
+	}
+	wrapper := string(content)
+
+	for _, expected := range []string{
+		`"RUNNER_ALLOW_RUNASROOT": "1"`,
+		`"UECB_PROVIDER": BACKEND_NAME`,
+		"runner_log=tail_log(log_path)",
+		"stderr=subprocess.STDOUT",
+		"stdout=log_file",
+	} {
+		if !strings.Contains(wrapper, expected) {
+			t.Fatalf("expected Azure Functions wrapper to contain %q", expected)
+		}
+	}
+}
