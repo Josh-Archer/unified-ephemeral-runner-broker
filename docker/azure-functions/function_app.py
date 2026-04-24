@@ -125,6 +125,13 @@ def write_status(execution_id: str, **changes: Any) -> dict[str, Any]:
     return status
 
 
+def tail_log(path: str, limit: int = 120) -> str:
+    if not os.path.exists(path):
+        return ""
+    with open(path, encoding="utf-8", errors="replace") as handle:
+        return "\n".join(handle.read().splitlines()[-limit:])
+
+
 def status_url_for(req: func.HttpRequest, execution_id: str) -> str:
     base_url = req.url.split("?", 1)[0]
     return f"{base_url}?action=status&execution_id={urllib.parse.quote(execution_id, safe='')}"
@@ -178,6 +185,8 @@ def build_runner_environment(payload: dict[str, Any], work_root: str) -> dict[st
         "RUNNER_LABELS": ",".join(payload.get("runner_labels") or []),
         "RUNNER_ROOT": os.path.join(work_root, "runner"),
         "RUNNER_VERSION": env("UECB_RUNNER_VERSION", "2.333.1"),
+        "RUNNER_ALLOW_RUNASROOT": "1",
+        "UECB_PROVIDER": BACKEND_NAME,
     }
 
 
@@ -250,6 +259,7 @@ def run_runner(msg: func.QueueMessage) -> None:
         return
 
     work_root = tempfile.mkdtemp(prefix=f"uecb-azure-functions-{execution_id}-")
+    log_path = os.path.join(work_root, "runner.log")
     write_status(
         execution_id,
         ok=True,
@@ -263,11 +273,16 @@ def run_runner(msg: func.QueueMessage) -> None:
     try:
         runner_env = os.environ.copy()
         runner_env.update(build_runner_environment(payload, work_root))
-        completed = subprocess.run(
-            ["/opt/uecb/runner-entrypoint.sh"],
-            check=False,
-            env=runner_env,
-        )
+        with open(log_path, "w", encoding="utf-8") as log_file:
+            completed = subprocess.run(
+                ["/opt/uecb/runner-entrypoint.sh"],
+                check=False,
+                cwd=work_root,
+                env=runner_env,
+                stderr=subprocess.STDOUT,
+                stdout=log_file,
+                text=True,
+            )
         if completed.returncode == 0:
             write_status(
                 execution_id,
@@ -285,6 +300,7 @@ def run_runner(msg: func.QueueMessage) -> None:
             exit_code=completed.returncode,
             completed_at=utc_now(),
             last_error=f"runner exited with code {completed.returncode}",
+            runner_log=tail_log(log_path),
         )
     except Exception as exc:
         logging.exception("azure functions runner execution failed")
@@ -294,6 +310,7 @@ def run_runner(msg: func.QueueMessage) -> None:
             state="failed",
             completed_at=utc_now(),
             last_error=str(exc),
+            runner_log=tail_log(log_path),
             traceback=traceback.format_exc(limit=20),
         )
     finally:
