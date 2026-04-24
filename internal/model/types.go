@@ -71,6 +71,7 @@ type BackendConfig struct {
 	MaxRunners     int           `yaml:"maxRunners" json:"maxRunners"`
 	Weight         int           `yaml:"weight,omitempty" json:"weight,omitempty"`
 	MaxJobDuration time.Duration `yaml:"maxJobDuration,omitempty" json:"maxJobDuration,omitempty"`
+	Capabilities   []string      `yaml:"capabilities,omitempty" json:"capabilities,omitempty"`
 	Template       string        `yaml:"template,omitempty" json:"template,omitempty"`
 	SecretRef      string        `yaml:"secretRef,omitempty" json:"secretRef,omitempty"`
 }
@@ -90,10 +91,12 @@ type BrokerConfig struct {
 }
 
 type AllocationRequest struct {
-	Pool       PoolName      `json:"pool"`
-	Backend    *BackendName  `json:"backend,omitempty"`
-	JobTimeout time.Duration `json:"job_timeout"`
-	Labels     []string      `json:"labels,omitempty"`
+	Pool                 PoolName      `json:"pool"`
+	Backend              *BackendName  `json:"backend,omitempty"`
+	JobTimeout           time.Duration `json:"job_timeout"`
+	Labels               []string      `json:"labels,omitempty"`
+	RequiredCapabilities []string      `json:"required_capabilities,omitempty"`
+	ExcludedCapabilities []string      `json:"excluded_capabilities,omitempty"`
 }
 
 type AllocationStatus struct {

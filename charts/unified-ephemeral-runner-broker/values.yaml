@@ -63,6 +63,10 @@ config:
           healthy: true
           maxRunners: 4
           weight: 1
+          capabilities:
+            - cluster-local
+            - docker
+            - region:local
           template: arc-full
     - name: lite
       labels:
@@ -80,6 +84,10 @@ config:
           healthy: true
           maxRunners: 2
           weight: 1
+          capabilities:
+            - cluster-local
+            - docker
+            - region:local
           template: arc-lite
         codebuild:
           enabled: false
@@ -87,6 +95,8 @@ config:
           maxRunners: 3
           weight: 1
           maxJobDuration: 14m
+          capabilities:
+            - region:aws-us-east-1
           secretRef: uecb-codebuild
         cloud-run:
           enabled: false
@@ -94,6 +104,8 @@ config:
           maxRunners: 2
           weight: 1
           maxJobDuration: 30m
+          capabilities:
+            - region:gcp-us-central1
           secretRef: uecb-cloud-run
         azure-functions:
           enabled: false
@@ -101,4 +113,6 @@ config:
           maxRunners: 2
           weight: 1
           maxJobDuration: 25m
+          capabilities:
+            - region:azure-eastus
           secretRef: uecb-azure-functions

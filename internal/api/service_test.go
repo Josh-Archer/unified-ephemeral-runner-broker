@@ -319,3 +319,125 @@ func TestAllocateFailsWhenHealthCheckFails(t *testing.T) {
 		t.Fatalf("expected health check failure, got %v", err)
 	}
 }
+
+func TestAllocateKeepsExistingBehaviorWhenCapabilitiesAreEmpty(t *testing.T) {
+	service := newService()
+
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:                 model.PoolLite,
+		RequiredCapabilities: []string{"", "  "},
+		ExcludedCapabilities: []string{},
+	})
+	if err != nil {
+		t.Fatalf("allocate failed: %v", err)
+	}
+
+	if allocation.SelectedBackend != model.BackendARC {
+		t.Fatalf("expected ARC backend, got %s", allocation.SelectedBackend)
+	}
+}
+
+func TestAllocateFiltersBackendsByRequiredCapabilities(t *testing.T) {
+	service := newServiceWithConfig(func(pool *model.PoolConfig) {
+		if pool.Name != model.PoolLite {
+			return
+		}
+		codebuildCfg := pool.Backends[model.BackendCodeBuild]
+		codebuildCfg.Enabled = true
+		codebuildCfg.Capabilities = []string{"gpu", "region:aws-us-east-1"}
+		pool.Backends[model.BackendCodeBuild] = codebuildCfg
+	})
+
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:                 model.PoolLite,
+		RequiredCapabilities: []string{"GPU"},
+	})
+	if err != nil {
+		t.Fatalf("allocate failed: %v", err)
+	}
+
+	if allocation.SelectedBackend != model.BackendCodeBuild {
+		t.Fatalf("expected codebuild backend, got %s", allocation.SelectedBackend)
+	}
+
+	if got := allocation.Metadata[backend.MetadataCapabilitiesKey]; got != "gpu,region:aws-us-east-1" {
+		t.Fatalf("unexpected capability metadata: %q", got)
+	}
+}
+
+func TestAllocateFiltersBackendsByExcludedCapabilities(t *testing.T) {
+	service := newService()
+
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:                 model.PoolLite,
+		ExcludedCapabilities: []string{"cluster-local"},
+	})
+	if err != nil {
+		t.Fatalf("allocate failed: %v", err)
+	}
+
+	if allocation.SelectedBackend != model.BackendCodeBuild {
+		t.Fatalf("expected codebuild backend, got %s", allocation.SelectedBackend)
+	}
+}
+
+func TestAllocateReturnsClearErrorWhenNoBackendMatchesCapabilities(t *testing.T) {
+	service := newServiceWithConfig(func(pool *model.PoolConfig) {
+		if pool.Name != model.PoolLite {
+			return
+		}
+		for name, cfg := range pool.Backends {
+			cfg.Capabilities = nil
+			pool.Backends[name] = cfg
+		}
+	})
+
+	_, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:                 model.PoolLite,
+		RequiredCapabilities: []string{"gpu"},
+	})
+	if !errors.Is(err, ErrNoMatchingBackendCapabilities) {
+		t.Fatalf("expected capability mismatch error, got %v", err)
+	}
+}
+
+func TestAllocateTreatsMissingCapabilityMetadataAsEmptySet(t *testing.T) {
+	service := newServiceWithConfig(func(pool *model.PoolConfig) {
+		if pool.Name != model.PoolLite {
+			return
+		}
+		for name, cfg := range pool.Backends {
+			cfg.Capabilities = nil
+			pool.Backends[name] = cfg
+		}
+		codebuildCfg := pool.Backends[model.BackendCodeBuild]
+		codebuildCfg.Enabled = true
+		codebuildCfg.Capabilities = nil
+		pool.Backends[model.BackendCodeBuild] = codebuildCfg
+	})
+
+	_, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:                 model.PoolLite,
+		RequiredCapabilities: []string{"region:aws-us-east-1"},
+	})
+	if !errors.Is(err, ErrNoMatchingBackendCapabilities) {
+		t.Fatalf("expected capability mismatch error, got %v", err)
+	}
+}
+
+func TestAllocateRejectsPinnedBackendThatFailsCapabilityFilter(t *testing.T) {
+	service := newService()
+	pinned := model.BackendARC
+
+	_, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:                 model.PoolLite,
+		Backend:              &pinned,
+		ExcludedCapabilities: []string{"cluster-local"},
+	})
+	if !errors.Is(err, ErrNoMatchingBackendCapabilities) {
+		t.Fatalf("expected capability mismatch error, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "pinned backend") {
+		t.Fatalf("expected pinned backend error context, got %v", err)
+	}
+}
