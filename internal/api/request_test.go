@@ -64,3 +64,16 @@ func TestDecodeAllocationRequestCopiesLabels(t *testing.T) {
 		t.Fatalf("unexpected labels: %#v", request.Labels)
 	}
 }
+
+func TestDecodeAllocationRequestCopiesCapabilities(t *testing.T) {
+	request, err := decodeAllocationRequest(bytes.NewReader([]byte(`{"pool":"lite","required_capabilities":["region:gcp-us-central1"],"excluded_capabilities":["cluster-local"]}`)))
+	if err != nil {
+		t.Fatalf("decode failed: %v", err)
+	}
+	if len(request.RequiredCapabilities) != 1 || request.RequiredCapabilities[0] != "region:gcp-us-central1" {
+		t.Fatalf("unexpected required capabilities: %#v", request.RequiredCapabilities)
+	}
+	if len(request.ExcludedCapabilities) != 1 || request.ExcludedCapabilities[0] != "cluster-local" {
+		t.Fatalf("unexpected excluded capabilities: %#v", request.ExcludedCapabilities)
+	}
+}
