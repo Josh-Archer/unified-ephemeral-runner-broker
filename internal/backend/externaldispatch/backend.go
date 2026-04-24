@@ -16,8 +16,10 @@ import (
 )
 
 const (
-	secretKeyDispatchURL   = "dispatch_url"
-	secretKeyDispatchToken = "dispatch_token"
+	secretKeyDispatchURL          = "dispatch_url"
+	secretKeyDispatchToken        = "dispatch_token"
+	defaultDispatchTimeout        = 20 * time.Second
+	azureFunctionsDispatchTimeout = 90 * time.Second
 )
 
 type HTTPClient interface {
@@ -32,17 +34,17 @@ type Backend struct {
 }
 
 type dispatchRequest struct {
-	Action        string          `json:"action"`
-	Backend       string          `json:"backend"`
-	AllocationID  string          `json:"allocation_id"`
-	Pool          string          `json:"pool"`
-	RunnerLabel   string          `json:"runner_label"`
-	RunnerName    string          `json:"runner_name"`
-	RunnerLabels  []string        `json:"runner_labels"`
-	RequestedLabels []string      `json:"requested_labels,omitempty"`
-	JobTimeout    string          `json:"job_timeout"`
-	JobTimeoutSeconds int64       `json:"job_timeout_seconds"`
-	GitHub        dispatchGitHub  `json:"github"`
+	Action            string         `json:"action"`
+	Backend           string         `json:"backend"`
+	AllocationID      string         `json:"allocation_id"`
+	Pool              string         `json:"pool"`
+	RunnerLabel       string         `json:"runner_label"`
+	RunnerName        string         `json:"runner_name"`
+	RunnerLabels      []string       `json:"runner_labels"`
+	RequestedLabels   []string       `json:"requested_labels,omitempty"`
+	JobTimeout        string         `json:"job_timeout"`
+	JobTimeoutSeconds int64          `json:"job_timeout_seconds"`
+	GitHub            dispatchGitHub `json:"github"`
 }
 
 type dispatchGitHub struct {
@@ -68,8 +70,17 @@ func New(name model.BackendName, cfg model.BrokerConfig, secrets runtime.SecretR
 		cfg:     cfg,
 		secrets: secrets,
 		client: &http.Client{
-			Timeout: 20 * time.Second,
+			Timeout: dispatchTimeout(name),
 		},
+	}
+}
+
+func dispatchTimeout(name model.BackendName) time.Duration {
+	switch name {
+	case model.BackendAzureFunctions:
+		return azureFunctionsDispatchTimeout
+	default:
+		return defaultDispatchTimeout
 	}
 }
 
@@ -110,15 +121,15 @@ func (b *Backend) Provision(ctx context.Context, request model.AllocationRequest
 
 	runnerLabel := backend.DefaultRunnerLabel(b.name, allocation.ID)
 	payload := dispatchRequest{
-		Action:          "dispatch",
-		Backend:         string(b.name),
-		AllocationID:    allocation.ID,
-		Pool:            string(pool.Name),
-		RunnerLabel:     runnerLabel,
-		RunnerName:      runnerLabel,
-		RunnerLabels:    combineLabels(pool.Labels, allocation.RequestedLabels, runnerLabel),
-		RequestedLabels: append([]string(nil), allocation.RequestedLabels...),
-		JobTimeout:      request.JobTimeout.String(),
+		Action:            "dispatch",
+		Backend:           string(b.name),
+		AllocationID:      allocation.ID,
+		Pool:              string(pool.Name),
+		RunnerLabel:       runnerLabel,
+		RunnerName:        runnerLabel,
+		RunnerLabels:      combineLabels(pool.Labels, allocation.RequestedLabels, runnerLabel),
+		RequestedLabels:   append([]string(nil), allocation.RequestedLabels...),
+		JobTimeout:        request.JobTimeout.String(),
 		JobTimeoutSeconds: int64(request.JobTimeout / time.Second),
 		GitHub: dispatchGitHub{
 			ScopeType:    b.cfg.GitHub.Scope.Type,

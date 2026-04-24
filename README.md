@@ -84,6 +84,7 @@ See [docs/architecture.md](docs/architecture.md) and [docs/security-boundary.md]
 The published Azure Functions launcher image lives in `docker/azure-functions` and is designed for a Linux custom-container Function App.
 
 - The HTTP dispatch endpoint returns quickly and enqueues the allocation.
+- The broker waits up to 90 seconds for the Azure Functions dispatch controller so a cold-started Function App can return its admission response.
 - A queue-triggered function execution runs the ephemeral GitHub runner inside the same Function App container.
 - Use a hosting plan that supports long-running non-HTTP executions, such as Premium or Dedicated with `alwaysOn` enabled. The HTTP request still needs to finish quickly even when the runner job itself can run longer.
 
