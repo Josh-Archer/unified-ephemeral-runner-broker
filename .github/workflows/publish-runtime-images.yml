@@ -42,4 +42,4 @@ jobs:
           file: ${{ matrix.image.dockerfile }}
           platforms: linux/amd64
           push: true
-          tags: ghcr.io/${{ github.repository }}/${{ matrix.image.name }}:${{ inputs.tag }}
+          tags: ghcr.io/josh-archer/unified-ephemeral-runner-broker/${{ matrix.image.name }}:${{ inputs.tag }}
