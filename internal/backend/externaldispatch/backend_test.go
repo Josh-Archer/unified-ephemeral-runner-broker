@@ -109,6 +109,90 @@ func TestProvisionDispatchesRunnerLaunch(t *testing.T) {
 	}
 }
 
+func TestNewUsesBackendSpecificDispatchTimeout(t *testing.T) {
+	azureFunctionsBackend := New(model.BackendAzureFunctions, newRepoScopedConfig(), staticSecrets{})
+	codebuildBackend := New(model.BackendCodeBuild, newRepoScopedConfig(), staticSecrets{})
+
+	azureFunctionsClient, ok := azureFunctionsBackend.client.(*http.Client)
+	if !ok {
+		t.Fatalf("expected default HTTP client, got %T", azureFunctionsBackend.client)
+	}
+	if azureFunctionsClient.Timeout != azureFunctionsDispatchTimeout {
+		t.Fatalf("expected azure functions timeout %s, got %s", azureFunctionsDispatchTimeout, azureFunctionsClient.Timeout)
+	}
+
+	codebuildClient, ok := codebuildBackend.client.(*http.Client)
+	if !ok {
+		t.Fatalf("expected default HTTP client, got %T", codebuildBackend.client)
+	}
+	if codebuildClient.Timeout != defaultDispatchTimeout {
+		t.Fatalf("expected default dispatch timeout %s, got %s", defaultDispatchTimeout, codebuildClient.Timeout)
+	}
+}
+
+func TestProvisionAllowsAzureFunctionsColdStartLatency(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(30 * time.Millisecond)
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"execution_id":"run-slow","metadata":{"provider":"azure-functions"}}`))
+	}))
+	defer server.Close()
+
+	cfg := newRepoScopedConfig()
+	for index := range cfg.Pools {
+		if cfg.Pools[index].Name != model.PoolLite {
+			continue
+		}
+		azureCfg := cfg.Pools[index].Backends[model.BackendAzureFunctions]
+		azureCfg.Enabled = true
+		azureCfg.SecretRef = "uecb-azure-functions"
+		cfg.Pools[index].Backends[model.BackendAzureFunctions] = azureCfg
+	}
+
+	azureFunctionsBackend := New(model.BackendAzureFunctions, cfg, staticSecrets{
+		"uecb-azure-functions": {
+			secretKeyDispatchURL: server.URL,
+		},
+	})
+	provisioned, err := azureFunctionsBackend.Provision(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolLite,
+		JobTimeout: 5 * time.Minute,
+	}, model.AllocationStatus{
+		ID:   "azf-001",
+		Pool: model.PoolLite,
+	})
+	if err != nil {
+		t.Fatalf("azure functions provision failed: %v", err)
+	}
+	if provisioned.Metadata["execution_id"] != "run-slow" {
+		t.Fatalf("expected execution_id metadata, got %+v", provisioned.Metadata)
+	}
+
+	codebuildBackend := New(model.BackendCodeBuild, cfg, staticSecrets{
+		"uecb-codebuild": {
+			secretKeyDispatchURL: server.URL,
+		},
+	})
+	codebuildClient, ok := codebuildBackend.client.(*http.Client)
+	if !ok {
+		t.Fatalf("expected default HTTP client, got %T", codebuildBackend.client)
+	}
+	codebuildClient.Timeout = 10 * time.Millisecond
+
+	_, err = codebuildBackend.Provision(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolLite,
+		JobTimeout: 5 * time.Minute,
+	}, model.AllocationStatus{
+		ID:   "cb-001",
+		Pool: model.PoolLite,
+	})
+	if err == nil || !strings.Contains(err.Error(), "Client.Timeout exceeded while awaiting headers") {
+		t.Fatalf("expected timeout from short-lived controller call, got %v", err)
+	}
+}
+
 func TestProvisionFailsWhenSecretMissesDispatchURL(t *testing.T) {
 	cfg := newRepoScopedConfig()
 	backend := New(model.BackendCodeBuild, cfg, staticSecrets{
