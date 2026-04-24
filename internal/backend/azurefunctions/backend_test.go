@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -80,5 +83,33 @@ func TestProvisionDispatchesToAzureFunctions(t *testing.T) {
 	}
 	if !strings.Contains(provisioned.Metadata["dispatch_url"], "http://") {
 		t.Fatalf("expected dispatch_url metadata, got %q", provisioned.Metadata["dispatch_url"])
+	}
+}
+
+func TestAzureFunctionsHostConfigUsesPlainTextQueueMessages(t *testing.T) {
+	_, filename, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+
+	hostPath := filepath.Join(filepath.Dir(filename), "..", "..", "..", "docker", "azure-functions", "host.json")
+	content, err := os.ReadFile(hostPath)
+	if err != nil {
+		t.Fatalf("read host.json: %v", err)
+	}
+
+	var hostConfig struct {
+		Extensions struct {
+			Queues struct {
+				MessageEncoding string `json:"messageEncoding"`
+			} `json:"queues"`
+		} `json:"extensions"`
+	}
+	if err := json.Unmarshal(content, &hostConfig); err != nil {
+		t.Fatalf("decode host.json: %v", err)
+	}
+
+	if got := hostConfig.Extensions.Queues.MessageEncoding; got != "none" {
+		t.Fatalf("expected queue messageEncoding to be %q, got %q", "none", got)
 	}
 }
