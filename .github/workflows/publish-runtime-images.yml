@@ -49,3 +49,25 @@ jobs:
           sbom: false
           outputs: type=image,push=true,oci-mediatypes=false
           tags: ghcr.io/josh-archer/${{ matrix.image.package }}:${{ inputs.tag }}
+
+      - name: Verify Lambda-compatible image manifest
+        if: ${{ matrix.image.name == 'lambda' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          image="ghcr.io/josh-archer/${{ matrix.image.package }}:${{ inputs.tag }}"
+          raw="$(docker buildx imagetools inspect --raw "${image}")"
+          media_type="$(printf '%s' "${raw}" | jq -r '.mediaType')"
+
+          if [ "${media_type}" != "application/vnd.docker.distribution.manifest.v2+json" ]; then
+            echo "Invalid Lambda manifest media type: ${media_type}" >&2
+            printf '%s\n' "${raw}" >&2
+            exit 1
+          fi
+
+          if printf '%s' "${raw}" | jq -e 'has("manifests")' >/dev/null; then
+            echo "Unexpected multi-manifest payload for Lambda image." >&2
+            printf '%s\n' "${raw}" >&2
+            exit 1
+          fi
