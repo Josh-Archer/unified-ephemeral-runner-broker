@@ -190,6 +190,16 @@ def build_runner_environment(payload: dict[str, Any], work_root: str) -> dict[st
     }
 
 
+def runner_timeout_seconds(payload: dict[str, Any]) -> int:
+    try:
+        timeout = int(payload.get("job_timeout_seconds") or 0)
+    except (TypeError, ValueError):
+        timeout = 0
+    if timeout <= 0:
+        timeout = 900
+    return timeout
+
+
 @app.route(route="dispatch", methods=["GET", "POST"], auth_level=func.AuthLevel.ANONYMOUS)
 def dispatch(req: func.HttpRequest) -> func.HttpResponse:
     if not authorized(req):
@@ -273,9 +283,18 @@ def run_runner(msg: func.QueueMessage) -> None:
     try:
         runner_env = os.environ.copy()
         runner_env.update(build_runner_environment(payload, work_root))
+        timeout_seconds = runner_timeout_seconds(payload)
+        timeout_command = [
+            "timeout",
+            "--preserve-status",
+            "-k",
+            "30s",
+            f"{timeout_seconds}s",
+            "/opt/uecb/runner-entrypoint.sh",
+        ]
         with open(log_path, "w", encoding="utf-8") as log_file:
             completed = subprocess.run(
-                ["/opt/uecb/runner-entrypoint.sh"],
+                timeout_command,
                 check=False,
                 cwd=work_root,
                 env=runner_env,
