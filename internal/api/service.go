@@ -18,14 +18,15 @@ var ErrUnknownPool = errors.New("pool is not configured")
 var ErrNoMatchingBackendCapabilities = errors.New("no backend matches the requested capabilities")
 
 type Service struct {
-	cfg      model.BrokerConfig
-	registry *backend.Registry
-	scheds   *scheduler.Registry
-	store    *store.Memory
-	observer Observer
-	initErr  error
-	health   func(context.Context) error
-	now      func() time.Time
+	cfg       model.BrokerConfig
+	registry  *backend.Registry
+	scheds    *scheduler.Registry
+	fairShare *scheduler.PriorityFairShare
+	store     *store.Memory
+	observer  Observer
+	initErr   error
+	health    func(context.Context) error
+	now       func() time.Time
 }
 
 func NewService(cfg model.BrokerConfig, registry *backend.Registry, health func(context.Context) error) *Service {
@@ -34,14 +35,15 @@ func NewService(cfg model.BrokerConfig, registry *backend.Registry, health func(
 	}
 	schedulerRegistry := scheduler.NewRegistry()
 	return &Service{
-		cfg:      cfg,
-		registry: registry,
-		scheds:   schedulerRegistry,
-		store:    store.NewMemory(),
-		observer: noopObserver{},
-		initErr:  validateSchedulers(cfg.Pools, schedulerRegistry),
-		health:   health,
-		now:      time.Now,
+		cfg:       cfg,
+		registry:  registry,
+		scheds:    schedulerRegistry,
+		fairShare: scheduler.NewPriorityFairShare(),
+		store:     store.NewMemory(),
+		observer:  noopObserver{},
+		initErr:   validateSchedulers(cfg.Pools, schedulerRegistry),
+		health:    health,
+		now:       time.Now,
 	}
 }
 
@@ -101,8 +103,7 @@ func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest)
 		}
 	}
 
-	poolScheduler := s.schedulerForPool(pool)
-	selected, err := poolScheduler.Reserve(pool, request.Backend)
+	selected, err := s.reserve(pool, request)
 	if err != nil {
 		return model.AllocationStatus{}, err
 	}
@@ -113,6 +114,8 @@ func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest)
 		CorrelationID:   correlationIDFromContext(ctx),
 		Pool:            pool.Name,
 		SelectedBackend: selected,
+		Tenant:          request.Tenant,
+		PriorityClass:   request.PriorityClass,
 		RequestedLabels: append([]string(nil), request.Labels...),
 		ExpiresAt:       s.now().Add(timeout),
 		State:           model.StateReserved,
@@ -122,7 +125,7 @@ func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest)
 
 	backendImpl, ok := s.registry.Get(selected)
 	if !ok {
-		poolScheduler.Release(pool.Name, selected)
+		s.release(pool, selected, allocation)
 		s.store.MarkState(allocation.ID, model.StateFailed, s.now(), "backend not registered")
 		return model.AllocationStatus{}, fmt.Errorf("backend implementation missing: %s", selected)
 	}
@@ -133,7 +136,7 @@ func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest)
 	s.observer.ObserveLaunchLatency(pool.Name, selected, launchLatency)
 	s.observer.ObserveRegistrationLatency(pool.Name, selected, launchLatency)
 	if err != nil {
-		poolScheduler.Release(pool.Name, selected)
+		s.release(pool, selected, allocation)
 		s.store.MarkState(allocation.ID, model.StateFailed, s.now(), err.Error())
 		logAllocationEvent(ctx, "allocation_failed", map[string]string{
 			"allocation_id": allocation.ID,
@@ -175,7 +178,7 @@ func (s *Service) Cancel(id string) (model.AllocationStatus, bool) {
 		return model.AllocationStatus{}, false
 	}
 	if pool, err := s.resolvePool(status.Pool); err == nil {
-		s.schedulerForPool(pool).Release(status.Pool, status.SelectedBackend)
+		s.release(pool, status.SelectedBackend, status)
 	}
 	s.observeState()
 	return status, true
@@ -192,7 +195,7 @@ func (s *Service) SweepExpired(now time.Time) int {
 		}
 		if _, ok := s.store.MarkState(status.ID, model.StateExpired, now, "allocation expired"); ok {
 			if pool, err := s.resolvePool(status.Pool); err == nil {
-				s.schedulerForPool(pool).Release(status.Pool, status.SelectedBackend)
+				s.release(pool, status.SelectedBackend, status)
 			}
 			expired++
 		}
@@ -241,6 +244,26 @@ func (s *Service) schedulerForPool(pool model.PoolConfig) scheduler.Scheduler {
 		return scheduler.NewRoundRobin()
 	}
 	return s.scheds.ForPool(pool)
+}
+
+func (s *Service) reserve(pool model.PoolConfig, request model.AllocationRequest) (model.BackendName, error) {
+	if pool.FairShare.Enabled {
+		if s.fairShare == nil {
+			return scheduler.NewPriorityFairShare().Reserve(pool, request)
+		}
+		return s.fairShare.Reserve(pool, request)
+	}
+	return s.schedulerForPool(pool).Reserve(pool, request)
+}
+
+func (s *Service) release(pool model.PoolConfig, backend model.BackendName, allocation model.AllocationStatus) {
+	if pool.FairShare.Enabled {
+		if s.fairShare != nil {
+			s.fairShare.Release(pool.Name, backend, allocation)
+		}
+		return
+	}
+	s.schedulerForPool(pool).Release(pool.Name, backend, allocation)
 }
 
 func validateSchedulers(pools []model.PoolConfig, registry *scheduler.Registry) error {

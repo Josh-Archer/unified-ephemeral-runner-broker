@@ -61,8 +61,13 @@ config:
         - x64
         - uecb
         - uecb-full
-      # Built-ins: round-robin, weighted-round-robin
+      # Backend schedulers: round-robin, weighted-round-robin
       scheduler: round-robin
+      fairShare:
+        enabled: false
+        priorityClasses:
+          normal: 1
+          high: 2
       capabilityProfile: full
       backends:
         arc:
@@ -82,8 +87,13 @@ config:
         - x64
         - uecb
         - uecb-lite
-      # Built-ins: round-robin, weighted-round-robin
+      # Backend schedulers: round-robin, weighted-round-robin
       scheduler: round-robin
+      fairShare:
+        enabled: false
+        priorityClasses:
+          normal: 1
+          high: 2
       capabilityProfile: lite
       backends:
         arc:

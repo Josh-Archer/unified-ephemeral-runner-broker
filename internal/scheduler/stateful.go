@@ -21,7 +21,7 @@ func newOrderedScheduler(order func(model.PoolConfig) []model.BackendName) *orde
 	}
 }
 
-func (s *orderedScheduler) Reserve(pool model.PoolConfig, pinned *model.BackendName) (model.BackendName, error) {
+func (s *orderedScheduler) Reserve(pool model.PoolConfig, request model.AllocationRequest) (model.BackendName, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -29,6 +29,7 @@ func (s *orderedScheduler) Reserve(pool model.PoolConfig, pinned *model.BackendN
 		s.active[pool.Name] = map[model.BackendName]int{}
 	}
 
+	pinned := request.Backend
 	if pinned != nil {
 		cfg, ok := pool.Backends[*pinned]
 		if !ok {
@@ -61,7 +62,8 @@ func (s *orderedScheduler) Reserve(pool model.PoolConfig, pinned *model.BackendN
 	return "", ErrNoCapacity
 }
 
-func (s *orderedScheduler) Release(pool model.PoolName, backend model.BackendName) {
+func (s *orderedScheduler) Release(pool model.PoolName, backend model.BackendName, allocation model.AllocationStatus) {
+	_ = allocation
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

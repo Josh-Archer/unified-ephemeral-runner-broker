@@ -141,6 +141,37 @@ pools:
 
 Rollback is just a config change: set `scheduler` back to `round-robin` for the pool and redeploy. Leaving `weight` values in place is safe because the default scheduler ignores them.
 
+### Priority And Fair-Share Scheduling
+
+Pools can opt into tenant-aware dispatch independently of the backend scheduler with `fairShare.enabled`.
+
+```yaml
+pools:
+  - name: lite
+    scheduler: weighted-round-robin
+    fairShare:
+      enabled: true
+      priorityClasses:
+        normal: 1
+        high: 2
+```
+
+Allocation requests may include:
+
+- `tenant`: queue, team, or workflow owner used for fair-share accounting
+- `priority_class`: priority class such as `normal` or `high`
+
+When enabled, fair-share admission prefers eligible backends with lower active load and lower active usage for the requesting tenant. Higher priority classes reduce the tenant penalty for that request, so urgent work can dispatch sooner when capacity is available. It does not preempt active runners, and allocations without a tenant use the `default` tenant bucket.
+
+```yaml
+- uses: ./actions/allocate-runner
+  with:
+    broker_url: https://broker.example.com
+    pool: lite
+    tenant: release
+    priority_class: high
+```
+
 ## Capability-Aware Routing
 
 Jobs can further narrow backend selection with optional capability filters on the allocation request:

@@ -12,12 +12,12 @@ func NewWeightedRoundRobin() *WeightedRoundRobin {
 	}
 }
 
-func (w *WeightedRoundRobin) Reserve(pool model.PoolConfig, pinned *model.BackendName) (model.BackendName, error) {
-	return w.state.Reserve(pool, pinned)
+func (w *WeightedRoundRobin) Reserve(pool model.PoolConfig, request model.AllocationRequest) (model.BackendName, error) {
+	return w.state.Reserve(pool, request)
 }
 
-func (w *WeightedRoundRobin) Release(pool model.PoolName, backend model.BackendName) {
-	w.state.Release(pool, backend)
+func (w *WeightedRoundRobin) Release(pool model.PoolName, backend model.BackendName, allocation model.AllocationStatus) {
+	w.state.Release(pool, backend, allocation)
 }
 
 func (w *WeightedRoundRobin) Active(pool model.PoolName, backend model.BackendName) int {

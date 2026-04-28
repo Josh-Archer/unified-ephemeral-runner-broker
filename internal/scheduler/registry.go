@@ -13,8 +13,8 @@ const (
 )
 
 type Scheduler interface {
-	Reserve(pool model.PoolConfig, pinned *model.BackendName) (model.BackendName, error)
-	Release(pool model.PoolName, backend model.BackendName)
+	Reserve(pool model.PoolConfig, request model.AllocationRequest) (model.BackendName, error)
+	Release(pool model.PoolName, backend model.BackendName, allocation model.AllocationStatus)
 	Active(pool model.PoolName, backend model.BackendName) int
 }
 

@@ -36,6 +36,13 @@ const (
 	StateFailed   AllocationState = "failed"
 )
 
+type PriorityClass string
+
+const (
+	PriorityClassNormal PriorityClass = "normal"
+	PriorityClassHigh   PriorityClass = "high"
+)
+
 type GitHubScope struct {
 	Type              string `yaml:"type" json:"type"`
 	Organization      string `yaml:"organization" json:"organization"`
@@ -76,10 +83,18 @@ type BackendConfig struct {
 	SecretRef      string        `yaml:"secretRef,omitempty" json:"secretRef,omitempty"`
 }
 
+type FairShareConfig struct {
+	Enabled         bool           `yaml:"enabled" json:"enabled"`
+	UsageWindow     time.Duration  `yaml:"usageWindow,omitempty" json:"usageWindow,omitempty"`
+	StarvationAfter time.Duration  `yaml:"starvationAfter,omitempty" json:"starvationAfter,omitempty"`
+	PriorityClasses map[string]int `yaml:"priorityClasses,omitempty" json:"priorityClasses,omitempty"`
+}
+
 type PoolConfig struct {
 	Name              PoolName                      `yaml:"name" json:"name"`
 	Labels            []string                      `yaml:"labels" json:"labels"`
 	Scheduler         string                        `yaml:"scheduler" json:"scheduler"`
+	FairShare         FairShareConfig               `yaml:"fairShare,omitempty" json:"fairShare,omitempty"`
 	CapabilityProfile CapabilityProfile             `yaml:"capabilityProfile" json:"capabilityProfile"`
 	Backends          map[BackendName]BackendConfig `yaml:"backends" json:"backends"`
 }
@@ -94,6 +109,8 @@ type AllocationRequest struct {
 	Pool                 PoolName      `json:"pool"`
 	Backend              *BackendName  `json:"backend,omitempty"`
 	JobTimeout           time.Duration `json:"job_timeout"`
+	Tenant               string        `json:"tenant,omitempty"`
+	PriorityClass        string        `json:"priority_class,omitempty"`
 	Labels               []string      `json:"labels,omitempty"`
 	RequiredCapabilities []string      `json:"required_capabilities,omitempty"`
 	ExcludedCapabilities []string      `json:"excluded_capabilities,omitempty"`
@@ -106,6 +123,8 @@ type AllocationStatus struct {
 	SelectedBackend BackendName       `json:"selected_backend"`
 	RunnerLabel     string            `json:"runner_label"`
 	RequestedLabels []string          `json:"requested_labels,omitempty"`
+	Tenant          string            `json:"tenant,omitempty"`
+	PriorityClass   string            `json:"priority_class,omitempty"`
 	ExpiresAt       time.Time         `json:"expires_at"`
 	State           AllocationState   `json:"state"`
 	Error           string            `json:"error,omitempty"`

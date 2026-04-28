@@ -28,6 +28,8 @@ Within a selected pool, backends use `round-robin` across healthy backends with 
 
 Pools can opt into `weighted-round-robin` instead. Backend weights are configured per pool and only affect selection when that scheduler is enabled.
 
+Pools can also enable `fairShare` independently from the backend scheduler. Allocation requests may include `tenant` and `priority_class`; fair-share admission uses active allocation counts to prefer lower-loaded backends and avoid repeatedly favoring a tenant that already has active work. Priority only affects dispatch choice when capacity is available. The broker does not preempt active runners.
+
 ## Capability Filtering
 
 Capability-aware routing is evaluated before scheduler selection.

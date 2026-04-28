@@ -114,6 +114,62 @@ func TestAllocateUsesWeightedSchedulerForPool(t *testing.T) {
 	}
 }
 
+func TestAllocateUsesPriorityFairShareScheduler(t *testing.T) {
+	service := newServiceWithConfig(func(pool *model.PoolConfig) {
+		if pool.Name != model.PoolLite {
+			return
+		}
+		pool.FairShare.Enabled = true
+
+		arcCfg := pool.Backends[model.BackendARC]
+		arcCfg.Enabled = true
+		arcCfg.MaxRunners = 4
+		pool.Backends[model.BackendARC] = arcCfg
+
+		codebuildCfg := pool.Backends[model.BackendCodeBuild]
+		codebuildCfg.Enabled = true
+		codebuildCfg.MaxRunners = 4
+		pool.Backends[model.BackendCodeBuild] = codebuildCfg
+	})
+
+	pinnedArc := model.BackendARC
+	for range 2 {
+		_, err := service.Allocate(context.Background(), model.AllocationRequest{
+			Pool:          model.PoolLite,
+			Backend:       &pinnedArc,
+			Tenant:        "tenant-a",
+			PriorityClass: string(model.PriorityClassHigh),
+			JobTimeout:    5 * time.Minute,
+		})
+		if err != nil {
+			t.Fatalf("tenant-a arc allocation failed: %v", err)
+		}
+	}
+
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:          model.PoolLite,
+		Tenant:        "tenant-b",
+		PriorityClass: string(model.PriorityClassNormal),
+		JobTimeout:    5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("tenant-b normal allocation failed: %v", err)
+	}
+	if allocation.SelectedBackend != model.BackendCodeBuild {
+		t.Fatalf("expected tenant-b to use fair-share low-load backend, got %s", allocation.SelectedBackend)
+	}
+	if allocation.Tenant != "tenant-b" {
+		t.Fatalf("expected tenant metadata on allocation, got %q", allocation.Tenant)
+	}
+	if allocation.PriorityClass != string(model.PriorityClassNormal) {
+		t.Fatalf("expected priority metadata on allocation, got %q", allocation.PriorityClass)
+	}
+
+	if _, ok := service.Cancel(allocation.ID); !ok {
+		t.Fatal("expected cancel to succeed")
+	}
+}
+
 func TestAllocateFailsForUnknownScheduler(t *testing.T) {
 	service := newServiceWithConfig(func(pool *model.PoolConfig) {
 		if pool.Name == model.PoolLite {
