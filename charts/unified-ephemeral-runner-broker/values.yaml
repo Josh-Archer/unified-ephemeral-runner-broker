@@ -16,6 +16,13 @@ serviceAccount:
 service:
   type: ClusterIP
   port: 8080
+  annotations: {}
+  labels: {}
+
+observability:
+  prometheus:
+    scrape: false
+    path: /metrics
 
 resources:
   requests:

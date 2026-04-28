@@ -1,0 +1,160 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "panels": [
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, pool) (rate(uecb_allocation_latency_seconds_bucket[5m])))",
+          "legendFormat": "p95 {{pool}}"
+        },
+        {
+          "expr": "histogram_quantile(0.50, sum by (le, pool) (rate(uecb_allocation_latency_seconds_bucket[5m])))",
+          "legendFormat": "p50 {{pool}}"
+        }
+      ],
+      "title": "Allocation Latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "id": 2,
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, pool, backend) (rate(uecb_launch_latency_seconds_bucket[5m])))",
+          "legendFormat": "launch p95 {{pool}}/{{backend}}"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, pool, backend) (rate(uecb_registration_latency_seconds_bucket[5m])))",
+          "legendFormat": "registration p95 {{pool}}/{{backend}}"
+        }
+      ],
+      "title": "Launch and Registration Latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 8
+      },
+      "id": 3,
+      "targets": [
+        {
+          "expr": "sum by (pool, backend, result) (rate(uecb_allocations_total[5m]))",
+          "legendFormat": "{{pool}}/{{backend}} {{result}}"
+        }
+      ],
+      "title": "Allocation Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 8
+      },
+      "id": 4,
+      "targets": [
+        {
+          "expr": "sum by (pool, state) (uecb_queue_depth)",
+          "legendFormat": "{{pool}} {{state}}"
+        }
+      ],
+      "title": "Queue Depth",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "max": 1,
+          "min": 0,
+          "unit": "percentunit"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 8
+      },
+      "id": 5,
+      "targets": [
+        {
+          "expr": "uecb_capacity_utilization_ratio",
+          "legendFormat": "{{pool}}/{{backend}}"
+        }
+      ],
+      "title": "Capacity Utilization",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": [
+    "uecb",
+    "github-actions",
+    "ephemeral-runners"
+  ],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "hide": 0,
+        "label": "Prometheus",
+        "name": "DS_PROMETHEUS",
+        "query": "prometheus",
+        "type": "datasource"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timezone": "browser",
+  "title": "Unified Ephemeral Runner Broker",
+  "uid": "uecb-observability-pack",
+  "version": 1
+}

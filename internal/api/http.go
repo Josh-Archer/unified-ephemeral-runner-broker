@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -20,12 +19,18 @@ type Server struct {
 }
 
 func NewServer(service *Service, allowedIssuers []string, expectedAud string, allowAnon bool) *Server {
+	observer := NewPrometheusObserver(prometheus.DefaultRegisterer)
+	if err := observer.Register(prometheus.DefaultRegisterer); err != nil {
+		panic(err)
+	}
+	service.SetObserver(observer)
+
 	return &Server{
 		service:        service,
 		allowedIssuers: allowedIssuers,
 		expectedAud:    expectedAud,
 		allowAnon:      allowAnon,
-		requests: promauto.NewCounterVec(prometheus.CounterOpts{
+		requests: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "uecb_http_requests_total",
 			Help: "HTTP requests handled by the broker.",
 		}, []string{"route", "method", "status"}),
@@ -38,7 +43,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1/allocations/", s.handleAllocationByID)
 	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/healthz", s.handleHealth)
-	return mux
+	if err := prometheus.Register(s.requests); err != nil {
+		if _, ok := err.(prometheus.AlreadyRegisteredError); !ok {
+			panic(err)
+		}
+	}
+	return s.withRequestObservability(mux)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -132,7 +142,6 @@ func (s *Server) authorize(r *http.Request) error {
 }
 
 func (s *Server) writeError(w http.ResponseWriter, code int, err error) {
-	s.record("error", code, http.MethodGet)
 	s.writeJSON(w, code, map[string]string{"error": err.Error()})
 }
 
@@ -144,4 +153,39 @@ func (s *Server) writeJSON(w http.ResponseWriter, code int, body interface{}) {
 
 func (s *Server) record(route string, status int, method string) {
 	s.requests.WithLabelValues(route, method, http.StatusText(status)).Inc()
+}
+
+func (s *Server) withRequestObservability(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		correlationID := correlationIDFromRequest(r)
+		w.Header().Set(correlationIDHeader, correlationID)
+		recorder := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(recorder, r.WithContext(withCorrelationID(r.Context(), correlationID)))
+		s.record(routeName(r.URL.Path), recorder.status, r.Method)
+	})
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *statusRecorder) WriteHeader(status int) {
+	r.status = status
+	r.ResponseWriter.WriteHeader(status)
+}
+
+func routeName(path string) string {
+	switch {
+	case path == "/v1/allocations":
+		return "/v1/allocations"
+	case strings.HasPrefix(path, "/v1/allocations/"):
+		return "/v1/allocations/{id}"
+	case path == "/metrics":
+		return "/metrics"
+	case path == "/healthz":
+		return "/healthz"
+	default:
+		return "unknown"
+	}
 }

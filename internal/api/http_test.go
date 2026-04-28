@@ -46,6 +46,7 @@ func TestHandleAllocationsAcceptsStringJobTimeout(t *testing.T) {
 	server := newTestServer(t, service)
 
 	request := httptest.NewRequest(http.MethodPost, "/v1/allocations", bytes.NewBufferString(`{"pool":"full","job_timeout":"15m"}`))
+	request.Header.Set(correlationIDHeader, "test-correlation")
 	recorder := httptest.NewRecorder()
 	server.Handler().ServeHTTP(recorder, request)
 
@@ -62,9 +63,48 @@ func TestHandleAllocationsAcceptsStringJobTimeout(t *testing.T) {
 		t.Fatalf("expected ARC backend, got %s", allocation.SelectedBackend)
 	}
 
+	if allocation.CorrelationID != "test-correlation" {
+		t.Fatalf("expected response correlation id to be preserved, got %q", allocation.CorrelationID)
+	}
+
+	if recorder.Header().Get(correlationIDHeader) != "test-correlation" {
+		t.Fatalf("expected response header correlation id to be preserved, got %q", recorder.Header().Get(correlationIDHeader))
+	}
+
 	wantExpiry := time.Unix(1000, 0).Add(15 * time.Minute)
 	if !allocation.ExpiresAt.Equal(wantExpiry) {
 		t.Fatalf("expected expiry %s, got %s", wantExpiry, allocation.ExpiresAt)
+	}
+}
+
+func TestMetricsExposeAllocationSignals(t *testing.T) {
+	service := newServiceWithConfig(nil)
+	server := newTestServer(t, service)
+	handler := server.Handler()
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/allocations", bytes.NewBufferString(`{"pool":"full","job_timeout":"15m"}`))
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("expected allocation to succeed, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+
+	metrics := httptest.NewRecorder()
+	handler.ServeHTTP(metrics, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := metrics.Body.String()
+
+	for _, metric := range []string{
+		`uecb_allocations_total{backend="arc",pool="full",result="success"} 1`,
+		`uecb_queue_depth{pool="full",state="ready"} 1`,
+		`uecb_capacity_utilization_ratio{backend="arc",pool="full"} 0.25`,
+		`uecb_http_requests_total{method="POST",route="/v1/allocations",status="Created"} 1`,
+		`uecb_allocation_latency_seconds_bucket`,
+		`uecb_launch_latency_seconds_bucket`,
+		`uecb_registration_latency_seconds_bucket`,
+	} {
+		if !strings.Contains(body, metric) {
+			t.Fatalf("expected metrics to contain %q, got:\n%s", metric, body)
+		}
 	}
 }
 
