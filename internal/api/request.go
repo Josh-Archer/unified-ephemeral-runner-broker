@@ -45,6 +45,8 @@ func decodeAllocationRequest(reader io.Reader) (model.AllocationRequest, error) 
 		Pool                 model.PoolName       `json:"pool"`
 		Backend              *model.BackendName   `json:"backend,omitempty"`
 		JobTimeout           durationRequestValue `json:"job_timeout"`
+		Tenant               string               `json:"tenant,omitempty"`
+		PriorityClass        string               `json:"priority_class,omitempty"`
 		Labels               []string             `json:"labels,omitempty"`
 		RequiredCapabilities []string             `json:"required_capabilities,omitempty"`
 		ExcludedCapabilities []string             `json:"excluded_capabilities,omitempty"`
@@ -65,6 +67,8 @@ func decodeAllocationRequest(reader io.Reader) (model.AllocationRequest, error) 
 		Pool:                 request.Pool,
 		Backend:              backend,
 		JobTimeout:           time.Duration(request.JobTimeout),
+		Tenant:               request.Tenant,
+		PriorityClass:        request.PriorityClass,
 		Labels:               append([]string(nil), request.Labels...),
 		RequiredCapabilities: append([]string(nil), request.RequiredCapabilities...),
 		ExcludedCapabilities: append([]string(nil), request.ExcludedCapabilities...),

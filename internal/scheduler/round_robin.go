@@ -21,12 +21,12 @@ func NewRoundRobin() *RoundRobin {
 	}
 }
 
-func (r *RoundRobin) Reserve(pool model.PoolConfig, pinned *model.BackendName) (model.BackendName, error) {
-	return r.state.Reserve(pool, pinned)
+func (r *RoundRobin) Reserve(pool model.PoolConfig, request model.AllocationRequest) (model.BackendName, error) {
+	return r.state.Reserve(pool, request)
 }
 
-func (r *RoundRobin) Release(pool model.PoolName, backend model.BackendName) {
-	r.state.Release(pool, backend)
+func (r *RoundRobin) Release(pool model.PoolName, backend model.BackendName, allocation model.AllocationStatus) {
+	r.state.Release(pool, backend, allocation)
 }
 
 func (r *RoundRobin) Active(pool model.PoolName, backend model.BackendName) int {

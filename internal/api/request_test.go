@@ -55,6 +55,26 @@ func TestDecodeAllocationRequestParsesLambdaBackendAsString(t *testing.T) {
 	}
 }
 
+func TestDecodeAllocationRequestParsesTenant(t *testing.T) {
+	request, err := decodeAllocationRequest(bytes.NewReader([]byte(`{"pool":"lite","tenant":"tenant-a","job_timeout":"1m"}`)))
+	if err != nil {
+		t.Fatalf("decode failed: %v", err)
+	}
+	if request.Tenant != "tenant-a" {
+		t.Fatalf("expected tenant-a, got %q", request.Tenant)
+	}
+}
+
+func TestDecodeAllocationRequestParsesPriorityClass(t *testing.T) {
+	request, err := decodeAllocationRequest(bytes.NewReader([]byte(`{"pool":"lite","priority_class":"high","job_timeout":"1m"}`)))
+	if err != nil {
+		t.Fatalf("decode failed: %v", err)
+	}
+	if request.PriorityClass != "high" {
+		t.Fatalf("expected high priority class, got %q", request.PriorityClass)
+	}
+}
+
 func TestDecodeAllocationRequestCopiesLabels(t *testing.T) {
 	request, err := decodeAllocationRequest(bytes.NewReader([]byte(`{"pool":"lite","labels":["a","b","c"]}`)))
 	if err != nil {

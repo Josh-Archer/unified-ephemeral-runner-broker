@@ -30,9 +30,16 @@ func Default() model.BrokerConfig {
 		},
 		Pools: []model.PoolConfig{
 			{
-				Name:              model.PoolFull,
-				Labels:            []string{"self-hosted", "linux", "x64", "uecb", "uecb-full"},
-				Scheduler:         "round-robin",
+				Name:      model.PoolFull,
+				Labels:    []string{"self-hosted", "linux", "x64", "uecb", "uecb-full"},
+				Scheduler: "round-robin",
+				FairShare: model.FairShareConfig{
+					Enabled: false,
+					PriorityClasses: map[string]int{
+						string(model.PriorityClassNormal): 1,
+						string(model.PriorityClassHigh):   2,
+					},
+				},
 				CapabilityProfile: model.CapabilityFull,
 				Backends: map[model.BackendName]model.BackendConfig{
 					model.BackendARC: {
@@ -46,9 +53,16 @@ func Default() model.BrokerConfig {
 				},
 			},
 			{
-				Name:              model.PoolLite,
-				Labels:            []string{"self-hosted", "linux", "x64", "uecb", "uecb-lite"},
-				Scheduler:         "round-robin",
+				Name:      model.PoolLite,
+				Labels:    []string{"self-hosted", "linux", "x64", "uecb", "uecb-lite"},
+				Scheduler: "round-robin",
+				FairShare: model.FairShareConfig{
+					Enabled: false,
+					PriorityClasses: map[string]int{
+						string(model.PriorityClassNormal): 1,
+						string(model.PriorityClassHigh):   2,
+					},
+				},
 				CapabilityProfile: model.CapabilityLite,
 				Backends: map[model.BackendName]model.BackendConfig{
 					model.BackendARC: {

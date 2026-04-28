@@ -23,6 +23,11 @@ data:
       - name: full
         labels: [self-hosted, linux, x64, uecb, uecb-full]
         scheduler: round-robin
+        fairShare:
+          enabled: false
+          priorityClasses:
+            normal: 1
+            high: 2
         capabilityProfile: full
         backends:
           arc:
@@ -35,6 +40,11 @@ data:
       - name: lite
         labels: [self-hosted, linux, x64, uecb, uecb-lite]
         scheduler: round-robin
+        fairShare:
+          enabled: false
+          priorityClasses:
+            normal: 1
+            high: 2
         capabilityProfile: lite
         backends:
           arc:

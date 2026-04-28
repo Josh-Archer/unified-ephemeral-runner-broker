@@ -19,6 +19,14 @@ inputs:
     description: Optional comma-separated labels to attach to the allocation request
     required: false
     default: ""
+  tenant:
+    description: Optional tenant or queue identity for fair-share scheduling
+    required: false
+    default: ""
+  priority_class:
+    description: Optional priority class, for example normal or high
+    required: false
+    default: ""
   required_capabilities:
     description: Optional comma-separated capability tags that the selected backend must advertise
     required: false
@@ -61,6 +69,8 @@ runs:
         INPUT_BACKEND: ${{ inputs.backend }}
         INPUT_JOB_TIMEOUT: ${{ inputs.job_timeout }}
         INPUT_LABELS: ${{ inputs.labels }}
+        INPUT_TENANT: ${{ inputs.tenant }}
+        INPUT_PRIORITY_CLASS: ${{ inputs.priority_class }}
         INPUT_REQUIRED_CAPABILITIES: ${{ inputs.required_capabilities }}
         INPUT_EXCLUDED_CAPABILITIES: ${{ inputs.excluded_capabilities }}
         INPUT_OIDC_AUDIENCE: ${{ inputs.oidc_audience }}
@@ -96,6 +106,14 @@ if backend:
 labels = [item.strip() for item in os.environ.get("INPUT_LABELS", "").split(",") if item.strip()]
 if labels:
     payload["labels"] = labels
+
+tenant = os.environ.get("INPUT_TENANT", "").strip()
+if tenant:
+    payload["tenant"] = tenant
+
+priority_class = os.environ.get("INPUT_PRIORITY_CLASS", "").strip()
+if priority_class:
+    payload["priority_class"] = priority_class
 
 required_capabilities = [item.strip() for item in os.environ.get("INPUT_REQUIRED_CAPABILITIES", "").split(",") if item.strip()]
 if required_capabilities:
