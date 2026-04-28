@@ -59,6 +59,7 @@ Built-in schedulers:
 - `actions/allocate-runner`: public workflow integration surface
 - `examples/`: generic Terraform and GitOps consumption examples
 - `docs/`: architecture and security notes
+- `observability/`: reusable Prometheus alert rules and Grafana dashboard artifacts
 
 ## Public CI and Private Release Boundary
 
@@ -213,6 +214,16 @@ This requires at least one backend in the selected pool to advertise `gpu`, for 
 ```
 
 If no backend matches the requested capability filters, the broker rejects the allocation request before scheduling.
+
+## Observability
+
+The broker exposes Prometheus metrics on `/metrics` and uses a shared `X-Correlation-ID` model across HTTP responses, allocation responses, and structured lifecycle logs. The reusable pack includes:
+
+- `observability/grafana-dashboard.json`
+- `observability/prometheus-rules.yaml`
+- [docs/observability.md](docs/observability.md)
+
+The pack observes allocation and backend lifecycle events without changing scheduling behavior.
 
 ## License
 

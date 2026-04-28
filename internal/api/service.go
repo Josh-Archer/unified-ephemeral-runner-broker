@@ -22,6 +22,7 @@ type Service struct {
 	registry *backend.Registry
 	scheds   *scheduler.Registry
 	store    *store.Memory
+	observer Observer
 	initErr  error
 	health   func(context.Context) error
 	now      func() time.Time
@@ -37,13 +38,31 @@ func NewService(cfg model.BrokerConfig, registry *backend.Registry, health func(
 		registry: registry,
 		scheds:   schedulerRegistry,
 		store:    store.NewMemory(),
+		observer: noopObserver{},
 		initErr:  validateSchedulers(cfg.Pools, schedulerRegistry),
 		health:   health,
 		now:      time.Now,
 	}
 }
 
+func (s *Service) SetObserver(observer Observer) {
+	if observer == nil {
+		s.observer = noopObserver{}
+		return
+	}
+	s.observer = observer
+}
+
 func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest) (model.AllocationStatus, error) {
+	started := s.now()
+	resultPool := request.Pool
+	var resultBackend model.BackendName
+	result := "failure"
+	defer func() {
+		s.observer.ObserveAllocationResult(resultPool, resultBackend, result, s.now().Sub(started))
+		s.observeState()
+	}()
+
 	if s.initErr != nil {
 		return model.AllocationStatus{}, s.initErr
 	}
@@ -55,11 +74,16 @@ func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest)
 	if err != nil {
 		return model.AllocationStatus{}, err
 	}
+	resultPool = pool.Name
 	request.Backend = s.resolveRequestedBackend(pool, request.Backend)
 	pool, err = filterEligibleBackends(pool, request)
 	if err != nil {
 		return model.AllocationStatus{}, err
 	}
+	s.observer.ObserveAllocationStart(pool.Name)
+	logAllocationEvent(ctx, "allocation_admitted", map[string]string{
+		"pool": string(pool.Name),
+	})
 
 	timeout := request.JobTimeout
 	if timeout <= 0 {
@@ -82,9 +106,11 @@ func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest)
 	if err != nil {
 		return model.AllocationStatus{}, err
 	}
+	resultBackend = selected
 
 	allocation := model.AllocationStatus{
 		ID:              newID(),
+		CorrelationID:   correlationIDFromContext(ctx),
 		Pool:            pool.Name,
 		SelectedBackend: selected,
 		RequestedLabels: append([]string(nil), request.Labels...),
@@ -101,10 +127,20 @@ func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest)
 		return model.AllocationStatus{}, fmt.Errorf("backend implementation missing: %s", selected)
 	}
 
+	launchStarted := s.now()
 	provisioned, err := backendImpl.Provision(ctx, request, allocation)
+	launchLatency := s.now().Sub(launchStarted)
+	s.observer.ObserveLaunchLatency(pool.Name, selected, launchLatency)
+	s.observer.ObserveRegistrationLatency(pool.Name, selected, launchLatency)
 	if err != nil {
 		poolScheduler.Release(pool.Name, selected)
 		s.store.MarkState(allocation.ID, model.StateFailed, s.now(), err.Error())
+		logAllocationEvent(ctx, "allocation_failed", map[string]string{
+			"allocation_id": allocation.ID,
+			"pool":          string(pool.Name),
+			"backend":       string(selected),
+			"error":         err.Error(),
+		})
 		return model.AllocationStatus{}, err
 	}
 
@@ -112,6 +148,12 @@ func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest)
 	allocation.Metadata = backend.WithCapabilitiesMetadata(pool.Backends[selected], provisioned.Metadata)
 	allocation.State = model.StateReady
 	s.store.Save(allocation)
+	result = "success"
+	logAllocationEvent(ctx, "allocation_ready", map[string]string{
+		"allocation_id": allocation.ID,
+		"pool":          string(pool.Name),
+		"backend":       string(selected),
+	})
 
 	return allocation, nil
 }
@@ -135,6 +177,7 @@ func (s *Service) Cancel(id string) (model.AllocationStatus, bool) {
 	if pool, err := s.resolvePool(status.Pool); err == nil {
 		s.schedulerForPool(pool).Release(status.Pool, status.SelectedBackend)
 	}
+	s.observeState()
 	return status, true
 }
 
@@ -154,7 +197,14 @@ func (s *Service) SweepExpired(now time.Time) int {
 			expired++
 		}
 	}
+	s.observeState()
 	return expired
+}
+
+func (s *Service) observeState() {
+	statuses := s.store.List()
+	s.observer.ObserveActiveAllocations(statuses)
+	s.observer.ObserveCapacity(s.cfg, statuses)
 }
 
 func (s *Service) resolvePool(name model.PoolName) (model.PoolConfig, error) {

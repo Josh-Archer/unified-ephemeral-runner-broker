@@ -101,6 +101,7 @@ type AllocationRequest struct {
 
 type AllocationStatus struct {
 	ID              string            `json:"allocation_id"`
+	CorrelationID   string            `json:"correlation_id,omitempty"`
 	Pool            PoolName          `json:"pool"`
 	SelectedBackend BackendName       `json:"selected_backend"`
 	RunnerLabel     string            `json:"runner_label"`
