@@ -2,6 +2,44 @@
 
 `unified-ephemeral-runner-broker` is a public control plane for allocating one-shot GitHub Actions runners across a unified ephemeral capacity pool.
 
+```mermaid
+graph TD
+    subgraph "GitHub Actions Workflow"
+        Step1[allocate-runner action]
+        Step2[Job with dynamic label]
+    end
+
+    subgraph "Kubernetes (Broker Namespace)"
+        Broker[Broker Service]
+        SecretAuth[GitHub App/OIDC Secret]
+        SecretBackends[Backend Secrets]
+    end
+
+    subgraph "Compute Backends"
+        ARC[ARC - Action Runner Controller]
+        CB[AWS CodeBuild]
+        Lambda[AWS Lambda]
+        CR[GCP Cloud Run]
+        AF[Azure Functions]
+    end
+
+    Step1 -- "REST API (Allocation)" --> Broker
+    Broker -- "K8s API" --> SecretAuth
+    Broker -- "K8s API" --> SecretBackends
+    
+    Broker -- "Native Provisioning" --> ARC
+    Broker -- "HTTP Dispatch" --> CB
+    Broker -- "HTTP Dispatch" --> Lambda
+    Broker -- "HTTP Dispatch" --> CR
+    Broker -- "HTTP Dispatch" --> AF
+
+    ARC -. "Runner Label" .-> Step2
+    CB -. "Runner Label" .-> Step2
+    Lambda -. "Runner Label" .-> Step2
+    CR -. "Runner Label" .-> Step2
+    AF -. "Runner Label" .-> Step2
+```
+
 V1 models exactly five backends:
 
 - `arc`
@@ -41,6 +79,30 @@ Built-in schedulers:
 - A public release workflow that can touch self-hosted runners
 
 ## High-Level Flow
+
+```mermaid
+sequenceDiagram
+    participant GH as GitHub Workflow
+    participant AR as allocate-runner action
+    participant B as Broker
+    participant BE as Backend (e.g., ARC/Lambda)
+    participant R as Ephemeral Runner
+
+    GH->>AR: Run action
+    AR->>B: POST /allocate (OIDC Token)
+    B->>B: Validate OIDC & Auth
+    B->>B: Capability Filtering
+    B->>B: Scheduler Selection
+    B->>BE: Dispatch Provisioning
+    BE-->>B: Admission OK (Label)
+    B-->>AR: Allocation Result (Label)
+    AR-->>GH: Set outputs (runner_label)
+    
+    GH->>R: Run Job on label
+    R->>R: Execute Job
+    R->>GH: Job Complete
+    R->>R: Self-Terminate
+```
 
 1. A lightweight workflow step calls `allocate-runner`.
 2. The broker selects an eligible backend from the chosen pool.
@@ -113,6 +175,16 @@ Environment-specific repositories can mirror images when a provider requires it.
 Repository scope requires `github.scope.owner` and `github.scope.repository`. Organization scope requires `github.scope.organization`.
 
 ## Scheduler Configuration
+
+```mermaid
+graph LR
+    Req[Allocation Request] --> Cap[Capability Filter]
+    Cap -- "Eligible Backends" --> FS{Fair Share?}
+    FS -- "Yes" --> FSL[Fair Share Logic]
+    FSL --> Sched[Scheduler RR/WRR]
+    FS -- "No" --> Sched
+    Sched --> BE[Selected Backend]
+```
 
 Each pool selects its scheduler with `pools[].scheduler`.
 
