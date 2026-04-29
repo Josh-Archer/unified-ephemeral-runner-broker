@@ -10,6 +10,7 @@ import (
 const (
 	NameRoundRobin         = "round-robin"
 	NameWeightedRoundRobin = "weighted-round-robin"
+	NamePriorityFairShare  = "priority-fair-share"
 )
 
 type Scheduler interface {
@@ -26,12 +27,14 @@ type Registry struct {
 func NewRegistry() *Registry {
 	roundRobin := NewRoundRobin()
 	weightedRoundRobin := NewWeightedRoundRobin()
+	priorityFairShare := NewPriorityFairShare()
 
 	return &Registry{
 		defaultScheduler: roundRobin,
 		schedulers: map[string]Scheduler{
 			NameRoundRobin:         roundRobin,
 			NameWeightedRoundRobin: weightedRoundRobin,
+			NamePriorityFairShare:  priorityFairShare,
 		},
 	}
 }
