@@ -1,11 +1,14 @@
 package scheduler
 
 import (
+	"errors"
 	"strings"
 	"sync"
 
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 )
+
+var ErrQuotaExceeded = errors.New("tenant quota exceeded")
 
 const (
 	defaultNormalPriorityClass  = 1
@@ -63,6 +66,17 @@ func (s *priorityFairShareState) Reserve(pool model.PoolConfig, request model.Al
 		s.tenantActive[pool.Name] = map[model.BackendName]map[string]int{}
 	}
 
+	tenant := normalizeTenant(request.Tenant)
+	if quota, ok := pool.FairShare.Quotas[tenant]; ok {
+		tenantTotal := 0
+		for _, counts := range s.tenantActive[pool.Name] {
+			tenantTotal += counts[tenant]
+		}
+		if tenantTotal >= quota {
+			return "", ErrQuotaExceeded
+		}
+	}
+
 	pinned := request.Backend
 	if pinned != nil {
 		cfg, ok := pool.Backends[*pinned]
@@ -94,7 +108,6 @@ func (s *priorityFairShareState) Reserve(pool model.PoolConfig, request model.Al
 	)
 
 	priorityWeight := normalizePriorityClassWeight(pool, request.PriorityClass)
-	tenant := normalizeTenant(request.Tenant)
 	start := s.cursors[pool.Name] % len(backends)
 
 	for offset := 0; offset < len(backends); offset++ {

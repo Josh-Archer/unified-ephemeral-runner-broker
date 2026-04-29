@@ -88,6 +88,7 @@ type FairShareConfig struct {
 	UsageWindow     time.Duration  `yaml:"usageWindow,omitempty" json:"usageWindow,omitempty"`
 	StarvationAfter time.Duration  `yaml:"starvationAfter,omitempty" json:"starvationAfter,omitempty"`
 	PriorityClasses map[string]int `yaml:"priorityClasses,omitempty" json:"priorityClasses,omitempty"`
+	Quotas          map[string]int `yaml:"quotas,omitempty" json:"quotas,omitempty"`
 }
 
 type PoolConfig struct {
