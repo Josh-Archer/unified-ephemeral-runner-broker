@@ -497,3 +497,38 @@ func TestAllocateRejectsPinnedBackendThatFailsCapabilityFilter(t *testing.T) {
 		t.Fatalf("expected pinned backend error context, got %v", err)
 	}
 }
+
+func TestAllocateEnforcesTenantQuotas(t *testing.T) {
+	service := newServiceWithConfig(func(pool *model.PoolConfig) {
+		if pool.Name != model.PoolLite {
+			return
+		}
+		pool.FairShare.Enabled = true
+		pool.FairShare.Quotas = map[string]int{
+			"limited-tenant": 1,
+		}
+
+		arcCfg := pool.Backends[model.BackendARC]
+		arcCfg.Enabled = true
+		arcCfg.MaxRunners = 4
+		pool.Backends[model.BackendARC] = arcCfg
+	})
+
+	// First allocation for limited-tenant should succeed
+	_, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:   model.PoolLite,
+		Tenant: "limited-tenant",
+	})
+	if err != nil {
+		t.Fatalf("first allocate failed: %v", err)
+	}
+
+	// Second allocation for limited-tenant should be rejected
+	_, err = service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:   model.PoolLite,
+		Tenant: "limited-tenant",
+	})
+	if !errors.Is(err, scheduler.ErrQuotaExceeded) {
+		t.Fatalf("expected ErrQuotaExceeded, got %v", err)
+	}
+}

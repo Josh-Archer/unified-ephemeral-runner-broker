@@ -193,3 +193,39 @@ func TestPriorityFairShareAllocatesByTenantShareWithoutPreemption(t *testing.T) 
 		t.Fatalf("expected fair-share to avoid tenant-a-heavy backend, got %s", selected)
 	}
 }
+
+func TestPriorityFairShareEnforcesTenantQuotas(t *testing.T) {
+	scheduler := NewPriorityFairShare()
+	pool := poolByName(model.PoolLite)
+	pool.FairShare.Enabled = true
+	pool.FairShare.Quotas = map[string]int{
+		"limited-tenant": 1,
+	}
+	pool.Backends[model.BackendARC] = model.BackendConfig{Enabled: true, Healthy: true, MaxRunners: 4}
+	pool.Backends[model.BackendCodeBuild] = model.BackendConfig{Enabled: true, Healthy: true, MaxRunners: 4}
+
+	// First allocation for limited-tenant should succeed
+	_, err := scheduler.Reserve(pool, allocationRequest(nil, "limited-tenant", ""))
+	if err != nil {
+		t.Fatalf("first reserve failed: %v", err)
+	}
+
+	// Second allocation for limited-tenant should be rejected
+	_, err = scheduler.Reserve(pool, allocationRequest(nil, "limited-tenant", ""))
+	if err != ErrQuotaExceeded {
+		t.Fatalf("expected ErrQuotaExceeded, got %v", err)
+	}
+
+	// Allocation for another tenant should still succeed
+	_, err = scheduler.Reserve(pool, allocationRequest(nil, "other-tenant", ""))
+	if err != nil {
+		t.Fatalf("other-tenant reserve failed: %v", err)
+	}
+
+	// Releasing the first allocation should allow a new one
+	scheduler.Release(pool.Name, model.BackendARC, model.AllocationStatus{Tenant: "limited-tenant"})
+	_, err = scheduler.Reserve(pool, allocationRequest(nil, "limited-tenant", ""))
+	if err != nil {
+		t.Fatalf("reserve after release failed: %v", err)
+	}
+}
