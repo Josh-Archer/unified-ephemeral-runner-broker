@@ -2,8 +2,10 @@ import json
 import logging
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
+import time
 import traceback
 import urllib.parse
 import uuid
@@ -20,6 +22,8 @@ app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 BACKEND_NAME = "azure-functions"
 DEFAULT_DISPATCH_QUEUE = "uecb-azure-functions-dispatch"
 DEFAULT_STATUS_CONTAINER = "uecb-azure-functions-status"
+MAX_RUNNER_TIMEOUT_SECONDS = 8 * 60
+STATUS_UPDATE_INTERVAL_SECONDS = 15
 
 
 def utc_now() -> str:
@@ -197,7 +201,29 @@ def runner_timeout_seconds(payload: dict[str, Any]) -> int:
         timeout = 0
     if timeout <= 0:
         timeout = 900
-    return timeout
+    return min(timeout, MAX_RUNNER_TIMEOUT_SECONDS)
+
+
+def terminate_process(process: subprocess.Popen[Any]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except Exception:
+        logging.exception("failed to send SIGTERM to runner process group")
+    try:
+        process.wait(timeout=30)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    except Exception:
+        logging.exception("failed to send SIGKILL to runner process group")
 
 
 @app.route(route="dispatch", methods=["GET", "POST"], auth_level=func.AuthLevel.ANONYMOUS)
@@ -284,41 +310,52 @@ def run_runner(msg: func.QueueMessage) -> None:
         runner_env = os.environ.copy()
         runner_env.update(build_runner_environment(payload, work_root))
         timeout_seconds = runner_timeout_seconds(payload)
-        timeout_command = [
-            "timeout",
-            "--preserve-status",
-            "-k",
-            "30s",
-            f"{timeout_seconds}s",
-            "/opt/uecb/runner-entrypoint.sh",
-        ]
         with open(log_path, "w", encoding="utf-8") as log_file:
-            completed = subprocess.run(
-                timeout_command,
-                check=False,
+            process = subprocess.Popen(
+                ["/opt/uecb/runner-entrypoint.sh"],
                 cwd=work_root,
                 env=runner_env,
                 stderr=subprocess.STDOUT,
                 stdout=log_file,
                 text=True,
+                start_new_session=True,
             )
-        if completed.returncode == 0:
+            deadline = time.monotonic() + timeout_seconds
+            next_status_update = time.monotonic() + STATUS_UPDATE_INTERVAL_SECONDS
+            while process.poll() is None:
+                now = time.monotonic()
+                if now >= deadline:
+                    terminate_process(process)
+                    break
+                if now >= next_status_update:
+                    log_file.flush()
+                    write_status(execution_id, state="running", runner_log=tail_log(log_path))
+                    next_status_update = now + STATUS_UPDATE_INTERVAL_SECONDS
+                time.sleep(1)
+
+        exit_code = process.returncode
+        if exit_code == 0:
             write_status(
                 execution_id,
                 ok=True,
                 state="completed",
-                exit_code=completed.returncode,
+                exit_code=exit_code,
                 completed_at=utc_now(),
             )
             return
 
+        timed_out = time.monotonic() >= deadline
+        if timed_out:
+            last_error = f"runner exceeded Azure Functions timeout budget of {timeout_seconds}s"
+        else:
+            last_error = f"runner exited with code {exit_code}"
         write_status(
             execution_id,
             ok=False,
             state="failed",
-            exit_code=completed.returncode,
+            exit_code=exit_code,
             completed_at=utc_now(),
-            last_error=f"runner exited with code {completed.returncode}",
+            last_error=last_error,
             runner_log=tail_log(log_path),
         )
     except Exception as exc:

@@ -134,8 +134,9 @@ func TestAzureFunctionsRunnerWrapperCapturesFailureContext(t *testing.T) {
 		"stderr=subprocess.STDOUT",
 		"stdout=log_file",
 		"runner_timeout_seconds(payload)",
-		`"timeout"`,
-		`"--preserve-status"`,
+		"MAX_RUNNER_TIMEOUT_SECONDS = 8 * 60",
+		"write_status(execution_id, state=\"running\", runner_log=tail_log(log_path))",
+		"terminate_process(process)",
 	} {
 		if !strings.Contains(wrapper, expected) {
 			t.Fatalf("expected Azure Functions wrapper to contain %q", expected)
