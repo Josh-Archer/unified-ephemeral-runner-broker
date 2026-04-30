@@ -78,28 +78,22 @@ func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest)
 	}
 	resultPool = pool.Name
 	request.Backend = s.resolveRequestedBackend(pool, request.Backend)
-	pool, err = filterEligibleBackends(pool, request)
-	if err != nil {
-		return model.AllocationStatus{}, err
-	}
-	s.observer.ObserveAllocationStart(pool.Name)
-	logAllocationEvent(ctx, "allocation_admitted", map[string]string{
-		"pool": string(pool.Name),
-	})
 
+	explicitTimeout := request.JobTimeout > 0
 	timeout := request.JobTimeout
 	if timeout <= 0 {
 		timeout = s.cfg.Broker.DefaultJobTimeout
 	}
 	request.JobTimeout = timeout
 
-	if request.Backend != nil {
-		backendCfg, ok := pool.Backends[*request.Backend]
-		if !ok {
-			return model.AllocationStatus{}, scheduler.ErrUnknownBackend
-		}
-		if backendCfg.MaxJobDuration > 0 && timeout > backendCfg.MaxJobDuration {
-			return model.AllocationStatus{}, fmt.Errorf("requested timeout %s exceeds backend limit %s", timeout, backendCfg.MaxJobDuration)
+	pool, err = filterEligibleBackends(pool, request)
+	if err != nil {
+		return model.AllocationStatus{}, err
+	}
+	if explicitTimeout {
+		pool, err = filterBackendsByTimeout(pool, request)
+		if err != nil {
+			return model.AllocationStatus{}, err
 		}
 	}
 
@@ -108,6 +102,11 @@ func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest)
 		return model.AllocationStatus{}, err
 	}
 	resultBackend = selected
+	s.observer.ObserveAllocationStart(pool.Name)
+	logAllocationEvent(ctx, "allocation_admitted", map[string]string{
+		"pool":    string(pool.Name),
+		"backend": string(selected),
+	})
 
 	allocation := model.AllocationStatus{
 		ID:              newID(),
@@ -304,6 +303,39 @@ func filterEligibleBackends(pool model.PoolConfig, request model.AllocationReque
 
 	if len(filtered.Backends) == 0 {
 		return model.PoolConfig{}, fmt.Errorf("%w for pool %q", ErrNoMatchingBackendCapabilities, pool.Name)
+	}
+
+	return filtered, nil
+}
+
+func filterBackendsByTimeout(pool model.PoolConfig, request model.AllocationRequest) (model.PoolConfig, error) {
+	timeout := request.JobTimeout
+	if timeout <= 0 {
+		return pool, nil
+	}
+
+	filtered := pool
+	filtered.Backends = make(map[model.BackendName]model.BackendConfig, len(pool.Backends))
+	for name, cfg := range pool.Backends {
+		if cfg.MaxJobDuration > 0 && timeout > cfg.MaxJobDuration {
+			continue
+		}
+		filtered.Backends[name] = cfg
+	}
+
+	if request.Backend != nil {
+		cfg, ok := pool.Backends[*request.Backend]
+		if !ok {
+			return model.PoolConfig{}, scheduler.ErrUnknownBackend
+		}
+		if cfg.MaxJobDuration > 0 && timeout > cfg.MaxJobDuration {
+			return model.PoolConfig{}, fmt.Errorf("requested timeout %s exceeds backend limit %s", timeout, cfg.MaxJobDuration)
+		}
+		return filtered, nil
+	}
+
+	if len(filtered.Backends) == 0 {
+		return model.PoolConfig{}, fmt.Errorf("%w for pool %q with timeout %s", scheduler.ErrNoCapacity, pool.Name, timeout)
 	}
 
 	return filtered, nil
