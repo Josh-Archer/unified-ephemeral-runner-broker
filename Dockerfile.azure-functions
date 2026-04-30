@@ -16,6 +16,7 @@ RUN set -eux; \
     git \
     gzip \
     jq \
+    nodejs \
     tar \
     unzip \
     "${libicu_pkg}"; \
