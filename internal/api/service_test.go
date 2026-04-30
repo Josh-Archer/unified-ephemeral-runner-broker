@@ -216,6 +216,42 @@ func TestAllocateRespectsPinnedBackendTimeoutLimit(t *testing.T) {
 	}
 }
 
+func TestAllocateSkipsBackendsThatCannotSatisfyTimeout(t *testing.T) {
+	service := newServiceWithConfig(func(pool *model.PoolConfig) {
+		if pool.Name != model.PoolLite {
+			return
+		}
+		for name, cfg := range pool.Backends {
+			cfg.Enabled = false
+			pool.Backends[name] = cfg
+		}
+		lambdaCfg := pool.Backends[model.BackendLambda]
+		lambdaCfg.Enabled = true
+		lambdaCfg.Healthy = true
+		lambdaCfg.MaxRunners = 1
+		lambdaCfg.MaxJobDuration = 15 * time.Minute
+		pool.Backends[model.BackendLambda] = lambdaCfg
+	})
+
+	if _, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolLite,
+		JobTimeout: 20 * time.Minute,
+	}); !errors.Is(err, scheduler.ErrNoCapacity) {
+		t.Fatalf("expected timeout-ineligible backend to be skipped as no capacity, got %v", err)
+	}
+
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolLite,
+		JobTimeout: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("expected later valid allocation to use available lambda capacity: %v", err)
+	}
+	if allocation.SelectedBackend != model.BackendLambda {
+		t.Fatalf("expected lambda backend, got %s", allocation.SelectedBackend)
+	}
+}
+
 func TestAllocateTreatsLegacyPinnedLambdaAsCodeBuildWhenLambdaBackendIsDisabled(t *testing.T) {
 	service := newService()
 	backend := model.BackendLambda
