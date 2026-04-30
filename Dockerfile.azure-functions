@@ -3,7 +3,8 @@ FROM mcr.microsoft.com/azure-functions/python:4-python3.11
 ENV DEBIAN_FRONTEND=noninteractive \
     AzureFunctionsJobHost__Logging__Console__IsEnabled=true \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    NODE_MAJOR=24
 
 RUN set -eux; \
   apt-get update; \
@@ -16,10 +17,12 @@ RUN set -eux; \
     git \
     gzip \
     jq \
-    nodejs \
     tar \
     unzip \
     "${libicu_pkg}"; \
+  curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash -; \
+  apt-get install -y --no-install-recommends nodejs; \
+  node --version; \
   rm -rf /var/lib/apt/lists/*
 
 WORKDIR /home/site/wwwroot
