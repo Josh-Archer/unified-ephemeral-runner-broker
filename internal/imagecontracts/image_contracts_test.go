@@ -31,17 +31,20 @@ func TestProviderImagesAreOwnedByRunnerRepo(t *testing.T) {
 		"Dockerfile.lambda": {
 			"COPY docker/lambda/handler.py /var/task/handler.py",
 			"awslambdaric boto3",
+			"nodejs",
 			"UECB_PROVIDER=lambda",
 			"RUNNER_ALLOW_RUNASROOT=1",
 		},
 		"Dockerfile.cloud-run": {
 			"COPY docker/launcher/entrypoint.sh /bootstrap/entrypoint.sh",
+			"nodejs",
 			"UECB_PROVIDER=cloud-run",
 			"RUNNER_ALLOW_RUNASROOT=1",
 		},
 		"Dockerfile.azure-functions": {
 			"COPY docker/azure-functions/function_app.py /home/site/wwwroot/function_app.py",
 			"COPY docker/launcher/entrypoint.sh /opt/uecb/runner-entrypoint.sh",
+			"nodejs",
 		},
 	}
 

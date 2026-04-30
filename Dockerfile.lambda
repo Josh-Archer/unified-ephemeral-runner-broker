@@ -15,6 +15,7 @@ RUN apt-get update \
     gzip \
     jq \
     libicu74 \
+    nodejs \
     python3 \
     python3-pip \
     tar \
