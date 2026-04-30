@@ -2,7 +2,8 @@ FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     RUNNER_ALLOW_RUNASROOT=1 \
-    UECB_PROVIDER=cloud-run
+    UECB_PROVIDER=cloud-run \
+    NODE_MAJOR=24
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
@@ -13,10 +14,12 @@ RUN apt-get update \
     gzip \
     jq \
     libicu74 \
-    nodejs \
     python3 \
     tar \
     unzip \
+  && curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash - \
+  && apt-get install -y --no-install-recommends nodejs \
+  && node --version \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /bootstrap

@@ -32,12 +32,16 @@ func TestProviderImagesAreOwnedByRunnerRepo(t *testing.T) {
 			"COPY docker/lambda/handler.py /var/task/handler.py",
 			"awslambdaric boto3",
 			"nodejs",
+			"NODE_MAJOR=24",
+			"https://deb.nodesource.com/setup_${NODE_MAJOR}.x",
 			"UECB_PROVIDER=lambda",
 			"RUNNER_ALLOW_RUNASROOT=1",
 		},
 		"Dockerfile.cloud-run": {
 			"COPY docker/launcher/entrypoint.sh /bootstrap/entrypoint.sh",
 			"nodejs",
+			"NODE_MAJOR=24",
+			"https://deb.nodesource.com/setup_${NODE_MAJOR}.x",
 			"UECB_PROVIDER=cloud-run",
 			"RUNNER_ALLOW_RUNASROOT=1",
 		},
@@ -45,6 +49,8 @@ func TestProviderImagesAreOwnedByRunnerRepo(t *testing.T) {
 			"COPY docker/azure-functions/function_app.py /home/site/wwwroot/function_app.py",
 			"COPY docker/launcher/entrypoint.sh /opt/uecb/runner-entrypoint.sh",
 			"nodejs",
+			"NODE_MAJOR=24",
+			"https://deb.nodesource.com/setup_${NODE_MAJOR}.x",
 		},
 	}
 
