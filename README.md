@@ -21,6 +21,9 @@ graph TD
         Lambda[AWS Lambda]
         CR[GCP Cloud Run]
         AF[Azure Functions]
+        AVM[Azure VM]
+        EC2[AWS EC2]
+        GCE[GCP Compute Engine]
     end
 
     Step1 -- "REST API (Allocation)" --> Broker
@@ -32,28 +35,37 @@ graph TD
     Broker -- "HTTP Dispatch" --> Lambda
     Broker -- "HTTP Dispatch" --> CR
     Broker -- "HTTP Dispatch" --> AF
+    Broker -- "Static Label" --> AVM
+    Broker -- "HTTP Dispatch" --> EC2
+    Broker -- "HTTP Dispatch" --> GCE
 
     ARC -. "Runner Label" .-> Step2
     CB -. "Runner Label" .-> Step2
     Lambda -. "Runner Label" .-> Step2
     CR -. "Runner Label" .-> Step2
     AF -. "Runner Label" .-> Step2
+    AVM -. "Runner Label" .-> Step2
+    EC2 -. "Runner Label" .-> Step2
+    GCE -. "Runner Label" .-> Step2
 ```
 
-V1 models exactly five backends:
+V1 models these backends:
 
 - `arc`
 - `codebuild`
 - `lambda`
 - `cloud-run`
 - `azure-functions`
+- `azure-vm`
+- `ec2`
+- `gce`
 
-The public repo ships ARC provisioning plus generic secret-backed external launcher dispatch for `codebuild`, `lambda`, `cloud-run`, and `azure-functions`. Each enabled external backend must point at a real launcher controller through a Kubernetes secret in the broker namespace.
+The public repo ships ARC provisioning, a static-label VM adapter for existing Azure VM runners, and generic secret-backed external launcher dispatch for `codebuild`, `lambda`, `cloud-run`, `azure-functions`, `ec2`, and `gce`. Each enabled external backend must point at a real launcher controller through a Kubernetes secret in the broker namespace.
 
 It is intentionally split into two capability pools:
 
 - `full`: ARC only in v1
-- `lite`: ARC plus the supported external backends
+- `lite`: ARC plus the supported external and VM backends
 
 Default multi-backend scheduling is `round-robin`.
 
@@ -106,7 +118,7 @@ sequenceDiagram
 
 1. A lightweight workflow step calls `allocate-runner`.
 2. The broker selects an eligible backend from the chosen pool.
-3. The broker sends the request to the selected backend integration. `codebuild`, `lambda`, `cloud-run`, and `azure-functions` dispatch through a secret-backed HTTP controller contract.
+3. The broker sends the request to the selected backend integration. `codebuild`, `lambda`, `cloud-run`, `azure-functions`, `ec2`, and `gce` dispatch through a secret-backed HTTP controller contract. `azure-vm` returns a configured existing runner label.
 4. `job_timeout` is accepted as duration strings like `15m`, with numeric nanoseconds still accepted for backward compatibility.
 5. The heavy workflow job runs on that exact label.
 6. The runner executes one job and exits.
@@ -273,7 +285,17 @@ pools:
         enabled: true
         maxRunners: 3
         capabilities:
+          - docker
           - region:aws-us-east-1
+      azure-vm:
+        enabled: true
+        maxRunners: 1
+        runnerLabel: az-vm-gha
+        capabilities:
+          - docker
+          - privileged
+          - vm
+          - cloud:azure
       cloud-run:
         enabled: true
         maxRunners: 2
@@ -292,6 +314,18 @@ Examples:
     pool: lite
     required_capabilities: cluster-local
 ```
+
+- Docker-capable routing:
+
+```yaml
+- uses: ./actions/allocate-runner
+  with:
+    broker_url: https://broker.example.com
+    pool: lite
+    required_capabilities: docker
+```
+
+This excludes serverless-only backends such as `lambda`, `cloud-run`, and `azure-functions` unless an environment explicitly advertises Docker support for those backends.
 
 - GPU routing:
 

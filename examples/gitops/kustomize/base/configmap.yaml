@@ -60,8 +60,16 @@ data:
             maxRunners: 3
             weight: 1
             maxJobDuration: 14m
-            capabilities: [region:aws-us-east-1]
+            capabilities: [docker, region:aws-us-east-1]
             secretRef: uecb-codebuild
+          lambda:
+            enabled: false
+            healthy: true
+            maxRunners: 3
+            weight: 1
+            maxJobDuration: 14m
+            capabilities: [region:aws-us-east-1]
+            secretRef: uecb-lambda
           cloud-run:
             enabled: false
             healthy: true
@@ -78,3 +86,27 @@ data:
             maxJobDuration: 25m
             capabilities: [region:azure-eastus]
             secretRef: uecb-azure-functions
+          azure-vm:
+            enabled: false
+            healthy: true
+            maxRunners: 1
+            weight: 1
+            maxJobDuration: 6h
+            capabilities: [docker, privileged, vm, cloud:azure, region:azure-eastus]
+            runnerLabel: az-vm-gha
+          ec2:
+            enabled: false
+            healthy: true
+            maxRunners: 1
+            weight: 1
+            maxJobDuration: 6h
+            capabilities: [docker, privileged, vm, cloud:aws, region:aws-us-east-1]
+            secretRef: uecb-ec2
+          gce:
+            enabled: false
+            healthy: true
+            maxRunners: 1
+            weight: 1
+            maxJobDuration: 6h
+            capabilities: [docker, privileged, vm, cloud:gcp, region:gcp-us-central1]
+            secretRef: uecb-gce

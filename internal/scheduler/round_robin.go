@@ -40,6 +40,9 @@ func orderedBackends(pool model.PoolConfig) []model.BackendName {
 		model.BackendLambda,
 		model.BackendCloudRun,
 		model.BackendAzureFunctions,
+		model.BackendAzureVM,
+		model.BackendEC2,
+		model.BackendGCE,
 	}
 
 	result := make([]model.BackendName, 0, len(pool.Backends))
