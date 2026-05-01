@@ -10,8 +10,11 @@ import (
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend"
 	arcbackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/arc"
 	azurebackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/azurefunctions"
+	azurevmbackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/azurevm"
 	cloudbackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/cloudrun"
 	codebuildbackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/codebuild"
+	ec2backend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/ec2"
+	gcebackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/gce"
 	lambdabackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/lambda"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/config"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/runtime"
@@ -34,6 +37,9 @@ func main() {
 		lambdabackend.New(cfg, secretReader),
 		cloudbackend.New(cfg, secretReader),
 		azurebackend.New(cfg, secretReader),
+		azurevmbackend.New(cfg),
+		ec2backend.New(cfg, secretReader),
+		gcebackend.New(cfg, secretReader),
 	)
 	healthChecker, err := runtime.NewSecretRefCheckerFromEnv(cfg)
 	if err != nil {

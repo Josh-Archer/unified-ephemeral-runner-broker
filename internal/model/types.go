@@ -10,6 +10,9 @@ const (
 	BackendLambda         BackendName = "lambda"
 	BackendCloudRun       BackendName = "cloud-run"
 	BackendAzureFunctions BackendName = "azure-functions"
+	BackendAzureVM        BackendName = "azure-vm"
+	BackendEC2            BackendName = "ec2"
+	BackendGCE            BackendName = "gce"
 )
 
 type PoolName string
@@ -79,6 +82,7 @@ type BackendConfig struct {
 	Weight         int           `yaml:"weight,omitempty" json:"weight,omitempty"`
 	MaxJobDuration time.Duration `yaml:"maxJobDuration,omitempty" json:"maxJobDuration,omitempty"`
 	Capabilities   []string      `yaml:"capabilities,omitempty" json:"capabilities,omitempty"`
+	RunnerLabel    string        `yaml:"runnerLabel,omitempty" json:"runnerLabel,omitempty"`
 	Template       string        `yaml:"template,omitempty" json:"template,omitempty"`
 	SecretRef      string        `yaml:"secretRef,omitempty" json:"secretRef,omitempty"`
 }

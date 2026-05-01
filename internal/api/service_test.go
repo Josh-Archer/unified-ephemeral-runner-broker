@@ -10,8 +10,11 @@ import (
 
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend"
 	azurebackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/azurefunctions"
+	azurevmbackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/azurevm"
 	cloudbackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/cloudrun"
 	codebuildbackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/codebuild"
+	ec2backend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/ec2"
+	gcebackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/gce"
 	lambdabackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/lambda"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/config"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
@@ -69,6 +72,9 @@ func newServiceWithConfig(mutator func(*model.PoolConfig)) *Service {
 			testBackend{name: model.BackendLambda},
 			testBackend{name: model.BackendCloudRun},
 			testBackend{name: model.BackendAzureFunctions},
+			testBackend{name: model.BackendAzureVM},
+			testBackend{name: model.BackendEC2},
+			testBackend{name: model.BackendGCE},
 		),
 		nil,
 	)
@@ -312,6 +318,12 @@ func TestAllocateFailsWhenExternalBackendSecretIsMissing(t *testing.T) {
 		azureCfg := cfg.Pools[index].Backends[model.BackendAzureFunctions]
 		azureCfg.Enabled = true
 		cfg.Pools[index].Backends[model.BackendAzureFunctions] = azureCfg
+		ec2Cfg := cfg.Pools[index].Backends[model.BackendEC2]
+		ec2Cfg.Enabled = true
+		cfg.Pools[index].Backends[model.BackendEC2] = ec2Cfg
+		gceCfg := cfg.Pools[index].Backends[model.BackendGCE]
+		gceCfg.Enabled = true
+		cfg.Pools[index].Backends[model.BackendGCE] = gceCfg
 	}
 
 	service := NewService(
@@ -322,6 +334,9 @@ func TestAllocateFailsWhenExternalBackendSecretIsMissing(t *testing.T) {
 			lambdabackend.New(cfg, missingSecretReader{}),
 			cloudbackend.New(cfg, missingSecretReader{}),
 			azurebackend.New(cfg, missingSecretReader{}),
+			azurevmbackend.New(cfg),
+			ec2backend.New(cfg, missingSecretReader{}),
+			gcebackend.New(cfg, missingSecretReader{}),
 		),
 		nil,
 	)
@@ -331,6 +346,8 @@ func TestAllocateFailsWhenExternalBackendSecretIsMissing(t *testing.T) {
 		model.BackendLambda,
 		model.BackendCloudRun,
 		model.BackendAzureFunctions,
+		model.BackendEC2,
+		model.BackendGCE,
 	} {
 		backend := backend
 		_, err := service.Allocate(context.Background(), model.AllocationRequest{
@@ -454,6 +471,79 @@ func TestAllocateFiltersBackendsByRequiredCapabilities(t *testing.T) {
 
 	if got := allocation.Metadata[backend.MetadataCapabilitiesKey]; got != "gpu,region:aws-us-east-1" {
 		t.Fatalf("unexpected capability metadata: %q", got)
+	}
+}
+
+func TestAllocateRoutesDockerCapabilityToDockerBackend(t *testing.T) {
+	service := newServiceWithConfig(func(pool *model.PoolConfig) {
+		if pool.Name != model.PoolLite {
+			return
+		}
+		for name, cfg := range pool.Backends {
+			cfg.Enabled = false
+			pool.Backends[name] = cfg
+		}
+		lambdaCfg := pool.Backends[model.BackendLambda]
+		lambdaCfg.Enabled = true
+		lambdaCfg.Capabilities = []string{"region:aws-us-east-1"}
+		pool.Backends[model.BackendLambda] = lambdaCfg
+		codebuildCfg := pool.Backends[model.BackendCodeBuild]
+		codebuildCfg.Enabled = true
+		codebuildCfg.Capabilities = []string{"docker", "region:aws-us-east-1"}
+		pool.Backends[model.BackendCodeBuild] = codebuildCfg
+	})
+
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:                 model.PoolLite,
+		RequiredCapabilities: []string{"docker"},
+	})
+	if err != nil {
+		t.Fatalf("allocate failed: %v", err)
+	}
+
+	if allocation.SelectedBackend != model.BackendCodeBuild {
+		t.Fatalf("expected docker-capable codebuild backend, got %s", allocation.SelectedBackend)
+	}
+}
+
+func TestAllocateAzureVMReturnsConfiguredRunnerLabel(t *testing.T) {
+	cfg := config.Default()
+	for index := range cfg.Pools {
+		if cfg.Pools[index].Name != model.PoolLite {
+			continue
+		}
+		for name, backendCfg := range cfg.Pools[index].Backends {
+			backendCfg.Enabled = false
+			cfg.Pools[index].Backends[name] = backendCfg
+		}
+		azureVMCfg := cfg.Pools[index].Backends[model.BackendAzureVM]
+		azureVMCfg.Enabled = true
+		azureVMCfg.RunnerLabel = "az-vm-gha"
+		cfg.Pools[index].Backends[model.BackendAzureVM] = azureVMCfg
+	}
+	service := NewService(
+		cfg,
+		backend.NewRegistry(
+			testBackend{name: model.BackendARC},
+			azurevmbackend.New(cfg),
+		),
+		nil,
+	)
+
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:                 model.PoolLite,
+		RequiredCapabilities: []string{"docker", "vm", "cloud:azure"},
+		JobTimeout:           30 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("allocate failed: %v", err)
+	}
+
+	if allocation.SelectedBackend != model.BackendAzureVM {
+		t.Fatalf("expected azure-vm backend, got %s", allocation.SelectedBackend)
+	}
+	if allocation.RunnerLabel != "az-vm-gha" {
+		t.Fatalf("expected configured Azure VM runner label, got %q", allocation.RunnerLabel)
 	}
 }
 

@@ -7,20 +7,21 @@
 - The broker runs in Kubernetes.
 - GitHub workflows call the `allocate-runner` action.
 - The action exchanges OIDC identity for a broker allocation request.
-- The broker selects a backend, reserves capacity, provisions a runner, and returns a unique label.
+- The broker selects a backend, reserves capacity, provisions a runner, and returns the label that the heavy job should target.
 - External backends read `dispatch_url` and optional `dispatch_token` from their configured `secretRef` and hand off provisioning to a provider-owned controller.
 
 ## Data Plane
 
 - `arc` provisions in-cluster runners.
-- `codebuild`, `lambda`, `cloud-run`, and `azure-functions` are lite-profile external runners that dispatch into provider-owned launcher controllers using the shared external dispatch contract.
+- `codebuild`, `lambda`, `cloud-run`, `azure-functions`, `ec2`, and `gce` are lite-profile external runners that dispatch into provider-owned launcher controllers using the shared external dispatch contract.
+- `azure-vm` is a static-label VM adapter for environments that already operate persistent Azure VM GitHub runners. It reserves broker capacity and returns `runnerLabel` from backend config.
 - The public Azure Functions launcher uses an HTTP dispatch endpoint only for admission and status. Actual runner execution happens on a queue-triggered function inside the same container so the HTTP trigger does not have to stay open for the whole job.
 - Each runner handles one job and exits.
 
 ## Pools
 
 - `full`: full-capability jobs, ARC only in v1
-- `lite`: lightweight jobs, ARC plus enabled external backends
+- `lite`: lightweight jobs, ARC plus enabled external and VM backends
 
 ## Default Scheduling
 
@@ -39,6 +40,7 @@ Capability-aware routing is evaluated before scheduler selection.
 - The broker filters the pool down to eligible backends first, then passes only that reduced backend set into the configured scheduler.
 - Pinned backend requests still honor capability filters. If the pinned backend is configured for the pool but excluded by the request, the broker returns a clear rejection instead of falling through to another backend.
 - Missing backend capability metadata means that backend advertises no extra capabilities.
+- Docker workflows should request `required_capabilities: docker`; serverless-only backends should omit that tag so Docker work is routed to ARC, CodeBuild, or VM-style backends.
 
 This keeps scheduling policy isolated in the scheduler registry while making capability eligibility deterministic at the API layer.
 
