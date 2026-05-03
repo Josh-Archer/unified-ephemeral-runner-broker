@@ -21,6 +21,10 @@ type Backend interface {
 	Provision(ctx context.Context, request model.AllocationRequest, allocation model.AllocationStatus) (ProvisionedRunner, error)
 }
 
+type CleanupBackend interface {
+	Cleanup(ctx context.Context, status model.AllocationStatus) error
+}
+
 type Registry struct {
 	backends map[model.BackendName]Backend
 }

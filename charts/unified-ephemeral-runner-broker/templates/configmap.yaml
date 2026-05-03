@@ -15,9 +15,11 @@ data:
     broker:
       defaultPool: {{ .Values.config.broker.defaultPool }}
       defaultJobTimeout: {{ .Values.config.broker.defaultJobTimeout }}
+      orphanCleanup:
+        enabled: {{ .Values.config.broker.orphanCleanup.enabled }}
+        quarantineTTL: {{ .Values.config.broker.orphanCleanup.quarantineTTL }}
       allowUnauthenticated: {{ .Values.config.allowUnauthenticated }}
       api:
         oidcAudience: {{ .Values.config.broker.api.oidcAudience }}
     pools:
 {{ toYaml .Values.config.pools | indent 6 }}
-

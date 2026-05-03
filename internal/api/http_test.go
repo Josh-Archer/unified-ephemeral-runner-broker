@@ -141,3 +141,66 @@ func TestHandleAllocationsRejectsMissingExternalBackendSecret(t *testing.T) {
 		t.Fatalf("expected secret error, got %s", recorder.Body.String())
 	}
 }
+
+func TestHandleAllocationCompleteMarksAllocationCompleted(t *testing.T) {
+	service := newServiceWithConfig(nil)
+	server := newTestServer(t, service)
+
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolFull,
+		JobTimeout: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("allocation failed: %v", err)
+	}
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/allocations/"+allocation.ID+"/complete", bytes.NewBufferString(`{"state":"completed","reason":"job done"}`))
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+
+	var completed model.AllocationStatus
+	if err := json.NewDecoder(recorder.Body).Decode(&completed); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if completed.State != model.StateCompleted {
+		t.Fatalf("expected completed state, got %q", completed.State)
+	}
+}
+
+func TestHandleAllocationCompleteReturnsNotFoundWhenAllocationMissing(t *testing.T) {
+	service := newServiceWithConfig(nil)
+	server := newTestServer(t, service)
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/allocations/missing-id/complete", bytes.NewBufferString(`{"state":"completed"}`))
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestHandleAllocationCompleteRejectsUnknownState(t *testing.T) {
+	service := newServiceWithConfig(nil)
+	server := newTestServer(t, service)
+
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolFull,
+		JobTimeout: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("allocation failed: %v", err)
+	}
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/allocations/"+allocation.ID+"/complete", bytes.NewBufferString(`{"state":"invalid-state"}`))
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+}

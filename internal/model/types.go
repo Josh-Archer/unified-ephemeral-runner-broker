@@ -32,11 +32,13 @@ const (
 type AllocationState string
 
 const (
-	StateReserved AllocationState = "reserved"
-	StateReady    AllocationState = "ready"
-	StateCanceled AllocationState = "canceled"
-	StateExpired  AllocationState = "expired"
-	StateFailed   AllocationState = "failed"
+	StateReserved    AllocationState = "reserved"
+	StateReady       AllocationState = "ready"
+	StateCanceled    AllocationState = "canceled"
+	StateExpired     AllocationState = "expired"
+	StateFailed      AllocationState = "failed"
+	StateCompleted   AllocationState = "completed"
+	StateQuarantined AllocationState = "quarantined"
 )
 
 type PriorityClass string
@@ -69,10 +71,14 @@ type BrokerAPIConfig struct {
 }
 
 type BrokerRuntimeConfig struct {
-	DefaultPool          PoolName        `yaml:"defaultPool" json:"defaultPool"`
-	DefaultJobTimeout    time.Duration   `yaml:"defaultJobTimeout" json:"defaultJobTimeout"`
-	AllowUnauthenticated bool            `yaml:"allowUnauthenticated" json:"allowUnauthenticated"`
-	API                  BrokerAPIConfig `yaml:"api" json:"api"`
+	DefaultPool          PoolName      `yaml:"defaultPool" json:"defaultPool"`
+	DefaultJobTimeout    time.Duration `yaml:"defaultJobTimeout" json:"defaultJobTimeout"`
+	AllowUnauthenticated bool          `yaml:"allowUnauthenticated" json:"allowUnauthenticated"`
+	OrphanCleanup        struct {
+		Enabled       bool          `yaml:"enabled" json:"enabled"`
+		QuarantineTTL time.Duration `yaml:"quarantineTTL" json:"quarantineTTL"`
+	} `yaml:"orphanCleanup" json:"orphanCleanup"`
+	API BrokerAPIConfig `yaml:"api" json:"api"`
 }
 
 type BackendConfig struct {

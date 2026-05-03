@@ -53,7 +53,7 @@ func (m *Memory) MarkState(id string, state model.AllocationState, now time.Time
 	if message != "" {
 		status.Error = message
 	}
-	if state == model.StateExpired {
+	if state == model.StateExpired || state == model.StateQuarantined {
 		status.ExpiresAt = now
 	}
 

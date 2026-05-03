@@ -74,3 +74,15 @@ func decodeAllocationRequest(reader io.Reader) (model.AllocationRequest, error) 
 		ExcludedCapabilities: append([]string(nil), request.ExcludedCapabilities...),
 	}, nil
 }
+
+func decodeCompletionRequest(reader io.Reader) (completionRequest, error) {
+	var request completionRequest
+	decoder := json.NewDecoder(reader)
+	if err := decoder.Decode(&request); err != nil {
+		return completionRequest{}, fmt.Errorf("invalid completion request: %w", err)
+	}
+	request.State = strings.TrimSpace(request.State)
+	request.Reason = strings.TrimSpace(request.Reason)
+	request.Error = strings.TrimSpace(request.Error)
+	return request, nil
+}

@@ -45,6 +45,22 @@ func (b testBackend) Provision(_ context.Context, request model.AllocationReques
 	}, nil
 }
 
+type testCleanupBackend struct {
+	testBackend
+	failCleanup bool
+	cleanupSeen *bool
+}
+
+func (b *testCleanupBackend) Cleanup(_ context.Context, _ model.AllocationStatus) error {
+	if b.cleanupSeen != nil {
+		*b.cleanupSeen = true
+	}
+	if !b.failCleanup {
+		return nil
+	}
+	return errors.New("cleanup failed")
+}
+
 func newService() *Service {
 	return newServiceWithConfig(func(pool *model.PoolConfig) {
 		if pool.Name != model.PoolLite {
@@ -390,6 +406,98 @@ func TestCancelReleasesCapacity(t *testing.T) {
 	}
 }
 
+func TestCompleteMarksAllocationCompletedAndReleasesCapacity(t *testing.T) {
+	service := newServiceWithConfig(func(pool *model.PoolConfig) {
+		if pool.Name != model.PoolFull {
+			return
+		}
+		arcCfg := pool.Backends[model.BackendARC]
+		arcCfg.MaxRunners = 1
+		pool.Backends[model.BackendARC] = arcCfg
+	})
+	service.now = func() time.Time { return time.Unix(1000, 0) }
+
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolFull,
+		JobTimeout: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("allocate failed: %v", err)
+	}
+
+	completed, ok, err := service.Complete(context.Background(), allocation.ID, completionRequest{State: "completed"})
+	if err != nil {
+		t.Fatalf("first completion failed: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected first completion to succeed")
+	}
+	if completed.State != model.StateCompleted {
+		t.Fatalf("expected completed state, got %s", completed.State)
+	}
+
+	// Duplicate completion must remain idempotent and not break capacity accounting.
+	duplicate, ok, err := service.Complete(context.Background(), allocation.ID, completionRequest{State: "completed"})
+	if err != nil {
+		t.Fatalf("duplicate completion failed: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected duplicate completion to return true")
+	}
+	if duplicate.State != model.StateCompleted {
+		t.Fatalf("expected duplicate completion state to remain completed, got %s", duplicate.State)
+	}
+
+	if _, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolFull,
+		JobTimeout: 5 * time.Minute,
+	}); err != nil {
+		t.Fatalf("expected capacity to be reusable after completion callback: %v", err)
+	}
+}
+
+func TestCompleteRejectsUnknownState(t *testing.T) {
+	service := newService()
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolFull,
+		JobTimeout: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("allocate failed: %v", err)
+	}
+
+	_, _, completeErr := service.Complete(context.Background(), allocation.ID, completionRequest{State: "not-a-state"})
+	if completeErr == nil {
+		t.Fatal("expected unknown completion state to fail")
+	}
+	if !errors.Is(completeErr, ErrInvalidCompletionState) {
+		t.Fatalf("expected ErrInvalidCompletionState, got: %v", completeErr)
+	}
+}
+
+func TestCompleteReturnsTerminalErrorWhenAlreadyTerminal(t *testing.T) {
+	service := newService()
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolFull,
+		JobTimeout: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("allocate failed: %v", err)
+	}
+
+	failed, _, err := service.Complete(context.Background(), allocation.ID, completionRequest{State: "failed"})
+	if err != nil {
+		t.Fatalf("failed completion failed: %v", err)
+	}
+	if failed.State != model.StateFailed {
+		t.Fatalf("expected failed state, got %s", failed.State)
+	}
+
+	if _, _, err = service.Complete(context.Background(), allocation.ID, completionRequest{State: "completed"}); err == nil || !errors.Is(err, ErrAllocationAlreadyCompleted) {
+		t.Fatalf("expected terminal state completion error, got %v", err)
+	}
+}
+
 func TestSweepExpiredMarksReadyAllocationsExpired(t *testing.T) {
 	service := newService()
 	service.now = func() time.Time { return time.Unix(1000, 0) }
@@ -414,6 +522,115 @@ func TestSweepExpiredMarksReadyAllocationsExpired(t *testing.T) {
 
 	if updated.State != model.StateExpired {
 		t.Fatalf("expected expired state, got %s", updated.State)
+	}
+}
+
+func TestSweepExpiredMarksReadyAllocationsQuarantinedWhenEnabled(t *testing.T) {
+	cfg := config.Default()
+	cfg.Broker.OrphanCleanup.Enabled = true
+	cfg.Broker.OrphanCleanup.QuarantineTTL = 10 * time.Second
+
+	service := NewService(
+		cfg,
+		backend.NewRegistry(
+			testBackend{name: model.BackendARC},
+			testBackend{name: model.BackendCodeBuild},
+			testBackend{name: model.BackendLambda},
+			testBackend{name: model.BackendCloudRun},
+			testBackend{name: model.BackendAzureFunctions},
+		),
+		nil,
+	)
+	service.now = func() time.Time { return time.Unix(1000, 0) }
+
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolFull,
+		JobTimeout: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("allocate failed: %v", err)
+	}
+
+	swept := service.SweepExpired(time.Unix(1015, 0))
+	if swept != 1 {
+		t.Fatalf("expected 1 allocation to be swept, got %d", swept)
+	}
+
+	updated, ok := service.Get(allocation.ID)
+	if !ok {
+		t.Fatal("allocation disappeared after sweep")
+	}
+	if updated.State != model.StateQuarantined {
+		t.Fatalf("expected quarantined state, got %s", updated.State)
+	}
+	expectedExpiry := time.Unix(1015, 0).Add(10 * time.Second)
+	if !updated.ExpiresAt.Equal(expectedExpiry) {
+		t.Fatalf("expected quarantine expiry %s, got %s", expectedExpiry, updated.ExpiresAt)
+	}
+
+	service.SweepExpired(time.Unix(1025, 0))
+	if updated, ok = service.Get(allocation.ID); !ok {
+		t.Fatal("allocation disappeared after quarantine expiry")
+	}
+	if updated.State != model.StateExpired {
+		t.Fatalf("expected expiry to clear quarantine, got %s", updated.State)
+	}
+}
+
+func TestCompleteReturnsNotFoundForMissingAllocation(t *testing.T) {
+	restartService := newService()
+	service := newService()
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolFull,
+		JobTimeout: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("allocate failed: %v", err)
+	}
+	if _, ok, err := restartService.Complete(context.Background(), allocation.ID, completionRequest{State: "completed"}); err != nil || ok {
+		t.Fatalf("expected missing allocation on restart-like service, got ok=%v err=%v", ok, err)
+	}
+}
+
+func TestCompleteHandlesCleanupFailureWithoutBlocking(t *testing.T) {
+	cfg := config.Default()
+	arcCfg := cfg.Pools[0].Backends[model.BackendARC]
+	arcCfg.MaxRunners = 1
+	cfg.Pools[0].Backends[model.BackendARC] = arcCfg
+	cleanupCalled := false
+
+	service := NewService(
+		cfg,
+		backend.NewRegistry(
+			&testCleanupBackend{
+				testBackend: testBackend{name: model.BackendARC},
+				failCleanup: true,
+				cleanupSeen: &cleanupCalled,
+			},
+		),
+		nil,
+	)
+
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolFull,
+		JobTimeout: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("allocate failed: %v", err)
+	}
+
+	updated, ok, err := service.Complete(context.Background(), allocation.ID, completionRequest{State: "failed", Error: "runner crashed"})
+	if err != nil {
+		t.Fatalf("completion failed: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected completion to return true")
+	}
+	if updated.State != model.StateFailed {
+		t.Fatalf("expected failed state, got %s", updated.State)
+	}
+	if !cleanupCalled {
+		t.Fatal("expected cleanup hook to run even with failures")
 	}
 }
 

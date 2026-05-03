@@ -47,7 +47,7 @@ High allocation failure rate means requests are being rejected or backend provis
 
 Saturated capacity means the scheduler has few or no healthy slots available for a pool/backend. Check `maxRunners`, runner cleanup, and whether completed jobs are leaving allocations in `ready` or `reserved`.
 
-Stuck queue depth means allocations are not moving to terminal states. Check expiration sweeps, backend cancellation behavior, and runner completion callbacks in the consuming environment.
+Stuck queue depth means allocations are not moving to terminal states. Check expiration sweeps, backend cancellation behavior, explicit completion callbacks, and quarantine transitions (`quarantined` -> `expired`).
 
 ## Example SLOs
 

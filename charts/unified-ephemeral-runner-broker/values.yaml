@@ -51,6 +51,9 @@ config:
   broker:
     defaultPool: full
     defaultJobTimeout: 15m
+    orphanCleanup:
+      enabled: false
+      quarantineTTL: 15m
     api:
       oidcAudience: uecb-broker
   pools:
