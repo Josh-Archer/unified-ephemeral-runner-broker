@@ -1,0 +1,20 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: uecb-arc-only
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/josh-archer/unified-ephemeral-runner-broker
+    targetRevision: v0.1.0
+    path: examples/gitops/packs/arc-only/overlays/production
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: arc-systems
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

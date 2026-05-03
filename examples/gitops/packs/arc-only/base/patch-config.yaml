@@ -1,0 +1,59 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: unified-ephemeral-runner-broker-config
+  namespace: arc-systems
+data:
+  broker.yaml: |
+    github:
+      auth:
+        mode: github-app
+        secretRef: uecb-github-app
+      scope:
+        type: organization
+        organization: my-org
+        runnerGroupPrefix: uecb
+    broker:
+      defaultPool: full
+      defaultJobTimeout: 15m
+      allowUnauthenticated: false
+      orphanCleanup:
+        enabled: false
+        quarantineTTL: 15m
+      api:
+        oidcAudience: uecb-broker
+    pools:
+      - name: full
+        labels: [self-hosted, linux, x64, uecb, uecb-full]
+        scheduler: round-robin
+        fairShare:
+          enabled: false
+          priorityClasses:
+            normal: 1
+            high: 2
+        capabilityProfile: full
+        backends:
+          arc:
+            enabled: true
+            healthy: true
+            maxRunners: 4
+            weight: 1
+            capabilities: [cluster-local, docker, region:local]
+            template: arc-full
+      - name: lite
+        labels: [self-hosted, linux, x64, uecb, uecb-lite]
+        scheduler: round-robin
+        fairShare:
+          enabled: false
+          priorityClasses:
+            normal: 1
+            high: 2
+        capabilityProfile: lite
+        backends:
+          arc:
+            enabled: true
+            healthy: true
+            maxRunners: 2
+            weight: 1
+            capabilities: [cluster-local, docker, region:local]
+            template: arc-lite
