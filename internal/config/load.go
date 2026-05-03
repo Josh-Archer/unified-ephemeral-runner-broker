@@ -24,6 +24,13 @@ func Default() model.BrokerConfig {
 		Broker: model.BrokerRuntimeConfig{
 			DefaultPool:       model.PoolFull,
 			DefaultJobTimeout: 15 * time.Minute,
+			OrphanCleanup: struct {
+				Enabled       bool          `yaml:"enabled" json:"enabled"`
+				QuarantineTTL time.Duration `yaml:"quarantineTTL" json:"quarantineTTL"`
+			}{
+				Enabled:       false,
+				QuarantineTTL: 15 * time.Minute,
+			},
 			API: model.BrokerAPIConfig{
 				OIDCAudience: "uecb-broker",
 			},

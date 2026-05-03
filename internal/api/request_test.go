@@ -97,3 +97,36 @@ func TestDecodeAllocationRequestCopiesCapabilities(t *testing.T) {
 		t.Fatalf("unexpected excluded capabilities: %#v", request.ExcludedCapabilities)
 	}
 }
+
+func TestDecodeCompletionRequestDefaultsToCompleted(t *testing.T) {
+	request, err := decodeCompletionRequest(bytes.NewReader([]byte(`{"reason":"already finished"}`)))
+	if err != nil {
+		t.Fatalf("decode failed: %v", err)
+	}
+	if request.State != "" {
+		t.Fatalf("expected empty state, got %q", request.State)
+	}
+}
+
+func TestDecodeCompletionRequestParsesFailedError(t *testing.T) {
+	request, err := decodeCompletionRequest(bytes.NewReader([]byte(`{"state":"failed","error":"boom","reason":"unused"}`)))
+	if err != nil {
+		t.Fatalf("decode failed: %v", err)
+	}
+	if request.Error != "boom" {
+		t.Fatalf("expected error, got %q", request.Error)
+	}
+}
+
+func TestDecodeCompletionRequestTrimsWhitespace(t *testing.T) {
+	request, err := decodeCompletionRequest(bytes.NewReader([]byte(`{"state":" completed ","reason":" job done "}`)))
+	if err != nil {
+		t.Fatalf("decode failed: %v", err)
+	}
+	if request.State != "completed" {
+		t.Fatalf("expected trimmed state, got %q", request.State)
+	}
+	if request.Reason != "job done" {
+		t.Fatalf("expected trimmed reason, got %q", request.Reason)
+	}
+}

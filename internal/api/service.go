@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
+	"strings"
 	"time"
 
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend"
@@ -16,6 +18,9 @@ import (
 
 var ErrUnknownPool = errors.New("pool is not configured")
 var ErrNoMatchingBackendCapabilities = errors.New("no backend matches the requested capabilities")
+var ErrAllocationNotFound = errors.New("allocation not found")
+var ErrAllocationAlreadyCompleted = errors.New("allocation already in terminal state")
+var ErrInvalidCompletionState = errors.New("invalid completion state")
 
 type Service struct {
 	cfg       model.BrokerConfig
@@ -125,7 +130,7 @@ func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest)
 
 	backendImpl, ok := s.registry.Get(selected)
 	if !ok {
-		s.release(pool, selected, allocation)
+		s.release(context.Background(), pool, selected, allocation)
 		s.store.MarkState(allocation.ID, model.StateFailed, s.now(), "backend not registered")
 		return model.AllocationStatus{}, fmt.Errorf("backend implementation missing: %s", selected)
 	}
@@ -136,7 +141,7 @@ func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest)
 	s.observer.ObserveLaunchLatency(pool.Name, selected, launchLatency)
 	s.observer.ObserveRegistrationLatency(pool.Name, selected, launchLatency)
 	if err != nil {
-		s.release(pool, selected, allocation)
+		s.release(context.Background(), pool, selected, allocation)
 		s.store.MarkState(allocation.ID, model.StateFailed, s.now(), err.Error())
 		logAllocationEvent(ctx, "allocation_failed", map[string]string{
 			"allocation_id": allocation.ID,
@@ -178,30 +183,115 @@ func (s *Service) Cancel(id string) (model.AllocationStatus, bool) {
 		return model.AllocationStatus{}, false
 	}
 	if pool, err := s.resolvePool(status.Pool); err == nil {
-		s.release(pool, status.SelectedBackend, status)
+		s.release(context.Background(), pool, status.SelectedBackend, status)
 	}
 	s.observeState()
 	return status, true
 }
 
+type completionRequest struct {
+	State  string `json:"state"`
+	Error  string `json:"error"`
+	Reason string `json:"reason"`
+}
+
+func (s *Service) Complete(ctx context.Context, id string, request completionRequest) (model.AllocationStatus, bool, error) {
+	status, ok := s.store.Get(id)
+	if !ok {
+		return model.AllocationStatus{}, false, nil
+	}
+
+	targetState, message, err := parseCompletionState(request)
+	if err != nil {
+		return model.AllocationStatus{}, false, err
+	}
+	if strings.TrimSpace(message) == "" {
+		message = defaultCompletionMessage(targetState)
+	}
+	if isTerminalAllocationState(status.State) {
+		if status.State == targetState {
+			return status, true, nil
+		}
+		return status, true, fmt.Errorf("%w: current=%s requested=%s", ErrAllocationAlreadyCompleted, status.State, targetState)
+	}
+	if status.State == targetState {
+		return status, true, nil
+	}
+
+	updated, ok := s.store.MarkState(id, targetState, s.now(), message)
+	if !ok {
+		return model.AllocationStatus{}, false, nil
+	}
+	if isActiveAllocationState(status.State) {
+		if pool, err := s.resolvePool(status.Pool); err == nil {
+			s.release(ctx, pool, status.SelectedBackend, status)
+		}
+	}
+	logAllocationEvent(ctx, completionEventName(targetState), map[string]string{
+		"allocation_id": allocationIDLabel(status.ID),
+		"pool":          string(status.Pool),
+		"backend":       string(status.SelectedBackend),
+		"state":         string(targetState),
+		"error":         message,
+	})
+	s.observeState()
+	return updated, true, nil
+}
+
 func (s *Service) SweepExpired(now time.Time) int {
-	expired := 0
+	updated := 0
 	for _, status := range s.store.List() {
-		if status.State != model.StateReady && status.State != model.StateReserved {
+		if isActiveAllocationState(status.State) {
+			if status.ExpiresAt.After(now) {
+				continue
+			}
+
+			nextState := model.StateExpired
+			nextMessage := "allocation expired"
+			nextExpiresAt := now
+			if s.cfg.Broker.OrphanCleanup.Enabled {
+				nextState = model.StateQuarantined
+				nextMessage = "allocation quarantined"
+				nextExpiresAt = now
+				if s.cfg.Broker.OrphanCleanup.QuarantineTTL > 0 {
+					nextExpiresAt = now.Add(s.cfg.Broker.OrphanCleanup.QuarantineTTL)
+				}
+			}
+			if _, ok := s.store.MarkState(status.ID, nextState, nextExpiresAt, nextMessage); ok {
+				if pool, err := s.resolvePool(status.Pool); err == nil {
+					s.release(context.Background(), pool, status.SelectedBackend, status)
+				}
+				logAllocationEvent(context.Background(), "allocation_"+string(nextState), map[string]string{
+					"allocation_id": allocationIDLabel(status.ID),
+					"pool":          string(status.Pool),
+					"backend":       string(status.SelectedBackend),
+				})
+				updated++
+			}
 			continue
 		}
+
+		if status.State != model.StateQuarantined {
+			continue
+		}
+
 		if status.ExpiresAt.After(now) {
 			continue
 		}
-		if _, ok := s.store.MarkState(status.ID, model.StateExpired, now, "allocation expired"); ok {
+		if _, ok := s.store.MarkState(status.ID, model.StateExpired, now, "allocation quarantine expired"); ok {
 			if pool, err := s.resolvePool(status.Pool); err == nil {
-				s.release(pool, status.SelectedBackend, status)
+				s.release(context.Background(), pool, status.SelectedBackend, status)
 			}
-			expired++
+			logAllocationEvent(context.Background(), "allocation_expired", map[string]string{
+				"allocation_id": allocationIDLabel(status.ID),
+				"pool":          string(status.Pool),
+				"backend":       string(status.SelectedBackend),
+			})
+			updated++
 		}
 	}
 	s.observeState()
-	return expired
+	return updated
 }
 
 func (s *Service) observeState() {
@@ -256,14 +346,109 @@ func (s *Service) reserve(pool model.PoolConfig, request model.AllocationRequest
 	return s.schedulerForPool(pool).Reserve(pool, request)
 }
 
-func (s *Service) release(pool model.PoolConfig, backend model.BackendName, allocation model.AllocationStatus) {
+func (s *Service) release(ctx context.Context, pool model.PoolConfig, backend model.BackendName, allocation model.AllocationStatus) {
 	if pool.FairShare.Enabled {
 		if s.fairShare != nil {
 			s.fairShare.Release(pool.Name, backend, allocation)
 		}
+		s.cleanupAllocation(ctx, allocation)
 		return
 	}
 	s.schedulerForPool(pool).Release(pool.Name, backend, allocation)
+	s.cleanupAllocation(ctx, allocation)
+}
+
+func (s *Service) cleanupAllocation(ctx context.Context, allocation model.AllocationStatus) {
+	backendImpl, ok := s.registry.Get(allocation.SelectedBackend)
+	if !ok {
+		return
+	}
+	cleanupBackend, ok := backendImpl.(backend.CleanupBackend)
+	if !ok {
+		return
+	}
+	if err := cleanupBackend.Cleanup(ctx, allocation); err != nil {
+		logAllocationEvent(ctx, "allocation_cleanup_failed", map[string]string{
+			"allocation_id": allocationIDLabel(allocation.ID),
+			"pool":          string(allocation.Pool),
+			"backend":       string(allocation.SelectedBackend),
+			"error":         err.Error(),
+		})
+		log.Printf("allocation cleanup failed for %s: %v", allocation.ID, err)
+	}
+}
+
+func allocationIDLabel(id string) string {
+	return strings.TrimSpace(id)
+}
+
+func isActiveAllocationState(state model.AllocationState) bool {
+	return state == model.StateReady || state == model.StateReserved
+}
+
+func isTerminalAllocationState(state model.AllocationState) bool {
+	switch state {
+	case model.StateCompleted, model.StateFailed, model.StateCanceled, model.StateExpired, model.StateQuarantined:
+		return true
+	default:
+		return false
+	}
+}
+
+func parseCompletionState(request completionRequest) (model.AllocationState, string, error) {
+	state := strings.TrimSpace(strings.ToLower(request.State))
+	if state == "" {
+		return model.StateCompleted, "", nil
+	}
+
+	switch state {
+	case "complete", "completed", "success", "succeeded":
+		return model.StateCompleted, request.Reason, nil
+	case "failed", "failure", "error":
+		return model.StateFailed, request.Error, nil
+	case "canceled", "cancelled", "cancel":
+		return model.StateCanceled, request.Reason, nil
+	case "expired":
+		return model.StateExpired, request.Reason, nil
+	case "quarantined", "quarantine":
+		return model.StateQuarantined, request.Reason, nil
+	default:
+		return "", "", fmt.Errorf("%w: %q", ErrInvalidCompletionState, request.State)
+	}
+}
+
+func defaultCompletionMessage(state model.AllocationState) string {
+	switch state {
+	case model.StateCompleted:
+		return "allocation completed"
+	case model.StateFailed:
+		return "allocation failed"
+	case model.StateCanceled:
+		return "allocation canceled"
+	case model.StateExpired:
+		return "allocation expired"
+	case model.StateQuarantined:
+		return "allocation quarantined"
+	default:
+		return ""
+	}
+}
+
+func completionEventName(state model.AllocationState) string {
+	switch state {
+	case model.StateCompleted:
+		return "allocation_completed"
+	case model.StateFailed:
+		return "allocation_failed"
+	case model.StateCanceled:
+		return "allocation_canceled"
+	case model.StateExpired:
+		return "allocation_expired"
+	case model.StateQuarantined:
+		return "allocation_quarantined"
+	default:
+		return "allocation_updated"
+	}
 }
 
 func validateSchedulers(pools []model.PoolConfig, registry *scheduler.Registry) error {

@@ -111,6 +111,35 @@ sequenceDiagram
 5. The heavy workflow job runs on that exact label.
 6. The runner executes one job and exits.
 
+### Completion Callback Endpoint
+
+The broker accepts completion callbacks on:
+
+`POST /v1/allocations/{id}/complete`
+
+Supported payload forms:
+
+- `{ "state": "completed" }` (default state)
+- `{ "state": "completed" | "failed" | "canceled", "reason": "...", "error": "..." }`
+- `{ "state": "expired" }`
+- `{ "state": "quarantined" }`
+
+Duplicate callbacks for the same terminal state are idempotent and do not re-release scheduler capacity.
+
+### Orphan cleanup and quarantine
+
+Stale active allocations are reclaimed during periodic sweep.
+
+```yaml
+broker:
+  orphanCleanup:
+    enabled: false
+    quarantineTTL: 15m
+```
+
+- `enabled: false` (default): active stale allocations move directly to `expired`.
+- `enabled: true`: active stale allocations move to `quarantined` for `quarantineTTL` (or immediately when `0`), then to `expired`.
+
 ## Project Layout
 
 - `cmd/broker`: broker entrypoint
