@@ -29,3 +29,22 @@ jobs:
           test -f actions/allocate-runner/action.yml
           test -f examples/gitops/kustomize/base/kustomization.yaml
 
+  warm-pool-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Warm pool regression tests
+        run: |
+          go test ./internal/api \
+            -run "TestAllocatePrefersWarmAllocationOverColdLaunch|TestReconcileWarmPoolsCreatesWarmAllocation|TestReconcileWarmPoolsRecyclesExpiredWarmAllocation" \
+            -count=1
+
+          go test ./internal/backend/externaldispatch \
+            -run "TestProvisionPassesLaunchModeFromAllocationMetadata" \
+            -count=1
+
