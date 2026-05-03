@@ -47,8 +47,8 @@
       "id": 2,
       "targets": [
         {
-          "expr": "histogram_quantile(0.95, sum by (le, pool, backend) (rate(uecb_launch_latency_seconds_bucket[5m])))",
-          "legendFormat": "launch p95 {{pool}}/{{backend}}"
+          "expr": "histogram_quantile(0.95, sum by (le, pool, backend, launch_mode) (rate(uecb_launch_latency_seconds_bucket[5m])))",
+          "legendFormat": "launch p95 {{pool}}/{{backend}} {{launch_mode}}"
         },
         {
           "expr": "histogram_quantile(0.95, sum by (le, pool, backend) (rate(uecb_registration_latency_seconds_bucket[5m])))",

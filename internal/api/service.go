@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend"
@@ -22,6 +24,12 @@ var ErrAllocationNotFound = errors.New("allocation not found")
 var ErrAllocationAlreadyCompleted = errors.New("allocation already in terminal state")
 var ErrInvalidCompletionState = errors.New("invalid completion state")
 
+const (
+	defaultWarmTTL = 15 * time.Minute
+	launchModeCold = "cold"
+	launchModeWarm = "warm"
+)
+
 type Service struct {
 	cfg       model.BrokerConfig
 	registry  *backend.Registry
@@ -29,6 +37,7 @@ type Service struct {
 	fairShare *scheduler.PriorityFairShare
 	store     *store.Memory
 	observer  Observer
+	warmMu    sync.Mutex
 	initErr   error
 	health    func(context.Context) error
 	now       func() time.Time
@@ -64,6 +73,7 @@ func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest)
 	started := s.now()
 	resultPool := request.Pool
 	var resultBackend model.BackendName
+	launchMode := launchModeCold
 	result := "failure"
 	defer func() {
 		s.observer.ObserveAllocationResult(resultPool, resultBackend, result, s.now().Sub(started))
@@ -121,6 +131,7 @@ func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest)
 		Tenant:          request.Tenant,
 		PriorityClass:   request.PriorityClass,
 		RequestedLabels: append([]string(nil), request.Labels...),
+		Metadata:        map[string]string{backend.MetadataLaunchModeKey: launchModeCold},
 		ExpiresAt:       s.now().Add(timeout),
 		State:           model.StateReserved,
 	}
@@ -134,10 +145,38 @@ func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest)
 		return model.AllocationStatus{}, fmt.Errorf("backend implementation missing: %s", selected)
 	}
 
+	if warmAllocation, ok := s.consumeWarmAllocation(ctx, pool, selected, allocation); ok {
+		s.schedulerForPool(pool).Release(pool.Name, selected, allocation)
+		launchMode = launchModeWarm
+		warmAllocation.State = model.StateReady
+		warmAllocation.CorrelationID = allocation.CorrelationID
+		warmAllocation.Tenant = request.Tenant
+		warmAllocation.PriorityClass = request.PriorityClass
+		warmAllocation.RequestedLabels = append([]string(nil), request.Labels...)
+		warmAllocation.ExpiresAt = allocation.ExpiresAt
+		warmAllocation.Metadata = withLaunchModeMetadata(
+			backend.WithCapabilitiesMetadata(pool.Backends[selected], warmAllocation.Metadata),
+			launchMode,
+		)
+		s.store.Save(warmAllocation)
+		launchLatency := time.Duration(0)
+		s.observer.ObserveLaunchLatency(pool.Name, selected, launchMode, launchLatency)
+		s.observer.ObserveRegistrationLatency(pool.Name, selected, launchLatency)
+		result = "success"
+		allocation = warmAllocation
+		logAllocationEvent(ctx, "allocation_ready", map[string]string{
+			"allocation_id": allocation.ID,
+			"pool":          string(pool.Name),
+			"backend":       string(selected),
+			"launch_mode":   launchMode,
+		})
+		return allocation, nil
+	}
+
 	launchStarted := s.now()
 	provisioned, err := backendImpl.Provision(ctx, request, allocation)
 	launchLatency := s.now().Sub(launchStarted)
-	s.observer.ObserveLaunchLatency(pool.Name, selected, launchLatency)
+	s.observer.ObserveLaunchLatency(pool.Name, selected, launchMode, launchLatency)
 	s.observer.ObserveRegistrationLatency(pool.Name, selected, launchLatency)
 	if err != nil {
 		s.release(context.Background(), pool, selected, allocation)
@@ -152,7 +191,10 @@ func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest)
 	}
 
 	allocation.RunnerLabel = provisioned.RunnerLabel
-	allocation.Metadata = backend.WithCapabilitiesMetadata(pool.Backends[selected], provisioned.Metadata)
+	allocation.Metadata = withLaunchModeMetadata(
+		backend.WithCapabilitiesMetadata(pool.Backends[selected], provisioned.Metadata),
+		launchMode,
+	)
 	allocation.State = model.StateReady
 	s.store.Save(allocation)
 	result = "success"
@@ -160,9 +202,21 @@ func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest)
 		"allocation_id": allocation.ID,
 		"pool":          string(pool.Name),
 		"backend":       string(selected),
+		"launch_mode":   launchMode,
 	})
 
 	return allocation, nil
+}
+
+func (s *Service) ReconcileWarmPools() {
+	s.warmMu.Lock()
+	defer s.warmMu.Unlock()
+
+	now := s.now()
+	statuses := s.store.List()
+	for _, pool := range s.cfg.Pools {
+		s.reconcileWarmForPool(pool, statuses, now)
+	}
 }
 
 func (s *Service) Health(ctx context.Context) error {
@@ -297,6 +351,303 @@ func (s *Service) observeState() {
 	statuses := s.store.List()
 	s.observer.ObserveActiveAllocations(statuses)
 	s.observer.ObserveCapacity(s.cfg, statuses)
+}
+
+func (s *Service) consumeWarmAllocation(ctx context.Context, pool model.PoolConfig, backendName model.BackendName, request model.AllocationStatus) (model.AllocationStatus, bool) {
+	cfg, ok := pool.Backends[backendName]
+	if !ok || !cfg.Enabled || !cfg.Healthy || !isWarmProvisionableBackend(backendName) {
+		return model.AllocationStatus{}, false
+	}
+
+	s.warmMu.Lock()
+	defer s.warmMu.Unlock()
+
+	ttl := resolveWarmTTL(cfg)
+	now := s.now()
+	warm := filterWarmAllocations(s.store.List(), pool.Name, backendName)
+	if len(warm) == 0 {
+		return model.AllocationStatus{}, false
+	}
+
+	sortWarmByExpiration(warm)
+	for _, candidate := range warm {
+		if isWarmExpired(candidate, now, ttl) {
+			s.recycleWarmAllocation(ctx, pool, candidate, "warm allocation expired")
+			continue
+		}
+		return candidate, true
+	}
+
+	return model.AllocationStatus{}, false
+}
+
+func (s *Service) recycleWarmAllocation(ctx context.Context, pool model.PoolConfig, status model.AllocationStatus, reason string) {
+	updated, ok := s.store.MarkState(status.ID, model.StateFailed, s.now(), reason)
+	if !ok {
+		return
+	}
+	s.release(ctx, pool, status.SelectedBackend, updated)
+}
+
+func (s *Service) reconcileWarmForPool(pool model.PoolConfig, statuses []model.AllocationStatus, now time.Time) {
+	for backendName, cfg := range pool.Backends {
+		if !isWarmProvisionableBackend(backendName) {
+			continue
+		}
+		s.reconcileWarmForBackend(pool, backendName, cfg, statuses, now)
+	}
+}
+
+func (s *Service) reconcileWarmForBackend(pool model.PoolConfig, backendName model.BackendName, cfg model.BackendConfig, statuses []model.AllocationStatus, now time.Time) {
+	warmMin, warmMax := normalizeWarmBounds(cfg)
+	ttl := resolveWarmTTL(cfg)
+
+	warm := filterWarmAllocations(statuses, pool.Name, backendName)
+
+	if !cfg.Enabled || !cfg.Healthy || cfg.MaxRunners <= 0 {
+		for _, warmStatus := range warm {
+			s.recycleWarmAllocation(context.Background(), pool, warmStatus, "warm backend disabled or unhealthy")
+		}
+		return
+	}
+
+	if warmMax <= 0 {
+		for _, warmStatus := range warm {
+			s.recycleWarmAllocation(context.Background(), pool, warmStatus, "warm disabled")
+		}
+		return
+	}
+
+	sortWarmByExpiration(warm)
+	for _, status := range warm {
+		if isWarmExpired(status, now, ttl) {
+			s.recycleWarmAllocation(context.Background(), pool, status, "warm allocation expired")
+		}
+	}
+
+	warm = filterFreshWarm(s.store.List(), pool.Name, backendName, now, ttl)
+	if len(warm) > warmMax {
+		excess := len(warm) - warmMax
+		for _, status := range warm[len(warm)-excess:] {
+			s.recycleWarmAllocation(context.Background(), pool, status, "warm pool at max capacity")
+		}
+		warm = warm[:warmMax]
+	}
+
+	target := normalizeWarmTarget(warmMin, warmMax, cfg.MaxRunners)
+	for len(warm) < target {
+		if err := s.createWarmAllocation(pool, backendName, now); err != nil {
+			return
+		}
+		warm = append(warm, model.AllocationStatus{})
+	}
+}
+
+func (s *Service) createWarmAllocation(pool model.PoolConfig, backendName model.BackendName, now time.Time) error {
+	cfg, ok := pool.Backends[backendName]
+	if !ok {
+		return fmt.Errorf("backend %q is not configured for pool %q", backendName, pool.Name)
+	}
+	if err := s.validateWarmBackend(pool, backendName); err != nil {
+		return err
+	}
+
+	ttl := resolveWarmTTL(cfg)
+	request := model.AllocationRequest{
+		Pool:    pool.Name,
+		Backend: &backendName,
+	}
+	if cfg.MaxJobDuration > 0 {
+		request.JobTimeout = cfg.MaxJobDuration
+	} else {
+		request.JobTimeout = s.cfg.Broker.DefaultJobTimeout
+	}
+
+	selection, err := s.reserveForBackend(pool, backendName)
+	if err != nil {
+		return err
+	}
+	if selection != backendName {
+		return fmt.Errorf("expected warm reservation for %s, got %s", backendName, selection)
+	}
+
+	allocation := model.AllocationStatus{
+		ID:              newID(),
+		Pool:            pool.Name,
+		SelectedBackend: backendName,
+		CorrelationID:   "",
+		Metadata:        map[string]string{backend.MetadataLaunchModeKey: launchModeWarm},
+		Tenant:          "",
+		PriorityClass:   "",
+		ExpiresAt:       now.Add(ttl),
+		State:           model.StateReserved,
+	}
+
+	backendImpl, ok := s.registry.Get(backendName)
+	if !ok {
+		s.release(context.Background(), pool, backendName, allocation)
+		return fmt.Errorf("backend implementation missing: %s", backendName)
+	}
+
+	provisioned, err := backendImpl.Provision(context.Background(), request, allocation)
+	if err != nil {
+		s.release(context.Background(), pool, backendName, allocation)
+		return err
+	}
+
+	allocation.RunnerLabel = provisioned.RunnerLabel
+	allocation.State = model.StateWarm
+	allocation.Metadata = withLaunchModeMetadata(
+		backend.WithCapabilitiesMetadata(cfg, provisioned.Metadata),
+		launchModeWarm,
+	)
+	allocation.ExpiresAt = now.Add(ttl)
+	s.store.Save(allocation)
+	return nil
+}
+
+func (s *Service) reserveForBackend(pool model.PoolConfig, backendName model.BackendName) (model.BackendName, error) {
+	request := model.AllocationRequest{
+		Pool:    pool.Name,
+		Backend: &backendName,
+	}
+	return s.reserve(pool, request)
+}
+
+func (s *Service) validateWarmBackend(pool model.PoolConfig, backendName model.BackendName) error {
+	cfg, ok := pool.Backends[backendName]
+	if !ok {
+		return fmt.Errorf("backend %q is not configured for pool %q", backendName, pool.Name)
+	}
+	if !cfg.Enabled {
+		return fmt.Errorf("backend %q is not enabled", backendName)
+	}
+	if !cfg.Healthy {
+		return fmt.Errorf("backend %q is unhealthy", backendName)
+	}
+	if !isWarmProvisionableBackend(backendName) {
+		return fmt.Errorf("backend %q does not support warm provisioning", backendName)
+	}
+	return nil
+}
+
+func resolveWarmTTL(cfg model.BackendConfig) time.Duration {
+	if cfg.WarmTTL > 0 {
+		return cfg.WarmTTL
+	}
+	return defaultWarmTTL
+}
+
+func normalizeWarmBounds(cfg model.BackendConfig) (int, int) {
+	min := cfg.WarmMin
+	max := cfg.WarmMax
+	if min < 0 {
+		min = 0
+	}
+	if max < 0 {
+		max = 0
+	}
+	if max < min {
+		max = min
+	}
+	return min, max
+}
+
+func normalizeWarmTarget(min, max, maxRunners int) int {
+	if maxRunners <= 0 {
+		return 0
+	}
+	if max > maxRunners {
+		max = maxRunners
+	}
+	if min < 0 {
+		min = 0
+	}
+	if min > max {
+		min = max
+	}
+	return min
+}
+
+func isWarmExpired(status model.AllocationStatus, now time.Time, ttl time.Duration) bool {
+	if ttl <= 0 {
+		return false
+	}
+	return !status.ExpiresAt.IsZero() && !now.Before(status.ExpiresAt)
+}
+
+func isWarmProvisionableBackend(backendName model.BackendName) bool {
+	switch backendName {
+	case model.BackendARC, model.BackendAzureVM:
+		return false
+	default:
+		return true
+	}
+}
+
+func filterWarmAllocations(statuses []model.AllocationStatus, poolName model.PoolName, backendName model.BackendName) []model.AllocationStatus {
+	result := make([]model.AllocationStatus, 0)
+	for _, status := range statuses {
+		if status.Pool != poolName {
+			continue
+		}
+		if status.SelectedBackend != backendName {
+			continue
+		}
+		if status.State != model.StateWarm {
+			continue
+		}
+		result = append(result, status)
+	}
+	return result
+}
+
+func filterFreshWarm(statuses []model.AllocationStatus, poolName model.PoolName, backendName model.BackendName, now time.Time, ttl time.Duration) []model.AllocationStatus {
+	result := make([]model.AllocationStatus, 0)
+	for _, status := range statuses {
+		if status.Pool != poolName {
+			continue
+		}
+		if status.SelectedBackend != backendName {
+			continue
+		}
+		if status.State != model.StateWarm {
+			continue
+		}
+		if !isWarmExpired(status, now, ttl) {
+			result = append(result, status)
+		}
+	}
+	return result
+}
+
+func sortWarmByExpiration(warm []model.AllocationStatus) {
+	sort.Slice(warm, func(i, j int) bool {
+		if !warm[i].ExpiresAt.Equal(warm[j].ExpiresAt) {
+			return warm[i].ExpiresAt.Before(warm[j].ExpiresAt)
+		}
+		return warm[i].ID < warm[j].ID
+	})
+}
+
+func withLaunchModeMetadata(metadata map[string]string, mode string) map[string]string {
+	if mode == "" {
+		return metadata
+	}
+	cloned := copyStringMap(metadata)
+	cloned[backend.MetadataLaunchModeKey] = mode
+	return cloned
+}
+
+func copyStringMap(source map[string]string) map[string]string {
+	if len(source) == 0 {
+		return map[string]string{}
+	}
+	copied := make(map[string]string, len(source))
+	for key, value := range source {
+		copied[key] = value
+	}
+	return copied
 }
 
 func (s *Service) resolvePool(name model.PoolName) (model.PoolConfig, error) {

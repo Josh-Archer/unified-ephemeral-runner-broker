@@ -34,6 +34,7 @@ type AllocationState string
 const (
 	StateReserved    AllocationState = "reserved"
 	StateReady       AllocationState = "ready"
+	StateWarm        AllocationState = "warm"
 	StateCanceled    AllocationState = "canceled"
 	StateExpired     AllocationState = "expired"
 	StateFailed      AllocationState = "failed"
@@ -85,6 +86,9 @@ type BackendConfig struct {
 	Enabled        bool          `yaml:"enabled" json:"enabled"`
 	Healthy        bool          `yaml:"healthy" json:"healthy"`
 	MaxRunners     int           `yaml:"maxRunners" json:"maxRunners"`
+	WarmMin        int           `yaml:"warmMin" json:"warmMin"`
+	WarmMax        int           `yaml:"warmMax" json:"warmMax"`
+	WarmTTL        time.Duration `yaml:"warmTTL,omitempty" json:"warmTTL,omitempty"`
 	Weight         int           `yaml:"weight,omitempty" json:"weight,omitempty"`
 	MaxJobDuration time.Duration `yaml:"maxJobDuration,omitempty" json:"maxJobDuration,omitempty"`
 	Capabilities   []string      `yaml:"capabilities,omitempty" json:"capabilities,omitempty"`

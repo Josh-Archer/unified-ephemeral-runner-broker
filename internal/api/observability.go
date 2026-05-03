@@ -23,7 +23,7 @@ const correlationContextKey contextKey = correlationIDKey
 type Observer interface {
 	ObserveAllocationStart(model.PoolName)
 	ObserveAllocationResult(model.PoolName, model.BackendName, string, time.Duration)
-	ObserveLaunchLatency(model.PoolName, model.BackendName, time.Duration)
+	ObserveLaunchLatency(model.PoolName, model.BackendName, string, time.Duration)
 	ObserveRegistrationLatency(model.PoolName, model.BackendName, time.Duration)
 	ObserveActiveAllocations([]model.AllocationStatus)
 	ObserveCapacity(model.BrokerConfig, []model.AllocationStatus)
@@ -34,7 +34,7 @@ type noopObserver struct{}
 func (noopObserver) ObserveAllocationStart(model.PoolName) {}
 func (noopObserver) ObserveAllocationResult(model.PoolName, model.BackendName, string, time.Duration) {
 }
-func (noopObserver) ObserveLaunchLatency(model.PoolName, model.BackendName, time.Duration) {}
+func (noopObserver) ObserveLaunchLatency(model.PoolName, model.BackendName, string, time.Duration) {}
 func (noopObserver) ObserveRegistrationLatency(model.PoolName, model.BackendName, time.Duration) {
 }
 func (noopObserver) ObserveActiveAllocations([]model.AllocationStatus)            {}
@@ -64,7 +64,7 @@ func NewPrometheusObserver(registerer prometheus.Registerer) *PrometheusObserver
 			Name:    "uecb_launch_latency_seconds",
 			Help:    "Backend launch latency for a selected ephemeral runner.",
 			Buckets: []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 90},
-		}, []string{"pool", "backend"}),
+		}, []string{"pool", "backend", "launch_mode"}),
 		registrationLatency: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "uecb_registration_latency_seconds",
 			Help:    "Observed latency until a provisioned runner registration response is available to the broker.",
@@ -115,8 +115,8 @@ func (o *PrometheusObserver) ObserveAllocationResult(pool model.PoolName, backen
 	o.allocationLatency.WithLabelValues(string(pool), string(backend), result).Observe(latency.Seconds())
 }
 
-func (o *PrometheusObserver) ObserveLaunchLatency(pool model.PoolName, backend model.BackendName, latency time.Duration) {
-	o.launchLatency.WithLabelValues(string(pool), string(backend)).Observe(latency.Seconds())
+func (o *PrometheusObserver) ObserveLaunchLatency(pool model.PoolName, backend model.BackendName, launchMode string, latency time.Duration) {
+	o.launchLatency.WithLabelValues(string(pool), string(backend), launchMode).Observe(latency.Seconds())
 }
 
 func (o *PrometheusObserver) ObserveRegistrationLatency(pool model.PoolName, backend model.BackendName, latency time.Duration) {

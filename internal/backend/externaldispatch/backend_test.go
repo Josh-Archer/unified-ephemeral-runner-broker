@@ -71,6 +71,9 @@ func TestProvisionDispatchesRunnerLaunch(t *testing.T) {
 		if !contains(payload.RunnerLabels, "uecb-lite") {
 			t.Fatalf("expected pool label to be forwarded, got %v", payload.RunnerLabels)
 		}
+		if payload.LaunchMode != "cold" {
+			t.Fatalf("expected launch mode cold, got %q", payload.LaunchMode)
+		}
 
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"execution_id":"run-123","details_url":"https://example.invalid/run-123","metadata":{"provider":"cloud-run"}}`))
@@ -92,6 +95,7 @@ func TestProvisionDispatchesRunnerLaunch(t *testing.T) {
 	}, model.AllocationStatus{
 		ID:              "abc123",
 		Pool:            model.PoolLite,
+		Metadata:        map[string]string{"launch_mode": "cold"},
 		RequestedLabels: []string{"custom-label"},
 	})
 	if err != nil {
@@ -106,6 +110,38 @@ func TestProvisionDispatchesRunnerLaunch(t *testing.T) {
 	}
 	if provisioned.Metadata["execution_id"] != "run-123" {
 		t.Fatalf("expected execution_id metadata, got %+v", provisioned.Metadata)
+	}
+}
+
+func TestProvisionPassesLaunchModeFromAllocationMetadata(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload dispatchRequest
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if payload.LaunchMode != "warm" {
+			t.Fatalf("expected launch_mode warm, got %q", payload.LaunchMode)
+		}
+	}))
+	defer server.Close()
+
+	cfg := newRepoScopedConfig()
+	dispatchBackend := New(model.BackendCodeBuild, cfg, staticSecrets{
+		"uecb-codebuild": {
+			secretKeyDispatchURL: server.URL,
+		},
+	})
+
+	_, err := dispatchBackend.Provision(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolLite,
+		JobTimeout: 5 * time.Minute,
+	}, model.AllocationStatus{
+		ID:       "abc123",
+		Pool:     model.PoolLite,
+		Metadata: map[string]string{"launch_mode": "warm"},
+	})
+	if err != nil {
+		t.Fatalf("provision failed: %v", err)
 	}
 }
 

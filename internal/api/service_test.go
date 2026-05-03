@@ -61,6 +61,47 @@ func (b *testCleanupBackend) Cleanup(_ context.Context, _ model.AllocationStatus
 	return errors.New("cleanup failed")
 }
 
+type countingBackend struct {
+	testBackend
+	provisionCount int
+	lastAllocation model.AllocationStatus
+}
+
+func (b *countingBackend) Provision(_ context.Context, _ model.AllocationRequest, allocation model.AllocationStatus) (backend.ProvisionedRunner, error) {
+	b.provisionCount++
+	b.lastAllocation = allocation
+	return backend.ProvisionedRunner{
+		RunnerLabel: backend.DefaultRunnerLabel(b.name, allocation.ID),
+		Metadata: map[string]string{
+			"provisioned_by": string(b.name),
+		},
+	}, nil
+}
+
+func newServiceWithCountingBackend(mutator func(*model.PoolConfig), counting *countingBackend) *Service {
+	cfg := config.Default()
+	for index := range cfg.Pools {
+		if mutator != nil {
+			mutator(&cfg.Pools[index])
+		}
+	}
+
+	return NewService(
+		cfg,
+		backend.NewRegistry(
+			testBackend{name: model.BackendARC},
+			counting,
+			testBackend{name: model.BackendLambda},
+			testBackend{name: model.BackendCloudRun},
+			testBackend{name: model.BackendAzureFunctions},
+			testBackend{name: model.BackendAzureVM},
+			testBackend{name: model.BackendEC2},
+			testBackend{name: model.BackendGCE},
+		),
+		nil,
+	)
+}
+
 func newService() *Service {
 	return newServiceWithConfig(func(pool *model.PoolConfig) {
 		if pool.Name != model.PoolLite {
@@ -313,6 +354,162 @@ func TestAllocateUsesLambdaWhenLambdaBackendIsEnabled(t *testing.T) {
 	}
 	if allocation.SelectedBackend != model.BackendLambda {
 		t.Fatalf("expected lambda backend, got %s", allocation.SelectedBackend)
+	}
+}
+
+func TestReconcileWarmPoolsCreatesWarmAllocation(t *testing.T) {
+	counting := &countingBackend{testBackend: testBackend{name: model.BackendCodeBuild}}
+	service := newServiceWithCountingBackend(func(pool *model.PoolConfig) {
+		if pool.Name != model.PoolLite {
+			return
+		}
+		for name, backendCfg := range pool.Backends {
+			backendCfg.Enabled = false
+			pool.Backends[name] = backendCfg
+		}
+		codebuildCfg := pool.Backends[model.BackendCodeBuild]
+		codebuildCfg.Enabled = true
+		codebuildCfg.Healthy = true
+		codebuildCfg.MaxRunners = 2
+		codebuildCfg.WarmMin = 1
+		codebuildCfg.WarmMax = 1
+		pool.Backends[model.BackendCodeBuild] = codebuildCfg
+	}, counting)
+
+	service.ReconcileWarmPools()
+
+	statuses := service.store.List()
+	if len(statuses) != 1 {
+		t.Fatalf("expected one warm allocation, got %d", len(statuses))
+	}
+	warm := statuses[0]
+	if warm.State != model.StateWarm {
+		t.Fatalf("expected warm state, got %s", warm.State)
+	}
+	if got := warm.Metadata[backend.MetadataLaunchModeKey]; got != launchModeWarm {
+		t.Fatalf("expected launch mode %q, got %q", launchModeWarm, got)
+	}
+	if counting.provisionCount != 1 {
+		t.Fatalf("expected one warm provisioning call, got %d", counting.provisionCount)
+	}
+}
+
+func TestAllocatePrefersWarmAllocationOverColdLaunch(t *testing.T) {
+	now := time.Unix(1000, 0)
+	counting := &countingBackend{testBackend: testBackend{name: model.BackendCodeBuild}}
+	service := newServiceWithCountingBackend(func(pool *model.PoolConfig) {
+		if pool.Name != model.PoolLite {
+			return
+		}
+		for name, backendCfg := range pool.Backends {
+			backendCfg.Enabled = false
+			pool.Backends[name] = backendCfg
+		}
+		codebuildCfg := pool.Backends[model.BackendCodeBuild]
+		codebuildCfg.Enabled = true
+		codebuildCfg.Healthy = true
+		codebuildCfg.MaxRunners = 2
+		codebuildCfg.WarmMin = 1
+		codebuildCfg.WarmMax = 1
+		pool.Backends[model.BackendCodeBuild] = codebuildCfg
+	}, counting)
+	service.now = func() time.Time { return now }
+
+	service.ReconcileWarmPools()
+
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolLite,
+		JobTimeout: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("allocation failed: %v", err)
+	}
+	if allocation.Metadata[backend.MetadataLaunchModeKey] != launchModeWarm {
+		t.Fatalf("expected warm launch mode, got %q", allocation.Metadata[backend.MetadataLaunchModeKey])
+	}
+
+	secondAllocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolLite,
+		JobTimeout: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("follow-up allocation failed: %v", err)
+	}
+	if secondAllocation.Metadata[backend.MetadataLaunchModeKey] != launchModeCold {
+		t.Fatalf("expected fallback cold launch mode, got %q", secondAllocation.Metadata[backend.MetadataLaunchModeKey])
+	}
+	if counting.provisionCount != 2 {
+		t.Fatalf("expected one warm then one cold provision call, got %d", counting.provisionCount)
+	}
+
+	var warmCount int
+	for _, status := range service.store.List() {
+		if status.State == model.StateWarm {
+			warmCount++
+		}
+	}
+	if warmCount != 0 {
+		t.Fatalf("expected warm allocation to be consumed, got %d", warmCount)
+	}
+
+	if _, ok := service.Get(secondAllocation.ID); !ok {
+		t.Fatal("expected second allocation to be stored")
+	}
+}
+
+func TestReconcileWarmPoolsRecyclesExpiredWarmAllocation(t *testing.T) {
+	now := time.Unix(1000, 0)
+	counting := &countingBackend{testBackend: testBackend{name: model.BackendCodeBuild}}
+	service := newServiceWithCountingBackend(func(pool *model.PoolConfig) {
+		if pool.Name != model.PoolLite {
+			return
+		}
+		for name, backendCfg := range pool.Backends {
+			backendCfg.Enabled = false
+			pool.Backends[name] = backendCfg
+		}
+		codebuildCfg := pool.Backends[model.BackendCodeBuild]
+		codebuildCfg.Enabled = true
+		codebuildCfg.Healthy = true
+		codebuildCfg.MaxRunners = 1
+		codebuildCfg.WarmMin = 1
+		codebuildCfg.WarmMax = 1
+		codebuildCfg.WarmTTL = time.Minute
+		pool.Backends[model.BackendCodeBuild] = codebuildCfg
+	}, counting)
+	service.now = func() time.Time { return now }
+
+	service.ReconcileWarmPools()
+	if counting.provisionCount != 1 {
+		t.Fatalf("expected one warm provisioning call, got %d", counting.provisionCount)
+	}
+
+	now = now.Add(2 * time.Minute)
+	service.ReconcileWarmPools()
+
+	warmCount := 0
+	for _, status := range service.store.List() {
+		if status.State == model.StateWarm {
+			warmCount++
+		}
+	}
+	if warmCount != 1 {
+		t.Fatalf("expected one active warm allocation after recycle/recreate, got %d", warmCount)
+	}
+	if counting.provisionCount != 2 {
+		t.Fatalf("expected expired warm to be recreated, provision call count=%d", counting.provisionCount)
+	}
+	failedCount := 0
+	for _, status := range service.store.List() {
+		if status.State == model.StateFailed {
+			failedCount++
+		}
+	}
+	if failedCount == 0 {
+		t.Fatalf("expected at least one failed allocation from recycled warm allocation")
+	}
+	if _, ok := service.Get(service.store.List()[0].ID); !ok {
+		t.Fatal("expected active warm allocation to be stored")
 	}
 }
 

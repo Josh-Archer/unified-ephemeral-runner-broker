@@ -27,7 +27,7 @@ Core metrics:
 - `uecb_http_requests_total{route,method,status}`: broker HTTP request count.
 - `uecb_allocations_total{pool,backend,result}`: allocation attempts and success or failure results.
 - `uecb_allocation_latency_seconds{pool,backend,result}`: end-to-end broker allocation latency.
-- `uecb_launch_latency_seconds{pool,backend}`: backend launch handoff latency.
+- `uecb_launch_latency_seconds{pool,backend,launch_mode}`: backend launch handoff latency by launch mode (`cold` or `warm`).
 - `uecb_registration_latency_seconds{pool,backend}`: time until the broker has a provisioned runner label.
 - `uecb_queue_depth{pool,state}`: current allocations by state.
 - `uecb_capacity_utilization_ratio{pool,backend}`: active allocation count divided by configured backend capacity.
@@ -41,7 +41,7 @@ The observability pack does not change scheduler selection, capacity reservation
 
 ## Failure Modes
 
-High allocation latency usually means the broker can accept requests but a backend is slow to launch or register a runner. Compare `uecb_allocation_latency_seconds` with `uecb_launch_latency_seconds` and `uecb_registration_latency_seconds` by backend.
+High allocation latency usually means the broker can accept requests but a backend is slow to launch or register a runner. Compare `uecb_allocation_latency_seconds` with `uecb_launch_latency_seconds` by backend and launch mode, and `uecb_registration_latency_seconds`.
 
 High allocation failure rate means requests are being rejected or backend provisioning is failing. Check broker logs by `correlation_id`, then inspect the selected backend controller logs for the same ID.
 
