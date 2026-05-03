@@ -10,6 +10,7 @@ import (
 )
 
 const MetadataCapabilitiesKey = "capabilities"
+const MetadataLaunchModeKey = "launch_mode"
 
 type ProvisionedRunner struct {
 	RunnerLabel string

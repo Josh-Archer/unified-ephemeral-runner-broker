@@ -18,6 +18,18 @@
 - The public Azure Functions launcher uses an HTTP dispatch endpoint only for admission and status. Actual runner execution happens on a queue-triggered function inside the same container so the HTTP trigger does not have to stay open for the whole job.
 - Each runner handles one job and exits.
 
+## Warm Capacity
+
+Each pool backend may define a warm policy:
+
+- `warmMin`: minimum warm instances to keep reserved.
+- `warmMax`: maximum warm instances allowed.
+- `warmTTL`: maximum idle lifetime for a warm allocation.
+
+The broker keeps warm allocations in the background when enabled and recycles them on TTL expiry or policy violations. Allocation requests consume warm capacity first when available, then fallback to cold launch.
+
+Warm capacity currently applies only to external dispatch backends and intentionally excludes `arc` and `azure-vm`.
+
 ## Pools
 
 - `full`: full-capability jobs, ARC only in v1

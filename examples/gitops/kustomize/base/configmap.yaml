@@ -58,6 +58,9 @@ data:
             enabled: false
             healthy: true
             maxRunners: 3
+            # warmMin: 0
+            # warmMax: 0
+            # warmTTL: 15m
             weight: 1
             maxJobDuration: 14m
             capabilities: [docker, region:aws-us-east-1]

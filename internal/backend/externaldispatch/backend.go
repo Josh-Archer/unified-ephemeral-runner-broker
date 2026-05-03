@@ -42,6 +42,7 @@ type dispatchRequest struct {
 	RunnerName        string         `json:"runner_name"`
 	RunnerLabels      []string       `json:"runner_labels"`
 	RequestedLabels   []string       `json:"requested_labels,omitempty"`
+	LaunchMode        string         `json:"launch_mode,omitempty"`
 	JobTimeout        string         `json:"job_timeout"`
 	JobTimeoutSeconds int64          `json:"job_timeout_seconds"`
 	GitHub            dispatchGitHub `json:"github"`
@@ -129,6 +130,7 @@ func (b *Backend) Provision(ctx context.Context, request model.AllocationRequest
 		RunnerName:        runnerLabel,
 		RunnerLabels:      combineLabels(pool.Labels, allocation.RequestedLabels, runnerLabel),
 		RequestedLabels:   append([]string(nil), allocation.RequestedLabels...),
+		LaunchMode:        strings.TrimSpace(allocation.Metadata[backend.MetadataLaunchModeKey]),
 		JobTimeout:        request.JobTimeout.String(),
 		JobTimeoutSeconds: int64(request.JobTimeout / time.Second),
 		GitHub: dispatchGitHub{

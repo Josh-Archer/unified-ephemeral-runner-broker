@@ -254,6 +254,42 @@ pools:
 
 Rollback is just a config change: set `scheduler` back to `round-robin` for the pool and redeploy. Leaving `weight` values in place is safe because the default scheduler ignores them.
 
+## Warm Capacity
+
+Backend pools can maintain pre-initialized warm runners to reduce cold-start latency for external backends.
+
+Warm behavior is configured per backend:
+
+- `warmMin`: minimum number of warm allocations to keep for the backend.
+- `warmMax`: maximum number of warm allocations to keep for the backend.
+- `warmTTL`: how long a warm allocation stays idle before recycle.
+
+Warm allocations are created only for external backends that are enabled and healthy. `arc` and `azure-vm` are not included because they are not external dispatchers and are expected to launch quickly.
+
+```yaml
+pools:
+  - name: lite
+    backends:
+      codebuild:
+        enabled: true
+        maxRunners: 3
+        weight: 1
+        warmMin: 1
+        warmMax: 2
+        warmTTL: 10m
+        secretRef: uecb-codebuild
+```
+
+When warm capacity exists:
+
+- the broker prefers an available warm slot before provisioning cold;
+- idle warm runners are recycled on TTL expiry or capacity policy changes;
+- warm capacity may consume active runner quota while in warm state.
+
+If a warm slot is unavailable or expired, the broker falls back to cold launch as before.
+
+Use warm pools where external cold-start latency dominates.
+
 ### Priority And Fair-Share Scheduling
 
 Pools can opt into tenant-aware dispatch independently of the backend scheduler with `fairShare.enabled`.

@@ -113,6 +113,9 @@ config:
           enabled: false
           healthy: true
           maxRunners: 3
+          # warmMin: 0
+          # warmMax: 0
+          # warmTTL: 15m
           weight: 1
           maxJobDuration: 14m
           capabilities:
@@ -123,6 +126,9 @@ config:
           enabled: false
           healthy: true
           maxRunners: 3
+          # warmMin: 0
+          # warmMax: 0
+          # warmTTL: 15m
           weight: 1
           maxJobDuration: 14m
           capabilities:
