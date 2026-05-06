@@ -181,6 +181,7 @@ See [docs/architecture.md](docs/architecture.md) and [docs/security-boundary.md]
    The broker validates referenced `secretRef` objects via the Kubernetes API and stays unready until they exist.
    External backend secrets should provide:
    `dispatch_url`: the controller endpoint the broker should call.
+   `health_url`: health endpoint used by circuit-breaker recovery probes when the backend enables `circuitBreaker`.
    `dispatch_token`: optional bearer token sent to that endpoint.
 3. Point the `allocate-runner` action at the broker URL. The broker accepts `job_timeout` in the same duration-string format used by the action, for example `15m`.
 4. Start with the `full` pool or ARC-only `lite` pool. Only enable an external backend after you have supplied a real launcher integration for that platform and the matching `secretRef`.
@@ -253,6 +254,33 @@ pools:
 `lambda` remains backward-compatible with older pinned requests: if the real `lambda` backend is disabled for a pool but `codebuild` is enabled, the broker treats a pinned `lambda` request as `codebuild`.
 
 Rollback is just a config change: set `scheduler` back to `round-robin` for the pool and redeploy. Leaving `weight` values in place is safe because the default scheduler ignores them.
+
+## Runtime Backend Admission
+
+Backends can opt into circuit breaking and cold-launch rate limiting. This is separate from static `enabled` and `healthy`: operator config is still the hard source of truth, while circuit state is learned at runtime per `pool/backend`.
+
+The broker opens a circuit after configured timeout-like failures, transport errors, throttling, server errors, allocation expiry, or completion callbacks with `failure_class: wait-timeout`. Open backends are skipped for unpinned requests so another eligible backend can run the job; pinned requests fail fast.
+
+```yaml
+pools:
+  - name: lite
+    backends:
+      azure-vm:
+        enabled: true
+        healthy: true
+        maxRunners: 1
+        runnerLabel: replace-with-private-azure-vm-runner-label
+        circuitBreaker:
+          enabled: true
+          failureThreshold: 1
+          evaluationWindow: 5m
+          openDuration: 2m
+          probeInterval: 30s
+          probeTimeout: 10s
+          recoverySuccessThreshold: 1
+```
+
+`rateLimit` applies only to cold provisioning attempts. Warm runner reuse is not rate limited.
 
 ## Warm Capacity
 
@@ -355,7 +383,7 @@ pools:
       azure-vm:
         enabled: true
         maxRunners: 1
-        runnerLabel: az-vm-gha
+        runnerLabel: replace-with-private-azure-vm-runner-label
         capabilities:
           - docker
           - privileged

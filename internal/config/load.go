@@ -123,7 +123,7 @@ func Default() model.BrokerConfig {
 						Weight:         1,
 						MaxJobDuration: 6 * time.Hour,
 						Capabilities:   []string{"docker", "privileged", "vm", "cloud:azure", "region:azure-eastus"},
-						RunnerLabel:    "az-vm-gha",
+						RunnerLabel:    "replace-with-private-azure-vm-runner-label",
 					},
 					model.BackendEC2: {
 						Enabled:        false,

@@ -82,19 +82,40 @@ type BrokerRuntimeConfig struct {
 	API BrokerAPIConfig `yaml:"api" json:"api"`
 }
 
+type CircuitBreakerConfig struct {
+	Enabled                  bool          `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	FailureThreshold         int           `yaml:"failureThreshold,omitempty" json:"failureThreshold,omitempty"`
+	EvaluationWindow         time.Duration `yaml:"evaluationWindow,omitempty" json:"evaluationWindow,omitempty"`
+	OpenDuration             time.Duration `yaml:"openDuration,omitempty" json:"openDuration,omitempty"`
+	ProbeInterval            time.Duration `yaml:"probeInterval,omitempty" json:"probeInterval,omitempty"`
+	ProbeTimeout             time.Duration `yaml:"probeTimeout,omitempty" json:"probeTimeout,omitempty"`
+	RecoverySuccessThreshold int           `yaml:"recoverySuccessThreshold,omitempty" json:"recoverySuccessThreshold,omitempty"`
+	HalfOpenMaxRequests      int           `yaml:"halfOpenMaxRequests,omitempty" json:"halfOpenMaxRequests,omitempty"`
+	TripReasons              []string      `yaml:"tripReasons,omitempty" json:"tripReasons,omitempty"`
+}
+
+type RateLimitConfig struct {
+	Enabled  bool          `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	Permits  int           `yaml:"permits,omitempty" json:"permits,omitempty"`
+	Interval time.Duration `yaml:"interval,omitempty" json:"interval,omitempty"`
+	Burst    int           `yaml:"burst,omitempty" json:"burst,omitempty"`
+}
+
 type BackendConfig struct {
-	Enabled        bool          `yaml:"enabled" json:"enabled"`
-	Healthy        bool          `yaml:"healthy" json:"healthy"`
-	MaxRunners     int           `yaml:"maxRunners" json:"maxRunners"`
-	WarmMin        int           `yaml:"warmMin" json:"warmMin"`
-	WarmMax        int           `yaml:"warmMax" json:"warmMax"`
-	WarmTTL        time.Duration `yaml:"warmTTL,omitempty" json:"warmTTL,omitempty"`
-	Weight         int           `yaml:"weight,omitempty" json:"weight,omitempty"`
-	MaxJobDuration time.Duration `yaml:"maxJobDuration,omitempty" json:"maxJobDuration,omitempty"`
-	Capabilities   []string      `yaml:"capabilities,omitempty" json:"capabilities,omitempty"`
-	RunnerLabel    string        `yaml:"runnerLabel,omitempty" json:"runnerLabel,omitempty"`
-	Template       string        `yaml:"template,omitempty" json:"template,omitempty"`
-	SecretRef      string        `yaml:"secretRef,omitempty" json:"secretRef,omitempty"`
+	Enabled        bool                 `yaml:"enabled" json:"enabled"`
+	Healthy        bool                 `yaml:"healthy" json:"healthy"`
+	MaxRunners     int                  `yaml:"maxRunners" json:"maxRunners"`
+	WarmMin        int                  `yaml:"warmMin" json:"warmMin"`
+	WarmMax        int                  `yaml:"warmMax" json:"warmMax"`
+	WarmTTL        time.Duration        `yaml:"warmTTL,omitempty" json:"warmTTL,omitempty"`
+	Weight         int                  `yaml:"weight,omitempty" json:"weight,omitempty"`
+	MaxJobDuration time.Duration        `yaml:"maxJobDuration,omitempty" json:"maxJobDuration,omitempty"`
+	Capabilities   []string             `yaml:"capabilities,omitempty" json:"capabilities,omitempty"`
+	RunnerLabel    string               `yaml:"runnerLabel,omitempty" json:"runnerLabel,omitempty"`
+	Template       string               `yaml:"template,omitempty" json:"template,omitempty"`
+	SecretRef      string               `yaml:"secretRef,omitempty" json:"secretRef,omitempty"`
+	CircuitBreaker CircuitBreakerConfig `yaml:"circuitBreaker,omitempty" json:"circuitBreaker,omitempty"`
+	RateLimit      RateLimitConfig      `yaml:"rateLimit,omitempty" json:"rateLimit,omitempty"`
 }
 
 type FairShareConfig struct {

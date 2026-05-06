@@ -37,6 +37,7 @@ type Service struct {
 	fairShare *scheduler.PriorityFairShare
 	store     *store.Memory
 	observer  Observer
+	admission *backendAdmission
 	warmMu    sync.Mutex
 	initErr   error
 	health    func(context.Context) error
@@ -55,6 +56,7 @@ func NewService(cfg model.BrokerConfig, registry *backend.Registry, health func(
 		fairShare: scheduler.NewPriorityFairShare(),
 		store:     store.NewMemory(),
 		observer:  noopObserver{},
+		admission: newBackendAdmission(),
 		initErr:   validateSchedulers(cfg.Pools, schedulerRegistry),
 		health:    health,
 		now:       time.Now,
@@ -111,10 +113,29 @@ func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest)
 			return model.AllocationStatus{}, err
 		}
 	}
+	pool, err = s.filterBackendsByAdmission(pool, request)
+	if err != nil {
+		return model.AllocationStatus{}, err
+	}
 
 	selected, err := s.reserve(pool, request)
 	if err != nil {
 		return model.AllocationStatus{}, err
+	}
+	if s.admission != nil {
+		decision := s.admission.allow(pool.Name, selected, pool.Backends[selected], s.now(), false, true)
+		if !decision.Allowed {
+			s.release(context.Background(), pool, selected, model.AllocationStatus{Pool: pool.Name, SelectedBackend: selected})
+			s.observer.ObserveBackendAdmissionRejected(pool.Name, selected, decision.Reason)
+			switch decision.Reason {
+			case "circuit-open":
+				return model.AllocationStatus{}, fmt.Errorf("selected backend %q is not admissible: %w", selected, ErrBackendCircuitOpen)
+			case "rate-limited":
+				return model.AllocationStatus{}, fmt.Errorf("selected backend %q is not admissible: %w", selected, ErrBackendRateLimited)
+			default:
+				return model.AllocationStatus{}, fmt.Errorf("selected backend %q is not admissible: %s", selected, decision.Reason)
+			}
+		}
 	}
 	resultBackend = selected
 	s.observer.ObserveAllocationStart(pool.Name)
@@ -181,6 +202,7 @@ func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest)
 	if err != nil {
 		s.release(context.Background(), pool, selected, allocation)
 		s.store.MarkState(allocation.ID, model.StateFailed, s.now(), err.Error())
+		s.recordBackendFailure(pool, selected, err, s.now())
 		logAllocationEvent(ctx, "allocation_failed", map[string]string{
 			"allocation_id": allocation.ID,
 			"pool":          string(pool.Name),
@@ -197,6 +219,7 @@ func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest)
 	)
 	allocation.State = model.StateReady
 	s.store.Save(allocation)
+	s.recordBackendSuccess(pool, selected, s.now())
 	result = "success"
 	logAllocationEvent(ctx, "allocation_ready", map[string]string{
 		"allocation_id": allocation.ID,
@@ -243,9 +266,10 @@ func (s *Service) Cancel(id string) (model.AllocationStatus, bool) {
 }
 
 type completionRequest struct {
-	State  string `json:"state"`
-	Error  string `json:"error"`
-	Reason string `json:"reason"`
+	State        string `json:"state"`
+	Error        string `json:"error"`
+	Reason       string `json:"reason"`
+	FailureClass string `json:"failure_class"`
 }
 
 func (s *Service) Complete(ctx context.Context, id string, request completionRequest) (model.AllocationStatus, bool, error) {
@@ -278,6 +302,9 @@ func (s *Service) Complete(ctx context.Context, id string, request completionReq
 	if isActiveAllocationState(status.State) {
 		if pool, err := s.resolvePool(status.Pool); err == nil {
 			s.release(ctx, pool, status.SelectedBackend, status)
+			if targetState == model.StateFailed {
+				s.recordBackendFailureClass(pool, status.SelectedBackend, request.FailureClass, s.now())
+			}
 		}
 	}
 	logAllocationEvent(ctx, completionEventName(targetState), map[string]string{
@@ -313,6 +340,7 @@ func (s *Service) SweepExpired(now time.Time) int {
 			if _, ok := s.store.MarkState(status.ID, nextState, nextExpiresAt, nextMessage); ok {
 				if pool, err := s.resolvePool(status.Pool); err == nil {
 					s.release(context.Background(), pool, status.SelectedBackend, status)
+					s.recordBackendFailureClass(pool, status.SelectedBackend, backend.FailureReasonWaitTimeout, now)
 				}
 				logAllocationEvent(context.Background(), "allocation_"+string(nextState), map[string]string{
 					"allocation_id": allocationIDLabel(status.ID),
@@ -347,10 +375,56 @@ func (s *Service) SweepExpired(now time.Time) int {
 	return updated
 }
 
+func (s *Service) ReconcileBackendHealth() {
+	if s.admission == nil {
+		return
+	}
+	now := s.now()
+	for _, pool := range s.cfg.Pools {
+		for backendName, cfg := range pool.Backends {
+			if !cfg.Enabled || !cfg.Healthy || !s.admission.probeDue(pool.Name, backendName, cfg, now) {
+				continue
+			}
+			backendImpl, ok := s.registry.Get(backendName)
+			if !ok {
+				continue
+			}
+			probe, ok := backendImpl.(backendProbe)
+			if !ok {
+				continue
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), normalizeProbeTimeout(cfg.CircuitBreaker))
+			err := probe.Probe(ctx, pool, cfg)
+			cancel()
+			if err != nil {
+				s.admission.deferProbe(pool.Name, backendName, cfg.CircuitBreaker, now, backend.FailureReasonProbeFailed)
+				s.observer.ObserveBackendProbe(pool.Name, backendName, "failure")
+				logAllocationEvent(context.Background(), "backend_probe_failed", map[string]string{
+					"pool":    string(pool.Name),
+					"backend": string(backendName),
+					"error":   err.Error(),
+				})
+				continue
+			}
+			s.observer.ObserveBackendProbe(pool.Name, backendName, "success")
+			s.recordBackendProbeSuccess(pool, backendName, now)
+		}
+	}
+	s.observeCircuitState()
+}
+
 func (s *Service) observeState() {
 	statuses := s.store.List()
 	s.observer.ObserveActiveAllocations(statuses)
 	s.observer.ObserveCapacity(s.cfg, statuses)
+	s.observeCircuitState()
+}
+
+func (s *Service) observeCircuitState() {
+	if s.admission == nil {
+		return
+	}
+	s.observer.ObserveBackendCircuitState(s.admission.stateSnapshot(s.cfg))
 }
 
 func (s *Service) consumeWarmAllocation(ctx context.Context, pool model.PoolConfig, backendName model.BackendName, request model.AllocationStatus) (model.AllocationStatus, bool) {
@@ -451,6 +525,12 @@ func (s *Service) createWarmAllocation(pool model.PoolConfig, backendName model.
 	if err := s.validateWarmBackend(pool, backendName); err != nil {
 		return err
 	}
+	if s.admission != nil {
+		decision := s.admission.allow(pool.Name, backendName, cfg, now, false, true)
+		if !decision.Allowed {
+			return fmt.Errorf("warm backend %q is not admissible: %s", backendName, decision.Reason)
+		}
+	}
 
 	ttl := resolveWarmTTL(cfg)
 	request := model.AllocationRequest{
@@ -492,8 +572,10 @@ func (s *Service) createWarmAllocation(pool model.PoolConfig, backendName model.
 	provisioned, err := backendImpl.Provision(context.Background(), request, allocation)
 	if err != nil {
 		s.release(context.Background(), pool, backendName, allocation)
+		s.recordBackendFailure(pool, backendName, err, now)
 		return err
 	}
+	s.recordBackendSuccess(pool, backendName, now)
 
 	allocation.RunnerLabel = provisioned.RunnerLabel
 	allocation.State = model.StateWarm
@@ -512,6 +594,107 @@ func (s *Service) reserveForBackend(pool model.PoolConfig, backendName model.Bac
 		Backend: &backendName,
 	}
 	return s.reserve(pool, request)
+}
+
+func (s *Service) filterBackendsByAdmission(pool model.PoolConfig, request model.AllocationRequest) (model.PoolConfig, error) {
+	if s.admission == nil {
+		return pool, nil
+	}
+	filtered, err := s.admission.filter(pool, request, s.now())
+	if err != nil {
+		if request.Backend != nil {
+			reason := "circuit-open"
+			if errors.Is(err, ErrBackendRateLimited) {
+				reason = "rate-limited"
+			}
+			s.observer.ObserveBackendAdmissionRejected(pool.Name, *request.Backend, reason)
+		}
+		return model.PoolConfig{}, err
+	}
+	for name := range pool.Backends {
+		if _, ok := filtered.Backends[name]; !ok {
+			decision := s.admission.allow(pool.Name, name, pool.Backends[name], s.now(), false, false)
+			if !decision.Allowed {
+				s.observer.ObserveBackendAdmissionRejected(pool.Name, name, decision.Reason)
+			}
+		}
+	}
+	return filtered, nil
+}
+
+func (s *Service) recordBackendFailure(pool model.PoolConfig, backendName model.BackendName, err error, now time.Time) {
+	reason, ok := backend.FailureReason(err)
+	if !ok {
+		return
+	}
+	s.recordBackendFailureClass(pool, backendName, reason, now)
+}
+
+func (s *Service) recordBackendFailureClass(pool model.PoolConfig, backendName model.BackendName, reason string, now time.Time) {
+	reason = backend.NormalizeFailureReason(reason)
+	if reason == "" || s.admission == nil {
+		return
+	}
+	cfg, ok := pool.Backends[backendName]
+	if !ok {
+		return
+	}
+	from, to, changed := s.admission.recordFailure(pool.Name, backendName, cfg, reason, now)
+	if !changed {
+		return
+	}
+	s.observer.ObserveBackendCircuitTransition(pool.Name, backendName, from, to, reason)
+	logAllocationEvent(context.Background(), "backend_circuit_opened", map[string]string{
+		"pool":    string(pool.Name),
+		"backend": string(backendName),
+		"from":    from,
+		"to":      to,
+		"reason":  reason,
+	})
+}
+
+func (s *Service) recordBackendSuccess(pool model.PoolConfig, backendName model.BackendName, now time.Time) {
+	if s.admission == nil {
+		return
+	}
+	cfg, ok := pool.Backends[backendName]
+	if !ok {
+		return
+	}
+	from, to, reason, changed := s.admission.recordSuccess(pool.Name, backendName, cfg, now)
+	if !changed {
+		return
+	}
+	s.observer.ObserveBackendCircuitTransition(pool.Name, backendName, from, to, reason)
+	logAllocationEvent(context.Background(), "backend_circuit_closed", map[string]string{
+		"pool":    string(pool.Name),
+		"backend": string(backendName),
+		"from":    from,
+		"to":      to,
+		"reason":  reason,
+	})
+}
+
+func (s *Service) recordBackendProbeSuccess(pool model.PoolConfig, backendName model.BackendName, now time.Time) {
+	if s.admission == nil {
+		return
+	}
+	cfg, ok := pool.Backends[backendName]
+	if !ok {
+		return
+	}
+	from, to, reason, changed := s.admission.recordProbeSuccess(pool.Name, backendName, cfg, now)
+	if !changed {
+		return
+	}
+	s.observer.ObserveBackendCircuitTransition(pool.Name, backendName, from, to, reason)
+	logAllocationEvent(context.Background(), "backend_circuit_closed", map[string]string{
+		"pool":    string(pool.Name),
+		"backend": string(backendName),
+		"from":    from,
+		"to":      to,
+		"reason":  reason,
+	})
 }
 
 func (s *Service) validateWarmBackend(pool model.PoolConfig, backendName model.BackendName) error {

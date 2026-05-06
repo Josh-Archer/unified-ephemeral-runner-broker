@@ -25,6 +25,16 @@ type testBackend struct {
 	name model.BackendName
 }
 
+type failingBackend struct {
+	testBackend
+	err error
+}
+
+type probeBackend struct {
+	testBackend
+	errs []error
+}
+
 type missingSecretReader struct{}
 
 func (missingSecretReader) ReadSecret(context.Context, string) (map[string]string, error) {
@@ -43,6 +53,19 @@ func (b testBackend) Provision(_ context.Context, request model.AllocationReques
 			"provisioner": fmt.Sprintf("test-%s", b.name),
 		},
 	}, nil
+}
+
+func (b failingBackend) Provision(context.Context, model.AllocationRequest, model.AllocationStatus) (backend.ProvisionedRunner, error) {
+	return backend.ProvisionedRunner{}, b.err
+}
+
+func (b *probeBackend) Probe(context.Context, model.PoolConfig, model.BackendConfig) error {
+	if len(b.errs) == 0 {
+		return nil
+	}
+	err := b.errs[0]
+	b.errs = b.errs[1:]
+	return err
 }
 
 type testCleanupBackend struct {
@@ -312,6 +335,285 @@ func TestAllocateSkipsBackendsThatCannotSatisfyTimeout(t *testing.T) {
 	}
 	if allocation.SelectedBackend != model.BackendLambda {
 		t.Fatalf("expected lambda backend, got %s", allocation.SelectedBackend)
+	}
+}
+
+func TestAllocateOpensCircuitForClassifiedBackendFailureAndFallsBack(t *testing.T) {
+	cfg := config.Default()
+	for index := range cfg.Pools {
+		if cfg.Pools[index].Name != model.PoolLite {
+			continue
+		}
+		for name, backendCfg := range cfg.Pools[index].Backends {
+			backendCfg.Enabled = false
+			cfg.Pools[index].Backends[name] = backendCfg
+		}
+		codebuildCfg := cfg.Pools[index].Backends[model.BackendCodeBuild]
+		codebuildCfg.Enabled = true
+		codebuildCfg.Healthy = true
+		codebuildCfg.MaxRunners = 1
+		codebuildCfg.CircuitBreaker.Enabled = true
+		codebuildCfg.CircuitBreaker.FailureThreshold = 1
+		cfg.Pools[index].Backends[model.BackendCodeBuild] = codebuildCfg
+
+		lambdaCfg := cfg.Pools[index].Backends[model.BackendLambda]
+		lambdaCfg.Enabled = true
+		lambdaCfg.Healthy = true
+		lambdaCfg.MaxRunners = 1
+		cfg.Pools[index].Backends[model.BackendLambda] = lambdaCfg
+	}
+
+	service := NewService(
+		cfg,
+		backend.NewRegistry(
+			failingBackend{
+				testBackend: testBackend{name: model.BackendCodeBuild},
+				err:         backend.NewClassifiedError(backend.FailureReasonTimeout, context.DeadlineExceeded),
+			},
+			testBackend{name: model.BackendLambda},
+		),
+		nil,
+	)
+	service.now = func() time.Time { return time.Unix(1000, 0) }
+
+	pinned := model.BackendCodeBuild
+	if _, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolLite,
+		Backend:    &pinned,
+		JobTimeout: 5 * time.Minute,
+	}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected classified timeout failure, got %v", err)
+	}
+
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolLite,
+		JobTimeout: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("expected fallback allocation to succeed: %v", err)
+	}
+	if allocation.SelectedBackend != model.BackendLambda {
+		t.Fatalf("expected circuit-open codebuild to be skipped in favor of lambda, got %s", allocation.SelectedBackend)
+	}
+
+	if _, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolLite,
+		Backend:    &pinned,
+		JobTimeout: 5 * time.Minute,
+	}); !errors.Is(err, ErrBackendCircuitOpen) {
+		t.Fatalf("expected pinned open backend to fail fast, got %v", err)
+	}
+}
+
+func TestCompleteFailureClassOpensCircuit(t *testing.T) {
+	service := newServiceWithConfig(func(pool *model.PoolConfig) {
+		if pool.Name != model.PoolLite {
+			return
+		}
+		for name, backendCfg := range pool.Backends {
+			backendCfg.Enabled = false
+			pool.Backends[name] = backendCfg
+		}
+		codebuildCfg := pool.Backends[model.BackendCodeBuild]
+		codebuildCfg.Enabled = true
+		codebuildCfg.Healthy = true
+		codebuildCfg.MaxRunners = 1
+		codebuildCfg.CircuitBreaker.Enabled = true
+		codebuildCfg.CircuitBreaker.FailureThreshold = 1
+		pool.Backends[model.BackendCodeBuild] = codebuildCfg
+	})
+	pinned := model.BackendCodeBuild
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolLite,
+		Backend:    &pinned,
+		JobTimeout: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("allocate failed: %v", err)
+	}
+
+	_, ok, err := service.Complete(context.Background(), allocation.ID, completionRequest{
+		State:        "failed",
+		Error:        "runner timed out waiting for job",
+		FailureClass: backend.FailureReasonWaitTimeout,
+	})
+	if err != nil || !ok {
+		t.Fatalf("completion failed: ok=%v err=%v", ok, err)
+	}
+
+	if _, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolLite,
+		Backend:    &pinned,
+		JobTimeout: 5 * time.Minute,
+	}); !errors.Is(err, ErrBackendCircuitOpen) {
+		t.Fatalf("expected pinned open backend to fail fast, got %v", err)
+	}
+}
+
+func TestRateLimitAppliesToSelectedColdBackendOnly(t *testing.T) {
+	service := newServiceWithConfig(func(pool *model.PoolConfig) {
+		if pool.Name != model.PoolLite {
+			return
+		}
+		for name, backendCfg := range pool.Backends {
+			backendCfg.Enabled = false
+			pool.Backends[name] = backendCfg
+		}
+		codebuildCfg := pool.Backends[model.BackendCodeBuild]
+		codebuildCfg.Enabled = true
+		codebuildCfg.Healthy = true
+		codebuildCfg.MaxRunners = 1
+		codebuildCfg.RateLimit.Enabled = true
+		codebuildCfg.RateLimit.Permits = 1
+		codebuildCfg.RateLimit.Interval = time.Minute
+		pool.Backends[model.BackendCodeBuild] = codebuildCfg
+	})
+	service.now = func() time.Time { return time.Unix(1000, 0) }
+
+	pinned := model.BackendCodeBuild
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolLite,
+		Backend:    &pinned,
+		JobTimeout: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("first allocation failed: %v", err)
+	}
+	if _, ok := service.Cancel(allocation.ID); !ok {
+		t.Fatal("cancel failed")
+	}
+
+	if _, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolLite,
+		Backend:    &pinned,
+		JobTimeout: 5 * time.Minute,
+	}); !errors.Is(err, ErrBackendRateLimited) {
+		t.Fatalf("expected second allocation to be rate limited, got %v", err)
+	}
+}
+
+func TestHalfOpenAdmissionDoesNotConsumeProbeSlotDuringFiltering(t *testing.T) {
+	service := newServiceWithConfig(func(pool *model.PoolConfig) {
+		if pool.Name != model.PoolLite {
+			return
+		}
+		for name, backendCfg := range pool.Backends {
+			backendCfg.Enabled = false
+			pool.Backends[name] = backendCfg
+		}
+		codebuildCfg := pool.Backends[model.BackendCodeBuild]
+		codebuildCfg.Enabled = true
+		codebuildCfg.Healthy = true
+		codebuildCfg.MaxRunners = 1
+		codebuildCfg.CircuitBreaker.Enabled = true
+		codebuildCfg.CircuitBreaker.FailureThreshold = 1
+		codebuildCfg.CircuitBreaker.OpenDuration = time.Minute
+		pool.Backends[model.BackendCodeBuild] = codebuildCfg
+	})
+	now := time.Unix(1000, 0)
+	service.now = func() time.Time { return now }
+	pinned := model.BackendCodeBuild
+
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolLite,
+		Backend:    &pinned,
+		JobTimeout: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("initial allocation failed: %v", err)
+	}
+	_, _, err = service.Complete(context.Background(), allocation.ID, completionRequest{
+		State:        "failed",
+		FailureClass: backend.FailureReasonWaitTimeout,
+	})
+	if err != nil {
+		t.Fatalf("completion failed: %v", err)
+	}
+
+	now = now.Add(2 * time.Minute)
+	recovered, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolLite,
+		Backend:    &pinned,
+		JobTimeout: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("expected half-open allocation to be admitted, got %v", err)
+	}
+	if recovered.SelectedBackend != model.BackendCodeBuild {
+		t.Fatalf("expected codebuild, got %s", recovered.SelectedBackend)
+	}
+}
+
+func TestProbeRecoveryRequiresConsecutiveSuccesses(t *testing.T) {
+	probe := &probeBackend{
+		testBackend: testBackend{name: model.BackendCodeBuild},
+		errs: []error{
+			nil,
+			backend.NewClassifiedError(backend.FailureReasonProbeFailed, context.DeadlineExceeded),
+			nil,
+			nil,
+		},
+	}
+	service := newServiceWithConfig(func(pool *model.PoolConfig) {
+		if pool.Name != model.PoolLite {
+			return
+		}
+		for name, backendCfg := range pool.Backends {
+			backendCfg.Enabled = false
+			pool.Backends[name] = backendCfg
+		}
+		codebuildCfg := pool.Backends[model.BackendCodeBuild]
+		codebuildCfg.Enabled = true
+		codebuildCfg.Healthy = true
+		codebuildCfg.MaxRunners = 1
+		codebuildCfg.CircuitBreaker.Enabled = true
+		codebuildCfg.CircuitBreaker.FailureThreshold = 1
+		codebuildCfg.CircuitBreaker.OpenDuration = time.Second
+		codebuildCfg.CircuitBreaker.ProbeInterval = time.Second
+		codebuildCfg.CircuitBreaker.RecoverySuccessThreshold = 2
+		pool.Backends[model.BackendCodeBuild] = codebuildCfg
+	})
+	service.registry = backend.NewRegistry(probe)
+	now := time.Unix(1000, 0)
+	service.now = func() time.Time { return now }
+	pinned := model.BackendCodeBuild
+
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolLite,
+		Backend:    &pinned,
+		JobTimeout: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("initial allocation failed: %v", err)
+	}
+	_, _, err = service.Complete(context.Background(), allocation.ID, completionRequest{
+		State:        "failed",
+		FailureClass: backend.FailureReasonWaitTimeout,
+	})
+	if err != nil {
+		t.Fatalf("completion failed: %v", err)
+	}
+
+	for i := 0; i < 3; i++ {
+		now = now.Add(2 * time.Second)
+		service.ReconcileBackendHealth()
+		if _, err := service.Allocate(context.Background(), model.AllocationRequest{
+			Pool:       model.PoolLite,
+			Backend:    &pinned,
+			JobTimeout: 5 * time.Minute,
+		}); !errors.Is(err, ErrBackendCircuitOpen) {
+			t.Fatalf("expected circuit to remain open after probe step %d, got %v", i+1, err)
+		}
+	}
+
+	now = now.Add(2 * time.Second)
+	service.ReconcileBackendHealth()
+	if _, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolLite,
+		Backend:    &pinned,
+		JobTimeout: 5 * time.Minute,
+	}); err != nil {
+		t.Fatalf("expected circuit to close after consecutive probe successes, got %v", err)
 	}
 }
 
@@ -932,7 +1234,7 @@ func TestAllocateAzureVMReturnsConfiguredRunnerLabel(t *testing.T) {
 		}
 		azureVMCfg := cfg.Pools[index].Backends[model.BackendAzureVM]
 		azureVMCfg.Enabled = true
-		azureVMCfg.RunnerLabel = "az-vm-gha"
+		azureVMCfg.RunnerLabel = "replace-with-private-azure-vm-runner-label"
 		cfg.Pools[index].Backends[model.BackendAzureVM] = azureVMCfg
 	}
 	service := NewService(
@@ -956,7 +1258,7 @@ func TestAllocateAzureVMReturnsConfiguredRunnerLabel(t *testing.T) {
 	if allocation.SelectedBackend != model.BackendAzureVM {
 		t.Fatalf("expected azure-vm backend, got %s", allocation.SelectedBackend)
 	}
-	if allocation.RunnerLabel != "az-vm-gha" {
+	if allocation.RunnerLabel != "replace-with-private-azure-vm-runner-label" {
 		t.Fatalf("expected configured Azure VM runner label, got %q", allocation.RunnerLabel)
 	}
 }

@@ -4,6 +4,8 @@ This repository ships a plain-manifest Kustomize base under `examples/gitops/kus
 
 Use it as a remote base pinned to a release ref and layer your local secrets, namespace, and backend enablement on top. Keep environment-specific Secret objects and cloud identity wiring in your private repo.
 
+The base generates the broker ConfigMap from `broker.yaml` with Kustomize's default content hash. Config-only changes therefore roll pods automatically when the generated ConfigMap name changes. If a private overlay disables name suffix hashes, add an explicit Deployment annotation bump whenever broker config changes.
+
 ## Required broker secret
 
 The base config references a Kubernetes Secret named `uecb-github-app`.
@@ -13,3 +15,7 @@ Create that Secret in your private overlay (or via ExternalSecret/secret manager
 ## Scheduler overlays
 
 The base keeps `round-robin` and `fairShare.enabled=false` as safe defaults. Private overlays can set `pools[].scheduler` to `weighted-round-robin`, enable `pools[].fairShare.enabled`, and tune `fairShare.priorityClasses` without changing live state by hand.
+
+## Runtime admission overlays
+
+Private overlays can enable `pools[].backends.<name>.circuitBreaker` or `rateLimit` for one backend at a time. Runtime circuit and rate-limit state is process-local, so keep the broker at one replica unless scheduler, allocation, and admission state are moved to shared storage together.
