@@ -31,8 +31,12 @@ Core metrics:
 - `uecb_registration_latency_seconds{pool,backend}`: time until the broker has a provisioned runner label.
 - `uecb_queue_depth{pool,state}`: current allocations by state.
 - `uecb_capacity_utilization_ratio{pool,backend}`: active allocation count divided by configured backend capacity.
+- `uecb_backend_circuit_state{pool,backend,state}`: active runtime circuit state for opt-in backends.
+- `uecb_backend_circuit_transitions_total{pool,backend,from,to,reason}`: circuit open/close transitions.
+- `uecb_backend_admission_rejections_total{pool,backend,reason}`: pre-scheduler backend admission rejections.
+- `uecb_backend_probe_results_total{pool,backend,result}`: background recovery probe results.
 
-The observability pack does not change scheduler selection, capacity reservation, or backend dispatch behavior. It only observes the existing lifecycle.
+Runtime admission metrics change only when a backend has opted into circuit breaking or rate limiting.
 
 ## Artifacts
 
@@ -44,6 +48,8 @@ The observability pack does not change scheduler selection, capacity reservation
 High allocation latency usually means the broker can accept requests but a backend is slow to launch or register a runner. Compare `uecb_allocation_latency_seconds` with `uecb_launch_latency_seconds` by backend and launch mode, and `uecb_registration_latency_seconds`.
 
 High allocation failure rate means requests are being rejected or backend provisioning is failing. Check broker logs by `correlation_id`, then inspect the selected backend controller logs for the same ID.
+
+Open backend circuits mean the broker is intentionally draining a backend after repeated timeout, wait, throttling, transport, or server-error signals. Check `uecb_backend_circuit_transitions_total` for the trip reason and `uecb_backend_probe_results_total` for recovery progress.
 
 Saturated capacity means the scheduler has few or no healthy slots available for a pool/backend. Check `maxRunners`, runner cleanup, and whether completed jobs are leaving allocations in `ready` or `reserved`.
 

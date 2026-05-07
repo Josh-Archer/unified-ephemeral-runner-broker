@@ -1,7 +1,10 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 )
@@ -27,6 +30,59 @@ func TestDefaultIncludesSeparateCodeBuildAndLambdaBackends(t *testing.T) {
 	}
 }
 
+func TestLoadParsesBackendAdmissionPolicy(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "broker.yaml")
+	if err := os.WriteFile(path, []byte(`
+pools:
+  - name: lite
+    backends:
+      codebuild:
+        circuitBreaker:
+          enabled: true
+          failureThreshold: 2
+          evaluationWindow: 3m
+          openDuration: 45s
+          probeInterval: 15s
+          probeTimeout: 5s
+          recoverySuccessThreshold: 2
+          halfOpenMaxRequests: 1
+          tripReasons:
+            - timeout
+            - throttled
+        rateLimit:
+          enabled: true
+          permits: 4
+          interval: 1m
+          burst: 2
+`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	var codebuildCfg model.BackendConfig
+	for _, pool := range cfg.Pools {
+		if pool.Name == model.PoolLite {
+			codebuildCfg = pool.Backends[model.BackendCodeBuild]
+			break
+		}
+	}
+	if !codebuildCfg.CircuitBreaker.Enabled {
+		t.Fatal("expected circuit breaker to be enabled")
+	}
+	if codebuildCfg.CircuitBreaker.FailureThreshold != 2 {
+		t.Fatalf("unexpected failure threshold: %d", codebuildCfg.CircuitBreaker.FailureThreshold)
+	}
+	if codebuildCfg.CircuitBreaker.EvaluationWindow != 3*time.Minute {
+		t.Fatalf("unexpected evaluation window: %s", codebuildCfg.CircuitBreaker.EvaluationWindow)
+	}
+	if !codebuildCfg.RateLimit.Enabled || codebuildCfg.RateLimit.Permits != 4 || codebuildCfg.RateLimit.Interval != time.Minute {
+		t.Fatalf("unexpected rate limit config: %+v", codebuildCfg.RateLimit)
+	}
+}
+
 func TestDefaultIncludesDockerAndVMBackends(t *testing.T) {
 	cfg := Default()
 	pool := cfg.Pools[1]
@@ -43,8 +99,8 @@ func TestDefaultIncludesDockerAndVMBackends(t *testing.T) {
 	if !ok {
 		t.Fatal("expected lite pool to include azure-vm backend")
 	}
-	if azureVMCfg.RunnerLabel != "az-vm-gha" {
-		t.Fatalf("expected default azure-vm runner label az-vm-gha, got %q", azureVMCfg.RunnerLabel)
+	if azureVMCfg.RunnerLabel != "replace-with-private-azure-vm-runner-label" {
+		t.Fatalf("expected default azure-vm runner label replace-with-private-azure-vm-runner-label, got %q", azureVMCfg.RunnerLabel)
 	}
 
 	for _, name := range []model.BackendName{model.BackendEC2, model.BackendGCE} {

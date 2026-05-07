@@ -27,6 +27,10 @@ type Observer interface {
 	ObserveRegistrationLatency(model.PoolName, model.BackendName, time.Duration)
 	ObserveActiveAllocations([]model.AllocationStatus)
 	ObserveCapacity(model.BrokerConfig, []model.AllocationStatus)
+	ObserveBackendCircuitState([]backendCircuitSnapshot)
+	ObserveBackendCircuitTransition(model.PoolName, model.BackendName, string, string, string)
+	ObserveBackendAdmissionRejected(model.PoolName, model.BackendName, string)
+	ObserveBackendProbe(model.PoolName, model.BackendName, string)
 }
 
 type noopObserver struct{}
@@ -39,6 +43,11 @@ func (noopObserver) ObserveRegistrationLatency(model.PoolName, model.BackendName
 }
 func (noopObserver) ObserveActiveAllocations([]model.AllocationStatus)            {}
 func (noopObserver) ObserveCapacity(model.BrokerConfig, []model.AllocationStatus) {}
+func (noopObserver) ObserveBackendCircuitState([]backendCircuitSnapshot)          {}
+func (noopObserver) ObserveBackendCircuitTransition(model.PoolName, model.BackendName, string, string, string) {
+}
+func (noopObserver) ObserveBackendAdmissionRejected(model.PoolName, model.BackendName, string) {}
+func (noopObserver) ObserveBackendProbe(model.PoolName, model.BackendName, string)             {}
 
 type PrometheusObserver struct {
 	allocationLatency   *prometheus.HistogramVec
@@ -47,6 +56,10 @@ type PrometheusObserver struct {
 	allocations         *prometheus.CounterVec
 	queueDepth          *prometheus.GaugeVec
 	capacityUtilization *prometheus.GaugeVec
+	circuitState        *prometheus.GaugeVec
+	circuitTransitions  *prometheus.CounterVec
+	admissionRejections *prometheus.CounterVec
+	probeResults        *prometheus.CounterVec
 }
 
 func NewPrometheusObserver(registerer prometheus.Registerer) *PrometheusObserver {
@@ -82,6 +95,22 @@ func NewPrometheusObserver(registerer prometheus.Registerer) *PrometheusObserver
 			Name: "uecb_capacity_utilization_ratio",
 			Help: "Active allocations divided by configured backend capacity.",
 		}, []string{"pool", "backend"}),
+		circuitState: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "uecb_backend_circuit_state",
+			Help: "Runtime backend circuit state. A value of 1 marks the active state for a pool/backend.",
+		}, []string{"pool", "backend", "state"}),
+		circuitTransitions: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "uecb_backend_circuit_transitions_total",
+			Help: "Runtime backend circuit transitions by pool, backend, state, and reason.",
+		}, []string{"pool", "backend", "from", "to", "reason"}),
+		admissionRejections: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "uecb_backend_admission_rejections_total",
+			Help: "Backend admission rejections before scheduler reservation.",
+		}, []string{"pool", "backend", "reason"}),
+		probeResults: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "uecb_backend_probe_results_total",
+			Help: "Background backend recovery probe results.",
+		}, []string{"pool", "backend", "result"}),
 	}
 }
 
@@ -96,6 +125,10 @@ func (o *PrometheusObserver) Register(registerer prometheus.Registerer) error {
 		o.allocations,
 		o.queueDepth,
 		o.capacityUtilization,
+		o.circuitState,
+		o.circuitTransitions,
+		o.admissionRejections,
+		o.probeResults,
 	} {
 		if err := registerer.Register(collector); err != nil {
 			if _, ok := err.(prometheus.AlreadyRegisteredError); !ok {
@@ -104,6 +137,31 @@ func (o *PrometheusObserver) Register(registerer prometheus.Registerer) error {
 		}
 	}
 	return nil
+}
+
+func (o *PrometheusObserver) ObserveBackendCircuitState(snapshots []backendCircuitSnapshot) {
+	o.circuitState.Reset()
+	for _, snapshot := range snapshots {
+		for _, state := range []string{circuitStateClosed, circuitStateOpen, circuitStateHalfOpen} {
+			value := 0.0
+			if snapshot.State == state {
+				value = 1
+			}
+			o.circuitState.WithLabelValues(string(snapshot.Pool), string(snapshot.Backend), state).Set(value)
+		}
+	}
+}
+
+func (o *PrometheusObserver) ObserveBackendCircuitTransition(pool model.PoolName, backend model.BackendName, from, to, reason string) {
+	o.circuitTransitions.WithLabelValues(string(pool), string(backend), from, to, reason).Inc()
+}
+
+func (o *PrometheusObserver) ObserveBackendAdmissionRejected(pool model.PoolName, backend model.BackendName, reason string) {
+	o.admissionRejections.WithLabelValues(string(pool), string(backend), reason).Inc()
+}
+
+func (o *PrometheusObserver) ObserveBackendProbe(pool model.PoolName, backend model.BackendName, result string) {
+	o.probeResults.WithLabelValues(string(pool), string(backend), result).Inc()
 }
 
 func (o *PrometheusObserver) ObserveAllocationStart(pool model.PoolName) {

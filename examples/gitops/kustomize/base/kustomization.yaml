@@ -6,6 +6,11 @@ resources:
   - serviceaccount.yaml
   - role.yaml
   - rolebinding.yaml
-  - configmap.yaml
   - deployment.yaml
   - service.yaml
+
+configMapGenerator:
+  - name: unified-ephemeral-runner-broker-config
+    namespace: arc-systems
+    files:
+      - broker.yaml=broker.yaml

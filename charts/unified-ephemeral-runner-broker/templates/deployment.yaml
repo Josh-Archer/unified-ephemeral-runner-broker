@@ -11,9 +11,14 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: {{ include "uecb.name" . }}
-{{ toYaml .Values.podLabels | indent 8 }}
+{{- with .Values.podLabels }}
+{{ toYaml . | indent 8 }}
+{{- end }}
       annotations:
-{{ toYaml .Values.podAnnotations | indent 8 }}
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+{{- with .Values.podAnnotations }}
+{{ toYaml . | indent 8 }}
+{{- end }}
     spec:
       serviceAccountName: {{ include "uecb.serviceAccountName" . }}
       containers:

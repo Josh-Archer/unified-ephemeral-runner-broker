@@ -108,6 +108,64 @@ func TestMetricsExposeAllocationSignals(t *testing.T) {
 	}
 }
 
+func TestMetricsExposeBackendAdmissionSignals(t *testing.T) {
+	cfg := config.Default()
+	for index := range cfg.Pools {
+		if cfg.Pools[index].Name != model.PoolLite {
+			continue
+		}
+		for name, backendCfg := range cfg.Pools[index].Backends {
+			backendCfg.Enabled = false
+			cfg.Pools[index].Backends[name] = backendCfg
+		}
+		codebuildCfg := cfg.Pools[index].Backends[model.BackendCodeBuild]
+		codebuildCfg.Enabled = true
+		codebuildCfg.Healthy = true
+		codebuildCfg.MaxRunners = 1
+		codebuildCfg.CircuitBreaker.Enabled = true
+		codebuildCfg.CircuitBreaker.FailureThreshold = 1
+		cfg.Pools[index].Backends[model.BackendCodeBuild] = codebuildCfg
+	}
+
+	service := NewService(
+		cfg,
+		backend.NewRegistry(failingBackend{
+			testBackend: testBackend{name: model.BackendCodeBuild},
+			err:         backend.NewClassifiedError(backend.FailureReasonTimeout, context.DeadlineExceeded),
+		}),
+		nil,
+	)
+	server := newTestServer(t, service)
+	handler := server.Handler()
+
+	first := httptest.NewRequest(http.MethodPost, "/v1/allocations", bytes.NewBufferString(`{"pool":"lite","backend":"codebuild","job_timeout":"5m"}`))
+	firstRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(firstRecorder, first)
+	if firstRecorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected first allocation to fail, got %d: %s", firstRecorder.Code, firstRecorder.Body.String())
+	}
+
+	second := httptest.NewRequest(http.MethodPost, "/v1/allocations", bytes.NewBufferString(`{"pool":"lite","backend":"codebuild","job_timeout":"5m"}`))
+	secondRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(secondRecorder, second)
+	if secondRecorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected second allocation to be rejected, got %d: %s", secondRecorder.Code, secondRecorder.Body.String())
+	}
+
+	metrics := httptest.NewRecorder()
+	handler.ServeHTTP(metrics, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := metrics.Body.String()
+	for _, metric := range []string{
+		`uecb_backend_circuit_state{backend="codebuild",pool="lite",state="open"} 1`,
+		`uecb_backend_circuit_transitions_total{backend="codebuild",from="closed",pool="lite",reason="timeout",to="open"} 1`,
+		`uecb_backend_admission_rejections_total{backend="codebuild",pool="lite",reason="circuit-open"} 1`,
+	} {
+		if !strings.Contains(body, metric) {
+			t.Fatalf("expected metrics to contain %q, got:\n%s", metric, body)
+		}
+	}
+}
+
 func TestHandleAllocationsRejectsMissingExternalBackendSecret(t *testing.T) {
 	cfg := config.Default()
 	for index := range cfg.Pools {

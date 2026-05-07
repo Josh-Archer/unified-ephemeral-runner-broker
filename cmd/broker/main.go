@@ -70,6 +70,14 @@ func main() {
 		}
 	}()
 
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			service.ReconcileBackendHealth()
+		}
+	}()
+
 	addr := os.Getenv("UECB_HTTP_ADDR")
 	if addr == "" {
 		addr = ":8080"

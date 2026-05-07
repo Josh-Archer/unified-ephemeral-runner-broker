@@ -116,6 +116,26 @@ config:
           # warmMin: 0
           # warmMax: 0
           # warmTTL: 15m
+          # circuitBreaker:
+          #   enabled: false
+          #   failureThreshold: 3
+          #   evaluationWindow: 5m
+          #   openDuration: 2m
+          #   probeInterval: 30s
+          #   probeTimeout: 10s
+          #   recoverySuccessThreshold: 1
+          #   halfOpenMaxRequests: 1
+          #   tripReasons:
+          #     - timeout
+          #     - transport-error
+          #     - throttled
+          #     - server-error
+          #     - wait-timeout
+          # rateLimit:
+          #   enabled: false
+          #   permits: 6
+          #   interval: 1m
+          #   burst: 1
           weight: 1
           maxJobDuration: 14m
           capabilities:
@@ -156,6 +176,16 @@ config:
           enabled: false
           healthy: true
           maxRunners: 1
+          # circuitBreaker is useful for static VM labels that start timing out
+          # while other backends remain available.
+          # circuitBreaker:
+          #   enabled: false
+          #   failureThreshold: 1
+          #   evaluationWindow: 5m
+          #   openDuration: 2m
+          #   probeInterval: 30s
+          #   probeTimeout: 10s
+          #   recoverySuccessThreshold: 1
           weight: 1
           maxJobDuration: 6h
           capabilities:
@@ -164,7 +194,7 @@ config:
             - vm
             - cloud:azure
             - region:azure-eastus
-          runnerLabel: az-vm-gha
+          runnerLabel: replace-with-private-azure-vm-runner-label
         ec2:
           enabled: false
           healthy: true

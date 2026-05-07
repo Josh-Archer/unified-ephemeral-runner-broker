@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -17,6 +19,7 @@ import (
 
 const (
 	secretKeyDispatchURL          = "dispatch_url"
+	secretKeyHealthURL            = "health_url"
 	secretKeyDispatchToken        = "dispatch_token"
 	defaultDispatchTimeout        = 20 * time.Second
 	azureFunctionsDispatchTimeout = 90 * time.Second
@@ -160,19 +163,31 @@ func (b *Backend) Provision(ctx context.Context, request model.AllocationRequest
 
 	resp, err := b.client.Do(req)
 	if err != nil {
-		return backend.ProvisionedRunner{}, fmt.Errorf("dispatch backend %s: %w", b.name, err)
+		return backend.ProvisionedRunner{}, classifyDispatchError(b.name, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		message, readErr := readErrorMessage(resp.Body)
+		reason := classifyStatus(resp.StatusCode)
+		baseErr := fmt.Errorf("dispatch backend %s: unexpected status %d", b.name, resp.StatusCode)
 		if readErr != nil {
-			return backend.ProvisionedRunner{}, fmt.Errorf("dispatch backend %s: unexpected status %d", b.name, resp.StatusCode)
+			if reason != "" {
+				return backend.ProvisionedRunner{}, backend.NewClassifiedError(reason, baseErr)
+			}
+			return backend.ProvisionedRunner{}, baseErr
 		}
 		if message == "" {
-			return backend.ProvisionedRunner{}, fmt.Errorf("dispatch backend %s: unexpected status %d", b.name, resp.StatusCode)
+			if reason != "" {
+				return backend.ProvisionedRunner{}, backend.NewClassifiedError(reason, baseErr)
+			}
+			return backend.ProvisionedRunner{}, baseErr
 		}
-		return backend.ProvisionedRunner{}, fmt.Errorf("dispatch backend %s: %s", b.name, message)
+		err := fmt.Errorf("dispatch backend %s: %s", b.name, message)
+		if reason != "" {
+			return backend.ProvisionedRunner{}, backend.NewClassifiedError(reason, err)
+		}
+		return backend.ProvisionedRunner{}, err
 	}
 
 	metadata := map[string]string{}
@@ -212,6 +227,72 @@ func (b *Backend) Provision(ctx context.Context, request model.AllocationRequest
 		RunnerLabel: runnerLabel,
 		Metadata:    metadata,
 	}, nil
+}
+
+func (b *Backend) Probe(ctx context.Context, pool model.PoolConfig, cfg model.BackendConfig) error {
+	secretRef := strings.TrimSpace(cfg.SecretRef)
+	if secretRef == "" {
+		return fmt.Errorf("backend %s is missing secretRef", b.name)
+	}
+	secretData, err := b.secrets.ReadSecret(ctx, secretRef)
+	if err != nil {
+		return err
+	}
+	dispatchURL := strings.TrimSpace(secretData[secretKeyDispatchURL])
+	if dispatchURL == "" {
+		return fmt.Errorf("backend secret %s is missing %q", secretRef, secretKeyDispatchURL)
+	}
+	healthURL := strings.TrimSpace(secretData[secretKeyHealthURL])
+	if healthURL == "" {
+		return fmt.Errorf("backend secret %s is missing %q", secretRef, secretKeyHealthURL)
+	}
+	dispatchToken := strings.TrimSpace(secretData[secretKeyDispatchToken])
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("X-UECB-Backend", string(b.name))
+	if dispatchToken != "" {
+		req.Header.Set("Authorization", "Bearer "+dispatchToken)
+	}
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return classifyDispatchError(b.name, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return nil
+	}
+	reason := classifyStatus(resp.StatusCode)
+	err = fmt.Errorf("probe backend %s: unexpected status %d for pool %s", b.name, resp.StatusCode, pool.Name)
+	if reason != "" {
+		return backend.NewClassifiedError(reason, err)
+	}
+	return err
+}
+
+func classifyDispatchError(name model.BackendName, err error) error {
+	reason := backend.FailureReasonTransport
+	if errors.Is(err, context.DeadlineExceeded) {
+		reason = backend.FailureReasonTimeout
+	} else {
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			reason = backend.FailureReasonTimeout
+		}
+	}
+	return backend.NewClassifiedError(reason, fmt.Errorf("dispatch backend %s: %w", name, err))
+}
+
+func classifyStatus(status int) string {
+	switch {
+	case status == http.StatusTooManyRequests:
+		return backend.FailureReasonThrottled
+	case status >= 500:
+		return backend.FailureReasonServerError
+	default:
+		return ""
+	}
 }
 
 func resolvePool(cfg model.BrokerConfig, name model.PoolName) (model.PoolConfig, error) {
