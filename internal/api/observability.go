@@ -31,6 +31,9 @@ type Observer interface {
 	ObserveBackendCircuitTransition(model.PoolName, model.BackendName, string, string, string)
 	ObserveBackendAdmissionRejected(model.PoolName, model.BackendName, string)
 	ObserveBackendProbe(model.PoolName, model.BackendName, string)
+	ObserveTierState([]tierDecisionSnapshot)
+	ObserveTierFallback(model.PoolName, string, string)
+	ObserveTierBlocked(model.PoolName, model.BackendName, string)
 }
 
 type noopObserver struct{}
@@ -48,6 +51,9 @@ func (noopObserver) ObserveBackendCircuitTransition(model.PoolName, model.Backen
 }
 func (noopObserver) ObserveBackendAdmissionRejected(model.PoolName, model.BackendName, string) {}
 func (noopObserver) ObserveBackendProbe(model.PoolName, model.BackendName, string)             {}
+func (noopObserver) ObserveTierState([]tierDecisionSnapshot)                                   {}
+func (noopObserver) ObserveTierFallback(model.PoolName, string, string)                        {}
+func (noopObserver) ObserveTierBlocked(model.PoolName, model.BackendName, string)              {}
 
 type PrometheusObserver struct {
 	allocationLatency   *prometheus.HistogramVec
@@ -60,6 +66,9 @@ type PrometheusObserver struct {
 	circuitTransitions  *prometheus.CounterVec
 	admissionRejections *prometheus.CounterVec
 	probeResults        *prometheus.CounterVec
+	tierState           *prometheus.GaugeVec
+	tierFallbacks       *prometheus.CounterVec
+	tierBlocked         *prometheus.CounterVec
 }
 
 func NewPrometheusObserver(registerer prometheus.Registerer) *PrometheusObserver {
@@ -111,6 +120,18 @@ func NewPrometheusObserver(registerer prometheus.Registerer) *PrometheusObserver
 			Name: "uecb_backend_probe_results_total",
 			Help: "Background backend recovery probe results.",
 		}, []string{"pool", "backend", "result"}),
+		tierState: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "uecb_tier_state",
+			Help: "Cached tier routing state. A value of 1 marks the active state for a pool/backend.",
+		}, []string{"pool", "backend", "state", "stale"}),
+		tierFallbacks: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "uecb_tier_fallback_total",
+			Help: "Tier routing fallback decisions by pool, mode, and reason.",
+		}, []string{"pool", "mode", "reason"}),
+		tierBlocked: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "uecb_tier_blocked_allocations_total",
+			Help: "Allocation attempts blocked by tier routing.",
+		}, []string{"pool", "backend", "reason"}),
 	}
 }
 
@@ -129,6 +150,9 @@ func (o *PrometheusObserver) Register(registerer prometheus.Registerer) error {
 		o.circuitTransitions,
 		o.admissionRejections,
 		o.probeResults,
+		o.tierState,
+		o.tierFallbacks,
+		o.tierBlocked,
 	} {
 		if err := registerer.Register(collector); err != nil {
 			if _, ok := err.(prometheus.AlreadyRegisteredError); !ok {
@@ -137,6 +161,38 @@ func (o *PrometheusObserver) Register(registerer prometheus.Registerer) error {
 		}
 	}
 	return nil
+}
+
+type tierDecisionSnapshot struct {
+	Pool    model.PoolName
+	Backend model.BackendName
+	State   string
+	Stale   bool
+}
+
+func (o *PrometheusObserver) ObserveTierState(snapshots []tierDecisionSnapshot) {
+	o.tierState.Reset()
+	for _, snapshot := range snapshots {
+		stale := "false"
+		if snapshot.Stale {
+			stale = "true"
+		}
+		for _, state := range []string{"healthy", "approaching", "exceeded", "unknown"} {
+			value := 0.0
+			if snapshot.State == state {
+				value = 1
+			}
+			o.tierState.WithLabelValues(string(snapshot.Pool), string(snapshot.Backend), state, stale).Set(value)
+		}
+	}
+}
+
+func (o *PrometheusObserver) ObserveTierFallback(pool model.PoolName, mode, reason string) {
+	o.tierFallbacks.WithLabelValues(string(pool), mode, reason).Inc()
+}
+
+func (o *PrometheusObserver) ObserveTierBlocked(pool model.PoolName, backend model.BackendName, reason string) {
+	o.tierBlocked.WithLabelValues(string(pool), string(backend), reason).Inc()
 }
 
 func (o *PrometheusObserver) ObserveBackendCircuitState(snapshots []backendCircuitSnapshot) {

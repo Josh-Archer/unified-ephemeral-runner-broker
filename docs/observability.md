@@ -35,8 +35,12 @@ Core metrics:
 - `uecb_backend_circuit_transitions_total{pool,backend,from,to,reason}`: circuit open/close transitions.
 - `uecb_backend_admission_rejections_total{pool,backend,reason}`: pre-scheduler backend admission rejections.
 - `uecb_backend_probe_results_total{pool,backend,result}`: background recovery probe results.
+- `uecb_tier_state{pool,backend,state,stale}`: cached tier-routing decision state.
+- `uecb_tier_fallback_total{pool,mode,reason}`: fallback mode activations caused by tier routing.
+- `uecb_tier_blocked_allocations_total{pool,backend,reason}`: allocation attempts blocked by tier routing.
 
 Runtime admission metrics change only when a backend has opted into circuit breaking or rate limiting.
+Tier-routing metrics appear when cached decisions are present or tier policies affect allocation.
 
 ## Artifacts
 
@@ -50,6 +54,8 @@ High allocation latency usually means the broker can accept requests but a backe
 High allocation failure rate means requests are being rejected or backend provisioning is failing. Check broker logs by `correlation_id`, then inspect the selected backend controller logs for the same ID.
 
 Open backend circuits mean the broker is intentionally draining a backend after repeated timeout, wait, throttling, transport, or server-error signals. Check `uecb_backend_circuit_transitions_total` for the trip reason and `uecb_backend_probe_results_total` for recovery progress.
+
+Tier fallback activity means all eligible cloud backends were unavailable under the current tier policy or tier data was stale/unknown. Check `uecb_tier_state` first, then validate the Prometheus recording rules and provider budget/free-tier/credit API responses that feed the cache.
 
 Saturated capacity means the scheduler has few or no healthy slots available for a pool/backend. Check `maxRunners`, runner cleanup, and whether completed jobs are leaving allocations in `ready` or `reserved`.
 

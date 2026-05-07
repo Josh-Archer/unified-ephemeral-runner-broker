@@ -53,6 +53,20 @@ Circuit state is in-memory and scoped to a single `pool/backend` within one brok
 
 The background backend-health loop probes open circuits and closes them after the configured recovery threshold. Backends without a probe implementation recover through the same success path once the circuit admits a half-open request.
 
+## Tier-Aware Routing
+
+Tier-aware routing is evaluated after static eligibility, capability filtering, timeout filtering, and runtime backend admission, but before scheduler reservation. It uses the same reduced-pool pattern as capability filtering: blocked backends are removed from the pool snapshot passed to the scheduler, and the configured scheduler remains responsible for final selection.
+
+The allocation path only reads cached tier decisions. Prometheus queries and provider budget, free-tier, or credit calls are refreshed out of band and stored in memory per broker process. This keeps allocation latency independent from billing API latency and avoids making `/healthz` depend on cloud billing availability.
+
+Tier states are normalized to `healthy`, `approaching`, `exceeded`, and `unknown`. Rule actions are `observe-only`, `deprioritize`, and `disable`. `observe-only` never changes routing. `disable` removes an approaching or exceeded backend from scheduler eligibility. Unknown or stale data follows `broker.tierRouting.failureMode`:
+
+- `pass-through-round-robin`: default; ignore tier data and preserve build throughput.
+- `block`: fail allocations when tier data is missing, stale, or over policy.
+- `fallback-backends`: route through explicit fallback backends, usually `arc` or another self-hosted label.
+
+Pinned backend requests are not silently rerouted when tier policy blocks the pinned backend. The broker returns a deterministic tier-policy error instead.
+
 ## Capability Filtering
 
 Capability-aware routing is evaluated before scheduler selection.

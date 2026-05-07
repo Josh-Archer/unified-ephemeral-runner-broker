@@ -83,6 +83,116 @@ pools:
 	}
 }
 
+func TestLoadParsesTierRoutingConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "broker.yaml")
+	if err := os.WriteFile(path, []byte(`
+broker:
+  tierRouting:
+    enabled: true
+    refreshInterval: 2m
+    staleAfter: 6m
+    failureMode: fallback-backends
+    fallbackBackends:
+      - codebuild
+    prometheus:
+      url: https://prometheus.example.invalid
+      timeout: 3s
+      secretRef: uecb-prometheus
+    providers:
+      aws-main:
+        provider: aws
+        mode: free-tier
+        secretRef: uecb-aws-billing
+pools:
+  - name: lite
+    backends:
+      codebuild:
+        tierRules:
+          - name: codebuild-free-tier
+            providerRef: aws-main
+            usageQuery: uecb:backend_usage:ratio
+            softLimitRatio: 0.75
+            hardLimitRatio: 0.9
+            minRemainingCredit: 2
+            action: disable
+`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if !cfg.Broker.TierRouting.Enabled {
+		t.Fatal("expected tier routing to be enabled")
+	}
+	if cfg.Broker.TierRouting.RefreshInterval != 2*time.Minute {
+		t.Fatalf("unexpected refresh interval: %s", cfg.Broker.TierRouting.RefreshInterval)
+	}
+	if cfg.Broker.TierRouting.Prometheus.SecretRef != "uecb-prometheus" {
+		t.Fatalf("unexpected prometheus secret ref: %q", cfg.Broker.TierRouting.Prometheus.SecretRef)
+	}
+	provider := cfg.Broker.TierRouting.Providers["aws-main"]
+	if provider.Provider != "aws" || provider.Mode != "free-tier" || provider.SecretRef != "uecb-aws-billing" {
+		t.Fatalf("unexpected provider config: %+v", provider)
+	}
+	rule := cfg.Pools[0].Backends[model.BackendCodeBuild].TierRules[0]
+	if rule.ProviderRef != "aws-main" || rule.Action != "disable" || rule.HardLimitRatio != 0.9 {
+		t.Fatalf("unexpected tier rule: %+v", rule)
+	}
+}
+
+func TestLoadRejectsInvalidTierRoutingConfig(t *testing.T) {
+	cases := map[string]string{
+		"invalid provider ref": `
+broker:
+  tierRouting:
+    enabled: true
+    prometheus:
+      url: https://prometheus.example.invalid
+pools:
+  - name: lite
+    backends:
+      codebuild:
+        tierRules:
+          - providerRef: missing-provider
+`,
+		"invalid threshold order": `
+broker:
+  tierRouting:
+    enabled: true
+    prometheus:
+      url: https://prometheus.example.invalid
+pools:
+  - name: lite
+    backends:
+      codebuild:
+        tierRules:
+          - usageQuery: uecb:usage
+            softLimitRatio: 0.95
+            hardLimitRatio: 0.8
+`,
+		"fallback without backends": `
+broker:
+  tierRouting:
+    enabled: true
+    failureMode: fallback-backends
+`,
+	}
+
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "broker.yaml")
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			if _, err := Load(path); err == nil {
+				t.Fatal("expected invalid tier routing config to fail")
+			}
+		})
+	}
+}
+
 func TestDefaultIncludesDockerAndVMBackends(t *testing.T) {
 	cfg := Default()
 	pool := cfg.Pools[1]

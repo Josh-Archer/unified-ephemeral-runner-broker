@@ -1,11 +1,11 @@
 package runtime
 
 import (
-	"encoding/base64"
-	"encoding/json"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -231,6 +231,17 @@ func requiredSecretRefs(cfg model.BrokerConfig) []string {
 				continue
 			}
 			if ref := strings.TrimSpace(backend.SecretRef); ref != "" {
+				refs[ref] = struct{}{}
+			}
+		}
+	}
+
+	if cfg.Broker.TierRouting.Enabled {
+		if ref := strings.TrimSpace(cfg.Broker.TierRouting.Prometheus.SecretRef); ref != "" {
+			refs[ref] = struct{}{}
+		}
+		for _, provider := range cfg.Broker.TierRouting.Providers {
+			if ref := strings.TrimSpace(provider.SecretRef); ref != "" {
 				refs[ref] = struct{}{}
 			}
 		}

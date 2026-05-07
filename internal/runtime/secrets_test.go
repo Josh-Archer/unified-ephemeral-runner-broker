@@ -30,6 +30,27 @@ func TestRequiredSecretRefsSkipsDisabledBackends(t *testing.T) {
 	}
 }
 
+func TestRequiredSecretRefsIncludesEnabledTierRoutingSecrets(t *testing.T) {
+	cfg := config.Default()
+	cfg.Broker.TierRouting.Enabled = true
+	cfg.Broker.TierRouting.Prometheus.SecretRef = "uecb-prometheus"
+	cfg.Broker.TierRouting.Providers = map[string]model.TierProviderConfig{
+		"aws-main": {
+			Provider:  "aws",
+			Mode:      "free-tier",
+			SecretRef: "uecb-aws-billing",
+		},
+	}
+
+	refs := requiredSecretRefs(cfg)
+	sort.Strings(refs)
+	got := strings.Join(refs, ",")
+	want := "uecb-aws-billing,uecb-github-app,uecb-prometheus"
+	if got != want {
+		t.Fatalf("expected %s, got %s", want, got)
+	}
+}
+
 func TestSecretRefCheckerReportsMissingSecret(t *testing.T) {
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
