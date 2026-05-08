@@ -79,7 +79,38 @@ type BrokerRuntimeConfig struct {
 		Enabled       bool          `yaml:"enabled" json:"enabled"`
 		QuarantineTTL time.Duration `yaml:"quarantineTTL" json:"quarantineTTL"`
 	} `yaml:"orphanCleanup" json:"orphanCleanup"`
-	API BrokerAPIConfig `yaml:"api" json:"api"`
+	API         BrokerAPIConfig   `yaml:"api" json:"api"`
+	TierRouting TierRoutingConfig `yaml:"tierRouting,omitempty" json:"tierRouting,omitempty"`
+}
+
+type TierRoutingConfig struct {
+	Enabled          bool                          `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	RefreshInterval  time.Duration                 `yaml:"refreshInterval,omitempty" json:"refreshInterval,omitempty"`
+	StaleAfter       time.Duration                 `yaml:"staleAfter,omitempty" json:"staleAfter,omitempty"`
+	FailureMode      string                        `yaml:"failureMode,omitempty" json:"failureMode,omitempty"`
+	FallbackBackends []BackendName                 `yaml:"fallbackBackends,omitempty" json:"fallbackBackends,omitempty"`
+	Prometheus       TierPrometheusConfig          `yaml:"prometheus,omitempty" json:"prometheus,omitempty"`
+	Providers        map[string]TierProviderConfig `yaml:"providers,omitempty" json:"providers,omitempty"`
+	RefreshOnStartup bool                          `yaml:"refreshOnStartup,omitempty" json:"refreshOnStartup,omitempty"`
+}
+
+type TierPrometheusConfig struct {
+	URL       string        `yaml:"url,omitempty" json:"url,omitempty"`
+	Timeout   time.Duration `yaml:"timeout,omitempty" json:"timeout,omitempty"`
+	SecretRef string        `yaml:"secretRef,omitempty" json:"secretRef,omitempty"`
+}
+
+type TierProviderConfig struct {
+	Provider         string            `yaml:"provider,omitempty" json:"provider,omitempty"`
+	Mode             string            `yaml:"mode,omitempty" json:"mode,omitempty"`
+	SecretRef        string            `yaml:"secretRef,omitempty" json:"secretRef,omitempty"`
+	AccountID        string            `yaml:"accountId,omitempty" json:"accountId,omitempty"`
+	SubscriptionID   string            `yaml:"subscriptionId,omitempty" json:"subscriptionId,omitempty"`
+	ProjectID        string            `yaml:"projectId,omitempty" json:"projectId,omitempty"`
+	BillingAccountID string            `yaml:"billingAccountId,omitempty" json:"billingAccountId,omitempty"`
+	BudgetName       string            `yaml:"budgetName,omitempty" json:"budgetName,omitempty"`
+	Region           string            `yaml:"region,omitempty" json:"region,omitempty"`
+	Labels           map[string]string `yaml:"labels,omitempty" json:"labels,omitempty"`
 }
 
 type CircuitBreakerConfig struct {
@@ -116,6 +147,22 @@ type BackendConfig struct {
 	SecretRef      string               `yaml:"secretRef,omitempty" json:"secretRef,omitempty"`
 	CircuitBreaker CircuitBreakerConfig `yaml:"circuitBreaker,omitempty" json:"circuitBreaker,omitempty"`
 	RateLimit      RateLimitConfig      `yaml:"rateLimit,omitempty" json:"rateLimit,omitempty"`
+	TierRules      []TierRuleConfig     `yaml:"tierRules,omitempty" json:"tierRules,omitempty"`
+}
+
+type TierRuleConfig struct {
+	Name               string        `yaml:"name,omitempty" json:"name,omitempty"`
+	ProviderRef        string        `yaml:"providerRef,omitempty" json:"providerRef,omitempty"`
+	Dimension          string        `yaml:"dimension,omitempty" json:"dimension,omitempty"`
+	UsageQuery         string        `yaml:"usageQuery,omitempty" json:"usageQuery,omitempty"`
+	BurnRateQuery      string        `yaml:"burnRateQuery,omitempty" json:"burnRateQuery,omitempty"`
+	LimitSources       []string      `yaml:"limitSources,omitempty" json:"limitSources,omitempty"`
+	Combine            string        `yaml:"combine,omitempty" json:"combine,omitempty"`
+	SoftLimitRatio     float64       `yaml:"softLimitRatio,omitempty" json:"softLimitRatio,omitempty"`
+	HardLimitRatio     float64       `yaml:"hardLimitRatio,omitempty" json:"hardLimitRatio,omitempty"`
+	MinRemainingCredit float64       `yaml:"minRemainingCredit,omitempty" json:"minRemainingCredit,omitempty"`
+	ProjectionWindow   time.Duration `yaml:"projectionWindow,omitempty" json:"projectionWindow,omitempty"`
+	Action             string        `yaml:"action,omitempty" json:"action,omitempty"`
 }
 
 type FairShareConfig struct {

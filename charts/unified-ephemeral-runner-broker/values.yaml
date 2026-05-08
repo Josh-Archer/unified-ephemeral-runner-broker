@@ -56,6 +56,18 @@ config:
       quarantineTTL: 15m
     api:
       oidcAudience: uecb-broker
+    tierRouting:
+      enabled: false
+      refreshInterval: 5m
+      staleAfter: 15m
+      failureMode: pass-through-round-robin
+      fallbackBackends:
+        - arc
+      prometheus:
+        url: ""
+        timeout: 2s
+        secretRef: ""
+      providers: {}
   pools:
     - name: full
       labels:
@@ -136,6 +148,14 @@ config:
           #   permits: 6
           #   interval: 1m
           #   burst: 1
+          # tierRules:
+          #   - name: codebuild-free-tier
+          #     providerRef: aws-main
+          #     usageQuery: uecb:backend_usage:ratio{backend="codebuild"}
+          #     burnRateQuery: uecb:backend_usage_burn_rate{backend="codebuild"}
+          #     softLimitRatio: 0.8
+          #     hardLimitRatio: 0.95
+          #     action: observe-only
           weight: 1
           maxJobDuration: 14m
           capabilities:

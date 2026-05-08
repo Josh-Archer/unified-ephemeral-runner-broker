@@ -16,6 +16,7 @@ import (
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/scheduler"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/store"
+	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/tier"
 )
 
 var ErrUnknownPool = errors.New("pool is not configured")
@@ -23,6 +24,7 @@ var ErrNoMatchingBackendCapabilities = errors.New("no backend matches the reques
 var ErrAllocationNotFound = errors.New("allocation not found")
 var ErrAllocationAlreadyCompleted = errors.New("allocation already in terminal state")
 var ErrInvalidCompletionState = errors.New("invalid completion state")
+var ErrBackendTierBlocked = errors.New("backend tier policy blocked allocation")
 
 const (
 	defaultWarmTTL = 15 * time.Minute
@@ -38,6 +40,7 @@ type Service struct {
 	store     *store.Memory
 	observer  Observer
 	admission *backendAdmission
+	tierMgr   *tier.Manager
 	warmMu    sync.Mutex
 	initErr   error
 	health    func(context.Context) error
@@ -57,10 +60,15 @@ func NewService(cfg model.BrokerConfig, registry *backend.Registry, health func(
 		store:     store.NewMemory(),
 		observer:  noopObserver{},
 		admission: newBackendAdmission(),
+		tierMgr:   tier.NewManager(),
 		initErr:   validateSchedulers(cfg.Pools, schedulerRegistry),
 		health:    health,
 		now:       time.Now,
 	}
+}
+
+func (s *Service) SetTierManager(manager *tier.Manager) {
+	s.tierMgr = manager
 }
 
 func (s *Service) SetObserver(observer Observer) {
@@ -114,6 +122,10 @@ func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest)
 		}
 	}
 	pool, err = s.filterBackendsByAdmission(pool, request)
+	if err != nil {
+		return model.AllocationStatus{}, err
+	}
+	pool, err = s.filterBackendsByTierState(pool, request)
 	if err != nil {
 		return model.AllocationStatus{}, err
 	}
@@ -418,6 +430,7 @@ func (s *Service) observeState() {
 	s.observer.ObserveActiveAllocations(statuses)
 	s.observer.ObserveCapacity(s.cfg, statuses)
 	s.observeCircuitState()
+	s.observeTierState()
 }
 
 func (s *Service) observeCircuitState() {
@@ -425,6 +438,23 @@ func (s *Service) observeCircuitState() {
 		return
 	}
 	s.observer.ObserveBackendCircuitState(s.admission.stateSnapshot(s.cfg))
+}
+
+func (s *Service) observeTierState() {
+	if s.tierMgr == nil {
+		return
+	}
+	decisions := s.tierMgr.Snapshot()
+	snapshots := make([]tierDecisionSnapshot, 0, len(decisions))
+	for _, decision := range decisions {
+		snapshots = append(snapshots, tierDecisionSnapshot{
+			Pool:    decision.Pool,
+			Backend: decision.Backend,
+			State:   decision.State,
+			Stale:   decision.Stale,
+		})
+	}
+	s.observer.ObserveTierState(snapshots)
 }
 
 func (s *Service) consumeWarmAllocation(ctx context.Context, pool model.PoolConfig, backendName model.BackendName, request model.AllocationStatus) (model.AllocationStatus, bool) {
@@ -491,6 +521,12 @@ func (s *Service) reconcileWarmForBackend(pool model.PoolConfig, backendName mod
 		}
 		return
 	}
+	if s.backendTierBlockedForWarm(pool.Name, backendName) {
+		for _, warmStatus := range warm {
+			s.recycleWarmAllocation(context.Background(), pool, warmStatus, "warm backend blocked by tier policy")
+		}
+		return
+	}
 
 	sortWarmByExpiration(warm)
 	for _, status := range warm {
@@ -530,6 +566,9 @@ func (s *Service) createWarmAllocation(pool model.PoolConfig, backendName model.
 		if !decision.Allowed {
 			return fmt.Errorf("warm backend %q is not admissible: %s", backendName, decision.Reason)
 		}
+	}
+	if s.backendTierBlockedForWarm(pool.Name, backendName) {
+		return fmt.Errorf("warm backend %q is blocked by tier policy", backendName)
 	}
 
 	ttl := resolveWarmTTL(cfg)
@@ -620,6 +659,206 @@ func (s *Service) filterBackendsByAdmission(pool model.PoolConfig, request model
 		}
 	}
 	return filtered, nil
+}
+
+func (s *Service) filterBackendsByTierState(pool model.PoolConfig, request model.AllocationRequest) (model.PoolConfig, error) {
+	if !s.cfg.Broker.TierRouting.Enabled || s.tierMgr == nil {
+		return pool, nil
+	}
+	eligible, deprioritized, blocked := s.tierEligibleBackends(pool)
+	if request.Backend != nil {
+		if _, ok := pool.Backends[*request.Backend]; !ok {
+			return model.PoolConfig{}, scheduler.ErrUnknownBackend
+		}
+		if s.pinnedBackendAllowedByTier(pool.Name, *request.Backend) {
+			return pool, nil
+		}
+		if _, ok := eligible.Backends[*request.Backend]; ok {
+			return eligible, nil
+		}
+		if _, ok := deprioritized.Backends[*request.Backend]; ok {
+			return deprioritized, nil
+		}
+		decision := blocked[*request.Backend]
+		s.observer.ObserveTierBlocked(pool.Name, *request.Backend, tierBlockReason(decision))
+		return model.PoolConfig{}, fmt.Errorf("pinned backend %q is blocked by tier policy: %w", *request.Backend, ErrBackendTierBlocked)
+	}
+	if len(eligible.Backends) > 0 {
+		return eligible, nil
+	}
+	if len(deprioritized.Backends) > 0 {
+		s.observer.ObserveTierFallback(pool.Name, "deprioritize", "approaching")
+		return deprioritized, nil
+	}
+	if len(blocked) == 0 {
+		return pool, nil
+	}
+
+	mode := normalizeTierFailureMode(s.cfg.Broker.TierRouting.FailureMode)
+	switch mode {
+	case tier.FailureModeBlock:
+		s.observer.ObserveTierFallback(pool.Name, mode, "all-backends-blocked")
+		return model.PoolConfig{}, fmt.Errorf("%w for pool %q", ErrBackendTierBlocked, pool.Name)
+	case tier.FailureModeFallback:
+		fallback := filterTierFallbackBackends(pool, s.cfg.Broker.TierRouting.FallbackBackends)
+		if len(fallback.Backends) > 0 {
+			s.observer.ObserveTierFallback(pool.Name, mode, "fallback-backends")
+			return fallback, nil
+		}
+		s.observer.ObserveTierFallback(pool.Name, mode, "fallback-empty")
+		return model.PoolConfig{}, fmt.Errorf("%w for pool %q: no fallback backends available", ErrBackendTierBlocked, pool.Name)
+	default:
+		s.observer.ObserveTierFallback(pool.Name, tier.FailureModePassThrough, "pass-through")
+		return pool, nil
+	}
+}
+
+func (s *Service) tierEligibleBackends(pool model.PoolConfig) (model.PoolConfig, model.PoolConfig, map[model.BackendName]tier.Decision) {
+	filtered := pool
+	filtered.Backends = make(map[model.BackendName]model.BackendConfig, len(pool.Backends))
+	deprioritized := pool
+	deprioritized.Backends = make(map[model.BackendName]model.BackendConfig, len(pool.Backends))
+	blocked := map[model.BackendName]tier.Decision{}
+	for name, cfg := range pool.Backends {
+		decision, ok := s.tierMgr.Decision(pool.Name, name)
+		if !ok {
+			decision = tier.Decision{
+				Pool:    pool.Name,
+				Backend: name,
+				State:   tier.StateUnknown,
+				Action:  tier.ActionDisable,
+				Reason:  "missing tier data",
+			}
+		}
+		if s.tierDecisionAllowsBackendNormally(decision) {
+			if !s.backendHasFreeSchedulerCapacity(pool, name, cfg) {
+				continue
+			}
+			filtered.Backends[name] = cfg
+			continue
+		}
+		if tierDecisionIsDeprioritized(decision) {
+			if !s.backendHasFreeSchedulerCapacity(pool, name, cfg) {
+				continue
+			}
+			deprioritized.Backends[name] = cfg
+			continue
+		}
+		blocked[name] = decision
+		s.observer.ObserveTierBlocked(pool.Name, name, tierBlockReason(decision))
+	}
+	return filtered, deprioritized, blocked
+}
+
+func (s *Service) pinnedBackendAllowedByTier(pool model.PoolName, backendName model.BackendName) bool {
+	decision, ok := s.tierMgr.Decision(pool, backendName)
+	if !ok {
+		decision = tier.Decision{
+			Pool:    pool,
+			Backend: backendName,
+			State:   tier.StateUnknown,
+			Action:  tier.ActionDisable,
+			Reason:  "missing tier data",
+		}
+	}
+	if decision.Action == tier.ActionObserveOnly {
+		return true
+	}
+	if decision.Stale || decision.State == tier.StateUnknown {
+		return normalizeTierFailureMode(s.cfg.Broker.TierRouting.FailureMode) == tier.FailureModePassThrough
+	}
+	if decision.State == tier.StateHealthy {
+		return true
+	}
+	if decision.State == tier.StateApproaching {
+		return decision.Action != tier.ActionDisable
+	}
+	return false
+}
+
+func (s *Service) tierDecisionAllowsBackendNormally(decision tier.Decision) bool {
+	if decision.Action == tier.ActionObserveOnly {
+		return true
+	}
+	if decision.Stale || decision.State == tier.StateUnknown {
+		return normalizeTierFailureMode(s.cfg.Broker.TierRouting.FailureMode) == tier.FailureModePassThrough
+	}
+	if decision.State == tier.StateHealthy {
+		return true
+	}
+	return false
+}
+
+func tierDecisionIsDeprioritized(decision tier.Decision) bool {
+	return !decision.Stale && decision.State == tier.StateApproaching && decision.Action == tier.ActionDeprioritize
+}
+
+func (s *Service) backendTierBlockedForWarm(pool model.PoolName, backendName model.BackendName) bool {
+	if !s.cfg.Broker.TierRouting.Enabled || s.tierMgr == nil {
+		return false
+	}
+	decision, ok := s.tierMgr.Decision(pool, backendName)
+	if !ok {
+		return normalizeTierFailureMode(s.cfg.Broker.TierRouting.FailureMode) == tier.FailureModeBlock
+	}
+	if decision.Action == tier.ActionObserveOnly {
+		return false
+	}
+	if decision.Stale || decision.State == tier.StateUnknown {
+		return normalizeTierFailureMode(s.cfg.Broker.TierRouting.FailureMode) == tier.FailureModeBlock
+	}
+	return decision.State == tier.StateExceeded || (decision.State == tier.StateApproaching && decision.Action == tier.ActionDisable)
+}
+
+func (s *Service) backendHasFreeSchedulerCapacity(pool model.PoolConfig, backendName model.BackendName, cfg model.BackendConfig) bool {
+	if !cfg.Enabled || !cfg.Healthy || cfg.MaxRunners <= 0 {
+		return false
+	}
+	active := 0
+	if pool.FairShare.Enabled {
+		if s.fairShare != nil {
+			active = s.fairShare.Active(pool.Name, backendName)
+		}
+	} else {
+		active = s.schedulerForPool(pool).Active(pool.Name, backendName)
+	}
+	return active < cfg.MaxRunners
+}
+
+func filterTierFallbackBackends(pool model.PoolConfig, fallbackBackends []model.BackendName) model.PoolConfig {
+	filtered := pool
+	filtered.Backends = make(map[model.BackendName]model.BackendConfig, len(pool.Backends))
+	allowed := map[model.BackendName]struct{}{}
+	for _, backendName := range fallbackBackends {
+		allowed[backendName] = struct{}{}
+	}
+	for name, cfg := range pool.Backends {
+		if _, ok := allowed[name]; ok {
+			filtered.Backends[name] = cfg
+		}
+	}
+	return filtered
+}
+
+func normalizeTierFailureMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case tier.FailureModeBlock:
+		return tier.FailureModeBlock
+	case tier.FailureModeFallback:
+		return tier.FailureModeFallback
+	default:
+		return tier.FailureModePassThrough
+	}
+}
+
+func tierBlockReason(decision tier.Decision) string {
+	if decision.State == "" {
+		return "unknown"
+	}
+	if decision.Stale {
+		return "stale-" + decision.State
+	}
+	return decision.State
 }
 
 func (s *Service) recordBackendFailure(pool model.PoolConfig, backendName model.BackendName, err error, now time.Time) {

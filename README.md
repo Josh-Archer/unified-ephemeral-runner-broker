@@ -255,6 +255,50 @@ pools:
 
 Rollback is just a config change: set `scheduler` back to `round-robin` for the pool and redeploy. Leaving `weight` values in place is safe because the default scheduler ignores them.
 
+## Tier-Aware Routing
+
+Tier-aware routing can keep cloud backends from consuming paid capacity once provider free tiers, budgets, or credits are surpassed or close to exhausted. It is disabled by default and reads cached tier decisions during allocation; Prometheus and provider API calls happen outside the allocation path so runner assignment is not delayed by billing APIs.
+
+```yaml
+broker:
+  tierRouting:
+    enabled: true
+    refreshInterval: 5m
+    staleAfter: 15m
+    failureMode: pass-through-round-robin
+    fallbackBackends:
+      - arc
+    prometheus:
+      url: https://prometheus.example.invalid
+      timeout: 2s
+      secretRef: uecb-prometheus
+    providers:
+      aws-main:
+        provider: aws
+        mode: free-tier
+        secretRef: uecb-aws-billing
+pools:
+  - name: lite
+    backends:
+      codebuild:
+        tierRules:
+          - name: codebuild-free-tier
+            providerRef: aws-main
+            usageQuery: uecb:backend_usage:ratio{backend="codebuild"}
+            burnRateQuery: uecb:backend_usage_burn_rate{backend="codebuild"}
+            softLimitRatio: 0.8
+            hardLimitRatio: 0.95
+            action: observe-only
+```
+
+Supported fallback modes:
+
+- `pass-through-round-robin`: default; unknown or stale tier data does not block builds.
+- `block`: fail allocations when tier data is unknown, stale, or over policy.
+- `fallback-backends`: route to configured fallback backends such as `arc`.
+
+Use `observe-only` first, then move a backend rule to `deprioritize` or `disable` after validating Prometheus queries and provider snapshots. Pinned requests fail clearly when the requested backend is tier-blocked.
+
 ## Runtime Backend Admission
 
 Backends can opt into circuit breaking and cold-launch rate limiting. This is separate from static `enabled` and `healthy`: operator config is still the hard source of truth, while circuit state is learned at runtime per `pool/backend`.
