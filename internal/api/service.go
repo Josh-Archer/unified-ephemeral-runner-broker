@@ -102,7 +102,8 @@ func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest)
 		return model.AllocationStatus{}, err
 	}
 	resultPool = pool.Name
-	request.Backend = s.resolveRequestedBackend(pool, request.Backend)
+	var fallbackSyntheticBackendPin bool
+	request.Backend, fallbackSyntheticBackendPin = s.resolveRequestedBackend(pool, request.Backend)
 
 	explicitTimeout := request.JobTimeout > 0
 	timeout := request.JobTimeout
@@ -121,9 +122,17 @@ func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest)
 			return model.AllocationStatus{}, err
 		}
 	}
+	admissionInputPool := pool
 	pool, err = s.filterBackendsByAdmission(pool, request)
 	if err != nil {
-		return model.AllocationStatus{}, err
+		if !fallbackSyntheticBackendPin || !errors.Is(err, ErrBackendRateLimited) && !errors.Is(err, ErrBackendCircuitOpen) {
+			return model.AllocationStatus{}, err
+		}
+		request.Backend = nil
+		pool, err = s.filterBackendsByAdmission(admissionInputPool, request)
+		if err != nil {
+			return model.AllocationStatus{}, err
+		}
 	}
 	pool, err = s.filterBackendsByTierState(pool, request)
 	if err != nil {
@@ -132,7 +141,14 @@ func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest)
 
 	selected, err := s.reserve(pool, request)
 	if err != nil {
-		return model.AllocationStatus{}, err
+		if !fallbackSyntheticBackendPin || request.Backend == nil || !errors.Is(err, scheduler.ErrNoCapacity) {
+			return model.AllocationStatus{}, err
+		}
+		request.Backend = nil
+		selected, err = s.reserve(pool, request)
+		if err != nil {
+			return model.AllocationStatus{}, err
+		}
 	}
 	if s.admission != nil {
 		decision := s.admission.allow(pool.Name, selected, pool.Backends[selected], s.now(), false, true)
@@ -1084,21 +1100,21 @@ func (s *Service) resolvePool(name model.PoolName) (model.PoolConfig, error) {
 	return model.PoolConfig{}, ErrUnknownPool
 }
 
-func (s *Service) resolveRequestedBackend(pool model.PoolConfig, requested *model.BackendName) *model.BackendName {
+func (s *Service) resolveRequestedBackend(pool model.PoolConfig, requested *model.BackendName) (*model.BackendName, bool) {
 	if requested == nil {
-		return nil
+		return nil, false
 	}
 	if *requested != model.BackendLambda {
-		return requested
+		return requested, false
 	}
 
 	lambdaCfg, hasLambda := pool.Backends[model.BackendLambda]
 	codebuildCfg, hasCodebuild := pool.Backends[model.BackendCodeBuild]
 	if (!hasLambda || !lambdaCfg.Enabled) && hasCodebuild && codebuildCfg.Enabled {
 		backend := model.BackendCodeBuild
-		return &backend
+		return &backend, true
 	}
-	return requested
+	return requested, false
 }
 
 func (s *Service) schedulerForPool(pool model.PoolConfig) scheduler.Scheduler {
