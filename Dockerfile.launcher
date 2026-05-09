@@ -11,7 +11,9 @@ RUN apt-get update \
     libicu74 \
     python3 \
     tar \
+    xz-utils \
     unzip \
+    zstd \
   && rm -rf /var/lib/apt/lists/*
 WORKDIR /bootstrap
 COPY docker/launcher/entrypoint.sh /bootstrap/entrypoint.sh

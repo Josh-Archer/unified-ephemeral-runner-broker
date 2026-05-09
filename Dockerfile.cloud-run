@@ -16,7 +16,9 @@ RUN apt-get update \
     libicu74 \
     python3 \
     tar \
+    xz-utils \
     unzip \
+    zstd \
   && curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash - \
   && apt-get install -y --no-install-recommends nodejs \
   && node --version \

@@ -36,6 +36,8 @@ func TestProviderImagesAreOwnedByRunnerRepo(t *testing.T) {
 			"https://deb.nodesource.com/setup_${NODE_MAJOR}.x",
 			"UECB_PROVIDER=lambda",
 			"RUNNER_ALLOW_RUNASROOT=1",
+			"xz-utils",
+			"zstd",
 		},
 		"Dockerfile.cloud-run": {
 			"COPY docker/launcher/entrypoint.sh /bootstrap/entrypoint.sh",
@@ -44,6 +46,8 @@ func TestProviderImagesAreOwnedByRunnerRepo(t *testing.T) {
 			"https://deb.nodesource.com/setup_${NODE_MAJOR}.x",
 			"UECB_PROVIDER=cloud-run",
 			"RUNNER_ALLOW_RUNASROOT=1",
+			"xz-utils",
+			"zstd",
 		},
 		"Dockerfile.azure-functions": {
 			"COPY docker/azure-functions/function_app.py /home/site/wwwroot/function_app.py",
@@ -51,6 +55,8 @@ func TestProviderImagesAreOwnedByRunnerRepo(t *testing.T) {
 			"nodejs",
 			"NODE_MAJOR=24",
 			"https://deb.nodesource.com/setup_${NODE_MAJOR}.x",
+			"xz-utils",
+			"zstd",
 		},
 	}
 
