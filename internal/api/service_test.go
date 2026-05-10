@@ -667,6 +667,61 @@ func TestRateLimitAppliesToSelectedColdBackendOnly(t *testing.T) {
 	}
 }
 
+func TestDisabledLambdaFallbackSkipsRateLimitedCodeBuild(t *testing.T) {
+	service := newServiceWithConfig(func(pool *model.PoolConfig) {
+		if pool.Name != model.PoolLite {
+			return
+		}
+		for name, backendCfg := range pool.Backends {
+			backendCfg.Enabled = false
+			pool.Backends[name] = backendCfg
+		}
+		arcCfg := pool.Backends[model.BackendARC]
+		arcCfg.Enabled = true
+		arcCfg.Healthy = true
+		arcCfg.MaxRunners = 1
+		pool.Backends[model.BackendARC] = arcCfg
+
+		codebuildCfg := pool.Backends[model.BackendCodeBuild]
+		codebuildCfg.Enabled = true
+		codebuildCfg.Healthy = true
+		codebuildCfg.MaxRunners = 1
+		codebuildCfg.RateLimit.Enabled = true
+		codebuildCfg.RateLimit.Permits = 1
+		codebuildCfg.RateLimit.Interval = time.Hour
+		pool.Backends[model.BackendCodeBuild] = codebuildCfg
+	})
+	service.now = func() time.Time { return time.Unix(1000, 0) }
+
+	pinnedLambda := model.BackendLambda
+	first, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolLite,
+		Backend:    &pinnedLambda,
+		JobTimeout: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("first lambda fallback allocation failed: %v", err)
+	}
+	if first.SelectedBackend != model.BackendCodeBuild {
+		t.Fatalf("expected disabled lambda to prefer codebuild, got %s", first.SelectedBackend)
+	}
+	if _, ok := service.Cancel(first.ID); !ok {
+		t.Fatal("cancel failed")
+	}
+
+	second, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolLite,
+		Backend:    &pinnedLambda,
+		JobTimeout: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("expected rate-limited codebuild fallback allocation to succeed: %v", err)
+	}
+	if second.SelectedBackend != model.BackendARC {
+		t.Fatalf("expected arc fallback after codebuild rate limit, got %s", second.SelectedBackend)
+	}
+}
+
 func TestHalfOpenAdmissionDoesNotConsumeProbeSlotDuringFiltering(t *testing.T) {
 	service := newServiceWithConfig(func(pool *model.PoolConfig) {
 		if pool.Name != model.PoolLite {
