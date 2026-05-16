@@ -77,6 +77,46 @@ func TestHandleAllocationsAcceptsStringJobTimeout(t *testing.T) {
 	}
 }
 
+func TestHandleAllocationsReturnsAcceptedForQueuedAllocation(t *testing.T) {
+	service := newServiceWithBrokerConfig(func(cfg *model.BrokerConfig) {
+		cfg.Broker.Queue.Enabled = true
+		cfg.Broker.Queue.RetryAfter = time.Second
+		cfg.Pools[0].Backends[model.BackendARC] = model.BackendConfig{
+			Enabled:    true,
+			Healthy:    true,
+			MaxRunners: 1,
+			Template:   "arc-full",
+		}
+	})
+	service.now = func() time.Time { return time.Unix(1000, 0) }
+	server := newTestServer(t, service)
+	handler := server.Handler()
+
+	first := httptest.NewRequest(http.MethodPost, "/v1/allocations", bytes.NewBufferString(`{"pool":"full","job_timeout":"15m"}`))
+	firstRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(firstRecorder, first)
+	if firstRecorder.Code != http.StatusCreated {
+		t.Fatalf("expected first allocation to succeed, got %d: %s", firstRecorder.Code, firstRecorder.Body.String())
+	}
+
+	second := httptest.NewRequest(http.MethodPost, "/v1/allocations", bytes.NewBufferString(`{"pool":"full","job_timeout":"15m"}`))
+	secondRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(secondRecorder, second)
+	if secondRecorder.Code != http.StatusAccepted {
+		t.Fatalf("expected queued allocation to return 202, got %d: %s", secondRecorder.Code, secondRecorder.Body.String())
+	}
+	if secondRecorder.Header().Get("Retry-After") == "" {
+		t.Fatalf("expected Retry-After header for queued allocation")
+	}
+	var allocation model.AllocationStatus
+	if err := json.NewDecoder(secondRecorder.Body).Decode(&allocation); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if allocation.State != model.StatePending {
+		t.Fatalf("expected pending state, got %+v", allocation)
+	}
+}
+
 func TestMetricsExposeAllocationSignals(t *testing.T) {
 	service := newServiceWithConfig(nil)
 	server := newTestServer(t, service)

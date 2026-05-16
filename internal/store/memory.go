@@ -7,6 +7,13 @@ import (
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 )
 
+type Store interface {
+	Save(model.AllocationStatus) error
+	Get(string) (model.AllocationStatus, bool)
+	List() []model.AllocationStatus
+	MarkState(string, model.AllocationState, time.Time, string) (model.AllocationStatus, bool)
+}
+
 type Memory struct {
 	mu          sync.RWMutex
 	allocations map[string]model.AllocationStatus
@@ -16,10 +23,11 @@ func NewMemory() *Memory {
 	return &Memory{allocations: map[string]model.AllocationStatus{}}
 }
 
-func (m *Memory) Save(status model.AllocationStatus) {
+func (m *Memory) Save(status model.AllocationStatus) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.allocations[status.ID] = status
+	return nil
 }
 
 func (m *Memory) Get(id string) (model.AllocationStatus, bool) {

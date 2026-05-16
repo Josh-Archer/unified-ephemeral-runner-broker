@@ -43,6 +43,10 @@ inputs:
     description: Skip OIDC and call the broker without a bearer token
     required: false
     default: "false"
+  queue_wait_timeout:
+    description: How long to poll a pending queued allocation before failing, for example 5m
+    required: false
+    default: 5m
 
 outputs:
   allocation_id:
@@ -75,6 +79,7 @@ runs:
         INPUT_EXCLUDED_CAPABILITIES: ${{ inputs.excluded_capabilities }}
         INPUT_OIDC_AUDIENCE: ${{ inputs.oidc_audience }}
         INPUT_ALLOW_UNAUTHENTICATED: ${{ inputs.allow_unauthenticated }}
+        INPUT_QUEUE_WAIT_TIMEOUT: ${{ inputs.queue_wait_timeout }}
       run: |
         set -euo pipefail
 
@@ -129,8 +134,58 @@ PY
 
         response="$(curl -fsSL "${auth_args[@]}" -H "Content-Type: application/json" -d "${request_body}" "${INPUT_BROKER_URL%/}/v1/allocations")"
 
+        deadline="$(python - <<'PY'
+import os
+import re
+import time
+
+value = os.environ.get("INPUT_QUEUE_WAIT_TIMEOUT", "5m").strip()
+match = re.fullmatch(r"(\d+)([smh]?)", value)
+if not match:
+    raise SystemExit(f"invalid queue_wait_timeout {value!r}")
+amount = int(match.group(1))
+unit = match.group(2) or "s"
+multiplier = {"s": 1, "m": 60, "h": 3600}[unit]
+print(int(time.time()) + amount * multiplier)
+PY
+)"
+
+        while [ "$(printf '%s' "${response}" | python -c "import json,sys; print(json.load(sys.stdin).get('state',''))")" = "pending" ]; do
+          now="$(date +%s)"
+          if [ "${now}" -ge "${deadline}" ]; then
+            echo "Timed out waiting for queued allocation to become ready." >&2
+            printf '%s\n' "${response}" >&2
+            exit 1
+          fi
+          allocation_id="$(printf '%s' "${response}" | python -c "import json,sys; print(json.load(sys.stdin)['allocation_id'])")"
+          retry_after="$(printf '%s' "${response}" | python - <<'PY'
+import datetime
+import json
+import sys
+
+payload = json.load(sys.stdin)
+value = payload.get("retry_after")
+if not value:
+    print(5)
+    raise SystemExit
+dt = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+now = datetime.datetime.now(datetime.timezone.utc)
+seconds = int((dt - now).total_seconds())
+print(max(1, min(seconds, 30)))
+PY
+)"
+          sleep "${retry_after}"
+          response="$(curl -fsSL "${auth_args[@]}" "${INPUT_BROKER_URL%/}/v1/allocations/${allocation_id}")"
+        done
+
+        state="$(printf '%s' "${response}" | python -c "import json,sys; print(json.load(sys.stdin).get('state',''))")"
+        if [ "${state}" != "ready" ] && [ "${state}" != "" ]; then
+          echo "Allocation did not become ready. Final state: ${state}" >&2
+          printf '%s\n' "${response}" >&2
+          exit 1
+        fi
+
         echo "allocation_id=$(printf '%s' "${response}" | python -c "import json,sys; print(json.load(sys.stdin)['allocation_id'])")" >> "${GITHUB_OUTPUT}"
         echo "runner_label=$(printf '%s' "${response}" | python -c "import json,sys; print(json.load(sys.stdin)['runner_label'])")" >> "${GITHUB_OUTPUT}"
         echo "selected_backend=$(printf '%s' "${response}" | python -c "import json,sys; print(json.load(sys.stdin)['selected_backend'])")" >> "${GITHUB_OUTPUT}"
         echo "expires_at=$(printf '%s' "${response}" | python -c "import json,sys; print(json.load(sys.stdin)['expires_at'])")" >> "${GITHUB_OUTPUT}"
-

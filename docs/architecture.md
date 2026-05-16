@@ -9,6 +9,7 @@
 - The action exchanges OIDC identity for a broker allocation request.
 - The broker selects a backend, reserves capacity, provisions a runner, and returns the label that the heavy job should target.
 - External backends read `dispatch_url` and optional `dispatch_token` from their configured `secretRef` and hand off provisioning to a provider-owned controller.
+- Provider-owned controllers can use the public `pkg/adapter` SDK and `pkg/adapter/adaptertest` conformance harness to keep health, capacity, reserve, launch, and cleanup behavior aligned with the broker contract.
 
 ## Data Plane
 
@@ -29,6 +30,25 @@ Each pool backend may define a warm policy:
 The broker keeps warm allocations in the background when enabled and recycles them on TTL expiry or policy violations. Allocation requests consume warm capacity first when available, then fallback to cold launch.
 
 Warm capacity currently applies only to external dispatch backends and intentionally excludes `arc` and `azure-vm`.
+
+## State And Restart Recovery
+
+The default state store is in-memory. A file-backed state store can persist
+allocation records to a mounted volume for restart recovery.
+
+On service startup, the broker rehydrates scheduler accounting from persisted
+`reserved`, `ready`, and `warm` allocations. Pending allocations remain queued
+and are retried by the queue reconciler when their `retryAfter` time is reached.
+
+## Queued Admission
+
+Queued admission is optional and disabled by default.
+
+When enabled, the broker stores retryable allocation failures as `pending`
+instead of failing the workflow immediately. Retryable failures include
+temporary provider dispatch errors, rate-limited backends, open backend
+circuits, and short capacity gaps. The queue reconciler retries pending
+allocations until they become `ready`, expire, or exhaust `maxAttempts`.
 
 ## Pools
 

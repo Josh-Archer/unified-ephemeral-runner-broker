@@ -78,6 +78,7 @@ Built-in schedulers:
 
 - A Kubernetes broker service with a small REST API
 - A reusable GitHub Action, `allocate-runner`
+- A public backend adapter SDK with a conformance test harness
 - An OCI Helm chart for installation
 - Generic provider runner images for `launcher`, `lambda`, `cloud-run`, and `azure-functions`
 - A generic Kustomize-facing GitOps consumption path
@@ -152,6 +153,39 @@ broker:
 - `enabled: false` (default): active stale allocations move directly to `expired`.
 - `enabled: true`: active stale allocations move to `quarantined` for `quarantineTTL` (or immediately when `0`), then to `expired`.
 
+### Durable State Store
+
+The broker keeps allocation state in memory by default. Environments that need
+restart recovery can opt into a file-backed state store on a persistent volume.
+
+```yaml
+broker:
+  stateStore:
+    type: file
+    path: /var/lib/uecb/allocations.json
+```
+
+On startup, active `reserved`, `ready`, and `warm` allocations are rehydrated
+into scheduler accounting so a restarted broker does not over-admit capacity.
+
+### Queued Admission
+
+Queued admission is disabled by default. When enabled, retryable allocation
+failures such as no capacity, backend rate limiting, open backend circuits, or
+transient provider dispatch failures are stored as `pending` allocations.
+
+```yaml
+broker:
+  queue:
+    enabled: true
+    retryAfter: 30s
+    maxAttempts: 3
+```
+
+`POST /v1/allocations` returns `202 Accepted` with `state: pending` and a
+`Retry-After` header for queued allocations. The `allocate-runner` action polls
+the allocation until it becomes `ready` or `queue_wait_timeout` expires.
+
 ## Project Layout
 
 - `cmd/broker`: broker entrypoint
@@ -163,6 +197,7 @@ broker:
 - `examples/`: generic Terraform and GitOps consumption examples
 - `docs/`: architecture and security notes
 - `observability/`: reusable Prometheus alert rules and Grafana dashboard artifacts
+- `pkg/adapter`: public backend adapter SDK and conformance test helpers
 
 ## Public CI and Private Release Boundary
 

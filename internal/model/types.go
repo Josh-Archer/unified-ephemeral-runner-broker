@@ -35,6 +35,7 @@ const (
 	StateReserved    AllocationState = "reserved"
 	StateReady       AllocationState = "ready"
 	StateWarm        AllocationState = "warm"
+	StatePending     AllocationState = "pending"
 	StateCanceled    AllocationState = "canceled"
 	StateExpired     AllocationState = "expired"
 	StateFailed      AllocationState = "failed"
@@ -71,6 +72,17 @@ type BrokerAPIConfig struct {
 	OIDCAudience string `yaml:"oidcAudience" json:"oidcAudience"`
 }
 
+type StateStoreConfig struct {
+	Type string `yaml:"type,omitempty" json:"type,omitempty"`
+	Path string `yaml:"path,omitempty" json:"path,omitempty"`
+}
+
+type AdmissionQueueConfig struct {
+	Enabled     bool          `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	RetryAfter  time.Duration `yaml:"retryAfter,omitempty" json:"retryAfter,omitempty"`
+	MaxAttempts int           `yaml:"maxAttempts,omitempty" json:"maxAttempts,omitempty"`
+}
+
 type BrokerRuntimeConfig struct {
 	DefaultPool          PoolName      `yaml:"defaultPool" json:"defaultPool"`
 	DefaultJobTimeout    time.Duration `yaml:"defaultJobTimeout" json:"defaultJobTimeout"`
@@ -79,8 +91,10 @@ type BrokerRuntimeConfig struct {
 		Enabled       bool          `yaml:"enabled" json:"enabled"`
 		QuarantineTTL time.Duration `yaml:"quarantineTTL" json:"quarantineTTL"`
 	} `yaml:"orphanCleanup" json:"orphanCleanup"`
-	API         BrokerAPIConfig   `yaml:"api" json:"api"`
-	TierRouting TierRoutingConfig `yaml:"tierRouting,omitempty" json:"tierRouting,omitempty"`
+	API         BrokerAPIConfig      `yaml:"api" json:"api"`
+	StateStore  StateStoreConfig     `yaml:"stateStore,omitempty" json:"stateStore,omitempty"`
+	Queue       AdmissionQueueConfig `yaml:"queue,omitempty" json:"queue,omitempty"`
+	TierRouting TierRoutingConfig    `yaml:"tierRouting,omitempty" json:"tierRouting,omitempty"`
 }
 
 type TierRoutingConfig struct {
@@ -200,16 +214,19 @@ type AllocationRequest struct {
 }
 
 type AllocationStatus struct {
-	ID              string            `json:"allocation_id"`
-	CorrelationID   string            `json:"correlation_id,omitempty"`
-	Pool            PoolName          `json:"pool"`
-	SelectedBackend BackendName       `json:"selected_backend"`
-	RunnerLabel     string            `json:"runner_label"`
-	RequestedLabels []string          `json:"requested_labels,omitempty"`
-	Tenant          string            `json:"tenant,omitempty"`
-	PriorityClass   string            `json:"priority_class,omitempty"`
-	ExpiresAt       time.Time         `json:"expires_at"`
-	State           AllocationState   `json:"state"`
-	Error           string            `json:"error,omitempty"`
-	Metadata        map[string]string `json:"metadata,omitempty"`
+	ID              string             `json:"allocation_id"`
+	CorrelationID   string             `json:"correlation_id,omitempty"`
+	Pool            PoolName           `json:"pool"`
+	SelectedBackend BackendName        `json:"selected_backend"`
+	RunnerLabel     string             `json:"runner_label"`
+	RequestedLabels []string           `json:"requested_labels,omitempty"`
+	Tenant          string             `json:"tenant,omitempty"`
+	PriorityClass   string             `json:"priority_class,omitempty"`
+	ExpiresAt       time.Time          `json:"expires_at"`
+	RetryAfter      time.Time          `json:"retry_after,omitempty"`
+	Attempts        int                `json:"attempts,omitempty"`
+	State           AllocationState    `json:"state"`
+	Error           string             `json:"error,omitempty"`
+	Metadata        map[string]string  `json:"metadata,omitempty"`
+	Request         *AllocationRequest `json:"request,omitempty"`
 }

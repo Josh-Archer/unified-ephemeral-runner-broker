@@ -102,6 +102,22 @@ func (b *countingBackend) Provision(_ context.Context, _ model.AllocationRequest
 	}, nil
 }
 
+type sequenceBackend struct {
+	testBackend
+	errs []error
+}
+
+func (b *sequenceBackend) Provision(ctx context.Context, request model.AllocationRequest, allocation model.AllocationStatus) (backend.ProvisionedRunner, error) {
+	if len(b.errs) > 0 {
+		err := b.errs[0]
+		b.errs = b.errs[1:]
+		if err != nil {
+			return backend.ProvisionedRunner{}, err
+		}
+	}
+	return b.testBackend.Provision(ctx, request, allocation)
+}
+
 func newServiceWithCountingBackend(mutator func(*model.PoolConfig), counting *countingBackend) *Service {
 	cfg := config.Default()
 	for index := range cfg.Pools {
@@ -180,6 +196,125 @@ func newServiceWithBrokerConfig(mutator func(*model.BrokerConfig)) *Service {
 		),
 		nil,
 	)
+}
+
+func TestFileStoreRehydratesSchedulerCapacity(t *testing.T) {
+	statePath := t.TempDir() + "/allocations.json"
+	cfg := config.Default()
+	cfg.Broker.StateStore = model.StateStoreConfig{Type: "file", Path: statePath}
+	cfg.Pools[0].Backends[model.BackendARC] = model.BackendConfig{
+		Enabled:    true,
+		Healthy:    true,
+		MaxRunners: 1,
+		Template:   "arc-full",
+	}
+
+	first := NewService(cfg, backend.NewRegistry(testBackend{name: model.BackendARC}), nil)
+	if err := first.Health(context.Background()); err != nil {
+		t.Fatalf("first service health: %v", err)
+	}
+	allocation, err := first.Allocate(context.Background(), model.AllocationRequest{Pool: model.PoolFull, JobTimeout: time.Minute})
+	if err != nil {
+		t.Fatalf("allocate: %v", err)
+	}
+	if allocation.State != model.StateReady {
+		t.Fatalf("expected ready allocation, got %s", allocation.State)
+	}
+
+	restarted := NewService(cfg, backend.NewRegistry(testBackend{name: model.BackendARC}), nil)
+	if err := restarted.Health(context.Background()); err != nil {
+		t.Fatalf("restarted service health: %v", err)
+	}
+	if _, err := restarted.Allocate(context.Background(), model.AllocationRequest{Pool: model.PoolFull, JobTimeout: time.Minute}); !errors.Is(err, scheduler.ErrNoCapacity) {
+		t.Fatalf("expected persisted active allocation to consume capacity, got %v", err)
+	}
+}
+
+func TestQueuePendingAllocationRetriesAfterCapacityIsReleased(t *testing.T) {
+	now := time.Unix(2000, 0)
+	service := newServiceWithBrokerConfig(func(cfg *model.BrokerConfig) {
+		cfg.Broker.Queue.Enabled = true
+		cfg.Broker.Queue.RetryAfter = time.Second
+		cfg.Broker.Queue.MaxAttempts = 2
+		cfg.Pools[0].Backends[model.BackendARC] = model.BackendConfig{
+			Enabled:    true,
+			Healthy:    true,
+			MaxRunners: 1,
+			Template:   "arc-full",
+		}
+	})
+	service.now = func() time.Time { return now }
+
+	first, err := service.Allocate(context.Background(), model.AllocationRequest{Pool: model.PoolFull, JobTimeout: time.Minute})
+	if err != nil {
+		t.Fatalf("first allocate: %v", err)
+	}
+	pending, err := service.Allocate(context.Background(), model.AllocationRequest{Pool: model.PoolFull, JobTimeout: time.Minute})
+	if err != nil {
+		t.Fatalf("expected second allocation to queue, got %v", err)
+	}
+	if pending.State != model.StatePending {
+		t.Fatalf("expected pending state, got %s", pending.State)
+	}
+
+	service.Cancel(first.ID)
+	now = now.Add(2 * time.Second)
+	if updated := service.ReconcileQueue(context.Background(), now); updated != 1 {
+		t.Fatalf("expected one queued allocation to reconcile, got %d", updated)
+	}
+	retried, ok := service.Get(pending.ID)
+	if !ok {
+		t.Fatal("expected queued allocation to still exist")
+	}
+	if retried.State != model.StateReady {
+		t.Fatalf("expected queued allocation to become ready, got %+v", retried)
+	}
+	if retried.Attempts != 1 {
+		t.Fatalf("expected one retry attempt, got %d", retried.Attempts)
+	}
+}
+
+func TestQueueRetriesTransientBackendFailure(t *testing.T) {
+	now := time.Unix(3000, 0)
+	cfg := config.Default()
+	cfg.Broker.Queue.Enabled = true
+	cfg.Broker.Queue.RetryAfter = time.Second
+	cfg.Broker.Queue.MaxAttempts = 2
+	cfg.Pools[0].Backends[model.BackendARC] = model.BackendConfig{
+		Enabled:    true,
+		Healthy:    true,
+		MaxRunners: 1,
+		Template:   "arc-full",
+	}
+	backendImpl := &sequenceBackend{
+		testBackend: testBackend{name: model.BackendARC},
+		errs:        []error{backend.NewClassifiedError(backend.FailureReasonTransport, errors.New("temporary transport failure"))},
+	}
+	service := NewService(cfg, backend.NewRegistry(backendImpl), nil)
+	service.now = func() time.Time { return now }
+
+	pending, err := service.Allocate(context.Background(), model.AllocationRequest{Pool: model.PoolFull, JobTimeout: time.Minute})
+	if err != nil {
+		t.Fatalf("expected transient failure to queue, got %v", err)
+	}
+	if pending.State != model.StatePending {
+		t.Fatalf("expected pending allocation, got %+v", pending)
+	}
+
+	now = now.Add(2 * time.Second)
+	if updated := service.ReconcileQueue(context.Background(), now); updated != 1 {
+		t.Fatalf("expected one queue retry, got %d", updated)
+	}
+	retried, ok := service.Get(pending.ID)
+	if !ok {
+		t.Fatal("expected allocation to remain addressable")
+	}
+	if retried.State != model.StateReady {
+		t.Fatalf("expected retry to become ready, got %+v", retried)
+	}
+	if retried.RunnerLabel == "" {
+		t.Fatalf("expected ready allocation to include runner label: %+v", retried)
+	}
 }
 
 func TestAllocateUsesWeightedSchedulerForPool(t *testing.T) {
