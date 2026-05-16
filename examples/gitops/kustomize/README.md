@@ -19,3 +19,11 @@ The base keeps `round-robin` and `fairShare.enabled=false` as safe defaults. Pri
 ## Runtime admission overlays
 
 Private overlays can enable `pools[].backends.<name>.circuitBreaker` or `rateLimit` for one backend at a time. Runtime circuit and rate-limit state is process-local, so keep the broker at one replica unless scheduler, allocation, and admission state are moved to shared storage together.
+
+## Reference packs
+
+For complete topology-specific examples with overlays, secret contract documentation, validation steps, and rollout notes, see the reference packs under [`examples/gitops/packs/`](../packs/README.md):
+
+- [`arc-only`](../packs/arc-only/README.md) — ARC-only, round-robin
+- [`arc-plus-codebuild`](../packs/arc-plus-codebuild/README.md) — hybrid ARC + CodeBuild, weighted-round-robin
+- [`multi-backend`](../packs/multi-backend/README.md) — ARC + CodeBuild + Lambda + Cloud Run, fair-share
