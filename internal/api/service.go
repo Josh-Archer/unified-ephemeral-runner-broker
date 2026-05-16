@@ -16,6 +16,7 @@ import (
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/scheduler"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/store"
+	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/tier"
 )
 
 var ErrUnknownPool = errors.New("pool is not configured")
@@ -23,6 +24,7 @@ var ErrNoMatchingBackendCapabilities = errors.New("no backend matches the reques
 var ErrAllocationNotFound = errors.New("allocation not found")
 var ErrAllocationAlreadyCompleted = errors.New("allocation already in terminal state")
 var ErrInvalidCompletionState = errors.New("invalid completion state")
+var ErrBackendTierBlocked = errors.New("backend tier policy blocked allocation")
 
 const (
 	defaultWarmTTL = 15 * time.Minute
@@ -37,6 +39,8 @@ type Service struct {
 	fairShare *scheduler.PriorityFairShare
 	store     *store.Memory
 	observer  Observer
+	admission *backendAdmission
+	tierMgr   *tier.Manager
 	warmMu    sync.Mutex
 	initErr   error
 	health    func(context.Context) error
@@ -55,10 +59,16 @@ func NewService(cfg model.BrokerConfig, registry *backend.Registry, health func(
 		fairShare: scheduler.NewPriorityFairShare(),
 		store:     store.NewMemory(),
 		observer:  noopObserver{},
+		admission: newBackendAdmission(),
+		tierMgr:   tier.NewManager(),
 		initErr:   validateSchedulers(cfg.Pools, schedulerRegistry),
 		health:    health,
 		now:       time.Now,
 	}
+}
+
+func (s *Service) SetTierManager(manager *tier.Manager) {
+	s.tierMgr = manager
 }
 
 func (s *Service) SetObserver(observer Observer) {
@@ -92,7 +102,8 @@ func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest)
 		return model.AllocationStatus{}, err
 	}
 	resultPool = pool.Name
-	request.Backend = s.resolveRequestedBackend(pool, request.Backend)
+	var fallbackSyntheticBackendPin bool
+	request.Backend, fallbackSyntheticBackendPin = s.resolveRequestedBackend(pool, request.Backend)
 
 	explicitTimeout := request.JobTimeout > 0
 	timeout := request.JobTimeout
@@ -111,10 +122,48 @@ func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest)
 			return model.AllocationStatus{}, err
 		}
 	}
+	admissionInputPool := pool
+	pool, err = s.filterBackendsByAdmission(pool, request)
+	if err != nil {
+		if !fallbackSyntheticBackendPin || !errors.Is(err, ErrBackendRateLimited) && !errors.Is(err, ErrBackendCircuitOpen) {
+			return model.AllocationStatus{}, err
+		}
+		request.Backend = nil
+		pool, err = s.filterBackendsByAdmission(admissionInputPool, request)
+		if err != nil {
+			return model.AllocationStatus{}, err
+		}
+	}
+	pool, err = s.filterBackendsByTierState(pool, request)
+	if err != nil {
+		return model.AllocationStatus{}, err
+	}
 
 	selected, err := s.reserve(pool, request)
 	if err != nil {
-		return model.AllocationStatus{}, err
+		if !fallbackSyntheticBackendPin || request.Backend == nil || !errors.Is(err, scheduler.ErrNoCapacity) {
+			return model.AllocationStatus{}, err
+		}
+		request.Backend = nil
+		selected, err = s.reserve(pool, request)
+		if err != nil {
+			return model.AllocationStatus{}, err
+		}
+	}
+	if s.admission != nil {
+		decision := s.admission.allow(pool.Name, selected, pool.Backends[selected], s.now(), false, true)
+		if !decision.Allowed {
+			s.release(context.Background(), pool, selected, model.AllocationStatus{Pool: pool.Name, SelectedBackend: selected})
+			s.observer.ObserveBackendAdmissionRejected(pool.Name, selected, decision.Reason)
+			switch decision.Reason {
+			case "circuit-open":
+				return model.AllocationStatus{}, fmt.Errorf("selected backend %q is not admissible: %w", selected, ErrBackendCircuitOpen)
+			case "rate-limited":
+				return model.AllocationStatus{}, fmt.Errorf("selected backend %q is not admissible: %w", selected, ErrBackendRateLimited)
+			default:
+				return model.AllocationStatus{}, fmt.Errorf("selected backend %q is not admissible: %s", selected, decision.Reason)
+			}
+		}
 	}
 	resultBackend = selected
 	s.observer.ObserveAllocationStart(pool.Name)
@@ -181,6 +230,7 @@ func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest)
 	if err != nil {
 		s.release(context.Background(), pool, selected, allocation)
 		s.store.MarkState(allocation.ID, model.StateFailed, s.now(), err.Error())
+		s.recordBackendFailure(pool, selected, err, s.now())
 		logAllocationEvent(ctx, "allocation_failed", map[string]string{
 			"allocation_id": allocation.ID,
 			"pool":          string(pool.Name),
@@ -197,6 +247,7 @@ func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest)
 	)
 	allocation.State = model.StateReady
 	s.store.Save(allocation)
+	s.recordBackendSuccess(pool, selected, s.now())
 	result = "success"
 	logAllocationEvent(ctx, "allocation_ready", map[string]string{
 		"allocation_id": allocation.ID,
@@ -243,9 +294,10 @@ func (s *Service) Cancel(id string) (model.AllocationStatus, bool) {
 }
 
 type completionRequest struct {
-	State  string `json:"state"`
-	Error  string `json:"error"`
-	Reason string `json:"reason"`
+	State        string `json:"state"`
+	Error        string `json:"error"`
+	Reason       string `json:"reason"`
+	FailureClass string `json:"failure_class"`
 }
 
 func (s *Service) Complete(ctx context.Context, id string, request completionRequest) (model.AllocationStatus, bool, error) {
@@ -278,6 +330,9 @@ func (s *Service) Complete(ctx context.Context, id string, request completionReq
 	if isActiveAllocationState(status.State) {
 		if pool, err := s.resolvePool(status.Pool); err == nil {
 			s.release(ctx, pool, status.SelectedBackend, status)
+			if targetState == model.StateFailed {
+				s.recordBackendFailureClass(pool, status.SelectedBackend, request.FailureClass, s.now())
+			}
 		}
 	}
 	logAllocationEvent(ctx, completionEventName(targetState), map[string]string{
@@ -313,6 +368,7 @@ func (s *Service) SweepExpired(now time.Time) int {
 			if _, ok := s.store.MarkState(status.ID, nextState, nextExpiresAt, nextMessage); ok {
 				if pool, err := s.resolvePool(status.Pool); err == nil {
 					s.release(context.Background(), pool, status.SelectedBackend, status)
+					s.recordBackendFailureClass(pool, status.SelectedBackend, backend.FailureReasonWaitTimeout, now)
 				}
 				logAllocationEvent(context.Background(), "allocation_"+string(nextState), map[string]string{
 					"allocation_id": allocationIDLabel(status.ID),
@@ -347,10 +403,74 @@ func (s *Service) SweepExpired(now time.Time) int {
 	return updated
 }
 
+func (s *Service) ReconcileBackendHealth() {
+	if s.admission == nil {
+		return
+	}
+	now := s.now()
+	for _, pool := range s.cfg.Pools {
+		for backendName, cfg := range pool.Backends {
+			if !cfg.Enabled || !cfg.Healthy || !s.admission.probeDue(pool.Name, backendName, cfg, now) {
+				continue
+			}
+			backendImpl, ok := s.registry.Get(backendName)
+			if !ok {
+				continue
+			}
+			probe, ok := backendImpl.(backendProbe)
+			if !ok {
+				continue
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), normalizeProbeTimeout(cfg.CircuitBreaker))
+			err := probe.Probe(ctx, pool, cfg)
+			cancel()
+			if err != nil {
+				s.admission.deferProbe(pool.Name, backendName, cfg.CircuitBreaker, now, backend.FailureReasonProbeFailed)
+				s.observer.ObserveBackendProbe(pool.Name, backendName, "failure")
+				logAllocationEvent(context.Background(), "backend_probe_failed", map[string]string{
+					"pool":    string(pool.Name),
+					"backend": string(backendName),
+					"error":   err.Error(),
+				})
+				continue
+			}
+			s.observer.ObserveBackendProbe(pool.Name, backendName, "success")
+			s.recordBackendProbeSuccess(pool, backendName, now)
+		}
+	}
+	s.observeCircuitState()
+}
+
 func (s *Service) observeState() {
 	statuses := s.store.List()
 	s.observer.ObserveActiveAllocations(statuses)
 	s.observer.ObserveCapacity(s.cfg, statuses)
+	s.observeCircuitState()
+	s.observeTierState()
+}
+
+func (s *Service) observeCircuitState() {
+	if s.admission == nil {
+		return
+	}
+	s.observer.ObserveBackendCircuitState(s.admission.stateSnapshot(s.cfg))
+}
+
+func (s *Service) observeTierState() {
+	if s.tierMgr == nil {
+		return
+	}
+	decisions := s.tierMgr.Snapshot()
+	snapshots := make([]tierDecisionSnapshot, 0, len(decisions))
+	for _, decision := range decisions {
+		snapshots = append(snapshots, tierDecisionSnapshot{
+			Pool:    decision.Pool,
+			Backend: decision.Backend,
+			State:   decision.State,
+			Stale:   decision.Stale,
+		})
+	}
+	s.observer.ObserveTierState(snapshots)
 }
 
 func (s *Service) consumeWarmAllocation(ctx context.Context, pool model.PoolConfig, backendName model.BackendName, request model.AllocationStatus) (model.AllocationStatus, bool) {
@@ -417,6 +537,12 @@ func (s *Service) reconcileWarmForBackend(pool model.PoolConfig, backendName mod
 		}
 		return
 	}
+	if s.backendTierBlockedForWarm(pool.Name, backendName) {
+		for _, warmStatus := range warm {
+			s.recycleWarmAllocation(context.Background(), pool, warmStatus, "warm backend blocked by tier policy")
+		}
+		return
+	}
 
 	sortWarmByExpiration(warm)
 	for _, status := range warm {
@@ -450,6 +576,15 @@ func (s *Service) createWarmAllocation(pool model.PoolConfig, backendName model.
 	}
 	if err := s.validateWarmBackend(pool, backendName); err != nil {
 		return err
+	}
+	if s.admission != nil {
+		decision := s.admission.allow(pool.Name, backendName, cfg, now, false, true)
+		if !decision.Allowed {
+			return fmt.Errorf("warm backend %q is not admissible: %s", backendName, decision.Reason)
+		}
+	}
+	if s.backendTierBlockedForWarm(pool.Name, backendName) {
+		return fmt.Errorf("warm backend %q is blocked by tier policy", backendName)
 	}
 
 	ttl := resolveWarmTTL(cfg)
@@ -492,8 +627,10 @@ func (s *Service) createWarmAllocation(pool model.PoolConfig, backendName model.
 	provisioned, err := backendImpl.Provision(context.Background(), request, allocation)
 	if err != nil {
 		s.release(context.Background(), pool, backendName, allocation)
+		s.recordBackendFailure(pool, backendName, err, now)
 		return err
 	}
+	s.recordBackendSuccess(pool, backendName, now)
 
 	allocation.RunnerLabel = provisioned.RunnerLabel
 	allocation.State = model.StateWarm
@@ -512,6 +649,307 @@ func (s *Service) reserveForBackend(pool model.PoolConfig, backendName model.Bac
 		Backend: &backendName,
 	}
 	return s.reserve(pool, request)
+}
+
+func (s *Service) filterBackendsByAdmission(pool model.PoolConfig, request model.AllocationRequest) (model.PoolConfig, error) {
+	if s.admission == nil {
+		return pool, nil
+	}
+	filtered, err := s.admission.filter(pool, request, s.now())
+	if err != nil {
+		if request.Backend != nil {
+			reason := "circuit-open"
+			if errors.Is(err, ErrBackendRateLimited) {
+				reason = "rate-limited"
+			}
+			s.observer.ObserveBackendAdmissionRejected(pool.Name, *request.Backend, reason)
+		}
+		return model.PoolConfig{}, err
+	}
+	for name := range pool.Backends {
+		if _, ok := filtered.Backends[name]; !ok {
+			decision := s.admission.allow(pool.Name, name, pool.Backends[name], s.now(), false, false)
+			if !decision.Allowed {
+				s.observer.ObserveBackendAdmissionRejected(pool.Name, name, decision.Reason)
+			}
+		}
+	}
+	return filtered, nil
+}
+
+func (s *Service) filterBackendsByTierState(pool model.PoolConfig, request model.AllocationRequest) (model.PoolConfig, error) {
+	if !s.cfg.Broker.TierRouting.Enabled || s.tierMgr == nil {
+		return pool, nil
+	}
+	eligible, deprioritized, blocked := s.tierEligibleBackends(pool)
+	if request.Backend != nil {
+		if _, ok := pool.Backends[*request.Backend]; !ok {
+			return model.PoolConfig{}, scheduler.ErrUnknownBackend
+		}
+		if s.pinnedBackendAllowedByTier(pool.Name, *request.Backend) {
+			return pool, nil
+		}
+		if _, ok := eligible.Backends[*request.Backend]; ok {
+			return eligible, nil
+		}
+		if _, ok := deprioritized.Backends[*request.Backend]; ok {
+			return deprioritized, nil
+		}
+		decision := blocked[*request.Backend]
+		s.observer.ObserveTierBlocked(pool.Name, *request.Backend, tierBlockReason(decision))
+		return model.PoolConfig{}, fmt.Errorf("pinned backend %q is blocked by tier policy: %w", *request.Backend, ErrBackendTierBlocked)
+	}
+	if len(eligible.Backends) > 0 {
+		return eligible, nil
+	}
+	if len(deprioritized.Backends) > 0 {
+		s.observer.ObserveTierFallback(pool.Name, "deprioritize", "approaching")
+		return deprioritized, nil
+	}
+	if len(blocked) == 0 {
+		return pool, nil
+	}
+
+	mode := normalizeTierFailureMode(s.cfg.Broker.TierRouting.FailureMode)
+	switch mode {
+	case tier.FailureModeBlock:
+		s.observer.ObserveTierFallback(pool.Name, mode, "all-backends-blocked")
+		return model.PoolConfig{}, fmt.Errorf("%w for pool %q", ErrBackendTierBlocked, pool.Name)
+	case tier.FailureModeFallback:
+		fallback := filterTierFallbackBackends(pool, s.cfg.Broker.TierRouting.FallbackBackends)
+		if len(fallback.Backends) > 0 {
+			s.observer.ObserveTierFallback(pool.Name, mode, "fallback-backends")
+			return fallback, nil
+		}
+		s.observer.ObserveTierFallback(pool.Name, mode, "fallback-empty")
+		return model.PoolConfig{}, fmt.Errorf("%w for pool %q: no fallback backends available", ErrBackendTierBlocked, pool.Name)
+	default:
+		s.observer.ObserveTierFallback(pool.Name, tier.FailureModePassThrough, "pass-through")
+		return pool, nil
+	}
+}
+
+func (s *Service) tierEligibleBackends(pool model.PoolConfig) (model.PoolConfig, model.PoolConfig, map[model.BackendName]tier.Decision) {
+	filtered := pool
+	filtered.Backends = make(map[model.BackendName]model.BackendConfig, len(pool.Backends))
+	deprioritized := pool
+	deprioritized.Backends = make(map[model.BackendName]model.BackendConfig, len(pool.Backends))
+	blocked := map[model.BackendName]tier.Decision{}
+	for name, cfg := range pool.Backends {
+		decision, ok := s.tierMgr.Decision(pool.Name, name)
+		if !ok {
+			decision = tier.Decision{
+				Pool:    pool.Name,
+				Backend: name,
+				State:   tier.StateUnknown,
+				Action:  tier.ActionDisable,
+				Reason:  "missing tier data",
+			}
+		}
+		if s.tierDecisionAllowsBackendNormally(decision) {
+			if !s.backendHasFreeSchedulerCapacity(pool, name, cfg) {
+				continue
+			}
+			filtered.Backends[name] = cfg
+			continue
+		}
+		if tierDecisionIsDeprioritized(decision) {
+			if !s.backendHasFreeSchedulerCapacity(pool, name, cfg) {
+				continue
+			}
+			deprioritized.Backends[name] = cfg
+			continue
+		}
+		blocked[name] = decision
+		s.observer.ObserveTierBlocked(pool.Name, name, tierBlockReason(decision))
+	}
+	return filtered, deprioritized, blocked
+}
+
+func (s *Service) pinnedBackendAllowedByTier(pool model.PoolName, backendName model.BackendName) bool {
+	decision, ok := s.tierMgr.Decision(pool, backendName)
+	if !ok {
+		decision = tier.Decision{
+			Pool:    pool,
+			Backend: backendName,
+			State:   tier.StateUnknown,
+			Action:  tier.ActionDisable,
+			Reason:  "missing tier data",
+		}
+	}
+	if decision.Action == tier.ActionObserveOnly {
+		return true
+	}
+	if decision.Stale || decision.State == tier.StateUnknown {
+		return normalizeTierFailureMode(s.cfg.Broker.TierRouting.FailureMode) == tier.FailureModePassThrough
+	}
+	if decision.State == tier.StateHealthy {
+		return true
+	}
+	if decision.State == tier.StateApproaching {
+		return decision.Action != tier.ActionDisable
+	}
+	return false
+}
+
+func (s *Service) tierDecisionAllowsBackendNormally(decision tier.Decision) bool {
+	if decision.Action == tier.ActionObserveOnly {
+		return true
+	}
+	if decision.Stale || decision.State == tier.StateUnknown {
+		return normalizeTierFailureMode(s.cfg.Broker.TierRouting.FailureMode) == tier.FailureModePassThrough
+	}
+	if decision.State == tier.StateHealthy {
+		return true
+	}
+	return false
+}
+
+func tierDecisionIsDeprioritized(decision tier.Decision) bool {
+	return !decision.Stale && decision.State == tier.StateApproaching && decision.Action == tier.ActionDeprioritize
+}
+
+func (s *Service) backendTierBlockedForWarm(pool model.PoolName, backendName model.BackendName) bool {
+	if !s.cfg.Broker.TierRouting.Enabled || s.tierMgr == nil {
+		return false
+	}
+	decision, ok := s.tierMgr.Decision(pool, backendName)
+	if !ok {
+		return normalizeTierFailureMode(s.cfg.Broker.TierRouting.FailureMode) == tier.FailureModeBlock
+	}
+	if decision.Action == tier.ActionObserveOnly {
+		return false
+	}
+	if decision.Stale || decision.State == tier.StateUnknown {
+		return normalizeTierFailureMode(s.cfg.Broker.TierRouting.FailureMode) == tier.FailureModeBlock
+	}
+	return decision.State == tier.StateExceeded || (decision.State == tier.StateApproaching && decision.Action == tier.ActionDisable)
+}
+
+func (s *Service) backendHasFreeSchedulerCapacity(pool model.PoolConfig, backendName model.BackendName, cfg model.BackendConfig) bool {
+	if !cfg.Enabled || !cfg.Healthy || cfg.MaxRunners <= 0 {
+		return false
+	}
+	active := 0
+	if pool.FairShare.Enabled {
+		if s.fairShare != nil {
+			active = s.fairShare.Active(pool.Name, backendName)
+		}
+	} else {
+		active = s.schedulerForPool(pool).Active(pool.Name, backendName)
+	}
+	return active < cfg.MaxRunners
+}
+
+func filterTierFallbackBackends(pool model.PoolConfig, fallbackBackends []model.BackendName) model.PoolConfig {
+	filtered := pool
+	filtered.Backends = make(map[model.BackendName]model.BackendConfig, len(pool.Backends))
+	allowed := map[model.BackendName]struct{}{}
+	for _, backendName := range fallbackBackends {
+		allowed[backendName] = struct{}{}
+	}
+	for name, cfg := range pool.Backends {
+		if _, ok := allowed[name]; ok {
+			filtered.Backends[name] = cfg
+		}
+	}
+	return filtered
+}
+
+func normalizeTierFailureMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case tier.FailureModeBlock:
+		return tier.FailureModeBlock
+	case tier.FailureModeFallback:
+		return tier.FailureModeFallback
+	default:
+		return tier.FailureModePassThrough
+	}
+}
+
+func tierBlockReason(decision tier.Decision) string {
+	if decision.State == "" {
+		return "unknown"
+	}
+	if decision.Stale {
+		return "stale-" + decision.State
+	}
+	return decision.State
+}
+
+func (s *Service) recordBackendFailure(pool model.PoolConfig, backendName model.BackendName, err error, now time.Time) {
+	reason, ok := backend.FailureReason(err)
+	if !ok {
+		return
+	}
+	s.recordBackendFailureClass(pool, backendName, reason, now)
+}
+
+func (s *Service) recordBackendFailureClass(pool model.PoolConfig, backendName model.BackendName, reason string, now time.Time) {
+	reason = backend.NormalizeFailureReason(reason)
+	if reason == "" || s.admission == nil {
+		return
+	}
+	cfg, ok := pool.Backends[backendName]
+	if !ok {
+		return
+	}
+	from, to, changed := s.admission.recordFailure(pool.Name, backendName, cfg, reason, now)
+	if !changed {
+		return
+	}
+	s.observer.ObserveBackendCircuitTransition(pool.Name, backendName, from, to, reason)
+	logAllocationEvent(context.Background(), "backend_circuit_opened", map[string]string{
+		"pool":    string(pool.Name),
+		"backend": string(backendName),
+		"from":    from,
+		"to":      to,
+		"reason":  reason,
+	})
+}
+
+func (s *Service) recordBackendSuccess(pool model.PoolConfig, backendName model.BackendName, now time.Time) {
+	if s.admission == nil {
+		return
+	}
+	cfg, ok := pool.Backends[backendName]
+	if !ok {
+		return
+	}
+	from, to, reason, changed := s.admission.recordSuccess(pool.Name, backendName, cfg, now)
+	if !changed {
+		return
+	}
+	s.observer.ObserveBackendCircuitTransition(pool.Name, backendName, from, to, reason)
+	logAllocationEvent(context.Background(), "backend_circuit_closed", map[string]string{
+		"pool":    string(pool.Name),
+		"backend": string(backendName),
+		"from":    from,
+		"to":      to,
+		"reason":  reason,
+	})
+}
+
+func (s *Service) recordBackendProbeSuccess(pool model.PoolConfig, backendName model.BackendName, now time.Time) {
+	if s.admission == nil {
+		return
+	}
+	cfg, ok := pool.Backends[backendName]
+	if !ok {
+		return
+	}
+	from, to, reason, changed := s.admission.recordProbeSuccess(pool.Name, backendName, cfg, now)
+	if !changed {
+		return
+	}
+	s.observer.ObserveBackendCircuitTransition(pool.Name, backendName, from, to, reason)
+	logAllocationEvent(context.Background(), "backend_circuit_closed", map[string]string{
+		"pool":    string(pool.Name),
+		"backend": string(backendName),
+		"from":    from,
+		"to":      to,
+		"reason":  reason,
+	})
 }
 
 func (s *Service) validateWarmBackend(pool model.PoolConfig, backendName model.BackendName) error {
@@ -662,21 +1100,21 @@ func (s *Service) resolvePool(name model.PoolName) (model.PoolConfig, error) {
 	return model.PoolConfig{}, ErrUnknownPool
 }
 
-func (s *Service) resolveRequestedBackend(pool model.PoolConfig, requested *model.BackendName) *model.BackendName {
+func (s *Service) resolveRequestedBackend(pool model.PoolConfig, requested *model.BackendName) (*model.BackendName, bool) {
 	if requested == nil {
-		return nil
+		return nil, false
 	}
 	if *requested != model.BackendLambda {
-		return requested
+		return requested, false
 	}
 
 	lambdaCfg, hasLambda := pool.Backends[model.BackendLambda]
 	codebuildCfg, hasCodebuild := pool.Backends[model.BackendCodeBuild]
 	if (!hasLambda || !lambdaCfg.Enabled) && hasCodebuild && codebuildCfg.Enabled {
 		backend := model.BackendCodeBuild
-		return &backend
+		return &backend, true
 	}
-	return requested
+	return requested, false
 }
 
 func (s *Service) schedulerForPool(pool model.PoolConfig) scheduler.Scheduler {

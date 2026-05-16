@@ -34,6 +34,15 @@ func Default() model.BrokerConfig {
 			API: model.BrokerAPIConfig{
 				OIDCAudience: "uecb-broker",
 			},
+			TierRouting: model.TierRoutingConfig{
+				Enabled:         false,
+				RefreshInterval: 5 * time.Minute,
+				StaleAfter:      15 * time.Minute,
+				FailureMode:     "pass-through-round-robin",
+				Prometheus: model.TierPrometheusConfig{
+					Timeout: 2 * time.Second,
+				},
+			},
 		},
 		Pools: []model.PoolConfig{
 			{
@@ -123,7 +132,7 @@ func Default() model.BrokerConfig {
 						Weight:         1,
 						MaxJobDuration: 6 * time.Hour,
 						Capabilities:   []string{"docker", "privileged", "vm", "cloud:azure", "region:azure-eastus"},
-						RunnerLabel:    "az-vm-gha",
+						RunnerLabel:    "replace-with-private-azure-vm-runner-label",
 					},
 					model.BackendEC2: {
 						Enabled:        false,
@@ -161,6 +170,9 @@ func Load(path string) (model.BrokerConfig, error) {
 
 	cfg := Default()
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return model.BrokerConfig{}, err
+	}
+	if err := Validate(cfg); err != nil {
 		return model.BrokerConfig{}, err
 	}
 	return cfg, nil

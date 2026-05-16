@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"os"
@@ -18,6 +19,7 @@ import (
 	lambdabackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/lambda"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/config"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/runtime"
+	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/tier"
 )
 
 func main() {
@@ -32,7 +34,7 @@ func main() {
 	}
 
 	registry := backend.NewRegistry(
-		arcbackend.New(),
+		arcbackend.New(cfg),
 		codebuildbackend.New(cfg, secretReader),
 		lambdabackend.New(cfg, secretReader),
 		cloudbackend.New(cfg, secretReader),
@@ -47,6 +49,22 @@ func main() {
 	}
 
 	service := api.NewService(cfg, registry, healthChecker.Check)
+	var tierManager *tier.Manager
+	if cfg.Broker.TierRouting.Enabled {
+		tierManager = tier.NewManager()
+		service.SetTierManager(tierManager)
+		refresher := tier.NewConfigRefresher(cfg, secretReader)
+		if cfg.Broker.TierRouting.RefreshOnStartup {
+			decisions, err := refresher.Refresh(context.Background())
+			if err != nil {
+				log.Printf("initial tier refresh failed: %v", err)
+			}
+			for _, decision := range decisions {
+				tierManager.SetDecision(decision)
+			}
+		}
+		tier.StartRefreshLoop(context.Background(), tierManager, refresher, cfg.Broker.TierRouting.RefreshInterval)
+	}
 	server := api.NewServer(
 		service,
 		[]string{"https://token.actions.githubusercontent.com"},
@@ -69,6 +87,24 @@ func main() {
 			service.ReconcileWarmPools()
 		}
 	}()
+
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			service.ReconcileBackendHealth()
+		}
+	}()
+
+	if tierManager != nil {
+		go func() {
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+			for now := range ticker.C {
+				tierManager.MarkStale(cfg.Broker.TierRouting.StaleAfter, now)
+			}
+		}()
+	}
 
 	addr := os.Getenv("UECB_HTTP_ADDR")
 	if addr == "" {

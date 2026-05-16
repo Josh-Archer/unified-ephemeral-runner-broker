@@ -39,3 +39,21 @@ groups:
         annotations:
           summary: "UECB allocations are not draining for pool {{ $labels.pool }}"
           description: "Reserved or ready allocations have remained active long enough to suggest cleanup or runner completion is stuck."
+
+      - alert: UECBBackendCircuitOpen
+        expr: uecb_backend_circuit_state{state="open"} == 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "UECB backend circuit is open for {{ $labels.pool }}/{{ $labels.backend }}"
+          description: "The broker is skipping this backend after repeated timeout, wait, throttling, transport, or server-error signals."
+
+      - alert: UECBBackendRateLimited
+        expr: sum by (pool, backend) (rate(uecb_backend_admission_rejections_total{reason="rate-limited"}[10m])) > 0.05
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "UECB backend admission is rate limited for {{ $labels.pool }}/{{ $labels.backend }}"
+          description: "Cold-launch requests are being rejected by backend rate limiting."

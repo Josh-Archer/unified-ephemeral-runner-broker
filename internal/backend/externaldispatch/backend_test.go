@@ -3,12 +3,14 @@ package externaldispatch
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/config"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 )
@@ -271,6 +273,124 @@ func TestProvisionSurfacesRemoteErrors(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "backend rejected request") {
 		t.Fatalf("expected remote error, got %v", err)
+	}
+}
+
+func TestProvisionClassifiesRetriableRemoteErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		reason string
+	}{
+		{name: "throttled", status: http.StatusTooManyRequests, reason: backend.FailureReasonThrottled},
+		{name: "server", status: http.StatusBadGateway, reason: backend.FailureReasonServerError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Error(w, `{"error":"backend unavailable"}`, tc.status)
+			}))
+			defer server.Close()
+
+			cfg := newRepoScopedConfig()
+			dispatchBackend := New(model.BackendCodeBuild, cfg, staticSecrets{
+				"uecb-codebuild": {
+					secretKeyDispatchURL: server.URL,
+				},
+			})
+
+			_, err := dispatchBackend.Provision(context.Background(), model.AllocationRequest{
+				Pool:       model.PoolLite,
+				JobTimeout: 5 * time.Minute,
+			}, model.AllocationStatus{
+				ID:   "abc123",
+				Pool: model.PoolLite,
+			})
+			if err == nil {
+				t.Fatal("expected provision to fail")
+			}
+			reason, ok := backend.FailureReason(err)
+			if !ok || reason != tc.reason {
+				t.Fatalf("expected reason %s, got %s ok=%v err=%v", tc.reason, reason, ok, err)
+			}
+		})
+	}
+}
+
+func TestProvisionClassifiesContextDeadline(t *testing.T) {
+	cfg := newRepoScopedConfig()
+	dispatchBackend := New(model.BackendCodeBuild, cfg, staticSecrets{
+		"uecb-codebuild": {
+			secretKeyDispatchURL: "http://127.0.0.1:1",
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := dispatchBackend.Provision(ctx, model.AllocationRequest{
+		Pool:       model.PoolLite,
+		JobTimeout: 5 * time.Minute,
+	}, model.AllocationStatus{
+		ID:   "abc123",
+		Pool: model.PoolLite,
+	})
+	if err == nil {
+		t.Fatal("expected provision to fail")
+	}
+	if errors.Is(err, context.Canceled) {
+		return
+	}
+	reason, ok := backend.FailureReason(err)
+	if !ok || reason != backend.FailureReasonTransport {
+		t.Fatalf("expected transport reason, got %s ok=%v err=%v", reason, ok, err)
+	}
+}
+
+func TestProbeRequiresSuccessfulHealthEndpoint(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		status  int
+		wantErr bool
+		reason  string
+	}{
+		{name: "ok", status: http.StatusOK},
+		{name: "unauthorized", status: http.StatusUnauthorized, wantErr: true},
+		{name: "throttled", status: http.StatusTooManyRequests, wantErr: true, reason: backend.FailureReasonThrottled},
+		{name: "server", status: http.StatusServiceUnavailable, wantErr: true, reason: backend.FailureReasonServerError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if got := r.Header.Get("Authorization"); got != "Bearer broker-secret" {
+					t.Fatalf("expected authorization header, got %q", got)
+				}
+				w.WriteHeader(tc.status)
+			}))
+			defer server.Close()
+
+			cfg := newRepoScopedConfig()
+			dispatchBackend := New(model.BackendCodeBuild, cfg, staticSecrets{
+				"uecb-codebuild": {
+					secretKeyDispatchURL:   "https://dispatch.example.invalid",
+					secretKeyHealthURL:     server.URL,
+					secretKeyDispatchToken: "broker-secret",
+				},
+			})
+			pool := cfg.Pools[1]
+			backendCfg := pool.Backends[model.BackendCodeBuild]
+
+			err := dispatchBackend.Probe(context.Background(), pool, backendCfg)
+			if tc.wantErr && err == nil {
+				t.Fatal("expected probe to fail")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("expected probe to pass, got %v", err)
+			}
+			if tc.reason != "" {
+				reason, ok := backend.FailureReason(err)
+				if !ok || reason != tc.reason {
+					t.Fatalf("expected reason %s, got %s ok=%v err=%v", tc.reason, reason, ok, err)
+				}
+			}
+		})
 	}
 }
 
