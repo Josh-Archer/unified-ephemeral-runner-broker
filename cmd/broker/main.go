@@ -96,6 +96,14 @@ func main() {
 		}
 	}()
 
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for now := range ticker.C {
+			service.ReconcileQueue(context.Background(), now)
+		}
+	}()
+
 	if tierManager != nil {
 		go func() {
 			ticker := time.NewTicker(30 * time.Second)

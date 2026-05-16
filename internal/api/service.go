@@ -37,7 +37,7 @@ type Service struct {
 	registry  *backend.Registry
 	scheds    *scheduler.Registry
 	fairShare *scheduler.PriorityFairShare
-	store     *store.Memory
+	store     store.Store
 	observer  Observer
 	admission *backendAdmission
 	tierMgr   *tier.Manager
@@ -52,19 +52,24 @@ func NewService(cfg model.BrokerConfig, registry *backend.Registry, health func(
 		health = func(context.Context) error { return nil }
 	}
 	schedulerRegistry := scheduler.NewRegistry()
-	return &Service{
+	stateStore, storeErr := store.NewFromConfig(cfg.Broker.StateStore)
+	if stateStore == nil {
+		stateStore = store.NewMemory()
+	}
+	service := &Service{
 		cfg:       cfg,
 		registry:  registry,
 		scheds:    schedulerRegistry,
 		fairShare: scheduler.NewPriorityFairShare(),
-		store:     store.NewMemory(),
+		store:     stateStore,
 		observer:  noopObserver{},
 		admission: newBackendAdmission(),
 		tierMgr:   tier.NewManager(),
-		initErr:   validateSchedulers(cfg.Pools, schedulerRegistry),
 		health:    health,
 		now:       time.Now,
 	}
+	service.initErr = firstErr(storeErr, validateSchedulers(cfg.Pools, schedulerRegistry), service.rehydrateSchedulerState())
+	return service
 }
 
 func (s *Service) SetTierManager(manager *tier.Manager) {
@@ -79,7 +84,49 @@ func (s *Service) SetObserver(observer Observer) {
 	s.observer = observer
 }
 
+func firstErr(errs ...error) error {
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Service) rehydrateSchedulerState() error {
+	if s.store == nil {
+		return nil
+	}
+	for _, status := range s.store.List() {
+		if !isSchedulerAccountedState(status.State) {
+			continue
+		}
+		pool, err := s.resolvePool(status.Pool)
+		if err != nil {
+			return fmt.Errorf("rehydrate allocation %s: %w", status.ID, err)
+		}
+		selected := status.SelectedBackend
+		if selected == "" {
+			return fmt.Errorf("rehydrate allocation %s: selected backend is empty", status.ID)
+		}
+		request := model.AllocationRequest{
+			Pool:          status.Pool,
+			Backend:       &selected,
+			Tenant:        status.Tenant,
+			PriorityClass: status.PriorityClass,
+		}
+		if _, err := s.reserve(pool, request); err != nil {
+			return fmt.Errorf("rehydrate allocation %s on backend %s: %w", status.ID, selected, err)
+		}
+	}
+	return nil
+}
+
 func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest) (model.AllocationStatus, error) {
+	return s.allocateNow(ctx, request, model.AllocationStatus{})
+}
+
+func (s *Service) allocateNow(ctx context.Context, request model.AllocationRequest, existing model.AllocationStatus) (model.AllocationStatus, error) {
 	started := s.now()
 	resultPool := request.Pool
 	var resultBackend model.BackendName
@@ -114,11 +161,19 @@ func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest)
 
 	pool, err = filterEligibleBackends(pool, request)
 	if err != nil {
+		if queued, ok := s.queueAllocation(ctx, request, resultPool, "", err, existing); ok {
+			result = "queued"
+			return queued, nil
+		}
 		return model.AllocationStatus{}, err
 	}
 	if explicitTimeout {
 		pool, err = filterBackendsByTimeout(pool, request)
 		if err != nil {
+			if queued, ok := s.queueAllocation(ctx, request, resultPool, "", err, existing); ok {
+				result = "queued"
+				return queued, nil
+			}
 			return model.AllocationStatus{}, err
 		}
 	}
@@ -126,27 +181,47 @@ func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest)
 	pool, err = s.filterBackendsByAdmission(pool, request)
 	if err != nil {
 		if !fallbackSyntheticBackendPin || !errors.Is(err, ErrBackendRateLimited) && !errors.Is(err, ErrBackendCircuitOpen) {
+			if queued, ok := s.queueAllocation(ctx, request, resultPool, "", err, existing); ok {
+				result = "queued"
+				return queued, nil
+			}
 			return model.AllocationStatus{}, err
 		}
 		request.Backend = nil
 		pool, err = s.filterBackendsByAdmission(admissionInputPool, request)
 		if err != nil {
+			if queued, ok := s.queueAllocation(ctx, request, resultPool, "", err, existing); ok {
+				result = "queued"
+				return queued, nil
+			}
 			return model.AllocationStatus{}, err
 		}
 	}
 	pool, err = s.filterBackendsByTierState(pool, request)
 	if err != nil {
+		if queued, ok := s.queueAllocation(ctx, request, resultPool, "", err, existing); ok {
+			result = "queued"
+			return queued, nil
+		}
 		return model.AllocationStatus{}, err
 	}
 
 	selected, err := s.reserve(pool, request)
 	if err != nil {
 		if !fallbackSyntheticBackendPin || request.Backend == nil || !errors.Is(err, scheduler.ErrNoCapacity) {
+			if queued, ok := s.queueAllocation(ctx, request, pool.Name, "", err, existing); ok {
+				result = "queued"
+				return queued, nil
+			}
 			return model.AllocationStatus{}, err
 		}
 		request.Backend = nil
 		selected, err = s.reserve(pool, request)
 		if err != nil {
+			if queued, ok := s.queueAllocation(ctx, request, pool.Name, "", err, existing); ok {
+				result = "queued"
+				return queued, nil
+			}
 			return model.AllocationStatus{}, err
 		}
 	}
@@ -157,11 +232,26 @@ func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest)
 			s.observer.ObserveBackendAdmissionRejected(pool.Name, selected, decision.Reason)
 			switch decision.Reason {
 			case "circuit-open":
-				return model.AllocationStatus{}, fmt.Errorf("selected backend %q is not admissible: %w", selected, ErrBackendCircuitOpen)
+				err := fmt.Errorf("selected backend %q is not admissible: %w", selected, ErrBackendCircuitOpen)
+				if queued, ok := s.queueAllocation(ctx, request, pool.Name, selected, err, existing); ok {
+					result = "queued"
+					return queued, nil
+				}
+				return model.AllocationStatus{}, err
 			case "rate-limited":
-				return model.AllocationStatus{}, fmt.Errorf("selected backend %q is not admissible: %w", selected, ErrBackendRateLimited)
+				err := fmt.Errorf("selected backend %q is not admissible: %w", selected, ErrBackendRateLimited)
+				if queued, ok := s.queueAllocation(ctx, request, pool.Name, selected, err, existing); ok {
+					result = "queued"
+					return queued, nil
+				}
+				return model.AllocationStatus{}, err
 			default:
-				return model.AllocationStatus{}, fmt.Errorf("selected backend %q is not admissible: %s", selected, decision.Reason)
+				err := fmt.Errorf("selected backend %q is not admissible: %s", selected, decision.Reason)
+				if queued, ok := s.queueAllocation(ctx, request, pool.Name, selected, err, existing); ok {
+					result = "queued"
+					return queued, nil
+				}
+				return model.AllocationStatus{}, err
 			}
 		}
 	}
@@ -172,18 +262,7 @@ func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest)
 		"backend": string(selected),
 	})
 
-	allocation := model.AllocationStatus{
-		ID:              newID(),
-		CorrelationID:   correlationIDFromContext(ctx),
-		Pool:            pool.Name,
-		SelectedBackend: selected,
-		Tenant:          request.Tenant,
-		PriorityClass:   request.PriorityClass,
-		RequestedLabels: append([]string(nil), request.Labels...),
-		Metadata:        map[string]string{backend.MetadataLaunchModeKey: launchModeCold},
-		ExpiresAt:       s.now().Add(timeout),
-		State:           model.StateReserved,
-	}
+	allocation := s.prepareAllocation(ctx, request, existing, pool.Name, selected, timeout)
 
 	s.store.Save(allocation)
 
@@ -229,8 +308,12 @@ func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest)
 	s.observer.ObserveRegistrationLatency(pool.Name, selected, launchLatency)
 	if err != nil {
 		s.release(context.Background(), pool, selected, allocation)
-		s.store.MarkState(allocation.ID, model.StateFailed, s.now(), err.Error())
 		s.recordBackendFailure(pool, selected, err, s.now())
+		if queued, ok := s.queueAllocation(ctx, request, pool.Name, selected, err, allocation); ok {
+			result = "queued"
+			return queued, nil
+		}
+		s.store.MarkState(allocation.ID, model.StateFailed, s.now(), err.Error())
 		logAllocationEvent(ctx, "allocation_failed", map[string]string{
 			"allocation_id": allocation.ID,
 			"pool":          string(pool.Name),
@@ -257,6 +340,118 @@ func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest)
 	})
 
 	return allocation, nil
+}
+
+func (s *Service) prepareAllocation(ctx context.Context, request model.AllocationRequest, existing model.AllocationStatus, pool model.PoolName, selected model.BackendName, timeout time.Duration) model.AllocationStatus {
+	allocation := existing
+	if allocation.ID == "" {
+		allocation.ID = newID()
+		allocation.CorrelationID = correlationIDFromContext(ctx)
+		allocation.Attempts = 0
+	}
+	allocation.Pool = pool
+	allocation.SelectedBackend = selected
+	allocation.Tenant = request.Tenant
+	allocation.PriorityClass = request.PriorityClass
+	allocation.RequestedLabels = append([]string(nil), request.Labels...)
+	allocation.Metadata = map[string]string{backend.MetadataLaunchModeKey: launchModeCold}
+	allocation.ExpiresAt = s.now().Add(timeout)
+	allocation.RetryAfter = time.Time{}
+	allocation.State = model.StateReserved
+	allocation.Error = ""
+	requestCopy := request
+	allocation.Request = &requestCopy
+	return allocation
+}
+
+func (s *Service) queueAllocation(ctx context.Context, request model.AllocationRequest, pool model.PoolName, selected model.BackendName, cause error, existing model.AllocationStatus) (model.AllocationStatus, bool) {
+	if !s.queueEnabled() || !queueableError(cause) {
+		return model.AllocationStatus{}, false
+	}
+	if existing.ID != "" && existing.Attempts >= normalizeQueueMaxAttempts(s.cfg.Broker.Queue) {
+		return model.AllocationStatus{}, false
+	}
+
+	now := s.now()
+	timeout := request.JobTimeout
+	if timeout <= 0 {
+		timeout = s.cfg.Broker.DefaultJobTimeout
+	}
+	if pool == "" {
+		pool = request.Pool
+	}
+	status := existing
+	if status.ID == "" {
+		status.ID = newID()
+		status.CorrelationID = correlationIDFromContext(ctx)
+		status.ExpiresAt = now.Add(timeout)
+	}
+	status.Pool = pool
+	status.SelectedBackend = selected
+	status.Tenant = request.Tenant
+	status.PriorityClass = request.PriorityClass
+	status.RequestedLabels = append([]string(nil), request.Labels...)
+	status.RetryAfter = now.Add(normalizeQueueRetryAfter(s.cfg.Broker.Queue))
+	status.State = model.StatePending
+	status.Error = cause.Error()
+	requestCopy := request
+	requestCopy.JobTimeout = timeout
+	status.Request = &requestCopy
+	if status.Metadata == nil {
+		status.Metadata = map[string]string{}
+	}
+	status.Metadata["queue_reason"] = queueReason(cause)
+	_ = s.store.Save(status)
+	logAllocationEvent(ctx, "allocation_pending", map[string]string{
+		"allocation_id": allocationIDLabel(status.ID),
+		"pool":          string(status.Pool),
+		"backend":       string(status.SelectedBackend),
+		"reason":        status.Metadata["queue_reason"],
+	})
+	return status, true
+}
+
+func (s *Service) ReconcileQueue(ctx context.Context, now time.Time) int {
+	if !s.queueEnabled() {
+		return 0
+	}
+	updated := 0
+	for _, status := range s.store.List() {
+		if status.State != model.StatePending {
+			continue
+		}
+		if !status.RetryAfter.IsZero() && status.RetryAfter.After(now) {
+			continue
+		}
+		if status.Request == nil {
+			s.store.MarkState(status.ID, model.StateFailed, now, "pending allocation is missing original request")
+			updated++
+			continue
+		}
+		if status.ExpiresAt.Before(now) {
+			s.store.MarkState(status.ID, model.StateExpired, now, "pending allocation expired")
+			updated++
+			continue
+		}
+		if status.Attempts >= normalizeQueueMaxAttempts(s.cfg.Broker.Queue) {
+			s.store.MarkState(status.ID, model.StateFailed, now, "pending allocation retry attempts exhausted")
+			updated++
+			continue
+		}
+		status.Attempts++
+		status.RetryAfter = now.Add(normalizeQueueRetryAfter(s.cfg.Broker.Queue))
+		_ = s.store.Save(status)
+		if _, err := s.allocateNow(ctx, *status.Request, status); err != nil {
+			if queued, ok := s.queueAllocation(ctx, *status.Request, status.Pool, status.SelectedBackend, err, status); ok {
+				_ = s.store.Save(queued)
+			} else {
+				s.store.MarkState(status.ID, model.StateFailed, now, err.Error())
+			}
+		}
+		updated++
+	}
+	s.observeState()
+	return updated
 }
 
 func (s *Service) ReconcileWarmPools() {
@@ -1174,6 +1369,10 @@ func isActiveAllocationState(state model.AllocationState) bool {
 	return state == model.StateReady || state == model.StateReserved
 }
 
+func isSchedulerAccountedState(state model.AllocationState) bool {
+	return state == model.StateReady || state == model.StateReserved || state == model.StateWarm
+}
+
 func isTerminalAllocationState(state model.AllocationState) bool {
 	switch state {
 	case model.StateCompleted, model.StateFailed, model.StateCanceled, model.StateExpired, model.StateQuarantined:
@@ -1220,6 +1419,59 @@ func defaultCompletionMessage(state model.AllocationState) string {
 	default:
 		return ""
 	}
+}
+
+func (s *Service) queueEnabled() bool {
+	return s.cfg.Broker.Queue.Enabled
+}
+
+func normalizeQueueRetryAfter(cfg model.AdmissionQueueConfig) time.Duration {
+	if cfg.RetryAfter > 0 {
+		return cfg.RetryAfter
+	}
+	return 30 * time.Second
+}
+
+func normalizeQueueMaxAttempts(cfg model.AdmissionQueueConfig) int {
+	if cfg.MaxAttempts > 0 {
+		return cfg.MaxAttempts
+	}
+	return 3
+}
+
+func queueableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, scheduler.ErrNoCapacity) || errors.Is(err, ErrBackendRateLimited) || errors.Is(err, ErrBackendCircuitOpen) {
+		return true
+	}
+	reason, ok := backend.FailureReason(err)
+	if !ok {
+		return false
+	}
+	switch reason {
+	case backend.FailureReasonTimeout, backend.FailureReasonTransport, backend.FailureReasonThrottled, backend.FailureReasonServerError:
+		return true
+	default:
+		return false
+	}
+}
+
+func queueReason(err error) string {
+	if errors.Is(err, scheduler.ErrNoCapacity) {
+		return "no-capacity"
+	}
+	if errors.Is(err, ErrBackendRateLimited) {
+		return "rate-limited"
+	}
+	if errors.Is(err, ErrBackendCircuitOpen) {
+		return "circuit-open"
+	}
+	if reason, ok := backend.FailureReason(err); ok {
+		return reason
+	}
+	return "retryable"
 }
 
 func completionEventName(state model.AllocationState) string {

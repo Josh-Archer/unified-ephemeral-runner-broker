@@ -18,6 +18,15 @@ data:
       orphanCleanup:
         enabled: {{ .Values.config.broker.orphanCleanup.enabled }}
         quarantineTTL: {{ .Values.config.broker.orphanCleanup.quarantineTTL }}
+      stateStore:
+        type: {{ .Values.config.broker.stateStore.type }}
+        {{- if .Values.config.broker.stateStore.path }}
+        path: {{ .Values.config.broker.stateStore.path }}
+        {{- end }}
+      queue:
+        enabled: {{ .Values.config.broker.queue.enabled }}
+        retryAfter: {{ .Values.config.broker.queue.retryAfter }}
+        maxAttempts: {{ .Values.config.broker.queue.maxAttempts }}
       allowUnauthenticated: {{ .Values.config.allowUnauthenticated }}
       api:
         oidcAudience: {{ .Values.config.broker.api.oidcAudience }}

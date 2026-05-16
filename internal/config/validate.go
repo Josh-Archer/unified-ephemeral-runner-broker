@@ -20,8 +20,38 @@ const (
 )
 
 func Validate(cfg model.BrokerConfig) error {
+	if err := validateStateStore(cfg.Broker.StateStore); err != nil {
+		return err
+	}
+	if err := validateAdmissionQueue(cfg.Broker.Queue); err != nil {
+		return err
+	}
 	if err := validateTierRouting(cfg); err != nil {
 		return err
+	}
+	return nil
+}
+
+func validateStateStore(cfg model.StateStoreConfig) error {
+	switch normalizeStringDefault(cfg.Type, "memory") {
+	case "memory":
+		return nil
+	case "file":
+		if strings.TrimSpace(cfg.Path) == "" {
+			return fmt.Errorf("broker.stateStore.path is required when type is file")
+		}
+		return nil
+	default:
+		return fmt.Errorf("broker.stateStore.type %q is not supported", cfg.Type)
+	}
+}
+
+func validateAdmissionQueue(cfg model.AdmissionQueueConfig) error {
+	if cfg.RetryAfter < 0 {
+		return fmt.Errorf("broker.queue.retryAfter must not be negative")
+	}
+	if cfg.MaxAttempts < 0 {
+		return fmt.Errorf("broker.queue.maxAttempts must not be negative")
 	}
 	return nil
 }

@@ -54,6 +54,13 @@ config:
     orphanCleanup:
       enabled: false
       quarantineTTL: 15m
+    stateStore:
+      type: memory
+      path: ""
+    queue:
+      enabled: false
+      retryAfter: 30s
+      maxAttempts: 3
     api:
       oidcAudience: uecb-broker
     tierRouting:

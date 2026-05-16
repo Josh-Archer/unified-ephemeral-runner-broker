@@ -34,6 +34,14 @@ func Default() model.BrokerConfig {
 			API: model.BrokerAPIConfig{
 				OIDCAudience: "uecb-broker",
 			},
+			StateStore: model.StateStoreConfig{
+				Type: "memory",
+			},
+			Queue: model.AdmissionQueueConfig{
+				Enabled:     false,
+				RetryAfter:  30 * time.Second,
+				MaxAttempts: 3,
+			},
 			TierRouting: model.TierRoutingConfig{
 				Enabled:         false,
 				RefreshInterval: 5 * time.Minute,

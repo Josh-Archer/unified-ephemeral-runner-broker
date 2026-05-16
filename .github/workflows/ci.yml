@@ -68,6 +68,34 @@ jobs:
             -run "Test.*Circuit|Test.*Breaker|Test.*Probe|Test.*Timeout|Test.*RateLimit" \
             -count=1
 
+  adapter-sdk-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Adapter SDK conformance tests
+        run: |
+          go test ./pkg/... ./examples/adapter/... -count=1
+
+  durable-state-queue-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Durable state and queue regression tests
+        run: |
+          go test ./internal/api ./internal/config ./internal/store \
+            -run "Test.*FileStore|Test.*Queue|Test.*Queued|Test.*StateStore" \
+            -count=1
+
   tier-routing-regression:
     runs-on: ubuntu-latest
     steps:

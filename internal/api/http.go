@@ -4,8 +4,11 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 
+	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -77,10 +80,28 @@ func (s *Server) handleAllocations(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusBadRequest, err)
 			return
 		}
+		if allocation.State == model.StatePending {
+			if !allocation.RetryAfter.IsZero() {
+				w.Header().Set("Retry-After", retryAfterSeconds(allocation.RetryAfter, time.Now()))
+			}
+			s.writeJSON(w, http.StatusAccepted, allocation)
+			return
+		}
 		s.writeJSON(w, http.StatusCreated, allocation)
 	default:
 		s.writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 	}
+}
+
+func retryAfterSeconds(retryAfter time.Time, now time.Time) string {
+	if !retryAfter.After(now) {
+		return "0"
+	}
+	seconds := int(retryAfter.Sub(now).Seconds())
+	if seconds < 1 {
+		seconds = 1
+	}
+	return strconv.Itoa(seconds)
 }
 
 func (s *Server) handleAllocationByID(w http.ResponseWriter, r *http.Request) {
