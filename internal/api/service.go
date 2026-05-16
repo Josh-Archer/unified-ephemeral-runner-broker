@@ -149,8 +149,6 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 		return model.AllocationStatus{}, err
 	}
 	resultPool = pool.Name
-	var fallbackSyntheticBackendPin bool
-	request.Backend, fallbackSyntheticBackendPin = s.resolveRequestedBackend(pool, request.Backend)
 
 	explicitTimeout := request.JobTimeout > 0
 	timeout := request.JobTimeout
@@ -177,25 +175,13 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 			return model.AllocationStatus{}, err
 		}
 	}
-	admissionInputPool := pool
 	pool, err = s.filterBackendsByAdmission(pool, request)
 	if err != nil {
-		if !fallbackSyntheticBackendPin || !errors.Is(err, ErrBackendRateLimited) && !errors.Is(err, ErrBackendCircuitOpen) {
-			if queued, ok := s.queueAllocation(ctx, request, resultPool, "", err, existing); ok {
-				result = "queued"
-				return queued, nil
-			}
-			return model.AllocationStatus{}, err
+		if queued, ok := s.queueAllocation(ctx, request, resultPool, "", err, existing); ok {
+			result = "queued"
+			return queued, nil
 		}
-		request.Backend = nil
-		pool, err = s.filterBackendsByAdmission(admissionInputPool, request)
-		if err != nil {
-			if queued, ok := s.queueAllocation(ctx, request, resultPool, "", err, existing); ok {
-				result = "queued"
-				return queued, nil
-			}
-			return model.AllocationStatus{}, err
-		}
+		return model.AllocationStatus{}, err
 	}
 	pool, err = s.filterBackendsByTierState(pool, request)
 	if err != nil {
@@ -208,22 +194,11 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 
 	selected, err := s.reserve(pool, request)
 	if err != nil {
-		if !fallbackSyntheticBackendPin || request.Backend == nil || !errors.Is(err, scheduler.ErrNoCapacity) {
-			if queued, ok := s.queueAllocation(ctx, request, pool.Name, "", err, existing); ok {
-				result = "queued"
-				return queued, nil
-			}
-			return model.AllocationStatus{}, err
+		if queued, ok := s.queueAllocation(ctx, request, pool.Name, "", err, existing); ok {
+			result = "queued"
+			return queued, nil
 		}
-		request.Backend = nil
-		selected, err = s.reserve(pool, request)
-		if err != nil {
-			if queued, ok := s.queueAllocation(ctx, request, pool.Name, "", err, existing); ok {
-				result = "queued"
-				return queued, nil
-			}
-			return model.AllocationStatus{}, err
-		}
+		return model.AllocationStatus{}, err
 	}
 	if s.admission != nil {
 		decision := s.admission.allow(pool.Name, selected, pool.Backends[selected], s.now(), false, true)
@@ -1293,23 +1268,6 @@ func (s *Service) resolvePool(name model.PoolName) (model.PoolConfig, error) {
 		}
 	}
 	return model.PoolConfig{}, ErrUnknownPool
-}
-
-func (s *Service) resolveRequestedBackend(pool model.PoolConfig, requested *model.BackendName) (*model.BackendName, bool) {
-	if requested == nil {
-		return nil, false
-	}
-	if *requested != model.BackendLambda {
-		return requested, false
-	}
-
-	lambdaCfg, hasLambda := pool.Backends[model.BackendLambda]
-	codebuildCfg, hasCodebuild := pool.Backends[model.BackendCodeBuild]
-	if (!hasLambda || !lambdaCfg.Enabled) && hasCodebuild && codebuildCfg.Enabled {
-		backend := model.BackendCodeBuild
-		return &backend, true
-	}
-	return requested, false
 }
 
 func (s *Service) schedulerForPool(pool model.PoolConfig) scheduler.Scheduler {
