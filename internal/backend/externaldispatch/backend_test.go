@@ -208,16 +208,24 @@ func TestProvisionAllowsAzureFunctionsColdStartLatency(t *testing.T) {
 		t.Fatalf("expected execution_id metadata, got %+v", provisioned.Metadata)
 	}
 
+	timeoutServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(250 * time.Millisecond)
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"execution_id":"run-timeout"}`))
+	}))
+	defer timeoutServer.Close()
+
 	codebuildBackend := New(model.BackendCodeBuild, cfg, staticSecrets{
 		"uecb-codebuild": {
-			secretKeyDispatchURL: server.URL,
+			secretKeyDispatchURL: timeoutServer.URL,
 		},
 	})
 	codebuildClient, ok := codebuildBackend.client.(*http.Client)
 	if !ok {
 		t.Fatalf("expected default HTTP client, got %T", codebuildBackend.client)
 	}
-	codebuildClient.Timeout = 10 * time.Millisecond
+	codebuildClient.Timeout = time.Millisecond
 
 	_, err = codebuildBackend.Provision(context.Background(), model.AllocationRequest{
 		Pool:       model.PoolLite,
@@ -226,7 +234,7 @@ func TestProvisionAllowsAzureFunctionsColdStartLatency(t *testing.T) {
 		ID:   "cb-001",
 		Pool: model.PoolLite,
 	})
-	if err == nil || !strings.Contains(err.Error(), "Client.Timeout exceeded while awaiting headers") {
+	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("expected timeout from short-lived controller call, got %v", err)
 	}
 }
