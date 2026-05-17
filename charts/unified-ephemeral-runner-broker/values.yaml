@@ -67,6 +67,7 @@ config:
       enabled: false
       refreshInterval: 5m
       staleAfter: 15m
+      refreshOnStartup: true
       failureMode: pass-through-round-robin
       fallbackBackends:
         - arc
@@ -75,6 +76,7 @@ config:
         timeout: 2s
         secretRef: ""
       providers: {}
+      providerRules: []
   pools:
     - name: full
       labels:
@@ -83,7 +85,7 @@ config:
         - x64
         - uecb
         - uecb-full
-      # Backend schedulers: round-robin, weighted-round-robin
+      # Backend schedulers: round-robin, weighted-round-robin, priority-fair-share
       scheduler: round-robin
       fairShare:
         enabled: false
@@ -109,7 +111,7 @@ config:
         - x64
         - uecb
         - uecb-lite
-      # Backend schedulers: round-robin, weighted-round-robin
+      # Backend schedulers: round-robin, weighted-round-robin, priority-fair-share
       scheduler: round-robin
       fairShare:
         enabled: false

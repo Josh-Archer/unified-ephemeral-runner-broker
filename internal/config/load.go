@@ -43,10 +43,11 @@ func Default() model.BrokerConfig {
 				MaxAttempts: 3,
 			},
 			TierRouting: model.TierRoutingConfig{
-				Enabled:         false,
-				RefreshInterval: 5 * time.Minute,
-				StaleAfter:      15 * time.Minute,
-				FailureMode:     "pass-through-round-robin",
+				Enabled:          false,
+				RefreshInterval:  5 * time.Minute,
+				StaleAfter:       15 * time.Minute,
+				FailureMode:      "pass-through-round-robin",
+				RefreshOnStartup: true,
 				Prometheus: model.TierPrometheusConfig{
 					Timeout: 2 * time.Second,
 				},

@@ -104,6 +104,12 @@ func validateTierRouting(cfg model.BrokerConfig) error {
 		}
 	}
 
+	for index, rule := range tierCfg.ProviderRules {
+		if err := validateProviderTierRule(cfg, tierCfg, index, rule); err != nil {
+			return err
+		}
+	}
+
 	for _, pool := range cfg.Pools {
 		for backendName, backendCfg := range pool.Backends {
 			for index, rule := range backendCfg.TierRules {
@@ -114,6 +120,34 @@ func validateTierRouting(cfg model.BrokerConfig) error {
 		}
 	}
 	return nil
+}
+
+func validateProviderTierRule(cfg model.BrokerConfig, tierCfg model.TierRoutingConfig, index int, rule model.ProviderTierRuleConfig) error {
+	prefix := fmt.Sprintf("broker.tierRouting.providerRules[%d]", index)
+	if strings.TrimSpace(rule.ProviderRef) == "" {
+		return fmt.Errorf("%s.providerRef is required", prefix)
+	}
+	if _, ok := tierCfg.Providers[rule.ProviderRef]; !ok {
+		return fmt.Errorf("%s.providerRef %q does not match a configured provider", prefix, rule.ProviderRef)
+	}
+	if len(rule.Backends) > 0 {
+		for _, backendName := range rule.Backends {
+			if !backendNameConfigured(cfg, backendName) {
+				return fmt.Errorf("%s.backends includes unknown backend %q", prefix, backendName)
+			}
+		}
+	}
+	return validateTierRule(tierCfg, "", "", index, model.TierRuleConfig{
+		Name:               rule.Name,
+		ProviderRef:        rule.ProviderRef,
+		UsageQuery:         rule.UsageQuery,
+		BurnRateQuery:      rule.BurnRateQuery,
+		SoftLimitRatio:     rule.SoftLimitRatio,
+		HardLimitRatio:     rule.HardLimitRatio,
+		MinRemainingCredit: rule.MinRemainingCredit,
+		ProjectionWindow:   rule.ProjectionWindow,
+		Action:             rule.Action,
+	})
 }
 
 func validateTierRule(tierCfg model.TierRoutingConfig, pool model.PoolName, backend model.BackendName, index int, rule model.TierRuleConfig) error {
@@ -161,6 +195,9 @@ func validateTierRule(tierCfg model.TierRoutingConfig, pool model.PoolName, back
 }
 
 func hasTierRules(cfg model.BrokerConfig) bool {
+	if len(cfg.Broker.TierRouting.ProviderRules) > 0 {
+		return true
+	}
 	for _, pool := range cfg.Pools {
 		for _, backend := range pool.Backends {
 			if len(backend.TierRules) > 0 {

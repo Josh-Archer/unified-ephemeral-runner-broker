@@ -78,3 +78,133 @@ func TestConfigRefresherCombinesPrometheusUsageWithProviderLimit(t *testing.T) {
 		t.Fatalf("expected exceeded decision, got %+v", decisions[0])
 	}
 }
+
+func TestConfigRefresherAppliesProviderRuleToMatchingBackends(t *testing.T) {
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	providerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"limit":100,"used":96,"updated_at":"` + now.Format(time.RFC3339) + `"}`))
+	}))
+	defer providerServer.Close()
+
+	refresher := NewConfigRefresher(model.BrokerConfig{
+		Broker: model.BrokerRuntimeConfig{
+			TierRouting: model.TierRoutingConfig{
+				Enabled: true,
+				Providers: map[string]model.TierProviderConfig{
+					"aws-main": {
+						Provider:  "aws",
+						Mode:      "budget",
+						SecretRef: "aws",
+					},
+				},
+				ProviderRules: []model.ProviderTierRuleConfig{{
+					Name:           "aws-budget",
+					ProviderRef:    "aws-main",
+					HardLimitRatio: 0.95,
+					Action:         ActionDisable,
+				}},
+			},
+		},
+		Pools: []model.PoolConfig{{
+			Name: model.PoolLite,
+			Backends: map[model.BackendName]model.BackendConfig{
+				model.BackendCodeBuild: {},
+				model.BackendEC2: {
+					Capabilities: []string{"cloud:aws"},
+				},
+				model.BackendAzureVM: {
+					Capabilities: []string{"cloud:azure"},
+				},
+				model.BackendGCE: {
+					Capabilities: []string{"cloud:gcp"},
+				},
+			},
+		}},
+	}, staticSecretReader{
+		"aws": {"snapshot_url": providerServer.URL},
+	})
+	refresher.now = func() time.Time { return now }
+
+	decisions, err := refresher.Refresh(context.Background())
+	if err != nil {
+		t.Fatalf("refresh returned error: %v", err)
+	}
+	got := decisionsByBackend(decisions)
+	for _, backendName := range []model.BackendName{model.BackendCodeBuild, model.BackendEC2} {
+		decision, ok := got[backendName]
+		if !ok {
+			t.Fatalf("expected decision for %s", backendName)
+		}
+		if decision.State != StateExceeded || decision.Action != ActionDisable {
+			t.Fatalf("expected exceeded disable for %s, got %+v", backendName, decision)
+		}
+	}
+	for _, backendName := range []model.BackendName{model.BackendAzureVM, model.BackendGCE} {
+		if _, ok := got[backendName]; ok {
+			t.Fatalf("did not expect AWS provider rule to affect %s", backendName)
+		}
+	}
+}
+
+func TestConfigRefresherMergesProviderAndBackendRulesMostRestrictively(t *testing.T) {
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	providerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"limit":100,"used":96,"updated_at":"` + now.Format(time.RFC3339) + `"}`))
+	}))
+	defer providerServer.Close()
+
+	refresher := NewConfigRefresher(model.BrokerConfig{
+		Broker: model.BrokerRuntimeConfig{
+			TierRouting: model.TierRoutingConfig{
+				Enabled: true,
+				Providers: map[string]model.TierProviderConfig{
+					"aws-main": {
+						Provider:  "aws",
+						Mode:      "budget",
+						SecretRef: "aws",
+					},
+				},
+				ProviderRules: []model.ProviderTierRuleConfig{{
+					Name:           "aws-budget",
+					ProviderRef:    "aws-main",
+					HardLimitRatio: 0.95,
+					Action:         ActionDisable,
+				}},
+			},
+		},
+		Pools: []model.PoolConfig{{
+			Name: model.PoolLite,
+			Backends: map[model.BackendName]model.BackendConfig{
+				model.BackendCodeBuild: {
+					TierRules: []model.TierRuleConfig{{
+						Name:           "codebuild-observe",
+						ProviderRef:    "aws-main",
+						HardLimitRatio: 0.99,
+						Action:         ActionObserveOnly,
+					}},
+				},
+			},
+		}},
+	}, staticSecretReader{
+		"aws": {"snapshot_url": providerServer.URL},
+	})
+	refresher.now = func() time.Time { return now }
+
+	decisions, err := refresher.Refresh(context.Background())
+	if err != nil {
+		t.Fatalf("refresh returned error: %v", err)
+	}
+	got := decisionsByBackend(decisions)
+	decision := got[model.BackendCodeBuild]
+	if decision.State != StateExceeded || decision.Action != ActionDisable {
+		t.Fatalf("expected provider disable decision to win, got %+v", decision)
+	}
+}
+
+func decisionsByBackend(decisions []Decision) map[model.BackendName]Decision {
+	result := map[model.BackendName]Decision{}
+	for _, decision := range decisions {
+		result[decision.Backend] = decision
+	}
+	return result
+}

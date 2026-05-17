@@ -30,5 +30,7 @@ data:
       allowUnauthenticated: {{ .Values.config.allowUnauthenticated }}
       api:
         oidcAudience: {{ .Values.config.broker.api.oidcAudience }}
+      tierRouting:
+{{ toYaml .Values.config.broker.tierRouting | indent 8 }}
     pools:
 {{ toYaml .Values.config.pools | indent 6 }}
