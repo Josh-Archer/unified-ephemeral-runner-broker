@@ -312,6 +312,11 @@ broker:
         provider: aws
         mode: free-tier
         secretRef: uecb-aws-billing
+    providerRules:
+      - name: aws-free-tier
+        providerRef: aws-main
+        hardLimitRatio: 0.95
+        action: disable
 pools:
   - name: lite
     backends:
@@ -326,13 +331,15 @@ pools:
             action: observe-only
 ```
 
+`providerRules` apply one provider budget, free-tier, or credit decision to every matching backend in every pool. The broker maps `aws` to CodeBuild, Lambda, and EC2; `gcp` to Cloud Run and GCE; and `azure` to Azure Functions and Azure VM. Use `backends` on a provider rule when only a subset should be affected.
+
 Supported fallback modes:
 
 - `pass-through-round-robin`: default; unknown or stale tier data does not block builds.
 - `block`: fail allocations when tier data is unknown, stale, or over policy.
 - `fallback-backends`: route to configured fallback backends such as `arc`.
 
-Use `observe-only` first, then move a backend rule to `deprioritize` or `disable` after validating Prometheus queries and provider snapshots. Pinned requests fail clearly when the requested backend is tier-blocked.
+Use `observe-only` first, then move a provider or backend rule to `deprioritize` or `disable` after validating Prometheus queries and provider snapshots. Pinned requests fail clearly when the requested backend is tier-blocked.
 
 ## Runtime Backend Admission
 

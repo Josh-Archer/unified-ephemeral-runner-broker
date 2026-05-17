@@ -3,6 +3,7 @@ package tier
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -36,8 +37,15 @@ func (r *ConfigRefresher) Refresh(ctx context.Context) ([]Decision, error) {
 		return nil, nil
 	}
 	now := r.now()
-	decisions := make([]Decision, 0)
+	decisions := map[decisionKey]Decision{}
 	var firstErr error
+	for _, ruleCfg := range r.cfg.Broker.TierRouting.ProviderRules {
+		decision, err := r.refreshProviderRule(ctx, ruleCfg, now)
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+		r.addProviderRuleDecisions(decisions, decision, ruleCfg)
+	}
 	for _, pool := range r.cfg.Pools {
 		for backendName, backendCfg := range pool.Backends {
 			for _, ruleCfg := range backendCfg.TierRules {
@@ -45,11 +53,11 @@ func (r *ConfigRefresher) Refresh(ctx context.Context) ([]Decision, error) {
 				if err != nil && firstErr == nil {
 					firstErr = err
 				}
-				decisions = append(decisions, decision)
+				mergeDecision(decisions, decision)
 			}
 		}
 	}
-	return decisions, firstErr
+	return sortedDecisions(decisions), firstErr
 }
 
 func (r *ConfigRefresher) refreshRule(ctx context.Context, pool model.PoolName, backendName model.BackendName, ruleCfg model.TierRuleConfig, now time.Time) (Decision, error) {
@@ -138,6 +146,38 @@ func (r *ConfigRefresher) refreshRule(ctx context.Context, pool model.PoolName, 
 		Now:       now,
 	})
 	return decision, firstErr
+}
+
+func (r *ConfigRefresher) refreshProviderRule(ctx context.Context, ruleCfg model.ProviderTierRuleConfig, now time.Time) (Decision, error) {
+	return r.refreshRule(ctx, "", "", model.TierRuleConfig{
+		Name:               ruleCfg.Name,
+		ProviderRef:        ruleCfg.ProviderRef,
+		UsageQuery:         ruleCfg.UsageQuery,
+		BurnRateQuery:      ruleCfg.BurnRateQuery,
+		SoftLimitRatio:     ruleCfg.SoftLimitRatio,
+		HardLimitRatio:     ruleCfg.HardLimitRatio,
+		MinRemainingCredit: ruleCfg.MinRemainingCredit,
+		ProjectionWindow:   ruleCfg.ProjectionWindow,
+		Action:             ruleCfg.Action,
+	}, now)
+}
+
+func (r *ConfigRefresher) addProviderRuleDecisions(decisions map[decisionKey]Decision, decision Decision, ruleCfg model.ProviderTierRuleConfig) {
+	providerCfg, ok := r.cfg.Broker.TierRouting.Providers[ruleCfg.ProviderRef]
+	if !ok {
+		return
+	}
+	for _, pool := range r.cfg.Pools {
+		for backendName, backendCfg := range pool.Backends {
+			if !providerRuleMatchesBackend(ruleCfg, providerCfg, backendName, backendCfg) {
+				continue
+			}
+			next := decision
+			next.Pool = pool.Name
+			next.Backend = backendName
+			mergeDecision(decisions, next)
+		}
+	}
 }
 
 func (r *ConfigRefresher) providerSnapshot(ctx context.Context, ref string, now time.Time) (SourceSnapshot, error) {
@@ -241,4 +281,100 @@ func resolvePrometheusTimeout(timeout time.Duration) time.Duration {
 		return timeout
 	}
 	return 2 * time.Second
+}
+
+type decisionKey struct {
+	pool    model.PoolName
+	backend model.BackendName
+}
+
+func mergeDecision(decisions map[decisionKey]Decision, next Decision) {
+	key := decisionKey{pool: next.Pool, backend: next.Backend}
+	current, ok := decisions[key]
+	if !ok || decisionMoreRestrictive(next, current) {
+		decisions[key] = next
+	}
+}
+
+func sortedDecisions(decisions map[decisionKey]Decision) []Decision {
+	result := make([]Decision, 0, len(decisions))
+	for _, decision := range decisions {
+		result = append(result, decision)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Pool != result[j].Pool {
+			return result[i].Pool < result[j].Pool
+		}
+		return result[i].Backend < result[j].Backend
+	})
+	return result
+}
+
+func decisionMoreRestrictive(candidate, current Decision) bool {
+	if decisionStateRank(candidate) != decisionStateRank(current) {
+		return decisionStateRank(candidate) > decisionStateRank(current)
+	}
+	return decisionActionRank(candidate.Action) > decisionActionRank(current.Action)
+}
+
+func decisionStateRank(decision Decision) int {
+	if decision.Stale {
+		return 2
+	}
+	switch decision.State {
+	case StateExceeded:
+		return 4
+	case StateApproaching:
+		return 3
+	case StateUnknown:
+		return 2
+	default:
+		return 1
+	}
+}
+
+func decisionActionRank(action string) int {
+	switch normalizeAction(action) {
+	case ActionDisable:
+		return 3
+	case ActionDeprioritize:
+		return 2
+	default:
+		return 1
+	}
+}
+
+func providerRuleMatchesBackend(ruleCfg model.ProviderTierRuleConfig, providerCfg model.TierProviderConfig, backendName model.BackendName, backendCfg model.BackendConfig) bool {
+	if len(ruleCfg.Backends) > 0 {
+		for _, candidate := range ruleCfg.Backends {
+			if candidate == backendName {
+				return true
+			}
+		}
+		return false
+	}
+	return backendProvider(backendName, backendCfg) == strings.ToLower(strings.TrimSpace(providerCfg.Provider))
+}
+
+func backendProvider(backendName model.BackendName, backendCfg model.BackendConfig) string {
+	for _, capability := range backendCfg.Capabilities {
+		switch strings.ToLower(strings.TrimSpace(capability)) {
+		case "cloud:aws":
+			return "aws"
+		case "cloud:azure":
+			return "azure"
+		case "cloud:gcp":
+			return "gcp"
+		}
+	}
+	switch backendName {
+	case model.BackendCodeBuild, model.BackendLambda, model.BackendEC2:
+		return "aws"
+	case model.BackendCloudRun, model.BackendGCE:
+		return "gcp"
+	case model.BackendAzureFunctions, model.BackendAzureVM:
+		return "azure"
+	default:
+		return ""
+	}
 }

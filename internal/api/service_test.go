@@ -230,6 +230,67 @@ func TestFileStoreRehydratesSchedulerCapacity(t *testing.T) {
 	}
 }
 
+func TestFileStoreRehydrateExpiresUnrehydratableAllocation(t *testing.T) {
+	statePath := t.TempDir() + "/allocations.json"
+	cfg := config.Default()
+	cfg.Broker.StateStore = model.StateStoreConfig{Type: "file", Path: statePath}
+
+	writer := NewService(cfg, backend.NewRegistry(testBackend{name: model.BackendARC}, testBackend{name: model.BackendCodeBuild}), nil)
+	if err := writer.store.Save(model.AllocationStatus{
+		ID:              "stale-codebuild",
+		Pool:            model.PoolLite,
+		SelectedBackend: model.BackendCodeBuild,
+		ExpiresAt:       time.Now().Add(30 * time.Minute),
+		State:           model.StateReady,
+	}); err != nil {
+		t.Fatalf("seed state: %v", err)
+	}
+
+	restarted := NewService(cfg, backend.NewRegistry(testBackend{name: model.BackendARC}, testBackend{name: model.BackendCodeBuild}), nil)
+	if err := restarted.Health(context.Background()); err != nil {
+		t.Fatalf("restarted service health should ignore unrehydratable state: %v", err)
+	}
+	status, ok := restarted.Get("stale-codebuild")
+	if !ok {
+		t.Fatal("expected stale allocation to remain visible")
+	}
+	if status.State != model.StateExpired {
+		t.Fatalf("expected stale allocation to be expired, got %s", status.State)
+	}
+	if !strings.Contains(status.Error, "rehydrate skipped") {
+		t.Fatalf("expected rehydrate skip reason, got %q", status.Error)
+	}
+}
+
+func TestFileStoreRehydrateExpiresPastDeadlineAllocation(t *testing.T) {
+	statePath := t.TempDir() + "/allocations.json"
+	cfg := config.Default()
+	cfg.Broker.StateStore = model.StateStoreConfig{Type: "file", Path: statePath}
+
+	writer := NewService(cfg, backend.NewRegistry(testBackend{name: model.BackendARC}), nil)
+	if err := writer.store.Save(model.AllocationStatus{
+		ID:              "expired-active",
+		Pool:            model.PoolFull,
+		SelectedBackend: model.BackendARC,
+		ExpiresAt:       time.Now().Add(-time.Minute),
+		State:           model.StateReady,
+	}); err != nil {
+		t.Fatalf("seed state: %v", err)
+	}
+
+	restarted := NewService(cfg, backend.NewRegistry(testBackend{name: model.BackendARC}), nil)
+	if err := restarted.Health(context.Background()); err != nil {
+		t.Fatalf("restarted service health should ignore expired active state: %v", err)
+	}
+	status, ok := restarted.Get("expired-active")
+	if !ok {
+		t.Fatal("expected expired allocation to remain visible")
+	}
+	if status.State != model.StateExpired {
+		t.Fatalf("expected allocation to be expired, got %s", status.State)
+	}
+}
+
 func TestQueuePendingAllocationRetriesAfterCapacityIsReleased(t *testing.T) {
 	now := time.Unix(2000, 0)
 	service := newServiceWithBrokerConfig(func(cfg *model.BrokerConfig) {

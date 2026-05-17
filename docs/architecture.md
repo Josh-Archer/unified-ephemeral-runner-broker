@@ -79,6 +79,8 @@ Tier-aware routing is evaluated after static eligibility, capability filtering, 
 
 The allocation path only reads cached tier decisions. Prometheus queries and provider budget, free-tier, or credit calls are refreshed out of band and stored in memory per broker process. This keeps allocation latency independent from billing API latency and avoids making `/healthz` depend on cloud billing availability.
 
+Provider-level `broker.tierRouting.providerRules` are evaluated once per provider snapshot and then applied to every matching backend in each pool. This makes spend limits a first-class routing input: if the AWS provider decision is exceeded with `action: disable`, CodeBuild, Lambda, and EC2 are removed before the scheduler sees the candidate pool.
+
 Tier states are normalized to `healthy`, `approaching`, `exceeded`, and `unknown`. Rule actions are `observe-only`, `deprioritize`, and `disable`. `observe-only` never changes routing. `disable` removes an approaching or exceeded backend from scheduler eligibility. Unknown or stale data follows `broker.tierRouting.failureMode`:
 
 - `pass-through-round-robin`: default; ignore tier data and preserve build throughput.
@@ -86,6 +88,8 @@ Tier states are normalized to `healthy`, `approaching`, `exceeded`, and `unknown
 - `fallback-backends`: route through explicit fallback backends, usually `arc` or another self-hosted label.
 
 Pinned backend requests are not silently rerouted when tier policy blocks the pinned backend. The broker returns a deterministic tier-policy error instead.
+
+Persisted allocation state is rehydrated best-effort on startup. Active, unexpired allocations that still fit the current pool/backend config count against scheduler capacity. Terminal, expired, or no-longer-rehydratable allocations are left visible in the state store but marked terminal so stale state cannot make `/healthz` fail after a backend is disabled.
 
 ## Capability Filtering
 

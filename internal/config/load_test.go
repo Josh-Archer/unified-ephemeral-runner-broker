@@ -103,6 +103,11 @@ broker:
         provider: aws
         mode: free-tier
         secretRef: uecb-aws-billing
+    providerRules:
+      - name: aws-free-tier
+        providerRef: aws-main
+        hardLimitRatio: 0.9
+        action: disable
 pools:
   - name: lite
     backends:
@@ -136,6 +141,10 @@ pools:
 	if provider.Provider != "aws" || provider.Mode != "free-tier" || provider.SecretRef != "uecb-aws-billing" {
 		t.Fatalf("unexpected provider config: %+v", provider)
 	}
+	providerRule := cfg.Broker.TierRouting.ProviderRules[0]
+	if providerRule.ProviderRef != "aws-main" || providerRule.Action != "disable" || providerRule.HardLimitRatio != 0.9 {
+		t.Fatalf("unexpected provider tier rule: %+v", providerRule)
+	}
 	rule := cfg.Pools[0].Backends[model.BackendCodeBuild].TierRules[0]
 	if rule.ProviderRef != "aws-main" || rule.Action != "disable" || rule.HardLimitRatio != 0.9 {
 		t.Fatalf("unexpected tier rule: %+v", rule)
@@ -156,6 +165,14 @@ pools:
       codebuild:
         tierRules:
           - providerRef: missing-provider
+`,
+		"invalid provider rule ref": `
+broker:
+  tierRouting:
+    enabled: true
+    providerRules:
+      - providerRef: missing-provider
+        hardLimitRatio: 0.9
 `,
 		"invalid threshold order": `
 broker:

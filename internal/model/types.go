@@ -105,6 +105,7 @@ type TierRoutingConfig struct {
 	FallbackBackends []BackendName                 `yaml:"fallbackBackends,omitempty" json:"fallbackBackends,omitempty"`
 	Prometheus       TierPrometheusConfig          `yaml:"prometheus,omitempty" json:"prometheus,omitempty"`
 	Providers        map[string]TierProviderConfig `yaml:"providers,omitempty" json:"providers,omitempty"`
+	ProviderRules    []ProviderTierRuleConfig      `yaml:"providerRules,omitempty" json:"providerRules,omitempty"`
 	RefreshOnStartup bool                          `yaml:"refreshOnStartup,omitempty" json:"refreshOnStartup,omitempty"`
 }
 
@@ -172,6 +173,19 @@ type TierRuleConfig struct {
 	BurnRateQuery      string        `yaml:"burnRateQuery,omitempty" json:"burnRateQuery,omitempty"`
 	LimitSources       []string      `yaml:"limitSources,omitempty" json:"limitSources,omitempty"`
 	Combine            string        `yaml:"combine,omitempty" json:"combine,omitempty"`
+	SoftLimitRatio     float64       `yaml:"softLimitRatio,omitempty" json:"softLimitRatio,omitempty"`
+	HardLimitRatio     float64       `yaml:"hardLimitRatio,omitempty" json:"hardLimitRatio,omitempty"`
+	MinRemainingCredit float64       `yaml:"minRemainingCredit,omitempty" json:"minRemainingCredit,omitempty"`
+	ProjectionWindow   time.Duration `yaml:"projectionWindow,omitempty" json:"projectionWindow,omitempty"`
+	Action             string        `yaml:"action,omitempty" json:"action,omitempty"`
+}
+
+type ProviderTierRuleConfig struct {
+	Name               string        `yaml:"name,omitempty" json:"name,omitempty"`
+	ProviderRef        string        `yaml:"providerRef,omitempty" json:"providerRef,omitempty"`
+	Backends           []BackendName `yaml:"backends,omitempty" json:"backends,omitempty"`
+	UsageQuery         string        `yaml:"usageQuery,omitempty" json:"usageQuery,omitempty"`
+	BurnRateQuery      string        `yaml:"burnRateQuery,omitempty" json:"burnRateQuery,omitempty"`
 	SoftLimitRatio     float64       `yaml:"softLimitRatio,omitempty" json:"softLimitRatio,omitempty"`
 	HardLimitRatio     float64       `yaml:"hardLimitRatio,omitempty" json:"hardLimitRatio,omitempty"`
 	MinRemainingCredit float64       `yaml:"minRemainingCredit,omitempty" json:"minRemainingCredit,omitempty"`

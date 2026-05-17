@@ -97,17 +97,24 @@ func (s *Service) rehydrateSchedulerState() error {
 	if s.store == nil {
 		return nil
 	}
+	now := s.now()
 	for _, status := range s.store.List() {
 		if !isSchedulerAccountedState(status.State) {
 			continue
 		}
 		pool, err := s.resolvePool(status.Pool)
 		if err != nil {
-			return fmt.Errorf("rehydrate allocation %s: %w", status.ID, err)
+			s.expireUnrehydratableAllocation(status, now, fmt.Sprintf("rehydrate skipped: %v", err))
+			continue
 		}
 		selected := status.SelectedBackend
 		if selected == "" {
-			return fmt.Errorf("rehydrate allocation %s: selected backend is empty", status.ID)
+			s.expireUnrehydratableAllocation(status, now, "rehydrate skipped: selected backend is empty")
+			continue
+		}
+		if !status.ExpiresAt.IsZero() && !status.ExpiresAt.After(now) {
+			s.expireUnrehydratableAllocation(status, now, "rehydrate skipped: allocation expired")
+			continue
 		}
 		request := model.AllocationRequest{
 			Pool:          status.Pool,
@@ -116,10 +123,29 @@ func (s *Service) rehydrateSchedulerState() error {
 			PriorityClass: status.PriorityClass,
 		}
 		if _, err := s.reserve(pool, request); err != nil {
-			return fmt.Errorf("rehydrate allocation %s on backend %s: %w", status.ID, selected, err)
+			s.expireUnrehydratableAllocation(status, now, fmt.Sprintf("rehydrate skipped: %v", err))
+			continue
 		}
 	}
 	return nil
+}
+
+func (s *Service) expireUnrehydratableAllocation(status model.AllocationStatus, now time.Time, reason string) {
+	if status.ID == "" || s.store == nil {
+		return
+	}
+	nextState := model.StateExpired
+	if status.State == model.StateWarm {
+		nextState = model.StateFailed
+	}
+	_, _ = s.store.MarkState(status.ID, nextState, now, reason)
+	logAllocationEvent(context.Background(), "allocation_rehydrate_skipped", map[string]string{
+		"allocation_id": allocationIDLabel(status.ID),
+		"pool":          string(status.Pool),
+		"backend":       string(status.SelectedBackend),
+		"state":         string(status.State),
+		"reason":        reason,
+	})
 }
 
 func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest) (model.AllocationStatus, error) {
