@@ -47,9 +47,9 @@ Queued admission is optional and disabled by default.
 When enabled, the broker stores retryable allocation failures as `pending`
 instead of failing the workflow immediately. Retryable failures include
 temporary provider dispatch errors, open backend circuits, and short capacity
-gaps. Rate-limited backends are treated as fallback candidates first: the broker
-tries another eligible backend, and fails fast with a rate-limit exhaustion
-error when no fallback backend can run the allocation.
+gaps. Rate-limited backends are treated as fallback candidates first and are
+not queued: the broker tries another eligible backend, then fails fast with a
+rate-limit exhaustion error when no fallback backend can run the allocation.
 
 ## Pools
 
@@ -71,6 +71,12 @@ Backends may opt into runtime admission controls with `circuitBreaker` and `rate
 Admission order is deterministic: static `enabled`/`healthy`, capability filtering, requested timeout filtering, runtime circuit and cold-launch rate limiting, scheduler reservation, then backend provisioning.
 
 Circuit state is in-memory and scoped to a single `pool/backend` within one broker process. Keep broker replicas at `1` for this feature unless scheduler, allocation, and admission state are moved to shared storage together. Timeout-like provision failures, throttling, server errors, explicit `failure_class` completion callbacks, and allocation expiry can open the circuit for the failing backend only. Open backends are skipped for unpinned requests so another eligible backend can serve the allocation; pinned requests fail fast with a circuit-open error.
+
+Rate limiting only applies to cold launches. The broker consumes permits during
+admission, skips rate-limited backends for the current attempt, and may route a
+pinned request to another eligible backend when the pinned backend is
+throttled. If every remaining backend is rate-limited, the broker returns an
+explicit rate-limit exhaustion error instead of creating a pending allocation.
 
 The background backend-health loop probes open circuits and closes them after the configured recovery threshold. Backends without a probe implementation recover through the same success path once the circuit admits a half-open request.
 

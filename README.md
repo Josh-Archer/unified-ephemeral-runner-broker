@@ -171,8 +171,10 @@ into scheduler accounting so a restarted broker does not over-admit capacity.
 ### Queued Admission
 
 Queued admission is disabled by default. When enabled, retryable allocation
-failures such as no capacity, backend rate limiting, open backend circuits, or
-transient provider dispatch failures are stored as `pending` allocations.
+failures such as no capacity, open backend circuits, or transient provider
+dispatch failures are stored as `pending` allocations. Cold-launch rate limits
+are handled separately: the broker tries another eligible backend immediately
+and returns a direct error when no fallback backend can admit the request.
 
 ```yaml
 broker:
@@ -366,9 +368,17 @@ pools:
           recoverySuccessThreshold: 1
 ```
 
-`rateLimit` applies only to cold provisioning attempts. Warm runner reuse is not rate limited. When a cold
-backend is rate-limited, the broker tries another eligible backend; if none can run the allocation, the
-request fails fast with a rate-limit fallback exhaustion error instead of waiting in the queue.
+`rateLimit` applies only to cold provisioning attempts. Warm runner reuse is
+not rate limited, and each cold launch attempt consumes a permit even if the
+allocation is later canceled or fails downstream. When a cold backend is
+rate-limited, the broker tries another eligible backend; if none can run the
+allocation, the request fails fast with a rate-limit fallback exhaustion error
+instead of waiting in the queue.
+
+Unlike circuit-open or tier-policy rejections, rate limiting can still redirect
+a pinned request to another eligible backend. Pinning remains a preference for
+the first cold-launch attempt, not a guarantee that a rate-limited backend will
+be retried in place.
 
 ## Warm Capacity
 
