@@ -75,10 +75,15 @@ func newBackendAdmission() *backendAdmission {
 func (a *backendAdmission) filter(pool model.PoolConfig, request model.AllocationRequest, now time.Time) (model.PoolConfig, error) {
 	filtered := pool
 	filtered.Backends = make(map[model.BackendName]model.BackendConfig, len(pool.Backends))
+	rateLimited := 0
 	for name, cfg := range pool.Backends {
 		decision := a.allow(pool.Name, name, cfg, now, false, false)
 		if decision.Allowed {
 			filtered.Backends[name] = cfg
+			continue
+		}
+		if decision.Reason == "rate-limited" {
+			rateLimited++
 		}
 	}
 
@@ -102,6 +107,9 @@ func (a *backendAdmission) filter(pool model.PoolConfig, request model.Allocatio
 	}
 
 	if len(filtered.Backends) == 0 {
+		if rateLimited == len(pool.Backends) {
+			return model.PoolConfig{}, fmt.Errorf("all eligible backends for pool %q are rate-limited: %w", pool.Name, ErrBackendRateLimited)
+		}
 		return model.PoolConfig{}, fmt.Errorf("%w for pool %q after backend admission filtering", scheduler.ErrNoCapacity, pool.Name)
 	}
 	return filtered, nil

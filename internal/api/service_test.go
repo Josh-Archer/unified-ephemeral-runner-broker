@@ -821,7 +821,7 @@ func TestCompleteFailureClassOpensCircuit(t *testing.T) {
 	}
 }
 
-func TestRateLimitAppliesToSelectedColdBackendOnly(t *testing.T) {
+func TestRateLimitedPinnedBackendFallsBackToAnotherBackend(t *testing.T) {
 	service := newServiceWithConfig(func(pool *model.PoolConfig) {
 		if pool.Name != model.PoolLite {
 			return
@@ -838,6 +838,11 @@ func TestRateLimitAppliesToSelectedColdBackendOnly(t *testing.T) {
 		codebuildCfg.RateLimit.Permits = 1
 		codebuildCfg.RateLimit.Interval = time.Minute
 		pool.Backends[model.BackendCodeBuild] = codebuildCfg
+		lambdaCfg := pool.Backends[model.BackendLambda]
+		lambdaCfg.Enabled = true
+		lambdaCfg.Healthy = true
+		lambdaCfg.MaxRunners = 1
+		pool.Backends[model.BackendLambda] = lambdaCfg
 	})
 	service.now = func() time.Time { return time.Unix(1000, 0) }
 
@@ -854,12 +859,71 @@ func TestRateLimitAppliesToSelectedColdBackendOnly(t *testing.T) {
 		t.Fatal("cancel failed")
 	}
 
-	if _, err := service.Allocate(context.Background(), model.AllocationRequest{
+	fallback, err := service.Allocate(context.Background(), model.AllocationRequest{
 		Pool:       model.PoolLite,
 		Backend:    &pinned,
 		JobTimeout: 5 * time.Minute,
-	}); !errors.Is(err, ErrBackendRateLimited) {
-		t.Fatalf("expected second allocation to be rate limited, got %v", err)
+	})
+	if err != nil {
+		t.Fatalf("expected second allocation to fall back from rate-limited pinned backend: %v", err)
+	}
+	if fallback.SelectedBackend != model.BackendLambda {
+		t.Fatalf("expected fallback backend %s, got %s", model.BackendLambda, fallback.SelectedBackend)
+	}
+}
+
+func TestRateLimitedPinnedBackendFailsFastWhenNoFallbackBackendAvailable(t *testing.T) {
+	service := newServiceWithBrokerConfig(func(cfg *model.BrokerConfig) {
+		cfg.Broker.Queue.Enabled = true
+		for index := range cfg.Pools {
+			pool := &cfg.Pools[index]
+			if pool.Name != model.PoolLite {
+				continue
+			}
+			for name, backendCfg := range pool.Backends {
+				backendCfg.Enabled = false
+				pool.Backends[name] = backendCfg
+			}
+			codebuildCfg := pool.Backends[model.BackendCodeBuild]
+			codebuildCfg.Enabled = true
+			codebuildCfg.Healthy = true
+			codebuildCfg.MaxRunners = 1
+			codebuildCfg.RateLimit.Enabled = true
+			codebuildCfg.RateLimit.Permits = 1
+			codebuildCfg.RateLimit.Interval = time.Minute
+			pool.Backends[model.BackendCodeBuild] = codebuildCfg
+		}
+	})
+	service.now = func() time.Time { return time.Unix(1000, 0) }
+
+	pinned := model.BackendCodeBuild
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolLite,
+		Backend:    &pinned,
+		JobTimeout: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("first allocation failed: %v", err)
+	}
+	if _, ok := service.Cancel(allocation.ID); !ok {
+		t.Fatal("cancel failed")
+	}
+
+	_, err = service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolLite,
+		Backend:    &pinned,
+		JobTimeout: 5 * time.Minute,
+	})
+	if !errors.Is(err, ErrBackendRateLimited) {
+		t.Fatalf("expected rate limit error, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "no fallback backend is available") {
+		t.Fatalf("expected explicit fallback exhaustion message, got %v", err)
+	}
+	for _, status := range service.store.List() {
+		if status.State == model.StatePending {
+			t.Fatalf("rate-limited fallback exhaustion should fail fast, got pending allocation %+v", status)
+		}
 	}
 }
 

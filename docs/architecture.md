@@ -46,9 +46,10 @@ Queued admission is optional and disabled by default.
 
 When enabled, the broker stores retryable allocation failures as `pending`
 instead of failing the workflow immediately. Retryable failures include
-temporary provider dispatch errors, rate-limited backends, open backend
-circuits, and short capacity gaps. The queue reconciler retries pending
-allocations until they become `ready`, expire, or exhaust `maxAttempts`.
+temporary provider dispatch errors, open backend circuits, and short capacity
+gaps. Rate-limited backends are treated as fallback candidates first: the broker
+tries another eligible backend, and fails fast with a rate-limit exhaustion
+error when no fallback backend can run the allocation.
 
 ## Pools
 

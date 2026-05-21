@@ -366,7 +366,9 @@ pools:
           recoverySuccessThreshold: 1
 ```
 
-`rateLimit` applies only to cold provisioning attempts. Warm runner reuse is not rate limited.
+`rateLimit` applies only to cold provisioning attempts. Warm runner reuse is not rate limited. When a cold
+backend is rate-limited, the broker tries another eligible backend; if none can run the allocation, the
+request fails fast with a rate-limit fallback exhaustion error instead of waiting in the queue.
 
 ## Warm Capacity
 
