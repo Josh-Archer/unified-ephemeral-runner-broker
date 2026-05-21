@@ -55,6 +55,12 @@ High allocation failure rate means requests are being rejected or backend provis
 
 Open backend circuits mean the broker is intentionally draining a backend after repeated timeout, wait, throttling, transport, or server-error signals. Check `uecb_backend_circuit_transitions_total` for the trip reason and `uecb_backend_probe_results_total` for recovery progress.
 
+High `uecb_backend_admission_rejections_total{reason="rate-limited"}` with
+flat `uecb_queue_depth` means cold-launch permits are being exhausted before
+the queue path is reached. Expect immediate allocation errors when no fallback
+backend remains; check whether another backend should be enabled, warm capacity
+should be raised, or the backend `rateLimit` should be relaxed.
+
 Tier fallback activity means all eligible cloud backends were unavailable under the current tier policy or tier data was stale/unknown. Check `uecb_tier_state` first, then validate the Prometheus recording rules and provider budget/free-tier/credit API responses that feed the cache.
 
 Saturated capacity means the scheduler has few or no healthy slots available for a pool/backend. Check `maxRunners`, runner cleanup, and whether completed jobs are leaving allocations in `ready` or `reserved`.
