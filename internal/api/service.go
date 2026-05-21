@@ -201,7 +201,9 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 			return model.AllocationStatus{}, err
 		}
 	}
-	pool, err = s.filterBackendsByAdmission(pool, request)
+	pinnedBackend := request.Backend
+	var fallbackFromRateLimit bool
+	pool, request, fallbackFromRateLimit, err = s.filterBackendsByAdmission(pool, request)
 	if err != nil {
 		if queued, ok := s.queueAllocation(ctx, request, resultPool, "", err, existing); ok {
 			result = "queued"
@@ -218,43 +220,65 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 		return model.AllocationStatus{}, err
 	}
 
-	selected, err := s.reserve(pool, request)
-	if err != nil {
-		if queued, ok := s.queueAllocation(ctx, request, pool.Name, "", err, existing); ok {
-			result = "queued"
-			return queued, nil
+	reservePool := pool
+	reserveRequest := request
+	var selected model.BackendName
+	var rateLimitedFallback model.BackendName
+	for {
+		selected, err = s.reserve(reservePool, reserveRequest)
+		if err != nil {
+			if errors.Is(err, scheduler.ErrNoCapacity) {
+				if rateLimitedFallback != "" {
+					return model.AllocationStatus{}, fmt.Errorf("selected backend %q is rate-limited and no fallback backend is available: %w", rateLimitedFallback, ErrBackendRateLimited)
+				}
+				if fallbackFromRateLimit && pinnedBackend != nil {
+					return model.AllocationStatus{}, fmt.Errorf("pinned backend %q is rate-limited and no fallback backend is available: %w", *pinnedBackend, ErrBackendRateLimited)
+				}
+			}
+			if queued, ok := s.queueAllocation(ctx, reserveRequest, reservePool.Name, "", err, existing); ok {
+				result = "queued"
+				return queued, nil
+			}
+			return model.AllocationStatus{}, err
 		}
-		return model.AllocationStatus{}, err
-	}
-	if s.admission != nil {
-		decision := s.admission.allow(pool.Name, selected, pool.Backends[selected], s.now(), false, true)
+		if s.admission == nil {
+			pool = reservePool
+			request = reserveRequest
+			break
+		}
+		decision := s.admission.allow(reservePool.Name, selected, reservePool.Backends[selected], s.now(), false, true)
 		if !decision.Allowed {
-			s.release(context.Background(), pool, selected, model.AllocationStatus{Pool: pool.Name, SelectedBackend: selected})
-			s.observer.ObserveBackendAdmissionRejected(pool.Name, selected, decision.Reason)
+			s.release(context.Background(), reservePool, selected, model.AllocationStatus{Pool: reservePool.Name, SelectedBackend: selected})
+			s.observer.ObserveBackendAdmissionRejected(reservePool.Name, selected, decision.Reason)
 			switch decision.Reason {
 			case "circuit-open":
 				err := fmt.Errorf("selected backend %q is not admissible: %w", selected, ErrBackendCircuitOpen)
-				if queued, ok := s.queueAllocation(ctx, request, pool.Name, selected, err, existing); ok {
+				if queued, ok := s.queueAllocation(ctx, reserveRequest, reservePool.Name, selected, err, existing); ok {
 					result = "queued"
 					return queued, nil
 				}
 				return model.AllocationStatus{}, err
 			case "rate-limited":
-				err := fmt.Errorf("selected backend %q is not admissible: %w", selected, ErrBackendRateLimited)
-				if queued, ok := s.queueAllocation(ctx, request, pool.Name, selected, err, existing); ok {
-					result = "queued"
-					return queued, nil
+				rateLimitedFallback = selected
+				reservePool = withoutBackend(reservePool, selected)
+				reserveRequest.Backend = nil
+				if len(reservePool.Backends) > 0 {
+					continue
 				}
+				err := fmt.Errorf("selected backend %q is rate-limited and no fallback backend is available: %w", selected, ErrBackendRateLimited)
 				return model.AllocationStatus{}, err
 			default:
 				err := fmt.Errorf("selected backend %q is not admissible: %s", selected, decision.Reason)
-				if queued, ok := s.queueAllocation(ctx, request, pool.Name, selected, err, existing); ok {
+				if queued, ok := s.queueAllocation(ctx, reserveRequest, reservePool.Name, selected, err, existing); ok {
 					result = "queued"
 					return queued, nil
 				}
 				return model.AllocationStatus{}, err
 			}
 		}
+		pool = reservePool
+		request = reserveRequest
+		break
 	}
 	resultBackend = selected
 	s.observer.ObserveAllocationStart(pool.Name)
@@ -847,9 +871,9 @@ func (s *Service) reserveForBackend(pool model.PoolConfig, backendName model.Bac
 	return s.reserve(pool, request)
 }
 
-func (s *Service) filterBackendsByAdmission(pool model.PoolConfig, request model.AllocationRequest) (model.PoolConfig, error) {
+func (s *Service) filterBackendsByAdmission(pool model.PoolConfig, request model.AllocationRequest) (model.PoolConfig, model.AllocationRequest, bool, error) {
 	if s.admission == nil {
-		return pool, nil
+		return pool, request, false, nil
 	}
 	filtered, err := s.admission.filter(pool, request, s.now())
 	if err != nil {
@@ -859,9 +883,24 @@ func (s *Service) filterBackendsByAdmission(pool model.PoolConfig, request model
 				reason = "rate-limited"
 			}
 			s.observer.ObserveBackendAdmissionRejected(pool.Name, *request.Backend, reason)
+			if errors.Is(err, ErrBackendRateLimited) {
+				fallbackRequest := request
+				fallbackRequest.Backend = nil
+				fallback, fallbackErr := s.admission.filter(pool, fallbackRequest, s.now())
+				if fallbackErr == nil {
+					s.observeAdmissionRejections(pool, fallback)
+					return fallback, fallbackRequest, true, nil
+				}
+				return model.PoolConfig{}, request, false, fmt.Errorf("pinned backend %q is rate-limited and no fallback backend is available: %w", *request.Backend, fallbackErr)
+			}
 		}
-		return model.PoolConfig{}, err
+		return model.PoolConfig{}, request, false, err
 	}
+	s.observeAdmissionRejections(pool, filtered)
+	return filtered, request, false, nil
+}
+
+func (s *Service) observeAdmissionRejections(pool model.PoolConfig, filtered model.PoolConfig) {
 	for name := range pool.Backends {
 		if _, ok := filtered.Backends[name]; !ok {
 			decision := s.admission.allow(pool.Name, name, pool.Backends[name], s.now(), false, false)
@@ -870,7 +909,18 @@ func (s *Service) filterBackendsByAdmission(pool model.PoolConfig, request model
 			}
 		}
 	}
-	return filtered, nil
+}
+
+func withoutBackend(pool model.PoolConfig, name model.BackendName) model.PoolConfig {
+	filtered := pool
+	filtered.Backends = make(map[model.BackendName]model.BackendConfig, len(pool.Backends))
+	for candidate, cfg := range pool.Backends {
+		if candidate == name {
+			continue
+		}
+		filtered.Backends[candidate] = cfg
+	}
+	return filtered
 }
 
 func (s *Service) filterBackendsByTierState(pool model.PoolConfig, request model.AllocationRequest) (model.PoolConfig, error) {
@@ -1427,7 +1477,7 @@ func queueableError(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, scheduler.ErrNoCapacity) || errors.Is(err, ErrBackendRateLimited) || errors.Is(err, ErrBackendCircuitOpen) {
+	if errors.Is(err, scheduler.ErrNoCapacity) || errors.Is(err, ErrBackendCircuitOpen) {
 		return true
 	}
 	reason, ok := backend.FailureReason(err)
