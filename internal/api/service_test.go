@@ -927,6 +927,13 @@ func TestRateLimitedPinnedBackendFailsFastWhenNoFallbackBackendAvailable(t *test
 	}
 }
 
+func TestRateLimitedErrorsAreNotQueued(t *testing.T) {
+	err := fmt.Errorf("pinned backend %q is rate-limited and no fallback backend is available: %w", model.BackendLambda, ErrBackendRateLimited)
+	if queueableError(err) {
+		t.Fatalf("rate-limited fallback exhaustion must fail fast instead of entering the admission queue")
+	}
+}
+
 func TestHalfOpenAdmissionDoesNotConsumeProbeSlotDuringFiltering(t *testing.T) {
 	service := newServiceWithConfig(func(pool *model.PoolConfig) {
 		if pool.Name != model.PoolLite {

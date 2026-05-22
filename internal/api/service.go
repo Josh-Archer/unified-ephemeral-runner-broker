@@ -1477,6 +1477,9 @@ func queueableError(err error) bool {
 	if err == nil {
 		return false
 	}
+	if errors.Is(err, ErrBackendRateLimited) {
+		return false
+	}
 	if errors.Is(err, scheduler.ErrNoCapacity) || errors.Is(err, ErrBackendCircuitOpen) {
 		return true
 	}
