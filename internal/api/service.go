@@ -1480,7 +1480,10 @@ func queueableError(err error) bool {
 	if errors.Is(err, ErrBackendRateLimited) {
 		return false
 	}
-	if errors.Is(err, scheduler.ErrNoCapacity) || errors.Is(err, ErrBackendCircuitOpen) {
+	if errors.Is(err, scheduler.ErrNoCapacity) {
+		return false
+	}
+	if errors.Is(err, ErrBackendCircuitOpen) {
 		return true
 	}
 	reason, ok := backend.FailureReason(err)
