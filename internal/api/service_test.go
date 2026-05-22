@@ -291,7 +291,7 @@ func TestFileStoreRehydrateExpiresPastDeadlineAllocation(t *testing.T) {
 	}
 }
 
-func TestQueuePendingAllocationRetriesAfterCapacityIsReleased(t *testing.T) {
+func TestNoCapacityFailsFastInsteadOfEnteringQueue(t *testing.T) {
 	now := time.Unix(2000, 0)
 	service := newServiceWithBrokerConfig(func(cfg *model.BrokerConfig) {
 		cfg.Broker.Queue.Enabled = true
@@ -306,32 +306,21 @@ func TestQueuePendingAllocationRetriesAfterCapacityIsReleased(t *testing.T) {
 	})
 	service.now = func() time.Time { return now }
 
-	first, err := service.Allocate(context.Background(), model.AllocationRequest{Pool: model.PoolFull, JobTimeout: time.Minute})
+	_, err := service.Allocate(context.Background(), model.AllocationRequest{Pool: model.PoolFull, JobTimeout: time.Minute})
 	if err != nil {
 		t.Fatalf("first allocate: %v", err)
 	}
-	pending, err := service.Allocate(context.Background(), model.AllocationRequest{Pool: model.PoolFull, JobTimeout: time.Minute})
-	if err != nil {
-		t.Fatalf("expected second allocation to queue, got %v", err)
+	_, err = service.Allocate(context.Background(), model.AllocationRequest{Pool: model.PoolFull, JobTimeout: time.Minute})
+	if !errors.Is(err, scheduler.ErrNoCapacity) {
+		t.Fatalf("expected no-capacity error, got %v", err)
 	}
-	if pending.State != model.StatePending {
-		t.Fatalf("expected pending state, got %s", pending.State)
+	if queueableError(err) {
+		t.Fatalf("no-capacity exhaustion must fail fast instead of entering the admission queue")
 	}
-
-	service.Cancel(first.ID)
-	now = now.Add(2 * time.Second)
-	if updated := service.ReconcileQueue(context.Background(), now); updated != 1 {
-		t.Fatalf("expected one queued allocation to reconcile, got %d", updated)
-	}
-	retried, ok := service.Get(pending.ID)
-	if !ok {
-		t.Fatal("expected queued allocation to still exist")
-	}
-	if retried.State != model.StateReady {
-		t.Fatalf("expected queued allocation to become ready, got %+v", retried)
-	}
-	if retried.Attempts != 1 {
-		t.Fatalf("expected one retry attempt, got %d", retried.Attempts)
+	for _, status := range service.store.List() {
+		if status.State == model.StatePending {
+			t.Fatalf("no-capacity exhaustion should fail fast, got pending allocation %+v", status)
+		}
 	}
 }
 

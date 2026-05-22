@@ -171,10 +171,11 @@ into scheduler accounting so a restarted broker does not over-admit capacity.
 ### Queued Admission
 
 Queued admission is disabled by default. When enabled, retryable allocation
-failures such as no capacity, open backend circuits, or transient provider
-dispatch failures are stored as `pending` allocations. Cold-launch rate limits
-are handled separately: the broker tries another eligible backend immediately
-and returns a direct error when no fallback backend can admit the request.
+failures such as open backend circuits or transient provider dispatch failures
+are stored as `pending` allocations. Capacity exhaustion and cold-launch rate
+limits fail fast instead of entering the queue: rate-limited backends are
+skipped in favor of another eligible backend, and the broker returns a direct
+error when no backend can admit the request.
 
 ```yaml
 broker:
