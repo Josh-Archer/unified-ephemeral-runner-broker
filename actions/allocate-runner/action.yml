@@ -158,12 +158,12 @@ PY
             exit 1
           fi
           allocation_id="$(printf '%s' "${response}" | python -c "import json,sys; print(json.load(sys.stdin)['allocation_id'])")"
-          retry_after="$(printf '%s' "${response}" | python - <<'PY'
+          retry_after="$(export RESPONSE_JSON="${response}"; python - <<'PY'
 import datetime
 import json
-import sys
+import os
 
-payload = json.load(sys.stdin)
+payload = json.loads(os.environ["RESPONSE_JSON"])
 value = payload.get("retry_after")
 if not value:
     print(5)
