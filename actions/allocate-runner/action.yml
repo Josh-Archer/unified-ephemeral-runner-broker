@@ -96,59 +96,59 @@ runs:
         fi
 
         request_body="$(python - <<'PY'
-import json
-import os
+        import json
+        import os
 
-payload = {
-    "pool": os.environ["INPUT_POOL"],
-    "job_timeout": os.environ["INPUT_JOB_TIMEOUT"],
-}
+        payload = {
+            "pool": os.environ["INPUT_POOL"],
+            "job_timeout": os.environ["INPUT_JOB_TIMEOUT"],
+        }
 
-backend = os.environ.get("INPUT_BACKEND", "").strip()
-if backend:
-    payload["backend"] = backend
+        backend = os.environ.get("INPUT_BACKEND", "").strip()
+        if backend:
+            payload["backend"] = backend
 
-labels = [item.strip() for item in os.environ.get("INPUT_LABELS", "").split(",") if item.strip()]
-if labels:
-    payload["labels"] = labels
+        labels = [item.strip() for item in os.environ.get("INPUT_LABELS", "").split(",") if item.strip()]
+        if labels:
+            payload["labels"] = labels
 
-tenant = os.environ.get("INPUT_TENANT", "").strip()
-if tenant:
-    payload["tenant"] = tenant
+        tenant = os.environ.get("INPUT_TENANT", "").strip()
+        if tenant:
+            payload["tenant"] = tenant
 
-priority_class = os.environ.get("INPUT_PRIORITY_CLASS", "").strip()
-if priority_class:
-    payload["priority_class"] = priority_class
+        priority_class = os.environ.get("INPUT_PRIORITY_CLASS", "").strip()
+        if priority_class:
+            payload["priority_class"] = priority_class
 
-required_capabilities = [item.strip() for item in os.environ.get("INPUT_REQUIRED_CAPABILITIES", "").split(",") if item.strip()]
-if required_capabilities:
-    payload["required_capabilities"] = required_capabilities
+        required_capabilities = [item.strip() for item in os.environ.get("INPUT_REQUIRED_CAPABILITIES", "").split(",") if item.strip()]
+        if required_capabilities:
+            payload["required_capabilities"] = required_capabilities
 
-excluded_capabilities = [item.strip() for item in os.environ.get("INPUT_EXCLUDED_CAPABILITIES", "").split(",") if item.strip()]
-if excluded_capabilities:
-    payload["excluded_capabilities"] = excluded_capabilities
+        excluded_capabilities = [item.strip() for item in os.environ.get("INPUT_EXCLUDED_CAPABILITIES", "").split(",") if item.strip()]
+        if excluded_capabilities:
+            payload["excluded_capabilities"] = excluded_capabilities
 
-print(json.dumps(payload))
-PY
-)"
+        print(json.dumps(payload))
+        PY
+        )"
 
         response="$(curl -fsSL "${auth_args[@]}" -H "Content-Type: application/json" -d "${request_body}" "${INPUT_BROKER_URL%/}/v1/allocations")"
 
         deadline="$(python - <<'PY'
-import os
-import re
-import time
+        import os
+        import re
+        import time
 
-value = os.environ.get("INPUT_QUEUE_WAIT_TIMEOUT", "5m").strip()
-match = re.fullmatch(r"(\d+)([smh]?)", value)
-if not match:
-    raise SystemExit(f"invalid queue_wait_timeout {value!r}")
-amount = int(match.group(1))
-unit = match.group(2) or "s"
-multiplier = {"s": 1, "m": 60, "h": 3600}[unit]
-print(int(time.time()) + amount * multiplier)
-PY
-)"
+        value = os.environ.get("INPUT_QUEUE_WAIT_TIMEOUT", "5m").strip()
+        match = re.fullmatch(r"(\d+)([smh]?)", value)
+        if not match:
+            raise SystemExit(f"invalid queue_wait_timeout {value!r}")
+        amount = int(match.group(1))
+        unit = match.group(2) or "s"
+        multiplier = {"s": 1, "m": 60, "h": 3600}[unit]
+        print(int(time.time()) + amount * multiplier)
+        PY
+        )"
 
         while [ "$(printf '%s' "${response}" | python -c "import json,sys; print(json.load(sys.stdin).get('state',''))")" = "pending" ]; do
           now="$(date +%s)"
@@ -159,21 +159,21 @@ PY
           fi
           allocation_id="$(printf '%s' "${response}" | python -c "import json,sys; print(json.load(sys.stdin)['allocation_id'])")"
           retry_after="$(export RESPONSE_JSON="${response}"; python - <<'PY'
-import datetime
-import json
-import os
+          import datetime
+          import json
+          import os
 
-payload = json.loads(os.environ["RESPONSE_JSON"])
-value = payload.get("retry_after")
-if not value:
-    print(5)
-    raise SystemExit
-dt = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
-now = datetime.datetime.now(datetime.timezone.utc)
-seconds = int((dt - now).total_seconds())
-print(max(1, min(seconds, 30)))
-PY
-)"
+          payload = json.loads(os.environ["RESPONSE_JSON"])
+          value = payload.get("retry_after")
+          if not value:
+              print(5)
+              raise SystemExit
+          dt = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+          now = datetime.datetime.now(datetime.timezone.utc)
+          seconds = int((dt - now).total_seconds())
+          print(max(1, min(seconds, 30)))
+          PY
+          )"
           sleep "${retry_after}"
           response="$(curl -fsSL "${auth_args[@]}" "${INPUT_BROKER_URL%/}/v1/allocations/${allocation_id}")"
         done
