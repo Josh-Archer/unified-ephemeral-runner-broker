@@ -231,15 +231,22 @@ func (s *Service) Get(id string) (model.AllocationStatus, bool) {
 }
 
 func (s *Service) Cancel(id string) (model.AllocationStatus, bool) {
-	status, ok := s.store.MarkState(id, model.StateCanceled, s.now(), "")
+	status, ok := s.store.Get(id)
 	if !ok {
 		return model.AllocationStatus{}, false
 	}
-	if pool, err := s.resolvePool(status.Pool); err == nil {
-		s.release(context.Background(), pool, status.SelectedBackend, status)
+	if isTerminalAllocationState(status.State) {
+		return status, true
+	}
+	updated, ok := s.store.MarkState(id, model.StateCanceled, s.now(), "")
+	if !ok {
+		return model.AllocationStatus{}, false
+	}
+	if pool, err := s.resolvePool(updated.Pool); err == nil {
+		s.release(context.Background(), pool, updated.SelectedBackend, updated)
 	}
 	s.observeState()
-	return status, true
+	return updated, true
 }
 
 type completionRequest struct {
@@ -332,9 +339,6 @@ func (s *Service) SweepExpired(now time.Time) int {
 			continue
 		}
 		if _, ok := s.store.MarkState(status.ID, model.StateExpired, now, "allocation quarantine expired"); ok {
-			if pool, err := s.resolvePool(status.Pool); err == nil {
-				s.release(context.Background(), pool, status.SelectedBackend, status)
-			}
 			logAllocationEvent(context.Background(), "allocation_expired", map[string]string{
 				"allocation_id": allocationIDLabel(status.ID),
 				"pool":          string(status.Pool),
@@ -578,7 +582,7 @@ func isWarmExpired(status model.AllocationStatus, now time.Time, ttl time.Durati
 
 func isWarmProvisionableBackend(backendName model.BackendName) bool {
 	switch backendName {
-	case model.BackendARC, model.BackendAzureVM:
+	case model.BackendARC:
 		return false
 	default:
 		return true
