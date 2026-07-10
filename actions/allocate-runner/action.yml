@@ -172,7 +172,7 @@ runs:
           now = datetime.datetime.now(datetime.timezone.utc)
           seconds = int((dt - now).total_seconds())
           print(max(1, min(seconds, 30)))
-          PY
+        PY
           )"
           sleep "${retry_after}"
           response="$(curl -fsSL "${auth_args[@]}" "${INPUT_BROKER_URL%/}/v1/allocations/${allocation_id}")"
