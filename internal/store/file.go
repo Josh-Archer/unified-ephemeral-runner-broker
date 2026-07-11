@@ -58,6 +58,13 @@ func (f *File) Save(status model.AllocationStatus) error {
 	return f.persistLocked()
 }
 
+func (f *File) Delete(id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.allocations, id)
+	return f.persistLocked()
+}
+
 func (f *File) Get(id string) (model.AllocationStatus, bool) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
