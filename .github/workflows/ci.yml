@@ -112,3 +112,60 @@ jobs:
           go test ./internal/api ./internal/config ./internal/runtime \
             -run "Test.*Tier" \
             -count=1
+
+  action-queue-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start mock broker
+        run: |
+          cat <<'EOF' > mock-broker.py
+          from http.server import HTTPServer, BaseHTTPRequestHandler
+          
+          class MockBroker(BaseHTTPRequestHandler):
+              call_count = 0
+              def do_POST(self):
+                  self.send_response(202)
+                  self.send_header("Content-Type", "application/json")
+                  self.end_headers()
+                  self.wfile.write(b'{"state": "pending", "allocation_id": "alloc-123", "retry_after": "2024-01-01T00:00:00Z"}')
+
+              def do_GET(self):
+                  MockBroker.call_count += 1
+                  if MockBroker.call_count < 2:
+                      self.send_response(202)
+                      self.send_header("Content-Type", "application/json")
+                      self.end_headers()
+                      self.wfile.write(b'{"state": "pending", "allocation_id": "alloc-123", "retry_after": "2024-01-01T00:00:00Z"}')
+                  else:
+                      self.send_response(200)
+                      self.send_header("Content-Type", "application/json")
+                      self.end_headers()
+                      self.wfile.write(b'{"state": "ready", "allocation_id": "alloc-123", "runner_label": "lbl-456", "selected_backend": "arc", "expires_at": "2025"}')
+          
+          HTTPServer(("127.0.0.1", 8080), MockBroker).serve_forever()
+          EOF
+          python3 mock-broker.py &
+          # Give it a second to start
+          sleep 1
+
+      - name: Test allocate-runner action
+        id: allocate
+        uses: ./actions/allocate-runner
+        with:
+          broker_url: http://127.0.0.1:8080
+          pool: test-pool
+          allow_unauthenticated: "true"
+
+      - name: Verify outputs
+        run: |
+          if [ "${{ steps.allocate.outputs.allocation_id }}" != "alloc-123" ]; then
+            echo "Expected alloc-123, got ${{ steps.allocate.outputs.allocation_id }}"
+            exit 1
+          fi
+          if [ "${{ steps.allocate.outputs.runner_label }}" != "lbl-456" ]; then
+            echo "Expected lbl-456, got ${{ steps.allocate.outputs.runner_label }}"
+            exit 1
+          fi
+
