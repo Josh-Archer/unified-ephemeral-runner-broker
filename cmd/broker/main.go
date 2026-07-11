@@ -14,6 +14,7 @@ import (
 	azurevmbackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/azurevm"
 	cloudbackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/cloudrun"
 	codebuildbackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/codebuild"
+	desktopbackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/desktop"
 	ec2backend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/ec2"
 	gcebackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/gce"
 	lambdabackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/lambda"
@@ -40,6 +41,7 @@ func main() {
 		cloudbackend.New(cfg, secretReader),
 		azurebackend.New(cfg, secretReader),
 		azurevmbackend.New(cfg),
+		desktopbackend.New(cfg),
 		ec2backend.New(cfg, secretReader),
 		gcebackend.New(cfg, secretReader),
 	)

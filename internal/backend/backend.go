@@ -2,6 +2,7 @@ package backend
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -11,6 +12,30 @@ import (
 
 const MetadataCapabilitiesKey = "capabilities"
 const MetadataLaunchModeKey = "launch_mode"
+
+var ErrBackendCapacityExhausted = errors.New("backend capacity exhausted")
+
+type AllocationError struct {
+	Err               error
+	Reason            error
+	CapacityExhausted bool
+}
+
+func (e *AllocationError) Error() string {
+	return e.Err.Error()
+}
+
+func (e *AllocationError) Unwrap() error {
+	return e.Err
+}
+
+func NewAllocationError(err error, reason error, capacityExhausted bool) error {
+	return &AllocationError{
+		Err:               err,
+		Reason:            reason,
+		CapacityExhausted: capacityExhausted,
+	}
+}
 
 type ProvisionedRunner struct {
 	RunnerLabel string
