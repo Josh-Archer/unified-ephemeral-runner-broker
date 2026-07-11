@@ -224,6 +224,24 @@ See [docs/architecture.md](docs/architecture.md) and [docs/security-boundary.md]
 3. Point the `allocate-runner` action at the broker URL. The broker accepts `job_timeout` in the same duration-string format used by the action, for example `15m`.
 4. Start with the `full` pool or ARC-only `lite` pool. Only enable an external backend after you have supplied a real launcher integration for that platform and the matching `secretRef`.
 
+## Broker OIDC Authentication
+
+When `broker.allowUnauthenticated` is false, allocation and completion requests
+must use `Authorization: Bearer <token>` with a GitHub Actions OIDC token. The
+broker discovers GitHub's JWKS from
+`https://token.actions.githubusercontent.com/.well-known/openid-configuration`,
+caches signing keys, and accepts only RS256 tokens signed by that issuer.
+
+The token must include:
+
+- `iss`: `https://token.actions.githubusercontent.com`
+- `aud`: the configured `broker.api.oidcAudience` value, `uecb-broker` by default
+- `sub`: a non-empty GitHub Actions subject such as `repo:OWNER/REPO:ref:...`
+- current `exp` and, when present, `nbf` claims
+
+Set `broker.allowUnauthenticated: true` only behind a separate trusted network
+or gateway boundary.
+
 ## Azure Functions Launcher
 
 The published Azure Functions launcher image lives in `docker/azure-functions` and is designed for a Linux custom-container Function App.

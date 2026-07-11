@@ -1,25 +1,96 @@
 package api
 
 import (
+	"context"
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 )
 
-func buildToken(payload string) string {
-	return fmt.Sprintf("header.%s.signature", base64.RawURLEncoding.EncodeToString([]byte(payload)))
+func TestVerifyTokenAcceptsSignedGitHubOIDCToken(t *testing.T) {
+	key := mustRSAKey(t)
+	issuer := newOIDCTestIssuer(t, key, "test-key")
+	now := time.Unix(2000, 0)
+	token := signedOIDCToken(t, key, "test-key", OIDCClaims{
+		Iss: issuer.URL,
+		Aud: "uecb-broker",
+		Sub: "repo:example/repo:ref",
+		Exp: now.Add(time.Hour).Unix(),
+		Nbf: now.Add(-time.Minute).Unix(),
+	})
+
+	verifier := NewOIDCVerifier()
+	verifier.now = func() time.Time { return now }
+
+	claims, err := verifier.VerifyToken(context.Background(), token, "uecb-broker", []string{issuer.URL})
+	if err != nil {
+		t.Fatalf("expected signed token to verify: %v", err)
+	}
+	if claims.Sub != "repo:example/repo:ref" {
+		t.Fatalf("unexpected subject %q", claims.Sub)
+	}
 }
 
-func TestExtractClaimsUnverified(t *testing.T) {
-	token := buildToken(`{"iss":"https://token.actions.githubusercontent.com","aud":"uecb-broker","sub":"repo:example/repo:ref"}`)
+func TestVerifyTokenRejectsForgedThreePartToken(t *testing.T) {
+	key := mustRSAKey(t)
+	issuer := newOIDCTestIssuer(t, key, "test-key")
+	now := time.Unix(2000, 0)
+	payload := fmt.Sprintf(`{"iss":%q,"aud":"uecb-broker","sub":"repo:example/repo:ref","exp":%d}`, issuer.URL, now.Add(time.Hour).Unix())
+	token := fmt.Sprintf("header.%s.signature", base64.RawURLEncoding.EncodeToString([]byte(payload)))
 
-	claims, err := ExtractClaimsUnverified(token)
-	if err != nil {
-		t.Fatalf("extract failed: %v", err)
+	verifier := NewOIDCVerifier()
+	verifier.now = func() time.Time { return now }
+
+	if _, err := verifier.VerifyToken(context.Background(), token, "uecb-broker", []string{issuer.URL}); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("expected invalid token error for forged header, got %v", err)
 	}
+}
 
-	if claims.Iss != "https://token.actions.githubusercontent.com" || claims.Sub == "" {
-		t.Fatalf("unexpected claims: %#v", claims)
+func TestVerifyTokenRejectsTamperedSignature(t *testing.T) {
+	key := mustRSAKey(t)
+	issuer := newOIDCTestIssuer(t, key, "test-key")
+	now := time.Unix(2000, 0)
+	token := signedOIDCToken(t, key, "test-key", OIDCClaims{
+		Iss: issuer.URL,
+		Aud: "uecb-broker",
+		Sub: "repo:example/repo:ref",
+		Exp: now.Add(time.Hour).Unix(),
+	})
+	token += "tamper"
+
+	verifier := NewOIDCVerifier()
+	verifier.now = func() time.Time { return now }
+
+	if _, err := verifier.VerifyToken(context.Background(), token, "uecb-broker", []string{issuer.URL}); !errors.Is(err, ErrInvalidSignature) {
+		t.Fatalf("expected invalid signature error, got %v", err)
+	}
+}
+
+func TestVerifyTokenRejectsExpiredToken(t *testing.T) {
+	key := mustRSAKey(t)
+	issuer := newOIDCTestIssuer(t, key, "test-key")
+	now := time.Unix(2000, 0)
+	token := signedOIDCToken(t, key, "test-key", OIDCClaims{
+		Iss: issuer.URL,
+		Aud: "uecb-broker",
+		Sub: "repo:example/repo:ref",
+		Exp: now.Add(-time.Second).Unix(),
+	})
+
+	verifier := NewOIDCVerifier()
+	verifier.now = func() time.Time { return now }
+
+	if _, err := verifier.VerifyToken(context.Background(), token, "uecb-broker", []string{issuer.URL}); !errors.Is(err, ErrTokenExpired) {
+		t.Fatalf("expected expired token error, got %v", err)
 	}
 }
 
@@ -37,4 +108,78 @@ func TestValidateOIDCClaims(t *testing.T) {
 	if err := ValidateOIDCClaims(claims, "different", []string{"https://token.actions.githubusercontent.com"}); err != ErrInvalidAudience {
 		t.Fatalf("expected invalid audience error, got %v", err)
 	}
+}
+
+func mustRSAKey(t *testing.T) *rsa.PrivateKey {
+	t.Helper()
+
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return key
+}
+
+func newOIDCTestIssuer(t *testing.T, key *rsa.PrivateKey, kid string) *httptest.Server {
+	t.Helper()
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"jwks_uri": server.URL + "/.well-known/jwks",
+		})
+	})
+	mux.HandleFunc("/.well-known/jwks", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(jwksDocument{
+			Keys: []jwkKey{{
+				Kty: "RSA",
+				Use: "sig",
+				Kid: kid,
+				Alg: "RS256",
+				N:   base64.RawURLEncoding.EncodeToString(key.PublicKey.N.Bytes()),
+				E:   base64.RawURLEncoding.EncodeToString(bigEndianInt(key.PublicKey.E)),
+			}},
+		})
+	})
+
+	return server
+}
+
+func signedOIDCToken(t *testing.T, key *rsa.PrivateKey, kid string, claims OIDCClaims) string {
+	t.Helper()
+
+	headerBytes, err := json.Marshal(jwtHeader{Alg: "RS256", Kid: kid, Typ: "JWT"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimsBytes, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	header := base64.RawURLEncoding.EncodeToString(headerBytes)
+	payload := base64.RawURLEncoding.EncodeToString(claimsBytes)
+	signingInput := []byte(header + "." + payload)
+	digest := sha256.Sum256(signingInput)
+	signature, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, digest[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return header + "." + payload + "." + base64.RawURLEncoding.EncodeToString(signature)
+}
+
+func bigEndianInt(value int) []byte {
+	if value == 0 {
+		return []byte{0}
+	}
+	var encoded []byte
+	for value > 0 {
+		encoded = append([]byte{byte(value)}, encoded...)
+		value >>= 8
+	}
+	return encoded
 }

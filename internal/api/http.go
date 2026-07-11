@@ -18,6 +18,7 @@ type Server struct {
 	allowedIssuers []string
 	expectedAud    string
 	allowAnon      bool
+	oidcVerifier   *OIDCVerifier
 	requests       *prometheus.CounterVec
 }
 
@@ -33,6 +34,7 @@ func NewServer(service *Service, allowedIssuers []string, expectedAud string, al
 		allowedIssuers: allowedIssuers,
 		expectedAud:    expectedAud,
 		allowAnon:      allowAnon,
+		oidcVerifier:   NewOIDCVerifier(),
 		requests: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "uecb_http_requests_total",
 			Help: "HTTP requests handled by the broker.",
@@ -184,12 +186,15 @@ func (s *Server) authorize(r *http.Request) error {
 		return ErrMissingBearerToken
 	}
 
-	token := strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
-	claims, err := ExtractClaimsUnverified(token)
-	if err != nil {
-		return err
+	if !strings.HasPrefix(authHeader, "Bearer ") {
+		return ErrInvalidBearerToken
 	}
-	return ValidateOIDCClaims(claims, s.expectedAud, s.allowedIssuers)
+	token := strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
+	if token == "" {
+		return ErrInvalidBearerToken
+	}
+	_, err := s.oidcVerifier.VerifyToken(r.Context(), token, s.expectedAud, s.allowedIssuers)
+	return err
 }
 
 func (s *Server) writeError(w http.ResponseWriter, code int, err error) {

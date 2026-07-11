@@ -7,6 +7,8 @@
 - The broker runs in Kubernetes.
 - GitHub workflows call the `allocate-runner` action.
 - The action exchanges OIDC identity for a broker allocation request.
+- The broker verifies GitHub Actions OIDC tokens through the issuer discovery
+  document and JWKS before authorizing allocation or completion requests.
 - The broker selects a backend, reserves capacity, provisions a runner, and returns the label that the heavy job should target.
 - External backends read `dispatch_url` and optional `dispatch_token` from their configured `secretRef` and hand off provisioning to a provider-owned controller.
 - Provider-owned controllers can use the public `pkg/adapter` SDK and `pkg/adapter/adaptertest` conformance harness to keep health, capacity, reserve, launch, and cleanup behavior aligned with the broker contract.
