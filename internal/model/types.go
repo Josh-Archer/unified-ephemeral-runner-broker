@@ -13,6 +13,7 @@ const (
 	BackendAzureVM        BackendName = "azure-vm"
 	BackendEC2            BackendName = "ec2"
 	BackendGCE            BackendName = "gce"
+	BackendDesktop        BackendName = "desktop"
 )
 
 type PoolName string
@@ -147,6 +148,11 @@ type RateLimitConfig struct {
 	Burst    int           `yaml:"burst,omitempty" json:"burst,omitempty"`
 }
 
+type DesktopConfig struct {
+	Address   string `yaml:"address" json:"address"`
+	CheckPort int    `yaml:"checkPort" json:"checkPort"`
+}
+
 type BackendConfig struct {
 	Enabled        bool                 `yaml:"enabled" json:"enabled"`
 	Healthy        bool                 `yaml:"healthy" json:"healthy"`
@@ -163,6 +169,7 @@ type BackendConfig struct {
 	CircuitBreaker CircuitBreakerConfig `yaml:"circuitBreaker,omitempty" json:"circuitBreaker,omitempty"`
 	RateLimit      RateLimitConfig      `yaml:"rateLimit,omitempty" json:"rateLimit,omitempty"`
 	TierRules      []TierRuleConfig     `yaml:"tierRules,omitempty" json:"tierRules,omitempty"`
+	Desktop        *DesktopConfig       `yaml:"desktop,omitempty" json:"desktop,omitempty"`
 }
 
 type TierRuleConfig struct {
