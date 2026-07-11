@@ -9,6 +9,7 @@ import (
 
 type Store interface {
 	Save(model.AllocationStatus) error
+	Delete(string) error
 	Get(string) (model.AllocationStatus, bool)
 	List() []model.AllocationStatus
 	MarkState(string, model.AllocationState, time.Time, string) (model.AllocationStatus, bool)
@@ -27,6 +28,13 @@ func (m *Memory) Save(status model.AllocationStatus) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.allocations[status.ID] = status
+	return nil
+}
+
+func (m *Memory) Delete(id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.allocations, id)
 	return nil
 }
 

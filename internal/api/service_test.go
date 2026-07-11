@@ -1190,6 +1190,13 @@ func TestAllocatePrefersWarmAllocationOverColdLaunch(t *testing.T) {
 	if allocation.Metadata[backend.MetadataLaunchModeKey] != launchModeWarm {
 		t.Fatalf("expected warm launch mode, got %q", allocation.Metadata[backend.MetadataLaunchModeKey])
 	}
+	statuses := service.store.List()
+	if len(statuses) != 1 {
+		t.Fatalf("expected only consumed warm allocation to remain stored, got %+v", statuses)
+	}
+	if statuses[0].ID != allocation.ID || statuses[0].State != model.StateReady {
+		t.Fatalf("expected stored allocation to be consumed warm allocation, got %+v", statuses[0])
+	}
 
 	secondAllocation, err := service.Allocate(context.Background(), model.AllocationRequest{
 		Pool:       model.PoolLite,
@@ -1217,6 +1224,58 @@ func TestAllocatePrefersWarmAllocationOverColdLaunch(t *testing.T) {
 
 	if _, ok := service.Get(secondAllocation.ID); !ok {
 		t.Fatal("expected second allocation to be stored")
+	}
+}
+
+func TestFileStoreWarmConsumptionRehydratesOnlyRealAllocation(t *testing.T) {
+	statePath := t.TempDir() + "/allocations.json"
+	now := time.Unix(1000, 0)
+	cfg := config.Default()
+	cfg.Broker.StateStore = model.StateStoreConfig{Type: "file", Path: statePath}
+	for index := range cfg.Pools {
+		if cfg.Pools[index].Name != model.PoolLite {
+			continue
+		}
+		for name, backendCfg := range cfg.Pools[index].Backends {
+			backendCfg.Enabled = false
+			cfg.Pools[index].Backends[name] = backendCfg
+		}
+		codebuildCfg := cfg.Pools[index].Backends[model.BackendCodeBuild]
+		codebuildCfg.Enabled = true
+		codebuildCfg.Healthy = true
+		codebuildCfg.MaxRunners = 2
+		codebuildCfg.WarmMin = 1
+		codebuildCfg.WarmMax = 1
+		cfg.Pools[index].Backends[model.BackendCodeBuild] = codebuildCfg
+	}
+
+	counting := &countingBackend{testBackend: testBackend{name: model.BackendCodeBuild}}
+	first := NewService(cfg, backend.NewRegistry(testBackend{name: model.BackendARC}, counting), nil)
+	first.now = func() time.Time { return now }
+	first.ReconcileWarmPools()
+
+	warmAllocation, err := first.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolLite,
+		JobTimeout: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("warm allocation failed: %v", err)
+	}
+	if warmAllocation.Metadata[backend.MetadataLaunchModeKey] != launchModeWarm {
+		t.Fatalf("expected warm launch mode, got %q", warmAllocation.Metadata[backend.MetadataLaunchModeKey])
+	}
+
+	restarted := NewService(cfg, backend.NewRegistry(testBackend{name: model.BackendARC}, counting), nil)
+	restarted.now = func() time.Time { return now }
+	coldAllocation, err := restarted.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolLite,
+		JobTimeout: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("expected one remaining capacity slot after restart, got %v", err)
+	}
+	if coldAllocation.Metadata[backend.MetadataLaunchModeKey] != launchModeCold {
+		t.Fatalf("expected cold launch after warm was consumed, got %q", coldAllocation.Metadata[backend.MetadataLaunchModeKey])
 	}
 }
 

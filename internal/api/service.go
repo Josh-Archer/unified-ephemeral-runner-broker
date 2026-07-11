@@ -300,6 +300,9 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 
 	if warmAllocation, ok := s.consumeWarmAllocation(ctx, pool, selected, allocation); ok {
 		s.schedulerForPool(pool).Release(pool.Name, selected, allocation)
+		if err := s.store.Delete(allocation.ID); err != nil {
+			return model.AllocationStatus{}, err
+		}
 		launchMode = launchModeWarm
 		warmAllocation.State = model.StateReady
 		warmAllocation.CorrelationID = allocation.CorrelationID
