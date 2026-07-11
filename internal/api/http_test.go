@@ -3,8 +3,11 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/rsa"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -38,6 +41,18 @@ func newTestServer(t *testing.T, service *Service) *Server {
 	})
 
 	return NewServer(service, nil, "", true)
+}
+
+func configureSignedOIDC(t *testing.T, server *Server, key *rsa.PrivateKey, kid string, now time.Time) *httptest.Server {
+	t.Helper()
+
+	issuer := newOIDCTestIssuer(t, key, kid)
+	server.allowAnon = false
+	server.allowedIssuers = []string{issuer.URL}
+	server.expectedAud = "uecb-broker"
+	server.oidcVerifier = NewOIDCVerifier()
+	server.oidcVerifier.now = func() time.Time { return now }
+	return issuer
 }
 
 func TestHandleAllocationsAcceptsStringJobTimeout(t *testing.T) {
@@ -110,6 +125,50 @@ func TestHandleAllocationsReturnsAcceptedForQueuedTransientFailure(t *testing.T)
 	}
 	if allocation.State != model.StatePending {
 		t.Fatalf("expected pending state, got %+v", allocation)
+	}
+}
+
+func TestHandleAllocationsRejectsForgedOIDCToken(t *testing.T) {
+	service := newServiceWithConfig(nil)
+	server := newTestServer(t, service)
+	now := time.Unix(2000, 0)
+	issuer := configureSignedOIDC(t, server, mustRSAKey(t), "test-key", now)
+
+	payload := fmt.Sprintf(`{"iss":%q,"aud":"uecb-broker","sub":"repo:example/repo:ref","exp":%d}`, issuer.URL, now.Add(time.Hour).Unix())
+	token := fmt.Sprintf("header.%s.signature", base64.RawURLEncoding.EncodeToString([]byte(payload)))
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/allocations", bytes.NewBufferString(`{"pool":"full","job_timeout":"15m"}`))
+	request.Header.Set("Authorization", "Bearer "+token)
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("expected forged token to return 401, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestHandleAllocationsAcceptsSignedOIDCToken(t *testing.T) {
+	service := newServiceWithConfig(nil)
+	service.now = func() time.Time { return time.Unix(1000, 0) }
+	server := newTestServer(t, service)
+	now := time.Unix(2000, 0)
+	key := mustRSAKey(t)
+	issuer := configureSignedOIDC(t, server, key, "test-key", now)
+	token := signedOIDCToken(t, key, "test-key", OIDCClaims{
+		Iss: issuer.URL,
+		Aud: "uecb-broker",
+		Sub: "repo:example/repo:ref",
+		Exp: now.Add(time.Hour).Unix(),
+		Nbf: now.Add(-time.Minute).Unix(),
+	})
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/allocations", bytes.NewBufferString(`{"pool":"full","job_timeout":"15m"}`))
+	request.Header.Set("Authorization", "Bearer "+token)
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("expected signed token allocation to return 201, got %d: %s", recorder.Code, recorder.Body.String())
 	}
 }
 
