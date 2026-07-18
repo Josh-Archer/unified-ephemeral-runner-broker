@@ -43,7 +43,12 @@ backends:
 
 ## Fair-Share Scheduling
 
-### Disable fair-share (fall back to pure weighted-round-robin)
+Fair-share **composes** with the pool scheduler. With this pack's default (`scheduler: weighted-round-robin` + `fairShare.enabled: true`):
+
+1. Tenant quotas and fair-share scores rank backends.
+2. When scores tie, backend `weight` values drive WRR selection.
+
+### Disable fair-share (pure weighted-round-robin only)
 
 ```yaml
 pools:
@@ -51,6 +56,8 @@ pools:
     fairShare:
       enabled: false
 ```
+
+Backend weights continue to apply via `weighted-round-robin`.
 
 ### Adjust priority class weights
 
@@ -69,6 +76,20 @@ pools:
 
 Allocation requests must include `priority_class: critical` to benefit from the higher weight.
 
+### Cap concurrent allocations per tenant
+
+```yaml
+pools:
+  - name: lite
+    fairShare:
+      enabled: true
+      quotas:
+        noisy-team: 2
+        release: 10
+```
+
+Once a tenant reaches its quota of active allocations, further reserves for that tenant fail with a quota error until capacity is released. Other tenants are unaffected.
+
 ### Send tenant and priority in a workflow
 
 ```yaml
@@ -84,7 +105,7 @@ Allocations without a `tenant` value use the `default` tenant bucket. The broker
 
 ## Scheduler Selection
 
-To fall back from `weighted-round-robin` to `round-robin` for a pool (ignoring backend weights):
+To fall back from `weighted-round-robin` to `round-robin` for a pool (ignoring backend weights, still composed with fair-share when enabled):
 
 ```yaml
 pools:
@@ -92,7 +113,7 @@ pools:
     scheduler: round-robin
 ```
 
-Weights are preserved and take effect again when `weighted-round-robin` is restored.
+Weights are preserved in config and take effect again when `weighted-round-robin` is restored. Prefer this dual-knob shape (`fairShare.enabled` + `scheduler`) over `scheduler: priority-fair-share`, which is standalone fair-share without weight expansion.
 
 ## Orphan Cleanup
 

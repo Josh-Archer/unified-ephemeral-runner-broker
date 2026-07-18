@@ -57,10 +57,12 @@ func NewService(cfg model.BrokerConfig, registry *backend.Registry, health func(
 		stateStore = store.NewMemory()
 	}
 	service := &Service{
-		cfg:       cfg,
-		registry:  registry,
-		scheds:    schedulerRegistry,
-		fairShare: scheduler.NewPriorityFairShare(),
+		cfg:      cfg,
+		registry: registry,
+		scheds:   schedulerRegistry,
+		// Share one PriorityFairShare instance with the scheduler registry so
+		// fairShare.enabled and scheduler: priority-fair-share do not diverge.
+		fairShare: schedulerRegistry.PriorityFairShare(),
 		store:     stateStore,
 		observer:  noopObserver{},
 		admission: newBackendAdmission(),

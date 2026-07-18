@@ -229,3 +229,100 @@ func TestPriorityFairShareEnforcesTenantQuotas(t *testing.T) {
 		t.Fatalf("reserve after release failed: %v", err)
 	}
 }
+
+func TestPriorityFairShareComposesWithWeightedRoundRobin(t *testing.T) {
+	scheduler := NewPriorityFairShare()
+	pool := poolByName(model.PoolLite)
+	pool.Scheduler = NameWeightedRoundRobin
+	pool.FairShare.Enabled = true
+	// Restrict to two backends so the weighted ring is deterministic.
+	pool.Backends = map[model.BackendName]model.BackendConfig{
+		model.BackendARC:       {Enabled: true, Healthy: true, MaxRunners: 10, Weight: 1},
+		model.BackendCodeBuild: {Enabled: true, Healthy: true, MaxRunners: 10, Weight: 3},
+	}
+
+	// Equal fair-share scores (release after each pick) → weights drive selection.
+	want := []model.BackendName{
+		model.BackendARC,
+		model.BackendCodeBuild,
+		model.BackendCodeBuild,
+		model.BackendCodeBuild,
+	}
+	for index, expected := range want {
+		selected, err := scheduler.Reserve(pool, allocationRequest(nil, "tenant-a", ""))
+		if err != nil {
+			t.Fatalf("reserve #%d failed: %v", index+1, err)
+		}
+		if selected != expected {
+			t.Fatalf("reserve #%d selected %s, want %s (weights should apply under fair-share)", index+1, selected, expected)
+		}
+		scheduler.Release(pool.Name, selected, model.AllocationStatus{Tenant: "tenant-a"})
+	}
+}
+
+func TestPriorityFairSharePrefersTenantBalanceOverWeights(t *testing.T) {
+	scheduler := NewPriorityFairShare()
+	pool := poolByName(model.PoolLite)
+	pool.Scheduler = NameWeightedRoundRobin
+	pool.FairShare.Enabled = true
+	pool.Backends = map[model.BackendName]model.BackendConfig{
+		// High weight on ARC must not override tenant load preference.
+		model.BackendARC:       {Enabled: true, Healthy: true, MaxRunners: 4, Weight: 10},
+		model.BackendCodeBuild: {Enabled: true, Healthy: true, MaxRunners: 4, Weight: 1},
+	}
+
+	pinned := model.BackendARC
+	for i := 0; i < 2; i++ {
+		if _, err := scheduler.Reserve(pool, allocationRequest(&pinned, "tenant-a", "")); err != nil {
+			t.Fatalf("setup reserve #%d failed: %v", i+1, err)
+		}
+	}
+
+	selected, err := scheduler.Reserve(pool, allocationRequest(nil, "tenant-b", ""))
+	if err != nil {
+		t.Fatalf("tenant-b reserve failed: %v", err)
+	}
+	if selected != model.BackendCodeBuild {
+		t.Fatalf("expected fair-share tenant balance to override weights, got %s", selected)
+	}
+}
+
+func TestPriorityFairShareWithRoundRobinIgnoresWeights(t *testing.T) {
+	scheduler := NewPriorityFairShare()
+	pool := poolByName(model.PoolLite)
+	pool.Scheduler = NameRoundRobin
+	pool.FairShare.Enabled = true
+	pool.Backends = map[model.BackendName]model.BackendConfig{
+		model.BackendARC:       {Enabled: true, Healthy: true, MaxRunners: 10, Weight: 1},
+		model.BackendCodeBuild: {Enabled: true, Healthy: true, MaxRunners: 10, Weight: 99},
+	}
+
+	// Equal scores + RR → one slot each, not weight-expanded.
+	want := []model.BackendName{
+		model.BackendARC,
+		model.BackendCodeBuild,
+		model.BackendARC,
+		model.BackendCodeBuild,
+	}
+	for index, expected := range want {
+		selected, err := scheduler.Reserve(pool, allocationRequest(nil, "tenant-a", ""))
+		if err != nil {
+			t.Fatalf("reserve #%d failed: %v", index+1, err)
+		}
+		if selected != expected {
+			t.Fatalf("reserve #%d selected %s, want %s", index+1, selected, expected)
+		}
+		scheduler.Release(pool.Name, selected, model.AllocationStatus{Tenant: "tenant-a"})
+	}
+}
+
+func TestRegistrySharesPriorityFairShareInstance(t *testing.T) {
+	registry := NewRegistry()
+	shared := registry.PriorityFairShare()
+	if shared == nil {
+		t.Fatal("expected shared PriorityFairShare instance")
+	}
+	if registry.ForName(NamePriorityFairShare) != shared {
+		t.Fatal("expected registry.ForName(priority-fair-share) to return the shared instance")
+	}
+}

@@ -96,7 +96,11 @@ func (s *priorityFairShareState) Reserve(pool model.PoolConfig, request model.Al
 		return *pinned, nil
 	}
 
-	backends := orderedBackends(pool)
+	// Compose with the pool backend scheduler: fair-share ranks by tenant/priority
+	// load, then WRR/RR order breaks ties among equal-score backends with capacity.
+	// When scheduler is weighted-round-robin, candidate order is weight-expanded so
+	// backend weights still influence selection when fair-share scores match.
+	backends := fairShareCandidateBackends(pool)
 	if len(backends) == 0 {
 		return "", ErrNoCapacity
 	}
@@ -141,6 +145,19 @@ func (s *priorityFairShareState) Reserve(pool model.PoolConfig, request model.Al
 	s.tenantActive[pool.Name][selected][tenant]++
 	s.cursors[pool.Name] = (bestIndex + 1) % len(backends)
 	return selected, nil
+}
+
+// fairShareCandidateBackends returns the ordered candidate ring used when
+// fair-share is selecting a backend. weighted-round-robin expands each backend
+// by its weight so weights apply as a tie-breaker among equal fair-share scores.
+// Other schedulers (round-robin, priority-fair-share) use one slot per backend.
+func fairShareCandidateBackends(pool model.PoolConfig) []model.BackendName {
+	switch normalizeSchedulerName(pool.Scheduler) {
+	case NameWeightedRoundRobin:
+		return weightedBackends(pool)
+	default:
+		return orderedBackends(pool)
+	}
 }
 
 func (s *priorityFairShareState) Release(pool model.PoolName, backend model.BackendName, allocation model.AllocationStatus) {

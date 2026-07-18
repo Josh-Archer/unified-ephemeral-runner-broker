@@ -63,9 +63,17 @@ when no backend can run the allocation.
 
 Within a selected pool, backends use `round-robin` across healthy backends with available slots.
 
-Pools can opt into `weighted-round-robin` instead. Backend weights are configured per pool and only affect selection when that scheduler is enabled.
+Pools can opt into `weighted-round-robin` instead. Backend weights are configured per pool and affect selection when that scheduler is enabled.
 
-Pools can also enable `fairShare` independently from the backend scheduler. Allocation requests may include `tenant` and `priority_class`; fair-share admission uses active allocation counts to prefer lower-loaded backends and avoid repeatedly favoring a tenant that already has active work. Priority only affects dispatch choice when capacity is available. The broker does not preempt active runners.
+Pools can also enable `fairShare`. Fair-share **composes** with the pool backend scheduler rather than replacing it:
+
+1. Optional per-tenant `fairShare.quotas` reject over-quota tenants before backend pick.
+2. Fair-share ranks eligible backends by active load and per-tenant usage; higher `priority_class` weights reduce the tenant penalty when capacity exists.
+3. Among backends with equal fair-share scores and free capacity, the pool scheduler chooses the backend. With `weighted-round-robin`, backend `weight` values still influence the pick; with `round-robin`, each backend has one slot.
+
+Allocation requests may include `tenant` and `priority_class`. Priority only affects dispatch choice when capacity is available. The broker does not preempt active runners. `usageWindow` and `starvationAfter` are reserved and unused today.
+
+Recommended path: `fairShare.enabled: true` with `scheduler: weighted-round-robin` or `round-robin`. `scheduler: priority-fair-share` is a standalone fair-share mode without weight expansion and shares the same fair-share state instance as `fairShare.enabled`.
 
 ## Runtime Backend Admission
 

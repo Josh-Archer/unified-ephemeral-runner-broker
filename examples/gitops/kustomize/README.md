@@ -14,7 +14,7 @@ Create that Secret in your private overlay (or via ExternalSecret/secret manager
 
 ## Scheduler overlays
 
-The base keeps `round-robin` and `fairShare.enabled=false` as safe defaults. Private overlays can set `pools[].scheduler` to `weighted-round-robin`, enable `pools[].fairShare.enabled`, and tune `fairShare.priorityClasses` without changing live state by hand.
+The base keeps `round-robin` and `fairShare.enabled=false` as safe defaults. Private overlays can set `pools[].scheduler` to `weighted-round-robin`, enable `pools[].fairShare.enabled`, and tune `fairShare.priorityClasses` / `fairShare.quotas` without changing live state by hand. When both are enabled, fair-share ranks tenants then the pool scheduler (including WRR weights) picks among equal-score backends.
 
 ## Runtime admission overlays
 
@@ -26,4 +26,4 @@ For complete topology-specific examples with overlays, secret contract documenta
 
 - [`arc-only`](../packs/arc-only/README.md) — ARC-only, round-robin
 - [`arc-plus-codebuild`](../packs/arc-plus-codebuild/README.md) — hybrid ARC + CodeBuild, weighted-round-robin
-- [`multi-backend`](../packs/multi-backend/README.md) — ARC + CodeBuild + Lambda + Cloud Run, fair-share
+- [`multi-backend`](../packs/multi-backend/README.md) — ARC + CodeBuild + Lambda + Cloud Run, fair-share composed with WRR
