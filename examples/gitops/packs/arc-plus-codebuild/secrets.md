@@ -22,13 +22,17 @@ The broker uses this secret to dispatch runner allocation requests to your CodeB
 kubectl create secret generic uecb-codebuild \
   --namespace arc-systems \
   --from-literal=dispatch_url=https://<YOUR_CODEBUILD_DISPATCHER_ENDPOINT> \
+  --from-literal=cleanup_url=https://<YOUR_CODEBUILD_DISPATCHER_ENDPOINT>/cleanup \
   --from-literal=dispatch_token=<BEARER_TOKEN_FOR_DISPATCHER>
 ```
 
 | Key | Type | Description |
 |-----|------|-------------|
 | `dispatch_url` | HTTPS URL | The HTTP endpoint of your CodeBuild launcher controller that accepts broker dispatch requests |
-| `dispatch_token` | string | Optional bearer token sent in the `Authorization` header to the dispatcher; leave blank if your dispatcher uses a network boundary instead of a token |
+| `cleanup_url` | HTTPS URL | Optional. Endpoint the broker POSTs on cancel/expire/release so the launcher can tear down the runner. Omit to skip provider teardown (broker capacity still releases). Prefer idempotent handlers (2xx and 404 both OK). |
+| `dispatch_token` | string | Optional bearer token sent in the `Authorization` header to the dispatcher (and cleanup when set); leave blank if your dispatcher uses a network boundary instead of a token |
+
+Cleanup POST body includes `action: "cleanup"`, `allocation_id`, `runner_label`, `backend`, `pool`, `state`, optional `correlation_id` / `error`, and allocation `metadata` (for example `execution_id` from provision).
 
 The dispatcher endpoint is operated by your private CodeBuild launcher controller (not part of this repository). See `docs/architecture.md` for the external dispatch contract.
 

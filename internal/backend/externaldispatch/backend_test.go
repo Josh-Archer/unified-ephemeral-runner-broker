@@ -402,6 +402,178 @@ func TestProbeRequiresSuccessfulHealthEndpoint(t *testing.T) {
 	}
 }
 
+func TestCleanupPostsToCleanupURL(t *testing.T) {
+	var gotMethod string
+	var gotAuth string
+	var gotBackendHeader string
+	var payload cleanupRequest
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotAuth = r.Header.Get("Authorization")
+		gotBackendHeader = r.Header.Get("X-UECB-Backend")
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode cleanup request: %v", err)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	cfg := newRepoScopedConfig()
+	dispatchBackend := New(model.BackendCodeBuild, cfg, staticSecrets{
+		"uecb-codebuild": {
+			secretKeyDispatchURL:   "https://dispatch.example.invalid",
+			secretKeyCleanupURL:    server.URL,
+			secretKeyDispatchToken: "broker-secret",
+		},
+	})
+
+	err := dispatchBackend.Cleanup(context.Background(), model.AllocationStatus{
+		ID:              "alloc-1",
+		CorrelationID:   "corr-9",
+		Pool:            model.PoolLite,
+		SelectedBackend: model.BackendCodeBuild,
+		RunnerLabel:     "uecb-codebuild-alloc-1",
+		State:           model.StateCanceled,
+		Error:           "client canceled",
+		Metadata: map[string]string{
+			"execution_id": "run-123",
+			"provider":     "codebuild",
+		},
+	})
+	if err != nil {
+		t.Fatalf("cleanup failed: %v", err)
+	}
+
+	if gotMethod != http.MethodPost {
+		t.Fatalf("expected POST, got %s", gotMethod)
+	}
+	if gotAuth != "Bearer broker-secret" {
+		t.Fatalf("expected bearer auth, got %q", gotAuth)
+	}
+	if gotBackendHeader != string(model.BackendCodeBuild) {
+		t.Fatalf("expected backend header %q, got %q", model.BackendCodeBuild, gotBackendHeader)
+	}
+	if payload.Action != "cleanup" {
+		t.Fatalf("expected action cleanup, got %q", payload.Action)
+	}
+	if payload.AllocationID != "alloc-1" {
+		t.Fatalf("expected allocation id alloc-1, got %q", payload.AllocationID)
+	}
+	if payload.CorrelationID != "corr-9" {
+		t.Fatalf("expected correlation id corr-9, got %q", payload.CorrelationID)
+	}
+	if payload.RunnerLabel != "uecb-codebuild-alloc-1" {
+		t.Fatalf("unexpected runner label %q", payload.RunnerLabel)
+	}
+	if payload.Backend != string(model.BackendCodeBuild) {
+		t.Fatalf("unexpected backend %q", payload.Backend)
+	}
+	if payload.State != string(model.StateCanceled) {
+		t.Fatalf("unexpected state %q", payload.State)
+	}
+	if payload.Metadata["execution_id"] != "run-123" {
+		t.Fatalf("expected execution_id metadata, got %+v", payload.Metadata)
+	}
+}
+
+func TestCleanupTreatsNotFoundAsSuccess(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":"already gone"}`, http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	cfg := newRepoScopedConfig()
+	dispatchBackend := New(model.BackendCodeBuild, cfg, staticSecrets{
+		"uecb-codebuild": {
+			secretKeyDispatchURL: "https://dispatch.example.invalid",
+			secretKeyCleanupURL:  server.URL,
+		},
+	})
+
+	err := dispatchBackend.Cleanup(context.Background(), model.AllocationStatus{
+		ID:   "alloc-gone",
+		Pool: model.PoolLite,
+		State: model.StateExpired,
+	})
+	if err != nil {
+		t.Fatalf("expected 404 cleanup to succeed, got %v", err)
+	}
+}
+
+func TestCleanupSurfacesRemoteFailures(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":"cleanup rejected"}`, http.StatusBadGateway)
+	}))
+	defer server.Close()
+
+	cfg := newRepoScopedConfig()
+	dispatchBackend := New(model.BackendCodeBuild, cfg, staticSecrets{
+		"uecb-codebuild": {
+			secretKeyDispatchURL: "https://dispatch.example.invalid",
+			secretKeyCleanupURL:  server.URL,
+		},
+	})
+
+	err := dispatchBackend.Cleanup(context.Background(), model.AllocationStatus{
+		ID:   "alloc-fail",
+		Pool: model.PoolLite,
+		State: model.StateCanceled,
+	})
+	if err == nil || !strings.Contains(err.Error(), "cleanup rejected") {
+		t.Fatalf("expected remote cleanup error, got %v", err)
+	}
+}
+
+func TestCleanupMissingCleanupURLIsNoop(t *testing.T) {
+	cfg := newRepoScopedConfig()
+	dispatchBackend := New(model.BackendCodeBuild, cfg, staticSecrets{
+		"uecb-codebuild": {
+			secretKeyDispatchURL:   "https://dispatch.example.invalid",
+			secretKeyDispatchToken: "broker-secret",
+		},
+	})
+
+	err := dispatchBackend.Cleanup(context.Background(), model.AllocationStatus{
+		ID:   "alloc-skip",
+		Pool: model.PoolLite,
+		State: model.StateCanceled,
+	})
+	if err != nil {
+		t.Fatalf("expected missing cleanup_url to be a no-op, got %v", err)
+	}
+}
+
+func TestCleanupDefaultsRunnerLabelWhenEmpty(t *testing.T) {
+	var payload cleanupRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode cleanup request: %v", err)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	cfg := newRepoScopedConfig()
+	dispatchBackend := New(model.BackendCodeBuild, cfg, staticSecrets{
+		"uecb-codebuild": {
+			secretKeyCleanupURL: server.URL,
+		},
+	})
+
+	err := dispatchBackend.Cleanup(context.Background(), model.AllocationStatus{
+		ID:   "xyz",
+		Pool: model.PoolLite,
+		State: model.StateExpired,
+	})
+	if err != nil {
+		t.Fatalf("cleanup failed: %v", err)
+	}
+	if payload.RunnerLabel != "uecb-codebuild-xyz" {
+		t.Fatalf("expected default runner label, got %q", payload.RunnerLabel)
+	}
+}
+
 func contains(values []string, target string) bool {
 	for _, value := range values {
 		if value == target {
