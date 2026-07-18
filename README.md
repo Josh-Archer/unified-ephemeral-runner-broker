@@ -129,20 +129,52 @@ sequenceDiagram
 Machine-readable reference: [docs/openapi.yaml](docs/openapi.yaml)
 (`POST`/`GET` `/v1/allocations`, complete, cancel; OIDC auth and correlation headers).
 
-### Completion Callback Endpoint
+All allocation endpoints require a GitHub OIDC bearer token unless
+`allowUnauthenticated` is enabled.
 
-The broker accepts completion callbacks on:
+| Operation | Method and path | Success response |
+| --- | --- | --- |
+| Create | `POST /v1/allocations` | `201 Created` when a runner is ready, or `202 Accepted` with a `Retry-After` header when queued |
+| Status | `GET /v1/allocations/{id}` | `200 OK` with the current allocation |
+| Cancel | `POST /v1/allocations/{id}/cancel` | `200 OK` with the canceled allocation |
+| Complete | `POST /v1/allocations/{id}/complete` | `200 OK` with the terminal allocation |
 
-`POST /v1/allocations/{id}/complete`
+Create requests include a pool and job timeout:
 
-Supported payload forms:
+```json
+{
+  "pool": "full",
+  "job_timeout": "15m"
+}
+```
+
+Every successful operation returns the allocation status. A ready allocation
+has this core response shape:
+
+```json
+{
+  "allocation_id": "alloc-123",
+  "correlation_id": "request-123",
+  "pool": "full",
+  "selected_backend": "arc",
+  "runner_label": "uecb-alloc-123",
+  "expires_at": "2026-07-17T12:00:00Z",
+  "state": "ready"
+}
+```
+
+Queued allocations use `state: pending`, may omit the runner label until they
+are ready, and include `retry_after` in the response body.
+
+Completion callbacks accept these payload forms:
 
 - `{ "state": "completed" }` (default state)
 - `{ "state": "completed" | "failed" | "canceled", "reason": "...", "error": "..." }`
 - `{ "state": "expired" }`
 - `{ "state": "quarantined" }`
 
-Duplicate callbacks for the same terminal state are idempotent and do not re-release scheduler capacity.
+Duplicate callbacks for the same terminal state are idempotent and do not
+re-release scheduler capacity.
 
 ### Orphan cleanup and quarantine
 
