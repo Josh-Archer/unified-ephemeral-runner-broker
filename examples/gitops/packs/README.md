@@ -58,6 +58,19 @@ Pin to a tag or commit SHA. Never consume a floating `main` reference in product
 └── feature-flags.md        # staged rollout, backend enable/disable, pinning, rollback
 ```
 
+## Validate Pack Renders
+
+Before submitting pack changes, render every published base and overlay from the
+repository root:
+
+```bash
+./scripts/validate-gitops-packs.sh
+```
+
+The command requires Bash 4 or later and `kubectl` with built-in Kustomize
+support. It discovers every `kustomization.yaml` below this directory, so new
+packs and overlays are included automatically.
+
 ## Safe Offload Pattern
 
 External automation in these packs does not use native GitHub Actions `schedule:` triggers for infrastructure operations. Periodic tasks such as capacity health checks or warm-pool status reports are offloaded to a Kubernetes CronJob running in the same cluster as the broker.
