@@ -1,6 +1,6 @@
 # multi-backend Reference Pack
 
-This pack deploys the broker in a multi-backend hybrid topology with ARC as the in-cluster backend and AWS CodeBuild, AWS Lambda, and GCP Cloud Run as external backends. The lite pool uses `weighted-round-robin` scheduling with `fairShare` tenant scheduling enabled.
+This pack deploys the broker in a multi-backend hybrid topology with ARC as the in-cluster backend and AWS CodeBuild, AWS Lambda, and GCP Cloud Run as external backends. The lite pool enables **composed** scheduling: `fairShare` ranks by tenant/priority, then `weighted-round-robin` picks among equal-score backends so backend `weight` values still apply (arc 3, codebuild 2, lambda 1, cloud-run 1).
 
 ## When to Use
 
@@ -19,8 +19,8 @@ allocate-runner action (with optional tenant + priority_class)
         ▼
  ┌──────────────────────────┐
  │  Broker (arc-systems)    │
- │  Fair-share admission    │
- │  Weighted-round-robin    │
+ │  Fair-share → then WRR   │
+ │  (compose, weights apply)│
  └──────────────────────────┘
         │
    ┌────┼──────────────────┬─────────────────┐

@@ -20,8 +20,9 @@ type Scheduler interface {
 }
 
 type Registry struct {
-	defaultScheduler Scheduler
-	schedulers       map[string]Scheduler
+	defaultScheduler  Scheduler
+	schedulers        map[string]Scheduler
+	priorityFairShare *PriorityFairShare
 }
 
 func NewRegistry() *Registry {
@@ -30,13 +31,24 @@ func NewRegistry() *Registry {
 	priorityFairShare := NewPriorityFairShare()
 
 	return &Registry{
-		defaultScheduler: roundRobin,
+		defaultScheduler:  roundRobin,
+		priorityFairShare: priorityFairShare,
 		schedulers: map[string]Scheduler{
 			NameRoundRobin:         roundRobin,
 			NameWeightedRoundRobin: weightedRoundRobin,
 			NamePriorityFairShare:  priorityFairShare,
 		},
 	}
+}
+
+// PriorityFairShare returns the shared fair-share scheduler instance used both
+// when pools[].fairShare.enabled is true and when pools[].scheduler is
+// priority-fair-share. Sharing one instance avoids split active/tenant state.
+func (r *Registry) PriorityFairShare() *PriorityFairShare {
+	if r == nil || r.priorityFairShare == nil {
+		return NewPriorityFairShare()
+	}
+	return r.priorityFairShare
 }
 
 func (r *Registry) ForPool(pool model.PoolConfig) Scheduler {

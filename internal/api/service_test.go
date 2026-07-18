@@ -617,6 +617,50 @@ func TestAllocateUsesPriorityFairShareScheduler(t *testing.T) {
 	}
 }
 
+func TestAllocateFairShareComposesWithWeightedRoundRobin(t *testing.T) {
+	service := newServiceWithConfig(func(pool *model.PoolConfig) {
+		if pool.Name != model.PoolLite {
+			return
+		}
+		pool.Scheduler = scheduler.NameWeightedRoundRobin
+		pool.FairShare.Enabled = true
+		// Keep only arc + codebuild so the weight ring is deterministic.
+		pool.Backends = map[model.BackendName]model.BackendConfig{
+			model.BackendARC: {
+				Enabled: true, Healthy: true, MaxRunners: 10, Weight: 1,
+				Capabilities: []string{"cluster-local"},
+			},
+			model.BackendCodeBuild: {
+				Enabled: true, Healthy: true, MaxRunners: 10, Weight: 3,
+				Capabilities: []string{"docker"},
+			},
+		}
+	})
+
+	want := []model.BackendName{
+		model.BackendARC,
+		model.BackendCodeBuild,
+		model.BackendCodeBuild,
+		model.BackendCodeBuild,
+	}
+	for index, expected := range want {
+		allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+			Pool:       model.PoolLite,
+			Tenant:     "tenant-a",
+			JobTimeout: 5 * time.Minute,
+		})
+		if err != nil {
+			t.Fatalf("allocate #%d failed: %v", index+1, err)
+		}
+		if allocation.SelectedBackend != expected {
+			t.Fatalf("allocate #%d selected %s, want %s (weights under fairShare)", index+1, allocation.SelectedBackend, expected)
+		}
+		if _, ok := service.Cancel(allocation.ID); !ok {
+			t.Fatalf("cancel #%d failed", index+1)
+		}
+	}
+}
+
 func TestAllocateFailsForUnknownScheduler(t *testing.T) {
 	service := newServiceWithConfig(func(pool *model.PoolConfig) {
 		if pool.Name == model.PoolLite {
@@ -1242,7 +1286,9 @@ func TestConcurrentAllocateDoesNotDoubleConsumeWarm(t *testing.T) {
 		codebuildCfg := pool.Backends[model.BackendCodeBuild]
 		codebuildCfg.Enabled = true
 		codebuildCfg.Healthy = true
-		codebuildCfg.MaxRunners = 2
+		// Warm prewarm holds 1 slot; concurrent workers each cold-reserve before
+		// warm claim, so MaxRunners must be >= 1(warm) + workers.
+		codebuildCfg.MaxRunners = 4
 		codebuildCfg.WarmMin = 1
 		codebuildCfg.WarmMax = 1
 		pool.Backends[model.BackendCodeBuild] = codebuildCfg
