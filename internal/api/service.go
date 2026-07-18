@@ -722,7 +722,18 @@ func (s *Service) consumeWarmAllocation(ctx context.Context, pool model.PoolConf
 			s.recycleWarmAllocation(ctx, pool, candidate, "warm allocation expired")
 			continue
 		}
-		return candidate, true
+		// Claim under warmMu so concurrent allocates cannot both observe the same
+		// warm slot. Transition warm → ready before releasing the lock; the
+		// caller then enriches the claimed status and Save()s the final fields.
+		current, ok := s.store.Get(candidate.ID)
+		if !ok || current.State != model.StateWarm {
+			continue
+		}
+		claimed, ok := s.store.MarkState(candidate.ID, model.StateReady, now, "")
+		if !ok || claimed.State != model.StateReady {
+			continue
+		}
+		return claimed, true
 	}
 
 	return model.AllocationStatus{}, false

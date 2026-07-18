@@ -1227,6 +1227,84 @@ func TestAllocatePrefersWarmAllocationOverColdLaunch(t *testing.T) {
 	}
 }
 
+func TestConcurrentWarmConsumeClaimsUniqueAllocations(t *testing.T) {
+	now := time.Unix(1000, 0)
+	counting := &countingBackend{testBackend: testBackend{name: model.BackendCodeBuild}}
+	service := newServiceWithCountingBackend(func(pool *model.PoolConfig) {
+		if pool.Name != model.PoolLite {
+			return
+		}
+		for name, backendCfg := range pool.Backends {
+			backendCfg.Enabled = false
+			pool.Backends[name] = backendCfg
+		}
+		codebuildCfg := pool.Backends[model.BackendCodeBuild]
+		codebuildCfg.Enabled = true
+		codebuildCfg.Healthy = true
+		// Peak concurrent path: existing warm reservation + N cold reserves before
+		// the warm claim releases its temporary cold slot.
+		codebuildCfg.MaxRunners = 32
+		codebuildCfg.WarmMin = 1
+		codebuildCfg.WarmMax = 1
+		pool.Backends[model.BackendCodeBuild] = codebuildCfg
+	}, counting)
+	service.now = func() time.Time { return now }
+
+	service.ReconcileWarmPools()
+	if counting.provisionCount != 1 {
+		t.Fatalf("expected one warm provision, got %d", counting.provisionCount)
+	}
+
+	const workers = 8
+	type result struct {
+		status model.AllocationStatus
+		err    error
+	}
+	results := make(chan result, workers)
+	start := make(chan struct{})
+	for i := 0; i < workers; i++ {
+		go func() {
+			<-start
+			status, err := service.Allocate(context.Background(), model.AllocationRequest{
+				Pool:       model.PoolLite,
+				JobTimeout: 5 * time.Minute,
+			})
+			results <- result{status: status, err: err}
+		}()
+	}
+	close(start)
+
+	warmHits := 0
+	seenIDs := map[string]struct{}{}
+	seenLabels := map[string]struct{}{}
+	for i := 0; i < workers; i++ {
+		got := <-results
+		if got.err != nil {
+			t.Fatalf("concurrent allocate failed: %v", got.err)
+		}
+		if _, ok := seenIDs[got.status.ID]; ok {
+			t.Fatalf("duplicate allocation id claimed by concurrent consumers: %s", got.status.ID)
+		}
+		seenIDs[got.status.ID] = struct{}{}
+		if got.status.RunnerLabel != "" {
+			if _, ok := seenLabels[got.status.RunnerLabel]; ok {
+				t.Fatalf("duplicate runner label claimed by concurrent consumers: %s", got.status.RunnerLabel)
+			}
+			seenLabels[got.status.RunnerLabel] = struct{}{}
+		}
+		if got.status.Metadata[backend.MetadataLaunchModeKey] == launchModeWarm {
+			warmHits++
+		}
+	}
+	if warmHits != 1 {
+		t.Fatalf("expected exactly one warm claim among concurrent consumers, got %d", warmHits)
+	}
+	if counting.provisionCount != workers {
+		// one warm provision during reconcile + (workers-1) cold provisions
+		t.Fatalf("expected %d total provision calls (1 warm + %d cold), got %d", workers, workers-1, counting.provisionCount)
+	}
+}
+
 func TestFileStoreWarmConsumptionRehydratesOnlyRealAllocation(t *testing.T) {
 	statePath := t.TempDir() + "/allocations.json"
 	now := time.Unix(1000, 0)
