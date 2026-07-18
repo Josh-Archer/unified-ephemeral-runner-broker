@@ -33,13 +33,18 @@ If you have a test workflow that calls `allocate-runner`, trigger it against the
 Alternatively, use `curl` with a valid OIDC token:
 
 ```bash
-curl -s -X POST http://localhost:8080/v1/allocations \
+curl -sS -o /tmp/uecb-allocation.json -w 'HTTP %{http_code}\n' \
+  -X POST http://localhost:8080/v1/allocations \
   -H "Authorization: Bearer <OIDC_TOKEN>" \
   -H "Content-Type: application/json" \
-  -d '{"pool":"full","job_timeout":"5m"}' | jq .
+  -d '{"pool":"full","job_timeout":"5m"}'
+jq . /tmp/uecb-allocation.json
 ```
 
-Expected: response contains `runner_label` and `correlation_id`.
+Expected: `HTTP 201` and a response with `state: "ready"`, `allocation_id`,
+`runner_label`, and `correlation_id`. When queued admission is enabled, the
+broker can instead return `HTTP 202` with `state: "pending"` and `retry_after`;
+poll `GET /v1/allocations/{id}` until the allocation becomes ready.
 
 ## 5. Confirm ARC Backends Are Healthy
 
