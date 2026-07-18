@@ -34,6 +34,9 @@ jobs:
           helm template uecb charts/unified-ephemeral-runner-broker >/tmp/uecb-helm.yaml
           kubectl kustomize examples/gitops/kustomize/base >/tmp/uecb-kustomize.yaml
 
+      - name: Render GitOps pack variants
+        run: ./scripts/validate-gitops-packs.sh
+
   api-docs-contract:
     runs-on: ubuntu-latest
     steps:
@@ -41,7 +44,6 @@ jobs:
 
       - name: API docs and action contract check
         run: bash scripts/check-api-docs-contract.sh
-
   warm-pool-regression:
     runs-on: ubuntu-latest
     steps:
