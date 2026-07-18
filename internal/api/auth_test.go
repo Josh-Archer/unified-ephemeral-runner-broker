@@ -14,6 +14,8 @@ import (
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 )
 
 func TestVerifyTokenAcceptsSignedGitHubOIDCToken(t *testing.T) {
@@ -107,6 +109,90 @@ func TestValidateOIDCClaims(t *testing.T) {
 
 	if err := ValidateOIDCClaims(claims, "different", []string{"https://token.actions.githubusercontent.com"}); err != ErrInvalidAudience {
 		t.Fatalf("expected invalid audience error, got %v", err)
+	}
+}
+
+func TestOIDCClaimsEffectiveRepositoryAndOwner(t *testing.T) {
+	claims := OIDCClaims{
+		Sub:             "repo:acme/widgets:ref:refs/heads/main",
+		Repository:      "acme/widgets",
+		RepositoryOwner: "acme",
+	}
+	if claims.EffectiveRepository() != "acme/widgets" {
+		t.Fatalf("unexpected repository %q", claims.EffectiveRepository())
+	}
+	if claims.EffectiveOwner() != "acme" {
+		t.Fatalf("unexpected owner %q", claims.EffectiveOwner())
+	}
+
+	derived := OIDCClaims{Sub: "repo:acme/widgets:environment:prod"}
+	if derived.EffectiveRepository() != "acme/widgets" {
+		t.Fatalf("expected repo derived from sub, got %q", derived.EffectiveRepository())
+	}
+	if derived.EffectiveOwner() != "acme" {
+		t.Fatalf("expected owner derived from sub, got %q", derived.EffectiveOwner())
+	}
+}
+
+func TestAuthorizeOIDCPolicy(t *testing.T) {
+	claims := OIDCClaims{
+		Sub:             "repo:acme/widgets:ref:refs/heads/main",
+		Repository:      "acme/widgets",
+		RepositoryOwner: "acme",
+	}
+
+	if err := AuthorizeOIDCPolicy(claims, model.OIDCPolicyConfig{}); err != nil {
+		t.Fatalf("empty policy should allow: %v", err)
+	}
+	if err := AuthorizeOIDCPolicy(claims, model.OIDCPolicyConfig{
+		AllowedRepositories: []string{"acme/widgets"},
+	}); err != nil {
+		t.Fatalf("exact repository allowlist should allow: %v", err)
+	}
+	if err := AuthorizeOIDCPolicy(claims, model.OIDCPolicyConfig{
+		AllowedRepositories: []string{"acme/*"},
+	}); err != nil {
+		t.Fatalf("wildcard repository allowlist should allow: %v", err)
+	}
+	if err := AuthorizeOIDCPolicy(claims, model.OIDCPolicyConfig{
+		AllowedOwners: []string{"acme"},
+	}); err != nil {
+		t.Fatalf("owner allowlist should allow: %v", err)
+	}
+	if err := AuthorizeOIDCPolicy(claims, model.OIDCPolicyConfig{
+		AllowedRepositories: []string{"other/repo"},
+		AllowedOwners:       []string{"other-org"},
+	}); !errors.Is(err, ErrOIDCPolicyDenied) {
+		t.Fatalf("expected policy denial, got %v", err)
+	}
+	// Union: owner match is enough even when repository list does not match.
+	if err := AuthorizeOIDCPolicy(claims, model.OIDCPolicyConfig{
+		AllowedRepositories: []string{"other/repo"},
+		AllowedOwners:       []string{"acme"},
+	}); err != nil {
+		t.Fatalf("owner match should allow via union: %v", err)
+	}
+}
+
+func TestOwnershipAllows(t *testing.T) {
+	status := model.AllocationStatus{
+		Subject:    "repo:acme/widgets:ref:refs/heads/main",
+		Repository: "acme/widgets",
+	}
+	if !OwnershipAllows(OIDCClaims{Sub: status.Subject}, status) {
+		t.Fatal("same subject should be allowed")
+	}
+	if OwnershipAllows(OIDCClaims{Sub: "repo:other/repo:ref:refs/heads/main", Repository: "other/repo"}, status) {
+		t.Fatal("cross-tenant subject should be denied")
+	}
+	if !OwnershipAllows(OIDCClaims{Sub: "repo:acme/widgets:pull_request", Repository: "acme/widgets"}, status) {
+		t.Fatal("same repository should be allowed as ownership fallback")
+	}
+	if !OwnershipAllows(OIDCClaims{Sub: "anyone"}, model.AllocationStatus{}) {
+		t.Fatal("unbound allocation should allow any caller")
+	}
+	if OwnershipAllows(OIDCClaims{}, status) {
+		t.Fatal("empty subject should not access bound allocation")
 	}
 }
 

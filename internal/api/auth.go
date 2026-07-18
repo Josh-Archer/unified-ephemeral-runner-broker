@@ -14,28 +14,70 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 )
 
 const oidcCacheTTL = time.Hour
 
 var (
-	ErrMissingBearerToken = errors.New("missing bearer token")
-	ErrInvalidBearerToken = errors.New("invalid bearer token")
-	ErrInvalidAudience    = errors.New("invalid oidc audience")
-	ErrInvalidIssuer      = errors.New("invalid oidc issuer")
-	ErrInvalidSubject     = errors.New("missing oidc subject")
-	ErrInvalidToken       = errors.New("invalid oidc token")
-	ErrInvalidSignature   = errors.New("invalid oidc token signature")
-	ErrTokenExpired       = errors.New("expired oidc token")
-	ErrTokenNotValidYet   = errors.New("oidc token not valid yet")
+	ErrMissingBearerToken  = errors.New("missing bearer token")
+	ErrInvalidBearerToken  = errors.New("invalid bearer token")
+	ErrInvalidAudience     = errors.New("invalid oidc audience")
+	ErrInvalidIssuer       = errors.New("invalid oidc issuer")
+	ErrInvalidSubject      = errors.New("missing oidc subject")
+	ErrInvalidToken        = errors.New("invalid oidc token")
+	ErrInvalidSignature    = errors.New("invalid oidc token signature")
+	ErrTokenExpired        = errors.New("expired oidc token")
+	ErrTokenNotValidYet    = errors.New("oidc token not valid yet")
+	ErrOIDCPolicyDenied    = errors.New("oidc identity is not allowed by policy")
+	ErrAllocationForbidden = errors.New("allocation access forbidden")
 )
 
+// OIDCClaims holds verified GitHub Actions OIDC identity claims used for
+// authentication, allowlist authorization, and allocation ownership binding.
 type OIDCClaims struct {
-	Iss string      `json:"iss"`
-	Aud interface{} `json:"aud"`
-	Sub string      `json:"sub"`
-	Exp int64       `json:"exp"`
-	Nbf int64       `json:"nbf,omitempty"`
+	Iss             string      `json:"iss"`
+	Aud             interface{} `json:"aud"`
+	Sub             string      `json:"sub"`
+	Exp             int64       `json:"exp"`
+	Nbf             int64       `json:"nbf,omitempty"`
+	Repository      string      `json:"repository,omitempty"`
+	RepositoryOwner string      `json:"repository_owner,omitempty"`
+	WorkflowRef     string      `json:"workflow_ref,omitempty"`
+	JobWorkflowRef  string      `json:"job_workflow_ref,omitempty"`
+}
+
+// EffectiveRepository returns the repository claim, or derives owner/repo from sub.
+func (c OIDCClaims) EffectiveRepository() string {
+	if repo := strings.TrimSpace(c.Repository); repo != "" {
+		return repo
+	}
+	// GitHub Actions sub formats: repo:OWNER/REPO:ref:..., repo:OWNER/REPO:environment:..., etc.
+	if !strings.HasPrefix(c.Sub, "repo:") {
+		return ""
+	}
+	rest := strings.TrimPrefix(c.Sub, "repo:")
+	parts := strings.SplitN(rest, ":", 2)
+	if len(parts) == 0 {
+		return ""
+	}
+	if strings.Contains(parts[0], "/") {
+		return parts[0]
+	}
+	return ""
+}
+
+// EffectiveOwner returns the repository owner claim, or derives it from repository/sub.
+func (c OIDCClaims) EffectiveOwner() string {
+	if owner := strings.TrimSpace(c.RepositoryOwner); owner != "" {
+		return owner
+	}
+	repo := c.EffectiveRepository()
+	if i := strings.Index(repo, "/"); i > 0 {
+		return repo[:i]
+	}
+	return ""
 }
 
 type OIDCVerifier struct {
@@ -197,6 +239,95 @@ func audienceMatches(value interface{}, expected string) bool {
 				return true
 			}
 		}
+	}
+	return false
+}
+
+// AuthorizeOIDCPolicy enforces broker.api.oidcPolicy against verified claims.
+// Empty policy (no repositories and no owners) allows any authenticated identity.
+// When either allowlist is non-empty, the caller must match at least one entry.
+func AuthorizeOIDCPolicy(claims OIDCClaims, policy model.OIDCPolicyConfig) error {
+	repos := normalizeAllowlist(policy.AllowedRepositories)
+	owners := normalizeAllowlist(policy.AllowedOwners)
+	if len(repos) == 0 && len(owners) == 0 {
+		return nil
+	}
+
+	repository := claims.EffectiveRepository()
+	owner := claims.EffectiveOwner()
+
+	if len(repos) > 0 && matchAllowlist(repository, repos) {
+		return nil
+	}
+	if len(owners) > 0 && matchAllowlist(owner, owners) {
+		return nil
+	}
+	return ErrOIDCPolicyDenied
+}
+
+func normalizeAllowlist(entries []string) []string {
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+func matchAllowlist(value string, patterns []string) bool {
+	if value == "" {
+		return false
+	}
+	for _, pattern := range patterns {
+		if matchAllowlistPattern(value, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+// matchAllowlistPattern supports exact match and a single trailing "/*" or "*" wildcard.
+func matchAllowlistPattern(value, pattern string) bool {
+	if pattern == "*" {
+		return true
+	}
+	if strings.HasSuffix(pattern, "/*") {
+		prefix := strings.TrimSuffix(pattern, "/*")
+		if prefix == "" {
+			return true
+		}
+		return value == prefix || strings.HasPrefix(value, prefix+"/")
+	}
+	if strings.HasSuffix(pattern, "*") && !strings.Contains(pattern[:len(pattern)-1], "*") {
+		prefix := strings.TrimSuffix(pattern, "*")
+		return strings.HasPrefix(value, prefix)
+	}
+	return value == pattern
+}
+
+// OwnershipAllows reports whether the caller may access an allocation.
+// Unbound allocations (no stored subject) remain readable by any authenticated
+// or anonymous caller. When a subject is bound, the caller must share the same
+// subject, or the same repository when both sides have a repository claim.
+func OwnershipAllows(claims OIDCClaims, status model.AllocationStatus) bool {
+	if status.Subject == "" {
+		return true
+	}
+	if claims.Sub == "" {
+		return false
+	}
+	if claims.Sub == status.Subject {
+		return true
+	}
+	repo := claims.EffectiveRepository()
+	if status.Repository != "" && repo != "" && status.Repository == repo {
+		return true
 	}
 	return false
 }

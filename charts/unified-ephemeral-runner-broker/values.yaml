@@ -63,6 +63,13 @@ config:
       maxAttempts: 3
     api:
       oidcAudience: uecb-broker
+      # Empty allowlists keep any authenticated GitHub Actions identity allowed
+      # (backward compatible). Non-empty lists enforce a union match on
+      # repository (owner/repo) and/or owner. Patterns support trailing /*.
+      # Ownership (subject) is always bound on allocate when OIDC is used.
+      oidcPolicy:
+        allowedRepositories: []
+        allowedOwners: []
     tierRouting:
       enabled: false
       refreshInterval: 5m

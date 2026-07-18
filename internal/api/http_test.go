@@ -155,11 +155,13 @@ func TestHandleAllocationsAcceptsSignedOIDCToken(t *testing.T) {
 	key := mustRSAKey(t)
 	issuer := configureSignedOIDC(t, server, key, "test-key", now)
 	token := signedOIDCToken(t, key, "test-key", OIDCClaims{
-		Iss: issuer.URL,
-		Aud: "uecb-broker",
-		Sub: "repo:example/repo:ref",
-		Exp: now.Add(time.Hour).Unix(),
-		Nbf: now.Add(-time.Minute).Unix(),
+		Iss:             issuer.URL,
+		Aud:             "uecb-broker",
+		Sub:             "repo:example/repo:ref:refs/heads/main",
+		Repository:      "example/repo",
+		RepositoryOwner: "example",
+		Exp:             now.Add(time.Hour).Unix(),
+		Nbf:             now.Add(-time.Minute).Unix(),
 	})
 
 	request := httptest.NewRequest(http.MethodPost, "/v1/allocations", bytes.NewBufferString(`{"pool":"full","job_timeout":"15m"}`))
@@ -169,6 +171,143 @@ func TestHandleAllocationsAcceptsSignedOIDCToken(t *testing.T) {
 
 	if recorder.Code != http.StatusCreated {
 		t.Fatalf("expected signed token allocation to return 201, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+
+	var allocation model.AllocationStatus
+	if err := json.NewDecoder(recorder.Body).Decode(&allocation); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if allocation.Subject != "repo:example/repo:ref:refs/heads/main" {
+		t.Fatalf("expected subject bound on allocation, got %q", allocation.Subject)
+	}
+	if allocation.Repository != "example/repo" {
+		t.Fatalf("expected repository bound on allocation, got %q", allocation.Repository)
+	}
+	if allocation.Owner != "example" {
+		t.Fatalf("expected owner bound on allocation, got %q", allocation.Owner)
+	}
+}
+
+func TestHandleAllocationsEnforcesOIDCPolicyAllowAndDeny(t *testing.T) {
+	service := newServiceWithConfig(nil)
+	service.now = func() time.Time { return time.Unix(1000, 0) }
+	server := newTestServer(t, service)
+	now := time.Unix(2000, 0)
+	key := mustRSAKey(t)
+	issuer := configureSignedOIDC(t, server, key, "test-key", now)
+	server.oidcPolicy = model.OIDCPolicyConfig{
+		AllowedRepositories: []string{"allowed/repo"},
+		AllowedOwners:       []string{"allowed-org"},
+	}
+
+	allowedToken := signedOIDCToken(t, key, "test-key", OIDCClaims{
+		Iss:             issuer.URL,
+		Aud:             "uecb-broker",
+		Sub:             "repo:allowed/repo:ref:refs/heads/main",
+		Repository:      "allowed/repo",
+		RepositoryOwner: "allowed",
+		Exp:             now.Add(time.Hour).Unix(),
+	})
+	deniedToken := signedOIDCToken(t, key, "test-key", OIDCClaims{
+		Iss:             issuer.URL,
+		Aud:             "uecb-broker",
+		Sub:             "repo:evil/repo:ref:refs/heads/main",
+		Repository:      "evil/repo",
+		RepositoryOwner: "evil",
+		Exp:             now.Add(time.Hour).Unix(),
+	})
+
+	allowedReq := httptest.NewRequest(http.MethodPost, "/v1/allocations", bytes.NewBufferString(`{"pool":"full","job_timeout":"15m"}`))
+	allowedReq.Header.Set("Authorization", "Bearer "+allowedToken)
+	allowedRec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(allowedRec, allowedReq)
+	if allowedRec.Code != http.StatusCreated {
+		t.Fatalf("expected allowed repo to allocate, got %d: %s", allowedRec.Code, allowedRec.Body.String())
+	}
+
+	deniedReq := httptest.NewRequest(http.MethodPost, "/v1/allocations", bytes.NewBufferString(`{"pool":"full","job_timeout":"15m"}`))
+	deniedReq.Header.Set("Authorization", "Bearer "+deniedToken)
+	deniedRec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(deniedRec, deniedReq)
+	if deniedRec.Code != http.StatusForbidden {
+		t.Fatalf("expected policy denial 403, got %d: %s", deniedRec.Code, deniedRec.Body.String())
+	}
+}
+
+func TestHandleAllocationRejectsCrossTenantOwnership(t *testing.T) {
+	service := newServiceWithConfig(nil)
+	service.now = func() time.Time { return time.Unix(1000, 0) }
+	server := newTestServer(t, service)
+	now := time.Unix(2000, 0)
+	key := mustRSAKey(t)
+	issuer := configureSignedOIDC(t, server, key, "test-key", now)
+
+	ownerClaims := OIDCClaims{
+		Iss:             issuer.URL,
+		Aud:             "uecb-broker",
+		Sub:             "repo:owner/repo:ref:refs/heads/main",
+		Repository:      "owner/repo",
+		RepositoryOwner: "owner",
+		Exp:             now.Add(time.Hour).Unix(),
+	}
+	otherClaims := OIDCClaims{
+		Iss:             issuer.URL,
+		Aud:             "uecb-broker",
+		Sub:             "repo:other/repo:ref:refs/heads/main",
+		Repository:      "other/repo",
+		RepositoryOwner: "other",
+		Exp:             now.Add(time.Hour).Unix(),
+	}
+	ownerToken := signedOIDCToken(t, key, "test-key", ownerClaims)
+	otherToken := signedOIDCToken(t, key, "test-key", otherClaims)
+
+	allocReq := httptest.NewRequest(http.MethodPost, "/v1/allocations", bytes.NewBufferString(`{"pool":"full","job_timeout":"15m"}`))
+	allocReq.Header.Set("Authorization", "Bearer "+ownerToken)
+	allocRec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(allocRec, allocReq)
+	if allocRec.Code != http.StatusCreated {
+		t.Fatalf("expected allocation 201, got %d: %s", allocRec.Code, allocRec.Body.String())
+	}
+	var allocation model.AllocationStatus
+	if err := json.NewDecoder(allocRec.Body).Decode(&allocation); err != nil {
+		t.Fatalf("decode allocation: %v", err)
+	}
+
+	// Cross-tenant get / cancel / complete must be rejected.
+	for _, tc := range []struct {
+		name   string
+		method string
+		path   string
+		body   string
+	}{
+		{name: "get", method: http.MethodGet, path: "/v1/allocations/" + allocation.ID},
+		{name: "cancel", method: http.MethodPost, path: "/v1/allocations/" + allocation.ID + "/cancel"},
+		{name: "complete", method: http.MethodPost, path: "/v1/allocations/" + allocation.ID + "/complete", body: `{"state":"completed"}`},
+	} {
+		req := httptest.NewRequest(tc.method, tc.path, bytes.NewBufferString(tc.body))
+		req.Header.Set("Authorization", "Bearer "+otherToken)
+		rec := httptest.NewRecorder()
+		server.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("%s: expected 403 for cross-tenant access, got %d: %s", tc.name, rec.Code, rec.Body.String())
+		}
+	}
+
+	// Owner can still get and complete.
+	getReq := httptest.NewRequest(http.MethodGet, "/v1/allocations/"+allocation.ID, nil)
+	getReq.Header.Set("Authorization", "Bearer "+ownerToken)
+	getRec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(getRec, getReq)
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("owner get expected 200, got %d: %s", getRec.Code, getRec.Body.String())
+	}
+
+	completeReq := httptest.NewRequest(http.MethodPost, "/v1/allocations/"+allocation.ID+"/complete", bytes.NewBufferString(`{"state":"completed"}`))
+	completeReq.Header.Set("Authorization", "Bearer "+ownerToken)
+	completeRec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(completeRec, completeReq)
+	if completeRec.Code != http.StatusOK {
+		t.Fatalf("owner complete expected 200, got %d: %s", completeRec.Code, completeRec.Body.String())
 	}
 }
 

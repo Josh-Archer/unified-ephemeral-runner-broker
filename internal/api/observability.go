@@ -18,7 +18,10 @@ const (
 
 type contextKey string
 
-const correlationContextKey contextKey = correlationIDKey
+const (
+	correlationContextKey contextKey = correlationIDKey
+	principalContextKey   contextKey = "oidc_principal"
+)
 
 type Observer interface {
 	ObserveAllocationStart(model.PoolName)
@@ -276,6 +279,30 @@ func correlationIDFromContext(ctx context.Context) string {
 		return id
 	}
 	return ""
+}
+
+func withPrincipal(ctx context.Context, claims OIDCClaims) context.Context {
+	if claims.Sub == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, principalContextKey, claims)
+}
+
+func principalFromContext(ctx context.Context) (OIDCClaims, bool) {
+	claims, ok := ctx.Value(principalContextKey).(OIDCClaims)
+	if !ok || claims.Sub == "" {
+		return OIDCClaims{}, false
+	}
+	return claims, true
+}
+
+func applyPrincipal(status *model.AllocationStatus, claims OIDCClaims) {
+	if status == nil || claims.Sub == "" {
+		return
+	}
+	status.Subject = claims.Sub
+	status.Repository = claims.EffectiveRepository()
+	status.Owner = claims.EffectiveOwner()
 }
 
 func correlationIDFromRequest(r *http.Request) string {
