@@ -299,17 +299,25 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 	}
 
 	if warmAllocation, ok := s.consumeWarmAllocation(ctx, pool, selected, allocation); ok {
-		s.schedulerForPool(pool).Release(pool.Name, selected, allocation)
+		// Release the temporary cold reservation via the same counter path as
+		// reserve() so fair-share active counts do not leak when warm is hit.
+		s.release(context.Background(), pool, selected, allocation)
 		if err := s.store.Delete(allocation.ID); err != nil {
 			return model.AllocationStatus{}, err
 		}
 		launchMode = launchModeWarm
 		warmAllocation.State = model.StateReady
 		warmAllocation.CorrelationID = allocation.CorrelationID
+		previousTenant := warmAllocation.Tenant
 		warmAllocation.Tenant = request.Tenant
 		warmAllocation.PriorityClass = request.PriorityClass
 		warmAllocation.RequestedLabels = append([]string(nil), request.Labels...)
 		warmAllocation.ExpiresAt = allocation.ExpiresAt
+		// Warm slots are reserved under an empty tenant ("default"). Move the
+		// fair-share tenant accounting onto the consuming request identity.
+		if pool.FairShare.Enabled && s.fairShare != nil {
+			s.fairShare.ReassignTenant(pool.Name, selected, previousTenant, request.Tenant)
+		}
 		warmAllocation.Metadata = withLaunchModeMetadata(
 			backend.WithCapabilitiesMetadata(pool.Backends[selected], warmAllocation.Metadata),
 			launchMode,

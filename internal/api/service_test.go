@@ -1227,6 +1227,72 @@ func TestAllocatePrefersWarmAllocationOverColdLaunch(t *testing.T) {
 	}
 }
 
+func TestWarmConsumeWithFairShareReleasesColdReservation(t *testing.T) {
+	now := time.Unix(1000, 0)
+	counting := &countingBackend{testBackend: testBackend{name: model.BackendCodeBuild}}
+	service := newServiceWithCountingBackend(func(pool *model.PoolConfig) {
+		if pool.Name != model.PoolLite {
+			return
+		}
+		pool.FairShare.Enabled = true
+		pool.Scheduler = "weighted-round-robin"
+		for name, backendCfg := range pool.Backends {
+			backendCfg.Enabled = false
+			pool.Backends[name] = backendCfg
+		}
+		codebuildCfg := pool.Backends[model.BackendCodeBuild]
+		codebuildCfg.Enabled = true
+		codebuildCfg.Healthy = true
+		codebuildCfg.MaxRunners = 4
+		codebuildCfg.WarmMin = 1
+		codebuildCfg.WarmMax = 1
+		pool.Backends[model.BackendCodeBuild] = codebuildCfg
+	}, counting)
+	service.now = func() time.Time { return now }
+
+	service.ReconcileWarmPools()
+	if got := service.fairShare.Active(model.PoolLite, model.BackendCodeBuild); got != 1 {
+		t.Fatalf("expected warm reservation to count as 1 active, got %d", got)
+	}
+	if got := service.fairShare.TenantActive(model.PoolLite, model.BackendCodeBuild, ""); got != 1 {
+		t.Fatalf("expected warm tenant active under default, got %d", got)
+	}
+
+	// Repeated warm-style hits should not permanently inflate fair-share active.
+	for i := 0; i < 3; i++ {
+		allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+			Pool:       model.PoolLite,
+			Tenant:     "team-a",
+			JobTimeout: 5 * time.Minute,
+		})
+		if err != nil {
+			t.Fatalf("allocate #%d failed: %v", i+1, err)
+		}
+		if i == 0 {
+			if allocation.Metadata[backend.MetadataLaunchModeKey] != launchModeWarm {
+				t.Fatalf("expected first allocate to consume warm, got %q", allocation.Metadata[backend.MetadataLaunchModeKey])
+			}
+			if got := service.fairShare.Active(model.PoolLite, model.BackendCodeBuild); got != 1 {
+				t.Fatalf("after warm consume expected active=1 (warm only), got %d", got)
+			}
+			if got := service.fairShare.TenantActive(model.PoolLite, model.BackendCodeBuild, "team-a"); got != 1 {
+				t.Fatalf("expected tenant team-a active=1 after warm handoff, got %d", got)
+			}
+			if got := service.fairShare.TenantActive(model.PoolLite, model.BackendCodeBuild, ""); got != 0 {
+				t.Fatalf("expected default tenant active=0 after handoff, got %d", got)
+			}
+		}
+		if _, ok := service.Cancel(allocation.ID); !ok {
+			t.Fatalf("cancel #%d failed", i+1)
+		}
+		service.ReconcileWarmPools()
+	}
+
+	if got := service.fairShare.Active(model.PoolLite, model.BackendCodeBuild); got != 1 {
+		t.Fatalf("expected stable warm-only active count after warm hit cycle, got %d", got)
+	}
+}
+
 func TestFileStoreWarmConsumptionRehydratesOnlyRealAllocation(t *testing.T) {
 	statePath := t.TempDir() + "/allocations.json"
 	now := time.Unix(1000, 0)

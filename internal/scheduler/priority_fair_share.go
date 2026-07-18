@@ -40,6 +40,18 @@ func (p *PriorityFairShare) Active(pool model.PoolName, backend model.BackendNam
 	return p.state.Active(pool, backend)
 }
 
+// ReassignTenant moves one unit of tenantActive from one tenant to another for
+// the given pool/backend without changing total active capacity. Used when a
+// warm allocation (reserved under the empty/"default" tenant) is handed off to
+// a real consumer identity.
+func (p *PriorityFairShare) ReassignTenant(pool model.PoolName, backend model.BackendName, from, to string) {
+	p.state.ReassignTenant(pool, backend, from, to)
+}
+
+func (p *PriorityFairShare) TenantActive(pool model.PoolName, backend model.BackendName, tenant string) int {
+	return p.state.TenantActive(pool, backend, tenant)
+}
+
 type priorityFairShareState struct {
 	mu           sync.Mutex
 	cursors      map[model.PoolName]int
@@ -175,6 +187,44 @@ func (s *priorityFairShareState) Active(pool model.PoolName, backend model.Backe
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.active[pool][backend]
+}
+
+func (s *priorityFairShareState) TenantActive(pool model.PoolName, backend model.BackendName, tenant string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.tenantActive[pool][backend][normalizeTenant(tenant)]
+}
+
+func (s *priorityFairShareState) ReassignTenant(pool model.PoolName, backend model.BackendName, from, to string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	fromTenant := normalizeTenant(from)
+	toTenant := normalizeTenant(to)
+	if fromTenant == toTenant {
+		return
+	}
+
+	if _, ok := s.tenantActive[pool]; !ok {
+		s.tenantActive[pool] = map[model.BackendName]map[string]int{}
+	}
+	fromCounts := s.tenantActive[pool][backend]
+	if fromCounts == nil {
+		fromCounts = map[string]int{}
+		s.tenantActive[pool][backend] = fromCounts
+	}
+	if fromCounts[fromTenant] > 0 {
+		fromCounts[fromTenant]--
+		if fromCounts[fromTenant] == 0 {
+			delete(fromCounts, fromTenant)
+		}
+	}
+	toCounts := s.tenantActive[pool][backend]
+	if toCounts == nil {
+		toCounts = map[string]int{}
+		s.tenantActive[pool][backend] = toCounts
+	}
+	toCounts[toTenant]++
 }
 
 func priorityFairShareScore(activeTotal, tenantActive, weight int) int {
