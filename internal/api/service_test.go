@@ -1286,7 +1286,9 @@ func TestConcurrentAllocateDoesNotDoubleConsumeWarm(t *testing.T) {
 		codebuildCfg := pool.Backends[model.BackendCodeBuild]
 		codebuildCfg.Enabled = true
 		codebuildCfg.Healthy = true
-		codebuildCfg.MaxRunners = 2
+		// Warm prewarm holds 1 slot; concurrent workers each cold-reserve before
+		// warm claim, so MaxRunners must be >= 1(warm) + workers.
+		codebuildCfg.MaxRunners = 4
 		codebuildCfg.WarmMin = 1
 		codebuildCfg.WarmMax = 1
 		pool.Backends[model.BackendCodeBuild] = codebuildCfg
