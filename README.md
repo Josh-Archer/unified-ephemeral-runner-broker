@@ -102,7 +102,7 @@ sequenceDiagram
     participant R as Ephemeral Runner
 
     GH->>AR: Run action
-    AR->>B: POST /allocate (OIDC Token)
+    AR->>B: POST /v1/allocations (OIDC Token)
     B->>B: Validate OIDC & Auth
     B->>B: Capability Filtering
     B->>B: Scheduler Selection
@@ -123,6 +123,11 @@ sequenceDiagram
 4. `job_timeout` is accepted as duration strings like `15m`, with numeric nanoseconds still accepted for backward compatibility.
 5. The heavy workflow job runs on that exact label.
 6. The runner executes one job and exits.
+
+### Allocation API
+
+Machine-readable reference: [docs/openapi.yaml](docs/openapi.yaml)
+(`POST`/`GET` `/v1/allocations`, complete, cancel; OIDC auth and correlation headers).
 
 ### Completion Callback Endpoint
 
@@ -198,7 +203,7 @@ the allocation until it becomes `ready` or `queue_wait_timeout` expires.
 - `charts/unified-ephemeral-runner-broker`: Helm chart
 - `actions/allocate-runner`: public workflow integration surface
 - `examples/`: generic Terraform and GitOps consumption examples
-- `docs/`: architecture and security notes
+- `docs/`: architecture notes, security boundary, and [OpenAPI](docs/openapi.yaml) for the allocation API
 - `observability/`: reusable Prometheus alert rules and Grafana dashboard artifacts
 - `pkg/adapter`: public backend adapter SDK and conformance test helpers
 

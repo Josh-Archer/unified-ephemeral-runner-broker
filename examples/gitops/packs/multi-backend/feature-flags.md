@@ -121,7 +121,7 @@ Pin an allocation to a specific backend, overriding scheduler selection:
   with:
     broker_url: https://broker.example.com
     pool: lite
-    pin_backend: lambda
+    backend: lambda
 ```
 
 Pinned requests still honor the `enabled` and `healthy` flags, and capability filters apply. If the pinned backend is disabled or its capabilities do not match, the broker returns a clear rejection.

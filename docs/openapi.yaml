@@ -1,0 +1,384 @@
+openapi: 3.0.3
+info:
+  title: Unified Ephemeral Runner Broker Allocation API
+  description: |
+    Public HTTP surface for allocating one-shot GitHub Actions runners.
+
+    When `broker.allowUnauthenticated` is false (default for production), every
+    allocation route requires a GitHub Actions OIDC bearer token.
+
+    Clients may send `X-Correlation-ID`; the broker always echoes it on the
+    response (generating a value when the request omits one).
+  version: 1.0.0
+
+servers:
+  - url: /
+    description: Broker base URL (for example https://broker.example.com)
+
+tags:
+  - name: allocations
+    description: Allocate, poll, complete, and cancel runner capacity
+
+paths:
+  /v1/allocations:
+    post:
+      tags: [allocations]
+      operationId: createAllocation
+      summary: Create an allocation
+      description: |
+        Requests a runner from the given pool. On success returns `201 Created`
+        with `state: ready` (or another non-pending state). When admission
+        queueing is enabled and the request is queued, returns `202 Accepted`
+        with `state: pending` and a `Retry-After` header (seconds).
+      security:
+        - bearerOIDC: []
+      parameters:
+        - $ref: '#/components/parameters/CorrelationID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AllocationRequest'
+            examples:
+              basic:
+                value:
+                  pool: full
+                  job_timeout: 15m
+              pinned:
+                value:
+                  pool: lite
+                  backend: codebuild
+                  job_timeout: 5m
+                  tenant: team-a
+                  priority_class: high
+      responses:
+        '201':
+          description: Allocation admitted and ready (or otherwise non-pending)
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/CorrelationID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AllocationStatus'
+        '202':
+          description: Allocation queued; poll GET until ready or timeout
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/CorrelationID'
+            Retry-After:
+              description: Suggested seconds before polling again
+              schema:
+                type: string
+                example: "30"
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AllocationStatus'
+        '400':
+          $ref: '#/components/responses/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '405':
+          $ref: '#/components/responses/Error'
+
+  /v1/allocations/{id}:
+    get:
+      tags: [allocations]
+      operationId: getAllocation
+      summary: Get allocation status
+      security:
+        - bearerOIDC: []
+      parameters:
+        - $ref: '#/components/parameters/AllocationID'
+        - $ref: '#/components/parameters/CorrelationID'
+      responses:
+        '200':
+          description: Current allocation status
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/CorrelationID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AllocationStatus'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/Error'
+        '405':
+          $ref: '#/components/responses/Error'
+
+  /v1/allocations/{id}/complete:
+    post:
+      tags: [allocations]
+      operationId: completeAllocation
+      summary: Complete an allocation
+      description: |
+        Marks an allocation terminal. Duplicate callbacks for the same terminal
+        state are idempotent. `failure_class` on failed completions can trip
+        backend circuit breakers (for example `wait-timeout`).
+      security:
+        - bearerOIDC: []
+      parameters:
+        - $ref: '#/components/parameters/AllocationID'
+        - $ref: '#/components/parameters/CorrelationID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CompletionRequest'
+            examples:
+              completed:
+                value:
+                  state: completed
+              failed:
+                value:
+                  state: failed
+                  error: runner crashed
+                  failure_class: wait-timeout
+      responses:
+        '200':
+          description: Updated allocation status
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/CorrelationID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AllocationStatus'
+        '400':
+          $ref: '#/components/responses/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/Error'
+        '405':
+          $ref: '#/components/responses/Error'
+
+  /v1/allocations/{id}/cancel:
+    post:
+      tags: [allocations]
+      operationId: cancelAllocation
+      summary: Cancel an allocation
+      description: Cancels a non-terminal allocation and releases reserved capacity when applicable.
+      security:
+        - bearerOIDC: []
+      parameters:
+        - $ref: '#/components/parameters/AllocationID'
+        - $ref: '#/components/parameters/CorrelationID'
+      responses:
+        '200':
+          description: Updated allocation status
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/CorrelationID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AllocationStatus'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/Error'
+        '405':
+          $ref: '#/components/responses/Error'
+
+components:
+  securitySchemes:
+    bearerOIDC:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        GitHub Actions OIDC ID token (`Authorization: Bearer <token>`).
+        Required unless the broker is configured with `allowUnauthenticated: true`.
+        Typical claims: `iss=https://token.actions.githubusercontent.com`,
+        `aud` matching `broker.api.oidcAudience` (default `uecb-broker`).
+
+  parameters:
+    AllocationID:
+      name: id
+      in: path
+      required: true
+      description: Allocation identifier returned as `allocation_id`
+      schema:
+        type: string
+    CorrelationID:
+      name: X-Correlation-ID
+      in: header
+      required: false
+      description: Optional client correlation ID; echoed on the response
+      schema:
+        type: string
+
+  headers:
+    CorrelationID:
+      description: Correlation ID for this request (echoed or generated)
+      schema:
+        type: string
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid bearer token
+      headers:
+        X-Correlation-ID:
+          $ref: '#/components/headers/CorrelationID'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Error:
+      description: Request error
+      headers:
+        X-Correlation-ID:
+          $ref: '#/components/headers/CorrelationID'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    AllocationRequest:
+      type: object
+      required:
+        - pool
+        - job_timeout
+      properties:
+        pool:
+          type: string
+          description: Target capacity pool (for example full or lite)
+          example: full
+        backend:
+          type: string
+          description: Optional pin to a specific backend name
+          example: arc
+        job_timeout:
+          description: |
+            Requested job duration. Prefer Go duration strings such as `15m`.
+            Numeric nanosecond integers are still accepted for compatibility.
+          oneOf:
+            - type: string
+              example: 15m
+            - type: integer
+              format: int64
+              description: Nanoseconds
+        tenant:
+          type: string
+          description: Optional tenant or queue identity for fair-share scheduling
+        priority_class:
+          type: string
+          description: Optional priority class (for example normal or high)
+          example: high
+        labels:
+          type: array
+          items:
+            type: string
+          description: Optional labels attached to the allocation request
+        required_capabilities:
+          type: array
+          items:
+            type: string
+          description: Capability tags the selected backend must advertise
+        excluded_capabilities:
+          type: array
+          items:
+            type: string
+          description: Capability tags the selected backend must not advertise
+
+    AllocationStatus:
+      type: object
+      required:
+        - allocation_id
+        - pool
+        - selected_backend
+        - runner_label
+        - expires_at
+        - state
+      properties:
+        allocation_id:
+          type: string
+        correlation_id:
+          type: string
+        pool:
+          type: string
+        selected_backend:
+          type: string
+          example: arc
+        runner_label:
+          type: string
+        requested_labels:
+          type: array
+          items:
+            type: string
+        tenant:
+          type: string
+        priority_class:
+          type: string
+        expires_at:
+          type: string
+          format: date-time
+        retry_after:
+          type: string
+          format: date-time
+          description: Present when state is pending (queue admission)
+        attempts:
+          type: integer
+        state:
+          $ref: '#/components/schemas/AllocationState'
+        error:
+          type: string
+        metadata:
+          type: object
+          additionalProperties:
+            type: string
+        request:
+          $ref: '#/components/schemas/AllocationRequest'
+
+    CompletionRequest:
+      type: object
+      properties:
+        state:
+          type: string
+          description: |
+            Terminal state. Empty defaults to completed.
+            Accepted aliases include complete/completed/success/succeeded,
+            failed/failure/error, canceled/cancelled/cancel, expired,
+            quarantined/quarantine.
+          example: completed
+        reason:
+          type: string
+          description: Human-readable reason (used for non-failed terminals)
+        error:
+          type: string
+          description: Error message when state is failed
+        failure_class:
+          type: string
+          description: |
+            Optional failure classification for circuit-breaker accounting
+            (for example wait-timeout).
+          example: wait-timeout
+
+    AllocationState:
+      type: string
+      enum:
+        - reserved
+        - ready
+        - warm
+        - pending
+        - canceled
+        - expired
+        - failed
+        - completed
+        - quarantined
+
+    Error:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: string
+          example: allocation not found

@@ -34,6 +34,14 @@ jobs:
           helm template uecb charts/unified-ephemeral-runner-broker >/tmp/uecb-helm.yaml
           kubectl kustomize examples/gitops/kustomize/base >/tmp/uecb-kustomize.yaml
 
+  api-docs-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: API docs and action contract check
+        run: bash scripts/check-api-docs-contract.sh
+
   warm-pool-regression:
     runs-on: ubuntu-latest
     steps:

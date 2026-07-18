@@ -33,7 +33,7 @@ If you have a test workflow that calls `allocate-runner`, trigger it against the
 Alternatively, use `curl` with a valid OIDC token:
 
 ```bash
-curl -s -X POST http://localhost:8080/v1/allocate \
+curl -s -X POST http://localhost:8080/v1/allocations \
   -H "Authorization: Bearer <OIDC_TOKEN>" \
   -H "Content-Type: application/json" \
   -d '{"pool":"full","job_timeout":"5m"}' | jq .

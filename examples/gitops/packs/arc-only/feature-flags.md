@@ -63,14 +63,14 @@ pools:
 
 ## Backend Pinning
 
-Clients can request a specific backend by including `pin_backend` in the allocation request. This overrides scheduler selection for that request.
+Clients can request a specific backend by including `backend` in the allocation request (action input and JSON field). This overrides scheduler selection for that request.
 
 ```yaml
 - uses: ./actions/allocate-runner
   with:
     broker_url: https://broker.example.com
     pool: lite
-    pin_backend: arc
+    backend: arc
 ```
 
 Pinned requests still honor capability filters and the `enabled`/`healthy` flags. If the pinned backend is disabled or unhealthy, the broker returns a clear rejection.
