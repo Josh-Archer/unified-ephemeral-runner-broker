@@ -218,9 +218,10 @@ See [docs/architecture.md](docs/architecture.md) and [docs/security-boundary.md]
 2. Create the GitHub auth secret and any enabled backend secrets in the same namespace as the broker.
    The broker validates referenced `secretRef` objects via the Kubernetes API and stays unready until they exist.
    External backend secrets should provide:
-   `dispatch_url`: the controller endpoint the broker should call.
+   `dispatch_url`: the controller endpoint the broker should call for provision.
    `health_url`: health endpoint used by circuit-breaker recovery probes when the backend enables `circuitBreaker`.
-   `dispatch_token`: optional bearer token sent to that endpoint.
+   `dispatch_token`: optional bearer token sent to dispatch, health, and cleanup endpoints.
+   `cleanup_url` (optional): controller endpoint the broker POSTs on cancel/expire/release so the provider can tear down runners. When omitted, cleanup is skipped (capacity is still released); when set, launchers should treat cleanup as idempotent (2xx and 404 both OK).
 3. Point the `allocate-runner` action at the broker URL. The broker accepts `job_timeout` in the same duration-string format used by the action, for example `15m`.
 4. Start with the `full` pool or ARC-only `lite` pool. Only enable an external backend after you have supplied a real launcher integration for that platform and the matching `secretRef`.
 

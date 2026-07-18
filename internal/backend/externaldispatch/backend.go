@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"strings"
@@ -19,6 +20,7 @@ import (
 
 const (
 	secretKeyDispatchURL          = "dispatch_url"
+	secretKeyCleanupURL           = "cleanup_url"
 	secretKeyHealthURL            = "health_url"
 	secretKeyDispatchToken        = "dispatch_token"
 	defaultDispatchTimeout        = 20 * time.Second
@@ -66,6 +68,20 @@ type dispatchResponse struct {
 	StatusURL   string            `json:"status_url"`
 	DetailsURL  string            `json:"details_url"`
 	ExecutionID string            `json:"execution_id"`
+}
+
+// cleanupRequest is the JSON body POSTed to cleanup_url (or derived cleanup endpoint).
+// Launchers should treat cleanup as idempotent: 200/204 and 404 are success.
+type cleanupRequest struct {
+	Action         string            `json:"action"`
+	Backend        string            `json:"backend"`
+	AllocationID   string            `json:"allocation_id"`
+	CorrelationID  string            `json:"correlation_id,omitempty"`
+	Pool           string            `json:"pool"`
+	RunnerLabel    string            `json:"runner_label"`
+	State          string            `json:"state"`
+	Error          string            `json:"error,omitempty"`
+	Metadata       map[string]string `json:"metadata,omitempty"`
 }
 
 func New(name model.BackendName, cfg model.BrokerConfig, secrets runtime.SecretReader) *Backend {
@@ -269,6 +285,107 @@ func (b *Backend) Probe(ctx context.Context, pool model.PoolConfig, cfg model.Ba
 		return backend.NewClassifiedError(reason, err)
 	}
 	return err
+}
+
+// Cleanup tears down provider-side runners for a terminal allocation.
+//
+// Contract:
+//   - Optional secret key cleanup_url. When set, the broker POSTs a cleanup JSON
+//     body to that URL with the same Bearer dispatch_token used for dispatch.
+//   - When cleanup_url is absent, Cleanup logs and returns nil so capacity release
+//     still succeeds (launchers that do not implement teardown remain compatible).
+//   - Idempotent responses: HTTP 2xx and 404 are treated as success.
+func (b *Backend) Cleanup(ctx context.Context, status model.AllocationStatus) error {
+	pool, err := resolvePool(b.cfg, status.Pool)
+	if err != nil {
+		// Soft-skip: release capacity even if pool config has been removed.
+		log.Printf("externaldispatch cleanup skipped for allocation %s backend %s: %v", status.ID, b.name, err)
+		return nil
+	}
+
+	backendCfg, ok := pool.Backends[b.name]
+	if !ok {
+		log.Printf("externaldispatch cleanup skipped for allocation %s: backend %s not configured for pool %s", status.ID, b.name, pool.Name)
+		return nil
+	}
+	secretRef := strings.TrimSpace(backendCfg.SecretRef)
+	if secretRef == "" {
+		log.Printf("externaldispatch cleanup skipped for allocation %s backend %s: missing secretRef", status.ID, b.name)
+		return nil
+	}
+
+	secretData, err := b.secrets.ReadSecret(ctx, secretRef)
+	if err != nil {
+		return fmt.Errorf("read backend secret %s: %w", secretRef, err)
+	}
+
+	cleanupURL := strings.TrimSpace(secretData[secretKeyCleanupURL])
+	if cleanupURL == "" {
+		log.Printf("externaldispatch cleanup skipped for allocation %s backend %s: secret %s has no %q", status.ID, b.name, secretRef, secretKeyCleanupURL)
+		return nil
+	}
+
+	dispatchToken := strings.TrimSpace(secretData[secretKeyDispatchToken])
+	runnerLabel := strings.TrimSpace(status.RunnerLabel)
+	if runnerLabel == "" {
+		runnerLabel = backend.DefaultRunnerLabel(b.name, status.ID)
+	}
+
+	payload := cleanupRequest{
+		Action:        "cleanup",
+		Backend:       string(b.name),
+		AllocationID:  status.ID,
+		CorrelationID: strings.TrimSpace(status.CorrelationID),
+		Pool:          string(status.Pool),
+		RunnerLabel:   runnerLabel,
+		State:         string(status.State),
+		Error:         strings.TrimSpace(status.Error),
+		Metadata:      cloneMetadata(status.Metadata),
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cleanupURL, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-UECB-Backend", string(b.name))
+	if dispatchToken != "" {
+		req.Header.Set("Authorization", "Bearer "+dispatchToken)
+	}
+
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return classifyDispatchError(b.name, err)
+	}
+	defer resp.Body.Close()
+
+	// Idempotent cleanup: success and not-found are both OK.
+	if (resp.StatusCode >= 200 && resp.StatusCode < 300) || resp.StatusCode == http.StatusNotFound {
+		return nil
+	}
+
+	message, readErr := readErrorMessage(resp.Body)
+	baseErr := fmt.Errorf("cleanup backend %s: unexpected status %d", b.name, resp.StatusCode)
+	if readErr != nil || message == "" {
+		return baseErr
+	}
+	return fmt.Errorf("cleanup backend %s: %s", b.name, message)
+}
+
+func cloneMetadata(metadata map[string]string) map[string]string {
+	if len(metadata) == 0 {
+		return nil
+	}
+	result := make(map[string]string, len(metadata))
+	for key, value := range metadata {
+		result[key] = value
+	}
+	return result
 }
 
 func classifyDispatchError(name model.BackendName, err error) error {

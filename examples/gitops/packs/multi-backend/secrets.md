@@ -18,12 +18,14 @@ The broker uses this secret to dispatch allocation requests to your AWS Lambda l
 kubectl create secret generic uecb-lambda \
   --namespace arc-systems \
   --from-literal=dispatch_url=https://<YOUR_LAMBDA_DISPATCHER_ENDPOINT> \
+  --from-literal=cleanup_url=https://<YOUR_LAMBDA_DISPATCHER_ENDPOINT>/cleanup \
   --from-literal=dispatch_token=<BEARER_TOKEN_FOR_DISPATCHER>
 ```
 
 | Key | Type | Description |
 |-----|------|-------------|
 | `dispatch_url` | HTTPS URL | The HTTP endpoint of your Lambda launcher controller |
+| `cleanup_url` | HTTPS URL | Optional. POST target for cancel/expire teardown; omit to skip provider cleanup |
 | `dispatch_token` | string | Optional bearer token; leave blank if the endpoint uses a network boundary instead |
 
 The Lambda launcher is a private controller that wraps the `lambda` OCI image published from this repository. The Lambda function image must be mirrored into ECR because AWS Lambda requires the function image to reside in a registry in the same account. The broker only calls the dispatcher endpoint; it does not interact with ECR or Lambda directly.
@@ -36,12 +38,14 @@ The broker uses this secret to dispatch allocation requests to your GCP Cloud Ru
 kubectl create secret generic uecb-cloud-run \
   --namespace arc-systems \
   --from-literal=dispatch_url=https://<YOUR_CLOUD_RUN_DISPATCHER_ENDPOINT> \
+  --from-literal=cleanup_url=https://<YOUR_CLOUD_RUN_DISPATCHER_ENDPOINT>/cleanup \
   --from-literal=dispatch_token=<BEARER_TOKEN_FOR_DISPATCHER>
 ```
 
 | Key | Type | Description |
 |-----|------|-------------|
 | `dispatch_url` | HTTPS URL | The HTTP endpoint of your Cloud Run launcher controller |
+| `cleanup_url` | HTTPS URL | Optional. POST target for cancel/expire teardown; omit to skip provider cleanup |
 | `dispatch_token` | string | Optional bearer token |
 
 ## Secret Provisioning Order

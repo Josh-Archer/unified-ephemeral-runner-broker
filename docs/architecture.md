@@ -11,6 +11,7 @@
   document and JWKS before authorizing allocation or completion requests.
 - The broker selects a backend, reserves capacity, provisions a runner, and returns the label that the heavy job should target.
 - External backends read `dispatch_url` and optional `dispatch_token` from their configured `secretRef` and hand off provisioning to a provider-owned controller.
+- On cancel, expire, quarantine terminal, or warm recycle, the broker calls `CleanupBackend.Cleanup` when implemented. Shared external-dispatch backends POST to optional secret key `cleanup_url` with `action: "cleanup"`, allocation id, runner label, state, and provision metadata (for example `execution_id`). Auth reuses `dispatch_token` as a Bearer token. Missing `cleanup_url` is a soft no-op so capacity release still succeeds; launchers should treat cleanup as idempotent (HTTP 2xx and 404 are success).
 - Provider-owned controllers can use the public `pkg/adapter` SDK and `pkg/adapter/adaptertest` conformance harness to keep health, capacity, reserve, launch, and cleanup behavior aligned with the broker contract.
 
 ## Data Plane
