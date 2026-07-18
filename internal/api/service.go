@@ -299,11 +299,35 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 	}
 
 	if warmAllocation, ok := s.consumeWarmAllocation(ctx, pool, selected, allocation); ok {
-		s.schedulerForPool(pool).Release(pool.Name, selected, allocation)
+		// Drop the cold reservation via fair-share-aware release. Warm capacity
+		// remains held by the prewarm reservation created earlier.
+		s.release(ctx, pool, selected, allocation)
 		if err := s.store.Delete(allocation.ID); err != nil {
 			return model.AllocationStatus{}, err
 		}
 		launchMode = launchModeWarm
+		// Warm pools reserve under an empty/"default" tenant; re-attribute the
+		// held capacity to the consuming tenant before overwriting metadata.
+		if pool.FairShare.Enabled && s.fairShare != nil {
+			s.fairShare.Release(pool.Name, selected, warmAllocation)
+			transfer := request
+			transfer.Backend = &selected
+			if _, err := s.fairShare.Reserve(pool, transfer); err != nil {
+				// Restore original warm reservation so capacity is not lost.
+				recoverReq := model.AllocationRequest{
+					Pool:    pool.Name,
+					Backend: &selected,
+					Tenant:  warmAllocation.Tenant,
+				}
+				if _, recoverErr := s.fairShare.Reserve(pool, recoverReq); recoverErr != nil {
+					logAllocationEvent(ctx, "fair_share_warm_tenant_transfer_failed", map[string]string{
+						"pool":    string(pool.Name),
+						"backend": string(selected),
+						"error":   err.Error(),
+					})
+				}
+			}
+		}
 		warmAllocation.State = model.StateReady
 		warmAllocation.CorrelationID = allocation.CorrelationID
 		warmAllocation.Tenant = request.Tenant
