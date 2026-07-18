@@ -101,7 +101,7 @@ Pin an allocation to a specific backend:
   with:
     broker_url: https://broker.example.com
     pool: lite
-    pin_backend: codebuild
+    backend: codebuild
 ```
 
 Useful for testing CodeBuild capacity specifically, or routing specific job types to a known backend. Pinned requests still honor the `enabled` and `healthy` flags.
