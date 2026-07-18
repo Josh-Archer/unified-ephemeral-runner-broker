@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1224,6 +1225,100 @@ func TestAllocatePrefersWarmAllocationOverColdLaunch(t *testing.T) {
 
 	if _, ok := service.Get(secondAllocation.ID); !ok {
 		t.Fatal("expected second allocation to be stored")
+	}
+}
+
+func TestConcurrentAllocateDoesNotDoubleConsumeWarm(t *testing.T) {
+	now := time.Unix(1000, 0)
+	counting := &countingBackend{testBackend: testBackend{name: model.BackendCodeBuild}}
+	service := newServiceWithCountingBackend(func(pool *model.PoolConfig) {
+		if pool.Name != model.PoolLite {
+			return
+		}
+		for name, backendCfg := range pool.Backends {
+			backendCfg.Enabled = false
+			pool.Backends[name] = backendCfg
+		}
+		codebuildCfg := pool.Backends[model.BackendCodeBuild]
+		codebuildCfg.Enabled = true
+		codebuildCfg.Healthy = true
+		codebuildCfg.MaxRunners = 2
+		codebuildCfg.WarmMin = 1
+		codebuildCfg.WarmMax = 1
+		pool.Backends[model.BackendCodeBuild] = codebuildCfg
+	}, counting)
+	service.now = func() time.Time { return now }
+
+	service.ReconcileWarmPools()
+	warmBefore := filterWarmAllocations(service.store.List(), model.PoolLite, model.BackendCodeBuild)
+	if len(warmBefore) != 1 {
+		t.Fatalf("expected one warm allocation before concurrent allocate, got %d", len(warmBefore))
+	}
+	warmID := warmBefore[0].ID
+
+	const workers = 2
+	start := make(chan struct{})
+	type result struct {
+		status model.AllocationStatus
+		err    error
+	}
+	results := make([]result, workers)
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		i := i
+		go func() {
+			defer wg.Done()
+			<-start
+			status, err := service.Allocate(context.Background(), model.AllocationRequest{
+				Pool:       model.PoolLite,
+				JobTimeout: 5 * time.Minute,
+				// Distinct tenants so fair-share / correlation paths stay independent.
+				Tenant: fmt.Sprintf("tenant-%d", i),
+			})
+			results[i] = result{status: status, err: err}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	ids := make(map[string]struct{}, workers)
+	labels := make(map[string]struct{}, workers)
+	var warmHits int
+	for i, res := range results {
+		if res.err != nil {
+			t.Fatalf("worker %d allocate failed: %v", i, res.err)
+		}
+		if res.status.ID == "" {
+			t.Fatalf("worker %d returned empty allocation id", i)
+		}
+		if _, dup := ids[res.status.ID]; dup {
+			t.Fatalf("duplicate allocation id %q handed to two jobs", res.status.ID)
+		}
+		ids[res.status.ID] = struct{}{}
+		if res.status.RunnerLabel != "" {
+			if _, dup := labels[res.status.RunnerLabel]; dup {
+				t.Fatalf("duplicate runner label %q handed to two jobs", res.status.RunnerLabel)
+			}
+			labels[res.status.RunnerLabel] = struct{}{}
+		}
+		if res.status.Metadata[backend.MetadataLaunchModeKey] == launchModeWarm {
+			warmHits++
+			if res.status.ID != warmID {
+				t.Fatalf("warm launch used unexpected id %q, want %q", res.status.ID, warmID)
+			}
+		}
+	}
+	if warmHits != 1 {
+		t.Fatalf("expected exactly one warm consumption, got %d (results=%+v)", warmHits, results)
+	}
+	if len(ids) != workers {
+		t.Fatalf("expected %d unique allocation ids, got %d", workers, len(ids))
+	}
+
+	// The pre-warmed runner must not still be StateWarm after exclusive claim.
+	if remaining := filterWarmAllocations(service.store.List(), model.PoolLite, model.BackendCodeBuild); len(remaining) != 0 {
+		t.Fatalf("expected no residual warm allocations, got %+v", remaining)
 	}
 }
 
