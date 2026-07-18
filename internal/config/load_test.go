@@ -9,6 +9,40 @@ import (
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 )
 
+func TestLoadParsesOIDCPolicy(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "broker.yaml")
+	if err := os.WriteFile(path, []byte(`
+broker:
+  api:
+    oidcAudience: custom-aud
+    oidcPolicy:
+      allowedRepositories:
+        - acme/widgets
+        - acme/*
+      allowedOwners:
+        - acme
+`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.Broker.API.OIDCAudience != "custom-aud" {
+		t.Fatalf("unexpected audience %q", cfg.Broker.API.OIDCAudience)
+	}
+	if len(cfg.Broker.API.OIDCPolicy.AllowedRepositories) != 2 {
+		t.Fatalf("expected 2 allowed repositories, got %#v", cfg.Broker.API.OIDCPolicy.AllowedRepositories)
+	}
+	if cfg.Broker.API.OIDCPolicy.AllowedRepositories[0] != "acme/widgets" {
+		t.Fatalf("unexpected repository entry %#v", cfg.Broker.API.OIDCPolicy.AllowedRepositories)
+	}
+	if len(cfg.Broker.API.OIDCPolicy.AllowedOwners) != 1 || cfg.Broker.API.OIDCPolicy.AllowedOwners[0] != "acme" {
+		t.Fatalf("unexpected allowed owners %#v", cfg.Broker.API.OIDCPolicy.AllowedOwners)
+	}
+}
+
 func TestDefaultIncludesSeparateCodeBuildAndLambdaBackends(t *testing.T) {
 	cfg := Default()
 	pool := cfg.Pools[1]

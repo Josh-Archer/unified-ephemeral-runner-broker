@@ -69,8 +69,23 @@ type GitHubConfig struct {
 	Scope GitHubScope `yaml:"scope" json:"scope"`
 }
 
+// OIDCPolicyConfig restricts which GitHub Actions identities may allocate
+// runners. Empty lists are permissive (any authenticated subject is allowed).
+// When either list is non-empty, the caller's identity must match at least one
+// entry across the configured lists (union of repository and owner allowlists).
+//
+// Entries are exact matches, or simple trailing wildcards:
+//   - "owner/repo" exact repository
+//   - "owner/*"    any repository under owner
+//   - "owner"      exact owner (for allowedOwners)
+type OIDCPolicyConfig struct {
+	AllowedRepositories []string `yaml:"allowedRepositories,omitempty" json:"allowedRepositories,omitempty"`
+	AllowedOwners       []string `yaml:"allowedOwners,omitempty" json:"allowedOwners,omitempty"`
+}
+
 type BrokerAPIConfig struct {
-	OIDCAudience string `yaml:"oidcAudience" json:"oidcAudience"`
+	OIDCAudience string           `yaml:"oidcAudience" json:"oidcAudience"`
+	OIDCPolicy   OIDCPolicyConfig `yaml:"oidcPolicy,omitempty" json:"oidcPolicy,omitempty"`
 }
 
 type StateStoreConfig struct {
@@ -235,19 +250,23 @@ type AllocationRequest struct {
 }
 
 type AllocationStatus struct {
-	ID              string             `json:"allocation_id"`
-	CorrelationID   string             `json:"correlation_id,omitempty"`
-	Pool            PoolName           `json:"pool"`
-	SelectedBackend BackendName        `json:"selected_backend"`
-	RunnerLabel     string             `json:"runner_label"`
-	RequestedLabels []string           `json:"requested_labels,omitempty"`
-	Tenant          string             `json:"tenant,omitempty"`
-	PriorityClass   string             `json:"priority_class,omitempty"`
-	ExpiresAt       time.Time          `json:"expires_at"`
-	RetryAfter      time.Time          `json:"retry_after,omitempty"`
-	Attempts        int                `json:"attempts,omitempty"`
-	State           AllocationState    `json:"state"`
-	Error           string             `json:"error,omitempty"`
-	Metadata        map[string]string  `json:"metadata,omitempty"`
-	Request         *AllocationRequest `json:"request,omitempty"`
+	ID              string      `json:"allocation_id"`
+	CorrelationID   string      `json:"correlation_id,omitempty"`
+	Pool            PoolName    `json:"pool"`
+	SelectedBackend BackendName `json:"selected_backend"`
+	RunnerLabel     string      `json:"runner_label"`
+	RequestedLabels []string    `json:"requested_labels,omitempty"`
+	Tenant          string      `json:"tenant,omitempty"`
+	PriorityClass   string      `json:"priority_class,omitempty"`
+	// Subject/Repository/Owner bind the allocating OIDC principal for ownership checks.
+	Subject    string             `json:"subject,omitempty"`
+	Repository string             `json:"repository,omitempty"`
+	Owner      string             `json:"owner,omitempty"`
+	ExpiresAt  time.Time          `json:"expires_at"`
+	RetryAfter time.Time          `json:"retry_after,omitempty"`
+	Attempts   int                `json:"attempts,omitempty"`
+	State      AllocationState    `json:"state"`
+	Error      string             `json:"error,omitempty"`
+	Metadata   map[string]string  `json:"metadata,omitempty"`
+	Request    *AllocationRequest `json:"request,omitempty"`
 }

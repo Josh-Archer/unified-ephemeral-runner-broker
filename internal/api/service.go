@@ -310,6 +310,9 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 		warmAllocation.PriorityClass = request.PriorityClass
 		warmAllocation.RequestedLabels = append([]string(nil), request.Labels...)
 		warmAllocation.ExpiresAt = allocation.ExpiresAt
+		warmAllocation.Subject = allocation.Subject
+		warmAllocation.Repository = allocation.Repository
+		warmAllocation.Owner = allocation.Owner
 		warmAllocation.Metadata = withLaunchModeMetadata(
 			backend.WithCapabilitiesMetadata(pool.Backends[selected], warmAllocation.Metadata),
 			launchMode,
@@ -389,6 +392,9 @@ func (s *Service) prepareAllocation(ctx context.Context, request model.Allocatio
 	allocation.Error = ""
 	requestCopy := request
 	allocation.Request = &requestCopy
+	if claims, ok := principalFromContext(ctx); ok {
+		applyPrincipal(&allocation, claims)
+	}
 	return allocation
 }
 
@@ -429,6 +435,9 @@ func (s *Service) queueAllocation(ctx context.Context, request model.AllocationR
 		status.Metadata = map[string]string{}
 	}
 	status.Metadata["queue_reason"] = queueReason(cause)
+	if claims, ok := principalFromContext(ctx); ok {
+		applyPrincipal(&status, claims)
+	}
 	_ = s.store.Save(status)
 	logAllocationEvent(ctx, "allocation_pending", map[string]string{
 		"allocation_id": allocationIDLabel(status.ID),

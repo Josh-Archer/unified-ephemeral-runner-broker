@@ -18,11 +18,17 @@ type Server struct {
 	allowedIssuers []string
 	expectedAud    string
 	allowAnon      bool
+	oidcPolicy     model.OIDCPolicyConfig
 	oidcVerifier   *OIDCVerifier
 	requests       *prometheus.CounterVec
 }
 
 func NewServer(service *Service, allowedIssuers []string, expectedAud string, allowAnon bool) *Server {
+	return NewServerWithPolicy(service, allowedIssuers, expectedAud, allowAnon, model.OIDCPolicyConfig{})
+}
+
+// NewServerWithPolicy constructs the API server with an OIDC repository/owner allowlist.
+func NewServerWithPolicy(service *Service, allowedIssuers []string, expectedAud string, allowAnon bool, policy model.OIDCPolicyConfig) *Server {
 	observer := NewPrometheusObserver(prometheus.DefaultRegisterer)
 	if err := observer.Register(prometheus.DefaultRegisterer); err != nil {
 		panic(err)
@@ -34,6 +40,7 @@ func NewServer(service *Service, allowedIssuers []string, expectedAud string, al
 		allowedIssuers: allowedIssuers,
 		expectedAud:    expectedAud,
 		allowAnon:      allowAnon,
+		oidcPolicy:     policy,
 		oidcVerifier:   NewOIDCVerifier(),
 		requests: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "uecb_http_requests_total",
@@ -65,7 +72,12 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAllocations(w http.ResponseWriter, r *http.Request) {
-	if err := s.authorize(r); err != nil {
+	claims, err := s.authorize(r)
+	if err != nil {
+		if errors.Is(err, ErrOIDCPolicyDenied) {
+			s.writeError(w, http.StatusForbidden, err)
+			return
+		}
 		s.writeError(w, http.StatusUnauthorized, err)
 		return
 	}
@@ -77,7 +89,8 @@ func (s *Server) handleAllocations(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		allocation, err := s.service.Allocate(r.Context(), request)
+		ctx := withPrincipal(r.Context(), claims)
+		allocation, err := s.service.Allocate(ctx, request)
 		if err != nil {
 			s.writeError(w, http.StatusBadRequest, err)
 			return
@@ -107,7 +120,12 @@ func retryAfterSeconds(retryAfter time.Time, now time.Time) string {
 }
 
 func (s *Server) handleAllocationByID(w http.ResponseWriter, r *http.Request) {
-	if err := s.authorize(r); err != nil {
+	claims, err := s.authorize(r)
+	if err != nil {
+		if errors.Is(err, ErrOIDCPolicyDenied) {
+			s.writeError(w, http.StatusForbidden, err)
+			return
+		}
 		s.writeError(w, http.StatusUnauthorized, err)
 		return
 	}
@@ -125,6 +143,10 @@ func (s *Server) handleAllocationByID(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 			return
 		}
+		if err := s.authorizeAllocationAccess(claims, id); err != nil {
+			s.writeOwnershipError(w, err)
+			return
+		}
 		status, ok := s.service.Cancel(id)
 		if !ok {
 			s.writeError(w, http.StatusNotFound, errors.New("allocation not found"))
@@ -139,6 +161,10 @@ func (s *Server) handleAllocationByID(w http.ResponseWriter, r *http.Request) {
 		id = strings.TrimSuffix(id, "/")
 		if r.Method != http.MethodPost {
 			s.writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+			return
+		}
+		if err := s.authorizeAllocationAccess(claims, id); err != nil {
+			s.writeOwnershipError(w, err)
 			return
 		}
 
@@ -169,6 +195,10 @@ func (s *Server) handleAllocationByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := s.authorizeAllocationAccess(claims, path); err != nil {
+		s.writeOwnershipError(w, err)
+		return
+	}
 	status, ok := s.service.Get(path)
 	if !ok {
 		s.writeError(w, http.StatusNotFound, errors.New("allocation not found"))
@@ -177,24 +207,58 @@ func (s *Server) handleAllocationByID(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, status)
 }
 
-func (s *Server) authorize(r *http.Request) error {
+// authorize verifies the bearer token (when present) and enforces OIDC allowlist
+// policy for authenticated callers. Anonymous access is only permitted when
+// allowUnauthenticated is enabled.
+func (s *Server) authorize(r *http.Request) (OIDCClaims, error) {
 	authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
 	if authHeader == "" {
 		if s.allowAnon {
-			return nil
+			return OIDCClaims{}, nil
 		}
-		return ErrMissingBearerToken
+		return OIDCClaims{}, ErrMissingBearerToken
 	}
 
 	if !strings.HasPrefix(authHeader, "Bearer ") {
-		return ErrInvalidBearerToken
+		return OIDCClaims{}, ErrInvalidBearerToken
 	}
 	token := strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
 	if token == "" {
-		return ErrInvalidBearerToken
+		return OIDCClaims{}, ErrInvalidBearerToken
 	}
-	_, err := s.oidcVerifier.VerifyToken(r.Context(), token, s.expectedAud, s.allowedIssuers)
-	return err
+	claims, err := s.oidcVerifier.VerifyToken(r.Context(), token, s.expectedAud, s.allowedIssuers)
+	if err != nil {
+		return OIDCClaims{}, err
+	}
+	if err := AuthorizeOIDCPolicy(claims, s.oidcPolicy); err != nil {
+		return OIDCClaims{}, err
+	}
+	return claims, nil
+}
+
+// authorizeAllocationAccess enforces ownership on get/cancel/complete.
+// When allowUnauthenticated is enabled and the request has no subject, ownership
+// checks are skipped so local/test modes and runner callbacks keep working.
+func (s *Server) authorizeAllocationAccess(claims OIDCClaims, id string) error {
+	if s.allowAnon && claims.Sub == "" {
+		return nil
+	}
+	status, ok := s.service.Get(id)
+	if !ok {
+		return ErrAllocationNotFound
+	}
+	if OwnershipAllows(claims, status) {
+		return nil
+	}
+	return ErrAllocationForbidden
+}
+
+func (s *Server) writeOwnershipError(w http.ResponseWriter, err error) {
+	if errors.Is(err, ErrAllocationNotFound) {
+		s.writeError(w, http.StatusNotFound, err)
+		return
+	}
+	s.writeError(w, http.StatusForbidden, err)
 }
 
 func (s *Server) writeError(w http.ResponseWriter, code int, err error) {

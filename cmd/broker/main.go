@@ -67,11 +67,12 @@ func main() {
 		}
 		tier.StartRefreshLoop(context.Background(), tierManager, refresher, cfg.Broker.TierRouting.RefreshInterval)
 	}
-	server := api.NewServer(
+	server := api.NewServerWithPolicy(
 		service,
 		[]string{"https://token.actions.githubusercontent.com"},
 		cfg.Broker.API.OIDCAudience,
 		cfg.Broker.AllowUnauthenticated,
+		cfg.Broker.API.OIDCPolicy,
 	)
 
 	go func() {

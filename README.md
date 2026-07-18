@@ -245,8 +245,46 @@ The token must include:
 - `sub`: a non-empty GitHub Actions subject such as `repo:OWNER/REPO:ref:...`
 - current `exp` and, when present, `nbf` claims
 
+Optional GitHub Actions claims used for authorization and ownership:
+
+- `repository` (`owner/repo`)
+- `repository_owner`
+- `workflow_ref` / `job_workflow_ref` (retained for future policy)
+
+### Authorization policy (`broker.api.oidcPolicy`)
+
+Authentication alone is not multi-tenant isolation. Configure an allowlist when
+the broker is reachable beyond a single trusted tenant:
+
+```yaml
+broker:
+  api:
+    oidcAudience: uecb-broker
+    oidcPolicy:
+      allowedRepositories:
+        - my-org/my-repo
+        - my-org/other-*
+      allowedOwners:
+        - my-org
+```
+
+- Empty `allowedRepositories` and `allowedOwners` (default): any **authenticated**
+  identity may allocate (backward compatible for single-tenant trusted deploys).
+- Non-empty lists: the caller's repository or owner must match at least one entry
+  (union). Patterns support a trailing `/*` (or `*`) wildcard.
+- Policy denial returns HTTP 403.
+
+### Allocation ownership (IDOR protection)
+
+On allocate, the broker stores the OIDC principal (`subject`, `repository`,
+`owner`) on the allocation. Get / cancel / complete require the same `sub` (or
+the same `repository` when both sides present it). Cross-tenant access returns
+HTTP 403. When `allowUnauthenticated` is true and the request has no bearer
+token, ownership checks are skipped so local/test modes keep working.
+
 Set `broker.allowUnauthenticated: true` only behind a separate trusted network
-or gateway boundary.
+or gateway boundary. For multi-tenant or internet-exposed brokers, keep
+authentication required and set a non-empty `oidcPolicy`.
 
 ## Azure Functions Launcher
 
