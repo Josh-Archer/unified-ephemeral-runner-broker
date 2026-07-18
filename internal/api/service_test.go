@@ -1322,6 +1322,100 @@ func TestConcurrentAllocateDoesNotDoubleConsumeWarm(t *testing.T) {
 	}
 }
 
+func TestAllocateWarmHitDoesNotLeakFairShareCapacity(t *testing.T) {
+	// Regression for #61: consuming a warm allocation must release the discarded
+	// cold reservation via the fair-share-aware path, and re-attribute warm
+	// capacity from the prewarm "default" tenant to the consumer so cancel
+	// correctly frees capacity.
+	now := time.Unix(1000, 0)
+	counting := &countingBackend{testBackend: testBackend{name: model.BackendCodeBuild}}
+	service := newServiceWithCountingBackend(func(pool *model.PoolConfig) {
+		if pool.Name != model.PoolLite {
+			return
+		}
+		pool.FairShare.Enabled = true
+		for name, backendCfg := range pool.Backends {
+			backendCfg.Enabled = false
+			pool.Backends[name] = backendCfg
+		}
+		codebuildCfg := pool.Backends[model.BackendCodeBuild]
+		codebuildCfg.Enabled = true
+		codebuildCfg.Healthy = true
+		codebuildCfg.MaxRunners = 2
+		codebuildCfg.WarmMin = 1
+		codebuildCfg.WarmMax = 1
+		pool.Backends[model.BackendCodeBuild] = codebuildCfg
+	}, counting)
+	service.now = func() time.Time { return now }
+
+	service.ReconcileWarmPools()
+	if active := service.fairShare.Active(model.PoolLite, model.BackendCodeBuild); active != 1 {
+		t.Fatalf("expected fair-share active=1 after warm prewarm, got %d", active)
+	}
+
+	// Repeated warm hits must not permanently inflate fair-share active.
+	// MaxRunners=2: warm holds 1; after consume still 1; cancel frees it.
+	for i := 0; i < 3; i++ {
+		allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+			Pool:       model.PoolLite,
+			Tenant:     "tenant-a",
+			JobTimeout: 5 * time.Minute,
+		})
+		if err != nil {
+			t.Fatalf("warm allocate #%d failed: %v", i+1, err)
+		}
+		if allocation.Metadata[backend.MetadataLaunchModeKey] != launchModeWarm {
+			t.Fatalf("allocate #%d: expected warm launch mode, got %q", i+1, allocation.Metadata[backend.MetadataLaunchModeKey])
+		}
+		if active := service.fairShare.Active(model.PoolLite, model.BackendCodeBuild); active != 1 {
+			t.Fatalf("after warm hit #%d: expected fair-share active=1 (no cold leak), got %d", i+1, active)
+		}
+		if _, ok := service.Cancel(allocation.ID); !ok {
+			t.Fatalf("cancel #%d failed", i+1)
+		}
+		if active := service.fairShare.Active(model.PoolLite, model.BackendCodeBuild); active != 0 {
+			t.Fatalf("after cancel #%d: expected fair-share active=0, got %d", i+1, active)
+		}
+		service.ReconcileWarmPools()
+		if active := service.fairShare.Active(model.PoolLite, model.BackendCodeBuild); active != 1 {
+			t.Fatalf("after re-warm #%d: expected fair-share active=1, got %d", i+1, active)
+		}
+	}
+
+	// Drain warm, fill to MaxRunners with cold allocations, and assert capacity
+	// is still enforced (proves earlier warm hits did not leave active elevated).
+	for _, status := range service.store.List() {
+		if status.State == model.StateWarm || status.State == model.StateReady {
+			service.Cancel(status.ID)
+		}
+	}
+	a1, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool: model.PoolLite, Tenant: "tenant-a", JobTimeout: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("capacity probe allocate 1 failed: %v", err)
+	}
+	a2, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool: model.PoolLite, Tenant: "tenant-b", JobTimeout: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("capacity probe allocate 2 failed: %v", err)
+	}
+	if active := service.fairShare.Active(model.PoolLite, model.BackendCodeBuild); active != 2 {
+		t.Fatalf("expected fair-share active=2 at capacity, got %d", active)
+	}
+	if _, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool: model.PoolLite, Tenant: "tenant-c", JobTimeout: 5 * time.Minute,
+	}); !errors.Is(err, scheduler.ErrNoCapacity) {
+		t.Fatalf("expected ErrNoCapacity at max runners, got %v", err)
+	}
+	service.Cancel(a1.ID)
+	service.Cancel(a2.ID)
+	if active := service.fairShare.Active(model.PoolLite, model.BackendCodeBuild); active != 0 {
+		t.Fatalf("expected fair-share active=0 after draining, got %d", active)
+	}
+}
+
 func TestFileStoreWarmConsumptionRehydratesOnlyRealAllocation(t *testing.T) {
 	statePath := t.TempDir() + "/allocations.json"
 	now := time.Unix(1000, 0)
