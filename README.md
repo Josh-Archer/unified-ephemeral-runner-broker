@@ -339,6 +339,23 @@ The private release lane should publish these OCI images from one immutable sour
 
 Environment-specific repositories can mirror images when a provider requires it. For example, AWS Lambda requires the function image to live in ECR, so a private consumer may mirror the published `lambda` image into its own ECR repository while still treating this repo as the image source of truth.
 
+### Image provenance and SBOM verification
+
+The public `Publish Runtime Images` workflow binds SLSA provenance and SPDX SBOM
+attestations to each pushed image digest without changing the Lambda Docker v2
+single-manifest format. After a release publish, consumers can verify:
+
+```bash
+REPO=Josh-Archer/unified-ephemeral-runner-broker
+
+gh attestation verify oci://ghcr.io/josh-archer/uecb-lambda:TAG -R "${REPO}"
+gh attestation verify oci://ghcr.io/josh-archer/uecb-lambda:TAG -R "${REPO}" \
+  --predicate-type https://spdx.dev/Document/v2.3
+```
+
+Copy-paste commands for all three runtime images (and Lambda manifest checks)
+are in [docs/image-attestations.md](docs/image-attestations.md).
+
 ## GitHub Scope
 
 `github.scope.type` supports:
