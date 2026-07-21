@@ -48,13 +48,36 @@ type Service struct {
 }
 
 func NewService(cfg model.BrokerConfig, registry *backend.Registry, health func(context.Context) error) *Service {
+	stateStore, storeErr := store.NewFromConfig(cfg.Broker.StateStore)
+	if stateStore == nil {
+		stateStore = store.NewMemory()
+	}
+	return newServiceWithStore(cfg, registry, health, stateStore, storeErr)
+}
+
+// NewServiceWithStore builds a service against an injected store. Used by HA
+// concurrency tests that share one store across simulated replicas.
+func NewServiceWithStore(cfg model.BrokerConfig, registry *backend.Registry, health func(context.Context) error, stateStore store.Store) *Service {
+	if stateStore == nil {
+		stateStore = store.NewMemory()
+	}
+	return newServiceWithStore(cfg, registry, health, stateStore, nil)
+}
+
+func newServiceWithStore(cfg model.BrokerConfig, registry *backend.Registry, health func(context.Context) error, stateStore store.Store, storeErr error) *Service {
 	if health == nil {
 		health = func(context.Context) error { return nil }
 	}
 	schedulerRegistry := scheduler.NewRegistry()
-	stateStore, storeErr := store.NewFromConfig(cfg.Broker.StateStore)
-	if stateStore == nil {
-		stateStore = store.NewMemory()
+	baseHealth := health
+	health = func(ctx context.Context) error {
+		if err := baseHealth(ctx); err != nil {
+			return err
+		}
+		if stateStore != nil {
+			return stateStore.Ping(ctx)
+		}
+		return nil
 	}
 	service := &Service{
 		cfg:      cfg,
@@ -65,13 +88,21 @@ func NewService(cfg model.BrokerConfig, registry *backend.Registry, health func(
 		fairShare: schedulerRegistry.PriorityFairShare(),
 		store:     stateStore,
 		observer:  noopObserver{},
-		admission: newBackendAdmission(),
+		admission: newBackendAdmission(store.AsAdmissionStateStore(stateStore)),
 		tierMgr:   tier.NewManager(),
 		health:    health,
 		now:       time.Now,
 	}
 	service.initErr = firstErr(storeErr, validateSchedulers(cfg.Pools, schedulerRegistry), service.rehydrateSchedulerState())
 	return service
+}
+
+// Store returns the underlying allocation store (for HA leader wiring).
+func (s *Service) Store() store.Store {
+	if s == nil {
+		return nil
+	}
+	return s.store
 }
 
 func (s *Service) SetTierManager(manager *tier.Manager) {
@@ -291,7 +322,17 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 
 	allocation := s.prepareAllocation(ctx, request, existing, pool.Name, selected, timeout)
 
-	s.store.Save(allocation)
+	if err := s.saveReservedAllocation(allocation, pool); err != nil {
+		s.release(context.Background(), pool, selected, allocation)
+		if errors.Is(err, store.ErrNoCapacity) {
+			if queued, ok := s.queueAllocation(ctx, request, pool.Name, selected, scheduler.ErrNoCapacity, existing); ok {
+				result = "queued"
+				return queued, nil
+			}
+			return model.AllocationStatus{}, scheduler.ErrNoCapacity
+		}
+		return model.AllocationStatus{}, err
+	}
 
 	backendImpl, ok := s.registry.Get(selected)
 	if !ok {
@@ -422,6 +463,29 @@ func (s *Service) prepareAllocation(ctx context.Context, request model.Allocatio
 		applyPrincipal(&allocation, claims)
 	}
 	return allocation
+}
+
+// saveReservedAllocation persists a newly reserved/warm allocation under
+// transactional capacity limits so concurrent replicas cannot over-admit.
+func (s *Service) saveReservedAllocation(allocation model.AllocationStatus, pool model.PoolConfig) error {
+	maxRunners := 0
+	if cfg, ok := pool.Backends[allocation.SelectedBackend]; ok {
+		maxRunners = cfg.MaxRunners
+	}
+	tenantQuota := 0
+	if pool.FairShare.Enabled {
+		tenant := strings.TrimSpace(allocation.Tenant)
+		if tenant == "" {
+			tenant = "default"
+		}
+		if quota, ok := pool.FairShare.Quotas[tenant]; ok {
+			tenantQuota = quota
+		}
+	}
+	if err := s.store.SaveIfCapacity(allocation, maxRunners, tenantQuota); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (s *Service) queueAllocation(ctx context.Context, request model.AllocationRequest, pool model.PoolName, selected model.BackendName, cause error, existing model.AllocationStatus) (model.AllocationStatus, bool) {
@@ -757,15 +821,9 @@ func (s *Service) consumeWarmAllocation(ctx context.Context, pool model.PoolConf
 			s.recycleWarmAllocation(ctx, pool, candidate, "warm allocation expired")
 			continue
 		}
-		// Claim under warmMu before returning so concurrent consumers cannot
-		// observe the same StateWarm runner. filterWarmAllocations only returns
-		// StateWarm, so MarkState→ready removes it from the warm set atomically
-		// with respect to other consumeWarmAllocation callers.
-		current, ok := s.store.Get(candidate.ID)
-		if !ok || current.State != model.StateWarm {
-			continue
-		}
-		claimed, ok := s.store.MarkState(candidate.ID, model.StateReady, now, "")
+		// Compare-and-swap claim so concurrent consumers (including across HA
+		// replicas) cannot double-consume the same warm runner.
+		claimed, ok := s.store.CompareAndMarkState(candidate.ID, model.StateWarm, model.StateReady, now, "")
 		if !ok || claimed.State != model.StateReady {
 			continue
 		}
@@ -913,7 +971,10 @@ func (s *Service) createWarmAllocation(pool model.PoolConfig, backendName model.
 		launchModeWarm,
 	)
 	allocation.ExpiresAt = now.Add(ttl)
-	s.store.Save(allocation)
+	if err := s.saveReservedAllocation(allocation, pool); err != nil {
+		s.release(context.Background(), pool, backendName, allocation)
+		return err
+	}
 	return nil
 }
 

@@ -271,8 +271,11 @@ broker:
 
 ### Durable State Store
 
-The broker keeps allocation state in memory by default. Environments that need
-restart recovery can opt into a file-backed state store on a persistent volume.
+The broker keeps allocation state in memory by default. Supported modes:
+
+- `memory` — process-local (default, single-replica)
+- `file` — process-local JSON file for single-replica restart recovery
+- `postgres` — shared transactional store for multi-replica HA
 
 ```yaml
 broker:
@@ -280,6 +283,22 @@ broker:
     type: file
     path: /var/lib/uecb/allocations.json
 ```
+
+Multi-replica deployments must use PostgreSQL:
+
+```yaml
+broker:
+  stateStore:
+    type: postgres
+    dsnEnv: UECB_STATE_STORE_DSN
+  ha:
+    leaseTTL: 15s
+```
+
+Set `UECB_STATE_STORE_DSN` (or chart `config.broker.stateStore.secretRef`) to a
+reachable Postgres DSN. The chart fails when `replicaCount > 1` unless
+`stateStore.type` is `postgres`. Background sweeps run under a leader lease so
+only one replica drives warm/queue/expiry reconciliation at a time.
 
 On startup, active `reserved`, `ready`, and `warm` allocations are rehydrated
 into scheduler accounting so a restarted broker does not over-admit capacity.

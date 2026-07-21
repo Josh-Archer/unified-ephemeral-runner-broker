@@ -23,6 +23,16 @@ data:
         {{- if .Values.config.broker.stateStore.path }}
         path: {{ .Values.config.broker.stateStore.path }}
         {{- end }}
+        {{- if .Values.config.broker.stateStore.dsn }}
+        dsn: {{ .Values.config.broker.stateStore.dsn }}
+        {{- end }}
+        {{- if .Values.config.broker.stateStore.dsnEnv }}
+        dsnEnv: {{ .Values.config.broker.stateStore.dsnEnv }}
+        {{- end }}
+      {{- if .Values.config.broker.ha }}
+      ha:
+{{ toYaml .Values.config.broker.ha | indent 8 }}
+      {{- end }}
       queue:
         enabled: {{ .Values.config.broker.queue.enabled }}
         retryAfter: {{ .Values.config.broker.queue.retryAfter }}

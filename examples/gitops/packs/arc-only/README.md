@@ -42,7 +42,7 @@ allocate-runner action
 
 - `base/` — Kustomize base (extends the shared upstream base, patches ConfigMap for ARC-only config)
 - `overlays/staging/` — staging overlay (1 broker replica)
-- `overlays/production/` — production overlay (2 broker replicas)
+- `overlays/production/` — production overlay (1 broker replica; multi-replica requires postgres HA state store)
 - `argocd/application.yaml` — ArgoCD Application manifest
 - `secrets.md` — required Kubernetes Secrets and their keys
 - `rollout.md` — initial install, update, and rollback steps
