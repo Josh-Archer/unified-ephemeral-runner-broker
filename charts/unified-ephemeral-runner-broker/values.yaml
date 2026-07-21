@@ -55,8 +55,18 @@ config:
       enabled: false
       quarantineTTL: 15m
     stateStore:
+      # memory and file are single-replica only. Use postgres for multi-replica HA.
       type: memory
       path: ""
+      # dsn: ""  # optional inline DSN (prefer secret env)
+      dsnEnv: UECB_STATE_STORE_DSN
+      # secretRef/secretKey inject the DSN when type=postgres (key defaults to dsn).
+      secretRef: ""
+      secretKey: dsn
+    ha:
+      # When null/omitted, HA leader election enables automatically for postgres.
+      # enabled: true
+      leaseTTL: 15s
     queue:
       enabled: false
       retryAfter: 30s

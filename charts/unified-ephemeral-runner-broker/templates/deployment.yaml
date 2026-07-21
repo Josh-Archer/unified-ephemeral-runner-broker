@@ -1,3 +1,7 @@
+{{- $storeType := default "memory" .Values.config.broker.stateStore.type }}
+{{- if and (gt (int .Values.replicaCount) 1) (ne $storeType "postgres") }}
+{{- fail (printf "replicaCount=%v is unsafe with process-local stateStore.type %q; set config.broker.stateStore.type=postgres for multi-replica HA, or set replicaCount=1" .Values.replicaCount $storeType) }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -28,10 +32,23 @@ spec:
           env:
             - name: UECB_CONFIG_PATH
               value: /etc/uecb/broker.yaml
+            - name: UECB_REPLICAS
+              value: {{ .Values.replicaCount | quote }}
+            - name: UECB_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             - name: UECB_POD_NAMESPACE
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+{{- if and (eq $storeType "postgres") .Values.config.broker.stateStore.secretRef }}
+            - name: {{ default "UECB_STATE_STORE_DSN" .Values.config.broker.stateStore.dsnEnv }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.config.broker.stateStore.secretRef }}
+                  key: {{ default "dsn" .Values.config.broker.stateStore.secretKey }}
+{{- end }}
           ports:
             - name: http
               containerPort: 8080

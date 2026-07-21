@@ -42,7 +42,7 @@ External backends use warm capacity to reduce cold-start latency.
 
 - `base/` — Kustomize base with CodeBuild, Lambda, and Cloud Run enabled
 - `overlays/staging/` — staging overlay (1 broker replica, reduced external capacity)
-- `overlays/production/` — production overlay (2 broker replicas, full external capacity)
+- `overlays/production/` — production overlay (1 broker replica; multi-replica requires postgres HA state store, full external capacity)
 - `argocd/application.yaml` — ArgoCD Application manifest
 - `secrets.md` — required Kubernetes Secrets for all four backends
 - `rollout.md` — phased enablement steps and rollback

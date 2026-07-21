@@ -4,4 +4,7 @@ metadata:
   name: unified-ephemeral-runner-broker
   namespace: arc-systems
 spec:
-  replicas: 2
+  # Process-local state (memory/file) is single-replica only. Multi-replica HA
+  # requires broker.stateStore.type=postgres plus a shared DSN; until that is
+  # configured in this pack, keep replicas at 1.
+  replicas: 1

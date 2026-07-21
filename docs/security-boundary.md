@@ -20,4 +20,8 @@ This public repository must stay free of private environment details.
 - authoritative releases are built and published from a separate private release lane
 - only immutable tags or SHAs are promoted
 - images and charts are signed and published with digests
+- public runtime image publishes attach digest-bound provenance and SPDX SBOM
+  attestations via GitHub artifact attestations (OIDC/Sigstore); BuildKit
+  embedded provenance/SBOM stay disabled so Lambda remains a single Docker v2
+  manifest — see [image-attestations.md](image-attestations.md)
 

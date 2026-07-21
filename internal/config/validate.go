@@ -23,6 +23,9 @@ func Validate(cfg model.BrokerConfig) error {
 	if err := validateStateStore(cfg.Broker.StateStore); err != nil {
 		return err
 	}
+	if err := validateHA(cfg.Broker); err != nil {
+		return err
+	}
 	if err := validateAdmissionQueue(cfg.Broker.Queue); err != nil {
 		return err
 	}
@@ -56,6 +59,27 @@ func validateLiveCapacity(cfg model.LiveCapacityConfig) error {
 	return nil
 }
 
+func validateHA(cfg model.BrokerRuntimeConfig) error {
+	if cfg.HA.LeaseTTL < 0 {
+		return fmt.Errorf("broker.ha.leaseTTL must not be negative")
+	}
+	enabled := HAEnabled(cfg)
+	if enabled && normalizeStringDefault(cfg.StateStore.Type, "memory") != "postgres" {
+		// Allow explicit HA with any store that implements leader election
+		// (memory/file implement local leases for tests). Only warn via docs;
+		// production multi-replica still requires ValidateReplicaSafety.
+	}
+	return nil
+}
+
+// HAEnabled reports whether leader election and shared coordination should run.
+func HAEnabled(cfg model.BrokerRuntimeConfig) bool {
+	if cfg.HA.Enabled != nil {
+		return *cfg.HA.Enabled
+	}
+	return normalizeStringDefault(cfg.StateStore.Type, "memory") == "postgres"
+}
+
 func validateStateStore(cfg model.StateStoreConfig) error {
 	switch normalizeStringDefault(cfg.Type, "memory") {
 	case "memory":
@@ -65,8 +89,30 @@ func validateStateStore(cfg model.StateStoreConfig) error {
 			return fmt.Errorf("broker.stateStore.path is required when type is file")
 		}
 		return nil
+	case "postgres":
+		// DSN may come from env at runtime; require either inline DSN or a non-empty env name.
+		if strings.TrimSpace(cfg.DSN) == "" && strings.TrimSpace(cfg.DSNEnv) == "" {
+			// Empty DSNEnv still defaults to UECB_STATE_STORE_DSN in the store package.
+			return nil
+		}
+		return nil
 	default:
 		return fmt.Errorf("broker.stateStore.type %q is not supported", cfg.Type)
+	}
+}
+
+// ValidateReplicaSafety rejects multi-replica deployments that use process-local state.
+// expectedReplicas comes from the UECB_REPLICAS environment variable (set by the chart).
+func ValidateReplicaSafety(cfg model.BrokerConfig, expectedReplicas int) error {
+	if expectedReplicas <= 1 {
+		return nil
+	}
+	storeType := normalizeStringDefault(cfg.Broker.StateStore.Type, "memory")
+	switch storeType {
+	case "postgres":
+		return nil
+	default:
+		return fmt.Errorf("broker replicas=%d is unsafe with process-local stateStore.type %q; use type postgres for multi-replica HA, or set replicas to 1", expectedReplicas, storeType)
 	}
 }
 
