@@ -17,6 +17,7 @@ import (
 	ec2backend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/ec2"
 	gcebackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/gce"
 	lambdabackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/lambda"
+	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/capacity"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/config"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/scheduler"
@@ -2127,5 +2128,542 @@ func TestAllocateEnforcesTenantQuotas(t *testing.T) {
 	})
 	if !errors.Is(err, scheduler.ErrQuotaExceeded) {
 		t.Fatalf("expected ErrQuotaExceeded, got %v", err)
+	}
+}
+
+type capacityTestBackend struct {
+	testBackend
+	status backend.CapacityStatus
+	err    error
+	mu     sync.Mutex
+}
+
+func (b *capacityTestBackend) Capacity(context.Context) (backend.CapacityStatus, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.err != nil {
+		return backend.CapacityStatus{}, b.err
+	}
+	return b.status, nil
+}
+
+func (b *capacityTestBackend) setStatus(status backend.CapacityStatus) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.status = status
+}
+
+func enableLiveCapacity(cfg *model.BrokerConfig) {
+	cfg.Broker.LiveCapacity.Enabled = true
+	cfg.Broker.LiveCapacity.FailureMode = "pass-through"
+	cfg.Broker.LiveCapacity.RefreshInterval = time.Second
+	cfg.Broker.LiveCapacity.StaleAfter = time.Minute
+}
+
+func TestLiveCapacitySkipsExhaustedBackend(t *testing.T) {
+	codebuildCap := &capacityTestBackend{
+		testBackend: testBackend{name: model.BackendCodeBuild},
+		status: backend.CapacityStatus{
+			MaxRunners:    2,
+			ActiveRunners: 2,
+		},
+	}
+	cfg := config.Default()
+	enableLiveCapacity(&cfg)
+	for i := range cfg.Pools {
+		if cfg.Pools[i].Name != model.PoolLite {
+			continue
+		}
+		codebuildCfg := cfg.Pools[i].Backends[model.BackendCodeBuild]
+		codebuildCfg.Enabled = true
+		codebuildCfg.MaxRunners = 4
+		cfg.Pools[i].Backends[model.BackendCodeBuild] = codebuildCfg
+		arcCfg := cfg.Pools[i].Backends[model.BackendARC]
+		arcCfg.Enabled = true
+		arcCfg.MaxRunners = 2
+		cfg.Pools[i].Backends[model.BackendARC] = arcCfg
+	}
+
+	service := NewService(cfg, backend.NewRegistry(
+		testBackend{name: model.BackendARC},
+		codebuildCap,
+	), nil)
+	manager := capacity.NewManager()
+	service.SetCapacityManager(manager)
+	manager.Set(capacity.Snapshot{
+		Backend:   model.BackendCodeBuild,
+		Status:    codebuildCap.status,
+		UpdatedAt: time.Now().UTC(),
+		Source:    "live",
+	})
+
+	// Prefer codebuild by weight so without live capacity it would win.
+	for i := range cfg.Pools {
+		if cfg.Pools[i].Name != model.PoolLite {
+			continue
+		}
+		cfg.Pools[i].Scheduler = "weighted-round-robin"
+		codebuildCfg := cfg.Pools[i].Backends[model.BackendCodeBuild]
+		codebuildCfg.Weight = 100
+		cfg.Pools[i].Backends[model.BackendCodeBuild] = codebuildCfg
+		arcCfg := cfg.Pools[i].Backends[model.BackendARC]
+		arcCfg.Weight = 1
+		cfg.Pools[i].Backends[model.BackendARC] = arcCfg
+	}
+	service = NewService(cfg, backend.NewRegistry(
+		testBackend{name: model.BackendARC},
+		codebuildCap,
+	), nil)
+	service.SetCapacityManager(manager)
+
+	for i := 0; i < 2; i++ {
+		status, err := service.Allocate(context.Background(), model.AllocationRequest{
+			Pool:       model.PoolLite,
+			JobTimeout: time.Minute,
+		})
+		if err != nil {
+			t.Fatalf("allocate %d: %v", i, err)
+		}
+		if status.SelectedBackend != model.BackendARC {
+			t.Fatalf("allocate %d: expected arc after codebuild exhausted, got %s", i, status.SelectedBackend)
+		}
+	}
+}
+
+func TestLiveCapacityBecomesRoutableWithoutRestart(t *testing.T) {
+	codebuildCap := &capacityTestBackend{
+		testBackend: testBackend{name: model.BackendCodeBuild},
+		status: backend.CapacityStatus{
+			MaxRunners:    1,
+			ActiveRunners: 1,
+		},
+	}
+	cfg := config.Default()
+	enableLiveCapacity(&cfg)
+	for i := range cfg.Pools {
+		if cfg.Pools[i].Name != model.PoolLite {
+			// Disable full pool arc so only lite is used.
+			for name, backendCfg := range cfg.Pools[i].Backends {
+				backendCfg.Enabled = false
+				cfg.Pools[i].Backends[name] = backendCfg
+			}
+			continue
+		}
+		// Only codebuild enabled initially.
+		for name, backendCfg := range cfg.Pools[i].Backends {
+			backendCfg.Enabled = name == model.BackendCodeBuild
+			if name == model.BackendCodeBuild {
+				backendCfg.MaxRunners = 4
+			}
+			cfg.Pools[i].Backends[name] = backendCfg
+		}
+	}
+
+	manager := capacity.NewManager()
+	manager.Set(capacity.Snapshot{
+		Backend:   model.BackendCodeBuild,
+		Status:    codebuildCap.status,
+		UpdatedAt: time.Now().UTC(),
+		Source:    "live",
+	})
+	service := NewService(cfg, backend.NewRegistry(codebuildCap), nil)
+	service.SetCapacityManager(manager)
+
+	if _, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool: model.PoolLite, JobTimeout: time.Minute,
+	}); !errors.Is(err, ErrBackendLiveCapacity) {
+		t.Fatalf("expected live capacity exhaustion, got %v", err)
+	}
+
+	// Provider regains capacity without config change.
+	codebuildCap.setStatus(backend.CapacityStatus{MaxRunners: 2, ActiveRunners: 0})
+	manager.Set(capacity.Snapshot{
+		Backend:   model.BackendCodeBuild,
+		Status:    backend.CapacityStatus{MaxRunners: 2, ActiveRunners: 0},
+		UpdatedAt: time.Now().UTC(),
+		Source:    "live",
+	})
+
+	status, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool: model.PoolLite, JobTimeout: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("expected allocation after capacity recovery: %v", err)
+	}
+	if status.SelectedBackend != model.BackendCodeBuild {
+		t.Fatalf("expected codebuild, got %s", status.SelectedBackend)
+	}
+}
+
+func TestLiveCapacityPinnedError(t *testing.T) {
+	codebuildCap := &capacityTestBackend{
+		testBackend: testBackend{name: model.BackendCodeBuild},
+		status:      backend.CapacityStatus{MaxRunners: 1, ActiveRunners: 1},
+	}
+	cfg := config.Default()
+	enableLiveCapacity(&cfg)
+	for i := range cfg.Pools {
+		if cfg.Pools[i].Name != model.PoolLite {
+			continue
+		}
+		codebuildCfg := cfg.Pools[i].Backends[model.BackendCodeBuild]
+		codebuildCfg.Enabled = true
+		codebuildCfg.MaxRunners = 4
+		cfg.Pools[i].Backends[model.BackendCodeBuild] = codebuildCfg
+		arcCfg := cfg.Pools[i].Backends[model.BackendARC]
+		arcCfg.Enabled = true
+		cfg.Pools[i].Backends[model.BackendARC] = arcCfg
+	}
+	manager := capacity.NewManager()
+	manager.Set(capacity.Snapshot{
+		Backend:   model.BackendCodeBuild,
+		Status:    codebuildCap.status,
+		UpdatedAt: time.Now().UTC(),
+		Source:    "live",
+	})
+	service := NewService(cfg, backend.NewRegistry(
+		testBackend{name: model.BackendARC},
+		codebuildCap,
+	), nil)
+	service.SetCapacityManager(manager)
+
+	pinned := model.BackendCodeBuild
+	_, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolLite,
+		Backend:    &pinned,
+		JobTimeout: time.Minute,
+	})
+	if !errors.Is(err, ErrBackendLiveCapacity) {
+		t.Fatalf("expected pinned live capacity error, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "pinned backend") {
+		t.Fatalf("expected deterministic pinned error message, got %v", err)
+	}
+}
+
+func TestLiveCapacityStalePassThroughAndBlock(t *testing.T) {
+	codebuildCap := &capacityTestBackend{
+		testBackend: testBackend{name: model.BackendCodeBuild},
+		status:      backend.CapacityStatus{MaxRunners: 1, ActiveRunners: 0},
+	}
+
+	t.Run("pass-through", func(t *testing.T) {
+		cfg := config.Default()
+		enableLiveCapacity(&cfg)
+		cfg.Broker.LiveCapacity.FailureMode = "pass-through"
+		for i := range cfg.Pools {
+			if cfg.Pools[i].Name != model.PoolLite {
+				continue
+			}
+			for name, backendCfg := range cfg.Pools[i].Backends {
+				backendCfg.Enabled = name == model.BackendCodeBuild
+				if name == model.BackendCodeBuild {
+					backendCfg.MaxRunners = 2
+				}
+				cfg.Pools[i].Backends[name] = backendCfg
+			}
+		}
+		manager := capacity.NewManager()
+		manager.Set(capacity.Snapshot{
+			Backend:   model.BackendCodeBuild,
+			Status:    codebuildCap.status,
+			UpdatedAt: time.Now().UTC().Add(-10 * time.Minute),
+			Stale:     true,
+			Source:    "live",
+		})
+		service := NewService(cfg, backend.NewRegistry(codebuildCap), nil)
+		service.SetCapacityManager(manager)
+		if _, err := service.Allocate(context.Background(), model.AllocationRequest{
+			Pool: model.PoolLite, JobTimeout: time.Minute,
+		}); err != nil {
+			t.Fatalf("stale pass-through should use local capacity: %v", err)
+		}
+	})
+
+	t.Run("block", func(t *testing.T) {
+		cfg := config.Default()
+		enableLiveCapacity(&cfg)
+		cfg.Broker.LiveCapacity.FailureMode = "block"
+		for i := range cfg.Pools {
+			if cfg.Pools[i].Name != model.PoolLite {
+				continue
+			}
+			for name, backendCfg := range cfg.Pools[i].Backends {
+				backendCfg.Enabled = name == model.BackendCodeBuild
+				if name == model.BackendCodeBuild {
+					backendCfg.MaxRunners = 2
+				}
+				cfg.Pools[i].Backends[name] = backendCfg
+			}
+		}
+		manager := capacity.NewManager()
+		manager.Set(capacity.Snapshot{
+			Backend:   model.BackendCodeBuild,
+			Status:    codebuildCap.status,
+			UpdatedAt: time.Now().UTC().Add(-10 * time.Minute),
+			Stale:     true,
+			Source:    "live",
+		})
+		service := NewService(cfg, backend.NewRegistry(codebuildCap), nil)
+		service.SetCapacityManager(manager)
+		if _, err := service.Allocate(context.Background(), model.AllocationRequest{
+			Pool: model.PoolLite, JobTimeout: time.Minute,
+		}); !errors.Is(err, ErrBackendLiveCapacity) {
+			t.Fatalf("stale block should reject, got %v", err)
+		}
+	})
+}
+
+func TestLiveCapacityProviderRejectFallsBack(t *testing.T) {
+	rejecting := &sequenceBackend{
+		testBackend: testBackend{name: model.BackendCodeBuild},
+		errs: []error{
+			backend.NewAllocationError(fmt.Errorf("no free slots"), backend.ErrBackendCapacityExhausted, true),
+		},
+	}
+	cfg := config.Default()
+	enableLiveCapacity(&cfg)
+	// Do not seed capacity cache as full so codebuild is selectable, then rejects at provision.
+	for i := range cfg.Pools {
+		if cfg.Pools[i].Name != model.PoolLite {
+			continue
+		}
+		codebuildCfg := cfg.Pools[i].Backends[model.BackendCodeBuild]
+		codebuildCfg.Enabled = true
+		codebuildCfg.MaxRunners = 2
+		codebuildCfg.Weight = 100
+		cfg.Pools[i].Backends[model.BackendCodeBuild] = codebuildCfg
+		arcCfg := cfg.Pools[i].Backends[model.BackendARC]
+		arcCfg.Enabled = true
+		arcCfg.MaxRunners = 2
+		arcCfg.Weight = 1
+		cfg.Pools[i].Backends[model.BackendARC] = arcCfg
+		cfg.Pools[i].Scheduler = "weighted-round-robin"
+	}
+	service := NewService(cfg, backend.NewRegistry(
+		testBackend{name: model.BackendARC},
+		rejecting,
+	), nil)
+
+	status, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool: model.PoolLite, JobTimeout: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("expected fallback after provider capacity reject: %v", err)
+	}
+	if status.SelectedBackend != model.BackendARC {
+		t.Fatalf("expected arc fallback, got %s", status.SelectedBackend)
+	}
+}
+
+func TestLiveCapacityRespectsLowerCeiling(t *testing.T) {
+	codebuildCap := &capacityTestBackend{
+		testBackend: testBackend{name: model.BackendCodeBuild},
+		status:      backend.CapacityStatus{MaxRunners: 1, ActiveRunners: 0},
+	}
+	cfg := config.Default()
+	enableLiveCapacity(&cfg)
+	for i := range cfg.Pools {
+		if cfg.Pools[i].Name != model.PoolLite {
+			continue
+		}
+		for name, backendCfg := range cfg.Pools[i].Backends {
+			backendCfg.Enabled = name == model.BackendCodeBuild
+			if name == model.BackendCodeBuild {
+				backendCfg.MaxRunners = 5
+			}
+			cfg.Pools[i].Backends[name] = backendCfg
+		}
+	}
+	manager := capacity.NewManager()
+	manager.Set(capacity.Snapshot{
+		Backend:   model.BackendCodeBuild,
+		Status:    codebuildCap.status,
+		UpdatedAt: time.Now().UTC(),
+		Source:    "live",
+	})
+	service := NewService(cfg, backend.NewRegistry(codebuildCap), nil)
+	service.SetCapacityManager(manager)
+
+	if _, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool: model.PoolLite, JobTimeout: time.Minute,
+	}); err != nil {
+		t.Fatalf("first allocate: %v", err)
+	}
+	// Second allocate should fail: provider max=1 even though config max=5.
+	if _, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool: model.PoolLite, JobTimeout: time.Minute,
+	}); !errors.Is(err, ErrBackendLiveCapacity) && !errors.Is(err, scheduler.ErrNoCapacity) {
+		t.Fatalf("expected capacity ceiling error, got %v", err)
+	}
+}
+
+func TestLiveCapacityFairShareStillRanks(t *testing.T) {
+	cfg := config.Default()
+	enableLiveCapacity(&cfg)
+	for i := range cfg.Pools {
+		if cfg.Pools[i].Name != model.PoolLite {
+			continue
+		}
+		cfg.Pools[i].FairShare.Enabled = true
+		cfg.Pools[i].Scheduler = "round-robin"
+		arcCfg := cfg.Pools[i].Backends[model.BackendARC]
+		arcCfg.Enabled = true
+		arcCfg.MaxRunners = 4
+		cfg.Pools[i].Backends[model.BackendARC] = arcCfg
+		codebuildCfg := cfg.Pools[i].Backends[model.BackendCodeBuild]
+		codebuildCfg.Enabled = true
+		codebuildCfg.MaxRunners = 4
+		cfg.Pools[i].Backends[model.BackendCodeBuild] = codebuildCfg
+	}
+	manager := capacity.NewManager()
+	// Both backends have free capacity.
+	manager.Set(capacity.Snapshot{
+		Backend: model.BackendARC,
+		Status:  backend.CapacityStatus{MaxRunners: 4, ActiveRunners: 0},
+		UpdatedAt: time.Now().UTC(), Source: "live",
+	})
+	manager.Set(capacity.Snapshot{
+		Backend: model.BackendCodeBuild,
+		Status:  backend.CapacityStatus{MaxRunners: 4, ActiveRunners: 0},
+		UpdatedAt: time.Now().UTC(), Source: "live",
+	})
+	service := NewService(cfg, backend.NewRegistry(
+		testBackend{name: model.BackendARC},
+		testBackend{name: model.BackendCodeBuild},
+	), nil)
+	service.SetCapacityManager(manager)
+
+	// Load tenant-a onto arc.
+	pinned := model.BackendARC
+	for i := 0; i < 2; i++ {
+		if _, err := service.Allocate(context.Background(), model.AllocationRequest{
+			Pool: model.PoolLite, Backend: &pinned, Tenant: "tenant-a", JobTimeout: time.Minute,
+		}); err != nil {
+			t.Fatalf("seed allocate: %v", err)
+		}
+	}
+	// tenant-b should prefer the less loaded backend (codebuild) under fair-share.
+	status, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool: model.PoolLite, Tenant: "tenant-b", JobTimeout: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("fair-share allocate: %v", err)
+	}
+	if status.SelectedBackend != model.BackendCodeBuild {
+		t.Fatalf("expected codebuild under fair-share with live capacity, got %s", status.SelectedBackend)
+	}
+}
+
+func TestLiveCapacityWarmPoolStillConsumed(t *testing.T) {
+	counting := &countingBackend{testBackend: testBackend{name: model.BackendCodeBuild}}
+	cfg := config.Default()
+	enableLiveCapacity(&cfg)
+	for i := range cfg.Pools {
+		if cfg.Pools[i].Name != model.PoolLite {
+			continue
+		}
+		for name, backendCfg := range cfg.Pools[i].Backends {
+			if name == model.BackendCodeBuild {
+				backendCfg.Enabled = true
+				backendCfg.MaxRunners = 4
+				backendCfg.WarmMin = 1
+				backendCfg.WarmMax = 1
+				backendCfg.WarmTTL = time.Hour
+			} else {
+				backendCfg.Enabled = false
+			}
+			cfg.Pools[i].Backends[name] = backendCfg
+		}
+	}
+	manager := capacity.NewManager()
+	// Provider free slots available.
+	manager.Set(capacity.Snapshot{
+		Backend:   model.BackendCodeBuild,
+		Status:    backend.CapacityStatus{MaxRunners: 4, ActiveRunners: 0, WarmRunners: 0},
+		UpdatedAt: time.Now().UTC(),
+		Source:    "live",
+	})
+	service := NewService(cfg, backend.NewRegistry(counting), nil)
+	service.SetCapacityManager(manager)
+	service.ReconcileWarmPools()
+
+	status, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool: model.PoolLite, JobTimeout: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("warm allocate: %v", err)
+	}
+	if status.Metadata["launch_mode"] != launchModeWarm {
+		t.Fatalf("expected warm launch, got metadata=%v", status.Metadata)
+	}
+	// Cold provision for warm preseed + no additional cold for consume.
+	if counting.provisionCount != 1 {
+		t.Fatalf("expected single warm provision, got %d", counting.provisionCount)
+	}
+}
+
+func TestLiveCapacityConcurrentProviderReject(t *testing.T) {
+	// Simulate concurrent reservations: first provision succeeds, second rejects capacity then falls back.
+	codebuild := &sequenceBackend{
+		testBackend: testBackend{name: model.BackendCodeBuild},
+		errs: []error{
+			nil,
+			backend.NewAllocationError(fmt.Errorf("capacity"), backend.ErrBackendCapacityExhausted, true),
+		},
+	}
+	cfg := config.Default()
+	enableLiveCapacity(&cfg)
+	for i := range cfg.Pools {
+		if cfg.Pools[i].Name != model.PoolLite {
+			continue
+		}
+		codebuildCfg := cfg.Pools[i].Backends[model.BackendCodeBuild]
+		codebuildCfg.Enabled = true
+		codebuildCfg.MaxRunners = 2
+		cfg.Pools[i].Backends[model.BackendCodeBuild] = codebuildCfg
+		arcCfg := cfg.Pools[i].Backends[model.BackendARC]
+		arcCfg.Enabled = true
+		arcCfg.MaxRunners = 2
+		cfg.Pools[i].Backends[model.BackendARC] = arcCfg
+	}
+	// Pin first to codebuild, second unpinned after reject path uses fallback logic via sequential calls.
+	service := NewService(cfg, backend.NewRegistry(
+		testBackend{name: model.BackendARC},
+		codebuild,
+	), nil)
+
+	pinned := model.BackendCodeBuild
+	if _, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool: model.PoolLite, Backend: &pinned, JobTimeout: time.Minute,
+	}); err != nil {
+		t.Fatalf("first: %v", err)
+	}
+	// Second pinned fails deterministically on capacity reject without fallback when only one attempt rejects.
+	// Use unpinned so fallback can engage after reject.
+	codebuild.errs = []error{
+		backend.NewAllocationError(fmt.Errorf("capacity"), backend.ErrBackendCapacityExhausted, true),
+	}
+	// Force selection of codebuild first via weight.
+	for i := range service.cfg.Pools {
+		if service.cfg.Pools[i].Name != model.PoolLite {
+			continue
+		}
+		service.cfg.Pools[i].Scheduler = "weighted-round-robin"
+		cb := service.cfg.Pools[i].Backends[model.BackendCodeBuild]
+		cb.Weight = 100
+		service.cfg.Pools[i].Backends[model.BackendCodeBuild] = cb
+		arc := service.cfg.Pools[i].Backends[model.BackendARC]
+		arc.Weight = 1
+		service.cfg.Pools[i].Backends[model.BackendARC] = arc
+	}
+	status, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool: model.PoolLite, JobTimeout: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("expected fallback after concurrent-style reject: %v", err)
+	}
+	if status.SelectedBackend != model.BackendARC {
+		t.Fatalf("expected arc fallback, got %s", status.SelectedBackend)
 	}
 }

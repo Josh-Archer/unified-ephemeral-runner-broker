@@ -29,6 +29,30 @@ func Validate(cfg model.BrokerConfig) error {
 	if err := validateTierRouting(cfg); err != nil {
 		return err
 	}
+	if err := validateLiveCapacity(cfg.Broker.LiveCapacity); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateLiveCapacity(cfg model.LiveCapacityConfig) error {
+	if !cfg.Enabled {
+		return nil
+	}
+	switch normalizeStringDefault(cfg.FailureMode, "pass-through") {
+	case "pass-through", "block", "block-stale", "fail-closed":
+	default:
+		return fmt.Errorf("broker.liveCapacity.failureMode %q is not supported", cfg.FailureMode)
+	}
+	if cfg.RefreshInterval < 0 {
+		return fmt.Errorf("broker.liveCapacity.refreshInterval must not be negative")
+	}
+	if cfg.StaleAfter < 0 {
+		return fmt.Errorf("broker.liveCapacity.staleAfter must not be negative")
+	}
+	if cfg.ProbeTimeout < 0 {
+		return fmt.Errorf("broker.liveCapacity.probeTimeout must not be negative")
+	}
 	return nil
 }
 

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend"
+	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/capacity"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/scheduler"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/store"
@@ -25,6 +26,7 @@ var ErrAllocationNotFound = errors.New("allocation not found")
 var ErrAllocationAlreadyCompleted = errors.New("allocation already in terminal state")
 var ErrInvalidCompletionState = errors.New("invalid completion state")
 var ErrBackendTierBlocked = errors.New("backend tier policy blocked allocation")
+var ErrBackendLiveCapacity = errors.New("backend live capacity exhausted")
 
 const (
 	defaultWarmTTL = 15 * time.Minute
@@ -33,18 +35,19 @@ const (
 )
 
 type Service struct {
-	cfg       model.BrokerConfig
-	registry  *backend.Registry
-	scheds    *scheduler.Registry
-	fairShare *scheduler.PriorityFairShare
-	store     store.Store
-	observer  Observer
-	admission *backendAdmission
-	tierMgr   *tier.Manager
-	warmMu    sync.Mutex
-	initErr   error
-	health    func(context.Context) error
-	now       func() time.Time
+	cfg         model.BrokerConfig
+	registry    *backend.Registry
+	scheds      *scheduler.Registry
+	fairShare   *scheduler.PriorityFairShare
+	store       store.Store
+	observer    Observer
+	admission   *backendAdmission
+	tierMgr     *tier.Manager
+	capacityMgr *capacity.Manager
+	warmMu      sync.Mutex
+	initErr     error
+	health      func(context.Context) error
+	now         func() time.Time
 }
 
 func NewService(cfg model.BrokerConfig, registry *backend.Registry, health func(context.Context) error) *Service {
@@ -62,13 +65,14 @@ func NewService(cfg model.BrokerConfig, registry *backend.Registry, health func(
 		scheds:   schedulerRegistry,
 		// Share one PriorityFairShare instance with the scheduler registry so
 		// fairShare.enabled and scheduler: priority-fair-share do not diverge.
-		fairShare: schedulerRegistry.PriorityFairShare(),
-		store:     stateStore,
-		observer:  noopObserver{},
-		admission: newBackendAdmission(),
-		tierMgr:   tier.NewManager(),
-		health:    health,
-		now:       time.Now,
+		fairShare:   schedulerRegistry.PriorityFairShare(),
+		store:       stateStore,
+		observer:    noopObserver{},
+		admission:   newBackendAdmission(),
+		tierMgr:     tier.NewManager(),
+		capacityMgr: capacity.NewManager(),
+		health:      health,
+		now:         time.Now,
 	}
 	service.initErr = firstErr(storeErr, validateSchedulers(cfg.Pools, schedulerRegistry), service.rehydrateSchedulerState())
 	return service
@@ -76,6 +80,17 @@ func NewService(cfg model.BrokerConfig, registry *backend.Registry, health func(
 
 func (s *Service) SetTierManager(manager *tier.Manager) {
 	s.tierMgr = manager
+}
+
+func (s *Service) SetCapacityManager(manager *capacity.Manager) {
+	if manager == nil {
+		manager = capacity.NewManager()
+	}
+	s.capacityMgr = manager
+}
+
+func (s *Service) CapacityManager() *capacity.Manager {
+	return s.capacityMgr
 }
 
 func (s *Service) SetObserver(observer Observer) {
@@ -221,182 +236,235 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 		}
 		return model.AllocationStatus{}, err
 	}
+	pool, err = s.filterBackendsByLiveCapacity(pool, request)
+	if err != nil {
+		if queued, ok := s.queueAllocation(ctx, request, resultPool, "", err, existing); ok {
+			result = "queued"
+			return queued, nil
+		}
+		return model.AllocationStatus{}, err
+	}
 
+	// Outer loop retries selection when a provider rejects reservation due to
+	// live capacity exhaustion. Local scheduler reservations remain the broker
+	// concurrency authority; provider rejection is the final capacity check.
 	reservePool := pool
 	reserveRequest := request
 	var selected model.BackendName
 	var rateLimitedFallback model.BackendName
+	var capacityFallback model.BackendName
 	for {
-		selected, err = s.reserve(reservePool, reserveRequest)
-		if err != nil {
-			if errors.Is(err, scheduler.ErrNoCapacity) {
-				if rateLimitedFallback != "" {
-					return model.AllocationStatus{}, fmt.Errorf("selected backend %q is rate-limited and no fallback backend is available: %w", rateLimitedFallback, ErrBackendRateLimited)
+		for {
+			selected, err = s.reserve(reservePool, reserveRequest)
+			if err != nil {
+				if errors.Is(err, scheduler.ErrNoCapacity) {
+					if capacityFallback != "" {
+						return model.AllocationStatus{}, fmt.Errorf("selected backend %q capacity exhausted and no fallback backend is available: %w", capacityFallback, ErrBackendLiveCapacity)
+					}
+					if rateLimitedFallback != "" {
+						return model.AllocationStatus{}, fmt.Errorf("selected backend %q is rate-limited and no fallback backend is available: %w", rateLimitedFallback, ErrBackendRateLimited)
+					}
+					if fallbackFromRateLimit && pinnedBackend != nil {
+						return model.AllocationStatus{}, fmt.Errorf("pinned backend %q is rate-limited and no fallback backend is available: %w", *pinnedBackend, ErrBackendRateLimited)
+					}
 				}
-				if fallbackFromRateLimit && pinnedBackend != nil {
-					return model.AllocationStatus{}, fmt.Errorf("pinned backend %q is rate-limited and no fallback backend is available: %w", *pinnedBackend, ErrBackendRateLimited)
+				if queued, ok := s.queueAllocation(ctx, reserveRequest, reservePool.Name, "", err, existing); ok {
+					result = "queued"
+					return queued, nil
+				}
+				return model.AllocationStatus{}, err
+			}
+			if s.admission == nil {
+				pool = reservePool
+				request = reserveRequest
+				break
+			}
+			decision := s.admission.allow(reservePool.Name, selected, reservePool.Backends[selected], s.now(), false, true)
+			if !decision.Allowed {
+				s.release(context.Background(), reservePool, selected, model.AllocationStatus{Pool: reservePool.Name, SelectedBackend: selected})
+				s.observer.ObserveBackendAdmissionRejected(reservePool.Name, selected, decision.Reason)
+				switch decision.Reason {
+				case "circuit-open":
+					err := fmt.Errorf("selected backend %q is not admissible: %w", selected, ErrBackendCircuitOpen)
+					if queued, ok := s.queueAllocation(ctx, reserveRequest, reservePool.Name, selected, err, existing); ok {
+						result = "queued"
+						return queued, nil
+					}
+					return model.AllocationStatus{}, err
+				case "rate-limited":
+					rateLimitedFallback = selected
+					reservePool = withoutBackend(reservePool, selected)
+					reserveRequest.Backend = nil
+					if len(reservePool.Backends) > 0 {
+						continue
+					}
+					err := fmt.Errorf("selected backend %q is rate-limited and no fallback backend is available: %w", selected, ErrBackendRateLimited)
+					return model.AllocationStatus{}, err
+				default:
+					err := fmt.Errorf("selected backend %q is not admissible: %s", selected, decision.Reason)
+					if queued, ok := s.queueAllocation(ctx, reserveRequest, reservePool.Name, selected, err, existing); ok {
+						result = "queued"
+						return queued, nil
+					}
+					return model.AllocationStatus{}, err
 				}
 			}
-			if queued, ok := s.queueAllocation(ctx, reserveRequest, reservePool.Name, "", err, existing); ok {
-				result = "queued"
-				return queued, nil
-			}
-			return model.AllocationStatus{}, err
-		}
-		if s.admission == nil {
 			pool = reservePool
 			request = reserveRequest
 			break
 		}
-		decision := s.admission.allow(reservePool.Name, selected, reservePool.Backends[selected], s.now(), false, true)
-		if !decision.Allowed {
-			s.release(context.Background(), reservePool, selected, model.AllocationStatus{Pool: reservePool.Name, SelectedBackend: selected})
-			s.observer.ObserveBackendAdmissionRejected(reservePool.Name, selected, decision.Reason)
-			switch decision.Reason {
-			case "circuit-open":
-				err := fmt.Errorf("selected backend %q is not admissible: %w", selected, ErrBackendCircuitOpen)
-				if queued, ok := s.queueAllocation(ctx, reserveRequest, reservePool.Name, selected, err, existing); ok {
-					result = "queued"
-					return queued, nil
-				}
+		resultBackend = selected
+		s.observer.ObserveAllocationStart(pool.Name)
+		logAllocationEvent(ctx, "allocation_admitted", map[string]string{
+			"pool":    string(pool.Name),
+			"backend": string(selected),
+		})
+
+		allocation := s.prepareAllocation(ctx, request, existing, pool.Name, selected, timeout)
+
+		s.store.Save(allocation)
+
+		backendImpl, ok := s.registry.Get(selected)
+		if !ok {
+			s.release(context.Background(), pool, selected, allocation)
+			s.store.MarkState(allocation.ID, model.StateFailed, s.now(), "backend not registered")
+			return model.AllocationStatus{}, fmt.Errorf("backend implementation missing: %s", selected)
+		}
+
+		if warmAllocation, ok := s.consumeWarmAllocation(ctx, pool, selected, allocation); ok {
+			// Drop the cold reservation via fair-share-aware release. Warm capacity
+			// remains held by the prewarm reservation created earlier.
+			s.release(ctx, pool, selected, allocation)
+			if err := s.store.Delete(allocation.ID); err != nil {
 				return model.AllocationStatus{}, err
-			case "rate-limited":
-				rateLimitedFallback = selected
+			}
+			launchMode = launchModeWarm
+			// Warm pools reserve under an empty/"default" tenant; re-attribute the
+			// held capacity to the consuming tenant before overwriting metadata.
+			if pool.FairShare.Enabled && s.fairShare != nil {
+				s.fairShare.Release(pool.Name, selected, warmAllocation)
+				transfer := request
+				transfer.Backend = &selected
+				if _, err := s.fairShare.Reserve(pool, transfer); err != nil {
+					// Restore original warm reservation so capacity is not lost.
+					recoverReq := model.AllocationRequest{
+						Pool:    pool.Name,
+						Backend: &selected,
+						Tenant:  warmAllocation.Tenant,
+					}
+					if _, recoverErr := s.fairShare.Reserve(pool, recoverReq); recoverErr != nil {
+						logAllocationEvent(ctx, "fair_share_warm_tenant_transfer_failed", map[string]string{
+							"pool":    string(pool.Name),
+							"backend": string(selected),
+							"error":   err.Error(),
+						})
+					}
+				}
+			}
+			warmAllocation.State = model.StateReady
+			warmAllocation.CorrelationID = allocation.CorrelationID
+			warmAllocation.Tenant = request.Tenant
+			warmAllocation.PriorityClass = request.PriorityClass
+			warmAllocation.RequestedLabels = append([]string(nil), request.Labels...)
+			warmAllocation.ExpiresAt = allocation.ExpiresAt
+			warmAllocation.Subject = allocation.Subject
+			warmAllocation.Repository = allocation.Repository
+			warmAllocation.Owner = allocation.Owner
+			warmAllocation.Metadata = withLaunchModeMetadata(
+				backend.WithCapabilitiesMetadata(pool.Backends[selected], warmAllocation.Metadata),
+				launchMode,
+			)
+			s.store.Save(warmAllocation)
+			launchLatency := time.Duration(0)
+			s.observer.ObserveLaunchLatency(pool.Name, selected, launchMode, launchLatency)
+			s.observer.ObserveRegistrationLatency(pool.Name, selected, launchLatency)
+			result = "success"
+			allocation = warmAllocation
+			logAllocationEvent(ctx, "allocation_ready", map[string]string{
+				"allocation_id": allocation.ID,
+				"pool":          string(pool.Name),
+				"backend":       string(selected),
+				"launch_mode":   launchMode,
+			})
+			return allocation, nil
+		}
+
+		launchStarted := s.now()
+		provisioned, err := backendImpl.Provision(ctx, request, allocation)
+		launchLatency := s.now().Sub(launchStarted)
+		s.observer.ObserveLaunchLatency(pool.Name, selected, launchMode, launchLatency)
+		s.observer.ObserveRegistrationLatency(pool.Name, selected, launchLatency)
+		if err != nil {
+			s.release(context.Background(), pool, selected, allocation)
+			s.recordBackendFailure(pool, selected, err, s.now())
+			if backend.IsCapacityExhausted(err) {
+				capacityFallback = selected
+				s.observer.ObserveLiveCapacityDecision(pool.Name, selected, "provider-reject", 0)
+				logAllocationEvent(ctx, "allocation_capacity_reject", map[string]string{
+					"allocation_id": allocation.ID,
+					"pool":          string(pool.Name),
+					"backend":       string(selected),
+					"error":         err.Error(),
+				})
+				if pinnedBackend != nil && *pinnedBackend == selected && !fallbackFromRateLimit {
+					// Pinned requests are not silently rerouted on live-capacity rejection.
+					if existing.ID == "" {
+						_ = s.store.Delete(allocation.ID)
+					} else {
+						s.store.MarkState(allocation.ID, model.StateFailed, s.now(), err.Error())
+					}
+					return model.AllocationStatus{}, fmt.Errorf("pinned backend %q live capacity exhausted: %w", selected, ErrBackendLiveCapacity)
+				}
 				reservePool = withoutBackend(reservePool, selected)
 				reserveRequest.Backend = nil
+				if existing.ID == "" {
+					_ = s.store.Delete(allocation.ID)
+					existing = model.AllocationStatus{}
+				} else {
+					existing = allocation
+					existing.State = model.StatePending
+					existing.Error = err.Error()
+				}
 				if len(reservePool.Backends) > 0 {
 					continue
 				}
-				err := fmt.Errorf("selected backend %q is rate-limited and no fallback backend is available: %w", selected, ErrBackendRateLimited)
-				return model.AllocationStatus{}, err
-			default:
-				err := fmt.Errorf("selected backend %q is not admissible: %s", selected, decision.Reason)
-				if queued, ok := s.queueAllocation(ctx, reserveRequest, reservePool.Name, selected, err, existing); ok {
-					result = "queued"
-					return queued, nil
+				if existing.ID != "" {
+					s.store.MarkState(existing.ID, model.StateFailed, s.now(), err.Error())
 				}
-				return model.AllocationStatus{}, err
+				return model.AllocationStatus{}, fmt.Errorf("selected backend %q capacity exhausted and no fallback backend is available: %w", selected, ErrBackendLiveCapacity)
 			}
-		}
-		pool = reservePool
-		request = reserveRequest
-		break
-	}
-	resultBackend = selected
-	s.observer.ObserveAllocationStart(pool.Name)
-	logAllocationEvent(ctx, "allocation_admitted", map[string]string{
-		"pool":    string(pool.Name),
-		"backend": string(selected),
-	})
-
-	allocation := s.prepareAllocation(ctx, request, existing, pool.Name, selected, timeout)
-
-	s.store.Save(allocation)
-
-	backendImpl, ok := s.registry.Get(selected)
-	if !ok {
-		s.release(context.Background(), pool, selected, allocation)
-		s.store.MarkState(allocation.ID, model.StateFailed, s.now(), "backend not registered")
-		return model.AllocationStatus{}, fmt.Errorf("backend implementation missing: %s", selected)
-	}
-
-	if warmAllocation, ok := s.consumeWarmAllocation(ctx, pool, selected, allocation); ok {
-		// Drop the cold reservation via fair-share-aware release. Warm capacity
-		// remains held by the prewarm reservation created earlier.
-		s.release(ctx, pool, selected, allocation)
-		if err := s.store.Delete(allocation.ID); err != nil {
+			if queued, ok := s.queueAllocation(ctx, request, pool.Name, selected, err, allocation); ok {
+				result = "queued"
+				return queued, nil
+			}
+			s.store.MarkState(allocation.ID, model.StateFailed, s.now(), err.Error())
+			logAllocationEvent(ctx, "allocation_failed", map[string]string{
+				"allocation_id": allocation.ID,
+				"pool":          string(pool.Name),
+				"backend":       string(selected),
+				"error":         err.Error(),
+			})
 			return model.AllocationStatus{}, err
 		}
-		launchMode = launchModeWarm
-		// Warm pools reserve under an empty/"default" tenant; re-attribute the
-		// held capacity to the consuming tenant before overwriting metadata.
-		if pool.FairShare.Enabled && s.fairShare != nil {
-			s.fairShare.Release(pool.Name, selected, warmAllocation)
-			transfer := request
-			transfer.Backend = &selected
-			if _, err := s.fairShare.Reserve(pool, transfer); err != nil {
-				// Restore original warm reservation so capacity is not lost.
-				recoverReq := model.AllocationRequest{
-					Pool:    pool.Name,
-					Backend: &selected,
-					Tenant:  warmAllocation.Tenant,
-				}
-				if _, recoverErr := s.fairShare.Reserve(pool, recoverReq); recoverErr != nil {
-					logAllocationEvent(ctx, "fair_share_warm_tenant_transfer_failed", map[string]string{
-						"pool":    string(pool.Name),
-						"backend": string(selected),
-						"error":   err.Error(),
-					})
-				}
-			}
-		}
-		warmAllocation.State = model.StateReady
-		warmAllocation.CorrelationID = allocation.CorrelationID
-		warmAllocation.Tenant = request.Tenant
-		warmAllocation.PriorityClass = request.PriorityClass
-		warmAllocation.RequestedLabels = append([]string(nil), request.Labels...)
-		warmAllocation.ExpiresAt = allocation.ExpiresAt
-		warmAllocation.Subject = allocation.Subject
-		warmAllocation.Repository = allocation.Repository
-		warmAllocation.Owner = allocation.Owner
-		warmAllocation.Metadata = withLaunchModeMetadata(
-			backend.WithCapabilitiesMetadata(pool.Backends[selected], warmAllocation.Metadata),
+
+		allocation.RunnerLabel = provisioned.RunnerLabel
+		allocation.Metadata = withLaunchModeMetadata(
+			backend.WithCapabilitiesMetadata(pool.Backends[selected], provisioned.Metadata),
 			launchMode,
 		)
-		s.store.Save(warmAllocation)
-		launchLatency := time.Duration(0)
-		s.observer.ObserveLaunchLatency(pool.Name, selected, launchMode, launchLatency)
-		s.observer.ObserveRegistrationLatency(pool.Name, selected, launchLatency)
+		allocation.State = model.StateReady
+		s.store.Save(allocation)
+		s.recordBackendSuccess(pool, selected, s.now())
 		result = "success"
-		allocation = warmAllocation
 		logAllocationEvent(ctx, "allocation_ready", map[string]string{
 			"allocation_id": allocation.ID,
 			"pool":          string(pool.Name),
 			"backend":       string(selected),
 			"launch_mode":   launchMode,
 		})
+
 		return allocation, nil
 	}
-
-	launchStarted := s.now()
-	provisioned, err := backendImpl.Provision(ctx, request, allocation)
-	launchLatency := s.now().Sub(launchStarted)
-	s.observer.ObserveLaunchLatency(pool.Name, selected, launchMode, launchLatency)
-	s.observer.ObserveRegistrationLatency(pool.Name, selected, launchLatency)
-	if err != nil {
-		s.release(context.Background(), pool, selected, allocation)
-		s.recordBackendFailure(pool, selected, err, s.now())
-		if queued, ok := s.queueAllocation(ctx, request, pool.Name, selected, err, allocation); ok {
-			result = "queued"
-			return queued, nil
-		}
-		s.store.MarkState(allocation.ID, model.StateFailed, s.now(), err.Error())
-		logAllocationEvent(ctx, "allocation_failed", map[string]string{
-			"allocation_id": allocation.ID,
-			"pool":          string(pool.Name),
-			"backend":       string(selected),
-			"error":         err.Error(),
-		})
-		return model.AllocationStatus{}, err
-	}
-
-	allocation.RunnerLabel = provisioned.RunnerLabel
-	allocation.Metadata = withLaunchModeMetadata(
-		backend.WithCapabilitiesMetadata(pool.Backends[selected], provisioned.Metadata),
-		launchMode,
-	)
-	allocation.State = model.StateReady
-	s.store.Save(allocation)
-	s.recordBackendSuccess(pool, selected, s.now())
-	result = "success"
-	logAllocationEvent(ctx, "allocation_ready", map[string]string{
-		"allocation_id": allocation.ID,
-		"pool":          string(pool.Name),
-		"backend":       string(selected),
-		"launch_mode":   launchMode,
-	})
-
-	return allocation, nil
 }
 
 func (s *Service) prepareAllocation(ctx context.Context, request model.AllocationRequest, existing model.AllocationStatus, pool model.PoolName, selected model.BackendName, timeout time.Duration) model.AllocationStatus {
@@ -709,6 +777,27 @@ func (s *Service) observeState() {
 	s.observer.ObserveCapacity(s.cfg, statuses)
 	s.observeCircuitState()
 	s.observeTierState()
+	s.observeLiveCapacityState()
+}
+
+func (s *Service) observeLiveCapacityState() {
+	if s.capacityMgr == nil || !s.cfg.Broker.LiveCapacity.Enabled {
+		return
+	}
+	raw := s.capacityMgr.Snapshot()
+	snapshots := make([]liveCapacitySnapshot, 0, len(raw))
+	for _, snap := range raw {
+		free := backend.FreeSlots(snap.Status)
+		snapshots = append(snapshots, liveCapacitySnapshot{
+			Backend: snap.Backend,
+			Free:    free,
+			Max:     snap.Status.MaxRunners,
+			Stale:   snap.Stale,
+			Source:  snap.Source,
+			Err:     snap.Err != "",
+		})
+	}
+	s.observer.ObserveLiveCapacityState(snapshots)
 }
 
 func (s *Service) observeCircuitState() {
@@ -1130,15 +1219,107 @@ func (s *Service) backendHasFreeSchedulerCapacity(pool model.PoolConfig, backend
 	if !cfg.Enabled || !cfg.Healthy || cfg.MaxRunners <= 0 {
 		return false
 	}
-	active := 0
+	active := s.backendActiveCount(pool, backendName)
+	if !s.cfg.Broker.LiveCapacity.Enabled || s.capacityMgr == nil {
+		return active < cfg.MaxRunners
+	}
+	snap, ok := s.capacityMgr.Get(backendName)
+	_, available, _ := capacity.EffectiveMaxRunners(cfg.MaxRunners, active, snap, ok, s.cfg.Broker.LiveCapacity.FailureMode)
+	return available
+}
+
+func (s *Service) backendActiveCount(pool model.PoolConfig, backendName model.BackendName) int {
 	if pool.FairShare.Enabled {
 		if s.fairShare != nil {
-			active = s.fairShare.Active(pool.Name, backendName)
+			return s.fairShare.Active(pool.Name, backendName)
 		}
-	} else {
-		active = s.schedulerForPool(pool).Active(pool.Name, backendName)
+		return 0
 	}
-	return active < cfg.MaxRunners
+	return s.schedulerForPool(pool).Active(pool.Name, backendName)
+}
+
+// filterBackendsByLiveCapacity removes backends whose cached provider capacity
+// reports no free slots, and clamps MaxRunners on the pool snapshot so the
+// scheduler never intentionally exceeds the lower of configured and provider
+// limits. Local scheduler reservation remains the final broker concurrency
+// authority; provider reservation rejection still falls back at provision time.
+func (s *Service) filterBackendsByLiveCapacity(pool model.PoolConfig, request model.AllocationRequest) (model.PoolConfig, error) {
+	if !s.cfg.Broker.LiveCapacity.Enabled || s.capacityMgr == nil {
+		return pool, nil
+	}
+
+	filtered := pool
+	filtered.Backends = make(map[model.BackendName]model.BackendConfig, len(pool.Backends))
+	skippedLive := 0
+	for name, cfg := range pool.Backends {
+		if !cfg.Enabled || !cfg.Healthy || cfg.MaxRunners <= 0 {
+			// Preserve disabled entries so pool shape stays intact for diagnostics,
+			// but do not treat them as live-capacity candidates.
+			filtered.Backends[name] = cfg
+			continue
+		}
+		active := s.backendActiveCount(pool, name)
+		snap, ok := s.capacityMgr.Get(name)
+		effectiveMax, available, reason := capacity.EffectiveMaxRunners(cfg.MaxRunners, active, snap, ok, s.cfg.Broker.LiveCapacity.FailureMode)
+		s.observer.ObserveLiveCapacityDecision(pool.Name, name, reason, effectiveMax)
+		if !available {
+			skippedLive++
+			// Mark unhealthy so the scheduler cannot select this backend for this attempt.
+			cfg.Healthy = false
+			filtered.Backends[name] = cfg
+			logAllocationEvent(context.Background(), "live_capacity_skip", map[string]string{
+				"pool":    string(pool.Name),
+				"backend": string(name),
+				"reason":  reason,
+				"active":  fmt.Sprintf("%d", active),
+			})
+			continue
+		}
+		if effectiveMax > 0 && effectiveMax < cfg.MaxRunners {
+			cfg.MaxRunners = effectiveMax
+		}
+		filtered.Backends[name] = cfg
+	}
+
+	if request.Backend != nil {
+		cfg, ok := pool.Backends[*request.Backend]
+		if !ok {
+			return model.PoolConfig{}, scheduler.ErrUnknownBackend
+		}
+		if !cfg.Enabled || !cfg.Healthy || cfg.MaxRunners <= 0 {
+			return model.PoolConfig{}, fmt.Errorf("pinned backend %q is not available: %w", *request.Backend, scheduler.ErrNoCapacity)
+		}
+		active := s.backendActiveCount(pool, *request.Backend)
+		snap, hasSnap := s.capacityMgr.Get(*request.Backend)
+		effectiveMax, available, reason := capacity.EffectiveMaxRunners(cfg.MaxRunners, active, snap, hasSnap, s.cfg.Broker.LiveCapacity.FailureMode)
+		if !available {
+			s.observer.ObserveLiveCapacityDecision(pool.Name, *request.Backend, reason, effectiveMax)
+			return model.PoolConfig{}, fmt.Errorf("pinned backend %q live capacity exhausted (%s): %w", *request.Backend, reason, ErrBackendLiveCapacity)
+		}
+		if effectiveMax > 0 && effectiveMax < cfg.MaxRunners {
+			cfg.MaxRunners = effectiveMax
+		}
+		pinned := pool
+		pinned.Backends = map[model.BackendName]model.BackendConfig{*request.Backend: cfg}
+		return pinned, nil
+	}
+
+	if !poolHasSchedulableBackend(filtered) {
+		if skippedLive > 0 {
+			return model.PoolConfig{}, fmt.Errorf("%w for pool %q: all backends exhausted by live capacity", ErrBackendLiveCapacity, pool.Name)
+		}
+		return model.PoolConfig{}, fmt.Errorf("%w for pool %q after live capacity filtering", scheduler.ErrNoCapacity, pool.Name)
+	}
+	return filtered, nil
+}
+
+func poolHasSchedulableBackend(pool model.PoolConfig) bool {
+	for _, cfg := range pool.Backends {
+		if cfg.Enabled && cfg.Healthy && cfg.MaxRunners > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func filterTierFallbackBackends(pool model.PoolConfig, fallbackBackends []model.BackendName) model.PoolConfig {
@@ -1534,7 +1715,13 @@ func queueableError(err error) bool {
 	if errors.Is(err, ErrBackendRateLimited) {
 		return false
 	}
+	if errors.Is(err, ErrBackendLiveCapacity) {
+		return false
+	}
 	if errors.Is(err, scheduler.ErrNoCapacity) {
+		return false
+	}
+	if backend.IsCapacityExhausted(err) {
 		return false
 	}
 	if errors.Is(err, ErrBackendCircuitOpen) {
@@ -1555,6 +1742,9 @@ func queueableError(err error) bool {
 func queueReason(err error) string {
 	if errors.Is(err, scheduler.ErrNoCapacity) {
 		return "no-capacity"
+	}
+	if errors.Is(err, ErrBackendLiveCapacity) || backend.IsCapacityExhausted(err) {
+		return "live-capacity"
 	}
 	if errors.Is(err, ErrBackendRateLimited) {
 		return "rate-limited"

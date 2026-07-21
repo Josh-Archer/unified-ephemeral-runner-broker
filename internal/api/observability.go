@@ -37,6 +37,8 @@ type Observer interface {
 	ObserveTierState([]tierDecisionSnapshot)
 	ObserveTierFallback(model.PoolName, string, string)
 	ObserveTierBlocked(model.PoolName, model.BackendName, string)
+	ObserveLiveCapacityState([]liveCapacitySnapshot)
+	ObserveLiveCapacityDecision(model.PoolName, model.BackendName, string, int)
 }
 
 type noopObserver struct{}
@@ -57,6 +59,18 @@ func (noopObserver) ObserveBackendProbe(model.PoolName, model.BackendName, strin
 func (noopObserver) ObserveTierState([]tierDecisionSnapshot)                                   {}
 func (noopObserver) ObserveTierFallback(model.PoolName, string, string)                        {}
 func (noopObserver) ObserveTierBlocked(model.PoolName, model.BackendName, string)              {}
+func (noopObserver) ObserveLiveCapacityState([]liveCapacitySnapshot)                           {}
+func (noopObserver) ObserveLiveCapacityDecision(model.PoolName, model.BackendName, string, int) {
+}
+
+type liveCapacitySnapshot struct {
+	Backend model.BackendName
+	Free    int
+	Max     int
+	Stale   bool
+	Source  string
+	Err     bool
+}
 
 type PrometheusObserver struct {
 	allocationLatency   *prometheus.HistogramVec
@@ -72,6 +86,9 @@ type PrometheusObserver struct {
 	tierState           *prometheus.GaugeVec
 	tierFallbacks       *prometheus.CounterVec
 	tierBlocked         *prometheus.CounterVec
+	liveCapacityFree    *prometheus.GaugeVec
+	liveCapacityStale   *prometheus.GaugeVec
+	liveCapacityDecisions *prometheus.CounterVec
 }
 
 func NewPrometheusObserver(registerer prometheus.Registerer) *PrometheusObserver {
@@ -135,6 +152,18 @@ func NewPrometheusObserver(registerer prometheus.Registerer) *PrometheusObserver
 			Name: "uecb_tier_blocked_allocations_total",
 			Help: "Allocation attempts blocked by tier routing.",
 		}, []string{"pool", "backend", "reason"}),
+		liveCapacityFree: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "uecb_live_capacity_free_slots",
+			Help: "Cached provider-reported free runner slots per backend.",
+		}, []string{"backend", "source"}),
+		liveCapacityStale: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "uecb_live_capacity_stale",
+			Help: "Whether the cached live capacity reading for a backend is stale (1) or fresh (0).",
+		}, []string{"backend"}),
+		liveCapacityDecisions: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "uecb_live_capacity_decisions_total",
+			Help: "Live capacity routing decisions by pool, backend, and reason.",
+		}, []string{"pool", "backend", "reason"}),
 	}
 }
 
@@ -156,6 +185,9 @@ func (o *PrometheusObserver) Register(registerer prometheus.Registerer) error {
 		o.tierState,
 		o.tierFallbacks,
 		o.tierBlocked,
+		o.liveCapacityFree,
+		o.liveCapacityStale,
+		o.liveCapacityDecisions,
 	} {
 		if err := registerer.Register(collector); err != nil {
 			if _, ok := err.(prometheus.AlreadyRegisteredError); !ok {
@@ -164,6 +196,33 @@ func (o *PrometheusObserver) Register(registerer prometheus.Registerer) error {
 		}
 	}
 	return nil
+}
+
+func (o *PrometheusObserver) ObserveLiveCapacityState(snapshots []liveCapacitySnapshot) {
+	o.liveCapacityFree.Reset()
+	o.liveCapacityStale.Reset()
+	for _, snapshot := range snapshots {
+		source := snapshot.Source
+		if source == "" {
+			source = "unknown"
+		}
+		if snapshot.Err {
+			source = "error"
+		}
+		o.liveCapacityFree.WithLabelValues(string(snapshot.Backend), source).Set(float64(snapshot.Free))
+		stale := 0.0
+		if snapshot.Stale {
+			stale = 1
+		}
+		o.liveCapacityStale.WithLabelValues(string(snapshot.Backend)).Set(stale)
+	}
+}
+
+func (o *PrometheusObserver) ObserveLiveCapacityDecision(pool model.PoolName, backend model.BackendName, reason string, _ int) {
+	if reason == "" {
+		reason = "unknown"
+	}
+	o.liveCapacityDecisions.WithLabelValues(string(pool), string(backend), reason).Inc()
 }
 
 type tierDecisionSnapshot struct {

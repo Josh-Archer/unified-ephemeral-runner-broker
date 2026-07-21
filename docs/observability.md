@@ -38,9 +38,13 @@ Core metrics:
 - `uecb_tier_state{pool,backend,state,stale}`: cached tier-routing decision state.
 - `uecb_tier_fallback_total{pool,mode,reason}`: fallback mode activations caused by tier routing.
 - `uecb_tier_blocked_allocations_total{pool,backend,reason}`: allocation attempts blocked by tier routing.
+- `uecb_live_capacity_free_slots{backend,source}`: cached provider-reported free runner slots.
+- `uecb_live_capacity_stale{backend}`: `1` when the cached live capacity reading is stale.
+- `uecb_live_capacity_decisions_total{pool,backend,reason}`: live capacity routing decisions (`live`, `provider-full`, `stale-pass-through`, `provider-reject`, …).
 
 Runtime admission metrics change only when a backend has opted into circuit breaking or rate limiting.
 Tier-routing metrics appear when cached decisions are present or tier policies affect allocation.
+Live-capacity metrics appear when `broker.liveCapacity.enabled` is true and backends publish capacity.
 
 ## Artifacts
 
