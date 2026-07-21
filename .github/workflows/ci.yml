@@ -27,7 +27,11 @@ jobs:
         run: |
           test -f charts/unified-ephemeral-runner-broker/Chart.yaml
           test -f actions/allocate-runner/action.yml
+          test -f actions/finalize-allocation/action.yml
           test -f examples/gitops/kustomize/base/kustomization.yaml
+
+      - name: finalize-allocation action unit tests
+        run: python -m unittest discover -s actions/finalize-allocation -p '*_test.py' -v
 
       - name: Manifest render sanity
         run: |

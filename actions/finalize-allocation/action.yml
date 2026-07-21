@@ -1,0 +1,92 @@
+name: finalize-allocation
+description: >
+  Report allocation success, failure, or cancellation to the unified broker so
+  scheduler capacity is released immediately after the runner job finishes.
+
+inputs:
+  broker_url:
+    description: Base URL for the broker API
+    required: true
+  allocation_id:
+    description: Broker allocation ID returned by allocate-runner
+    required: true
+  result:
+    description: >
+      GitHub job result (success, failure, cancelled) or broker terminal state.
+      Mapped deterministically to completed, failed, or canceled. Defaults to
+      completed when both result and state are empty.
+    required: false
+    default: ""
+  state:
+    description: >
+      Explicit broker terminal state (completed, failed, canceled, expired,
+      quarantined). When set, overrides result.
+    required: false
+    default: ""
+  reason:
+    description: Optional human-readable reason (used for non-failed terminals)
+    required: false
+    default: ""
+  error:
+    description: Optional error message when finalizing as failed
+    required: false
+    default: ""
+  failure_class:
+    description: >
+      Optional failure classification for circuit-breaker accounting
+      (for example wait-timeout)
+    required: false
+    default: ""
+  oidc_audience:
+    description: OIDC audience expected by the broker
+    required: false
+    default: uecb-broker
+  allow_unauthenticated:
+    description: Skip OIDC and call the broker without a bearer token
+    required: false
+    default: "false"
+  max_retries:
+    description: Number of retries after the first attempt for transient HTTP failures
+    required: false
+    default: "5"
+  initial_backoff_seconds:
+    description: Initial backoff in seconds before the first retry
+    required: false
+    default: "1"
+  max_backoff_seconds:
+    description: Maximum backoff in seconds between retries
+    required: false
+    default: "30"
+
+outputs:
+  allocation_id:
+    description: Broker allocation ID that was finalized
+    value: ${{ steps.finalize.outputs.allocation_id }}
+  state:
+    description: Terminal state applied (or confirmed) on the allocation
+    value: ${{ steps.finalize.outputs.state }}
+  http_status:
+    description: HTTP status from the successful complete callback
+    value: ${{ steps.finalize.outputs.http_status }}
+
+runs:
+  using: composite
+  steps:
+    - id: finalize
+      shell: bash
+      env:
+        INPUT_BROKER_URL: ${{ inputs.broker_url }}
+        INPUT_ALLOCATION_ID: ${{ inputs.allocation_id }}
+        INPUT_RESULT: ${{ inputs.result }}
+        INPUT_STATE: ${{ inputs.state }}
+        INPUT_REASON: ${{ inputs.reason }}
+        INPUT_ERROR: ${{ inputs.error }}
+        INPUT_FAILURE_CLASS: ${{ inputs.failure_class }}
+        INPUT_OIDC_AUDIENCE: ${{ inputs.oidc_audience }}
+        INPUT_ALLOW_UNAUTHENTICATED: ${{ inputs.allow_unauthenticated }}
+        INPUT_MAX_RETRIES: ${{ inputs.max_retries }}
+        INPUT_INITIAL_BACKOFF_SECONDS: ${{ inputs.initial_backoff_seconds }}
+        INPUT_MAX_BACKOFF_SECONDS: ${{ inputs.max_backoff_seconds }}
+      run: |
+        set -euo pipefail
+        python "${GITHUB_ACTION_PATH}/finalize.py"

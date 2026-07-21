@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Fails when public docs/examples drift from the live allocation API and
-# allocate-runner action contracts (see issue #64 / #54).
+# allocate-runner / finalize-allocation action contracts (see issue #64 / #54 / #50).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -22,6 +22,18 @@ ACTION_ONLY_INPUTS=(
   oidc_audience
   allow_unauthenticated
   queue_wait_timeout
+)
+
+# finalize-allocation inputs that are not CompletionRequest body fields.
+FINALIZE_ACTION_ONLY_INPUTS=(
+  broker_url
+  allocation_id
+  result
+  oidc_audience
+  allow_unauthenticated
+  max_retries
+  initial_backoff_seconds
+  max_backoff_seconds
 )
 
 fail() {
@@ -141,6 +153,80 @@ if [[ -f "${ACTION_YML}" && -f "${OPENAPI}" ]]; then
     done
     if [[ "${status}" -eq 0 ]]; then
       info "  ok: action body inputs match OpenAPI AllocationRequest properties"
+    fi
+  fi
+fi
+
+# --- 4b. finalize-allocation inputs ⊆ CompletionRequest + action-only -------
+FINALIZE_YML="actions/finalize-allocation/action.yml"
+if [[ -f "${FINALIZE_YML}" && -f "${OPENAPI}" ]]; then
+  info "Checking finalize-allocation inputs against OpenAPI CompletionRequest..."
+
+  mapfile -t finalize_inputs < <(
+    awk '
+      /^inputs:[[:space:]]*$/ { in_inputs=1; next }
+      in_inputs && /^[^[:space:]#]/ { exit }
+      in_inputs && /^  [a-zA-Z0-9_]+:/ {
+        line=$0
+        sub(/^  /, "", line)
+        sub(/:.*/, "", line)
+        print line
+      }
+    ' "${FINALIZE_YML}"
+  )
+
+  mapfile -t completion_props < <(
+    awk '
+      /^    CompletionRequest:[[:space:]]*$/ { in_schema=1; next }
+      in_schema && /^    [A-Za-z]/ { exit }
+      in_schema && /^      properties:[[:space:]]*$/ { in_props=1; next }
+      in_props && /^        [a-zA-Z0-9_]+:/ {
+        line=$0
+        sub(/^        /, "", line)
+        sub(/:.*/, "", line)
+        print line
+      }
+      in_props && /^      [a-zA-Z0-9_]+:/ { exit }
+    ' "${OPENAPI}"
+  )
+
+  is_finalize_action_only() {
+    local name="$1"
+    local only
+    for only in "${FINALIZE_ACTION_ONLY_INPUTS[@]}"; do
+      if [[ "${name}" == "${only}" ]]; then
+        return 0
+      fi
+    done
+    return 1
+  }
+
+  is_completion_prop() {
+    local name="$1"
+    local prop
+    for prop in "${completion_props[@]}"; do
+      if [[ "${name}" == "${prop}" ]]; then
+        return 0
+      fi
+    done
+    return 1
+  }
+
+  if [[ ${#finalize_inputs[@]} -eq 0 ]]; then
+    fail "could not parse inputs from ${FINALIZE_YML}"
+  elif [[ ${#completion_props[@]} -eq 0 ]]; then
+    fail "could not parse CompletionRequest properties from ${OPENAPI}"
+  else
+    for input in "${finalize_inputs[@]}"; do
+      if is_finalize_action_only "${input}"; then
+        continue
+      fi
+      if ! is_completion_prop "${input}"; then
+        fail "finalize-allocation input '${input}' is not a CompletionRequest property in ${OPENAPI} and is not listed as action-only"
+      fi
+    done
+    if [[ "${status}" -eq 0 ]]; then
+      info "  ok: finalize-allocation body inputs match OpenAPI CompletionRequest properties"
     fi
   fi
 fi
