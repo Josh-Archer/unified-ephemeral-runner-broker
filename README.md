@@ -7,6 +7,7 @@ graph TD
     subgraph "GitHub Actions Workflow"
         Step1[allocate-runner action]
         Step2[Job with dynamic label]
+        Step3[finalize-allocation action]
     end
 
     subgraph "Kubernetes (Broker Namespace)"
@@ -27,6 +28,7 @@ graph TD
     end
 
     Step1 -- "REST API (Allocation)" --> Broker
+    Step3 -- "REST API (Complete)" --> Broker
     Broker -- "K8s API" --> SecretAuth
     Broker -- "K8s API" --> SecretBackends
     
@@ -47,6 +49,7 @@ graph TD
     AVM -. "Runner Label" .-> Step2
     EC2 -. "Runner Label" .-> Step2
     GCE -. "Runner Label" .-> Step2
+    Step2 --> Step3
 ```
 
 V1 models these backends:
@@ -77,7 +80,7 @@ Built-in schedulers:
 ## What This Repo Ships
 
 - A Kubernetes broker service with a small REST API
-- A reusable GitHub Action, `allocate-runner`
+- Reusable GitHub Actions, `allocate-runner` and `finalize-allocation`
 - A public backend adapter SDK with a conformance test harness
 - An OCI Helm chart for installation
 - Generic provider runner images for `launcher`, `lambda`, `cloud-run`, and `azure-functions`
@@ -100,6 +103,7 @@ sequenceDiagram
     participant B as Broker
     participant BE as Backend (e.g., ARC/Lambda)
     participant R as Ephemeral Runner
+    participant FA as finalize-allocation action
 
     GH->>AR: Run action
     AR->>B: POST /v1/allocations (OIDC Token)
@@ -109,12 +113,17 @@ sequenceDiagram
     B->>BE: Dispatch Provisioning
     BE-->>B: Admission OK (Label)
     B-->>AR: Allocation Result (Label)
-    AR-->>GH: Set outputs (runner_label)
+    AR-->>GH: Set outputs (runner_label, allocation_id)
     
     GH->>R: Run Job on label
     R->>R: Execute Job
     R->>GH: Job Complete
     R->>R: Self-Terminate
+
+    GH->>FA: Cleanup job (if: always)
+    FA->>B: POST /v1/allocations/{id}/complete (OIDC Token)
+    B->>B: Mark terminal and release capacity
+    B-->>FA: Terminal allocation status
 ```
 
 1. A lightweight workflow step calls `allocate-runner`.
@@ -123,6 +132,7 @@ sequenceDiagram
 4. `job_timeout` is accepted as duration strings like `15m`, with numeric nanoseconds still accepted for backward compatibility.
 5. The heavy workflow job runs on that exact label.
 6. The runner executes one job and exits.
+7. A cleanup job (or step) calls `finalize-allocation` so the broker releases scheduler capacity immediately. If the callback never runs, orphan cleanup remains the fallback.
 
 ### Allocation API
 
@@ -175,6 +185,75 @@ Completion callbacks accept these payload forms:
 
 Duplicate callbacks for the same terminal state are idempotent and do not
 re-release scheduler capacity.
+
+### Workflow finalization pattern
+
+Without an explicit complete callback, active allocations keep consuming
+scheduler capacity until orphan expiry. Use `finalize-allocation` in a cleanup
+job that always runs after the runner job, including failure and cancellation.
+
+GitHub `job.result` values map deterministically to broker terminal states:
+
+| GitHub `job.result` / action `result` | Broker `state` |
+| --- | --- |
+| `success` | `completed` |
+| `failure` | `failed` |
+| `cancelled` / `canceled` | `canceled` |
+| `skipped` | `canceled` (capacity still released) |
+
+You can also pass broker states directly (`completed`, `failed`, `canceled`)
+via `result` or the explicit `state` input (`state` wins when both are set).
+
+```yaml
+permissions:
+  id-token: write   # required for broker OIDC unless allow_unauthenticated
+  contents: read
+
+jobs:
+  allocate:
+    runs-on: ubuntu-latest
+    outputs:
+      allocation_id: ${{ steps.alloc.outputs.allocation_id }}
+      runner_label: ${{ steps.alloc.outputs.runner_label }}
+    steps:
+      - id: alloc
+        uses: Josh-Archer/unified-ephemeral-runner-broker/actions/allocate-runner@main
+        with:
+          broker_url: https://broker.example.com
+          pool: lite
+          job_timeout: 15m
+
+  work:
+    needs: allocate
+    runs-on: ${{ needs.allocate.outputs.runner_label }}
+    steps:
+      - run: echo "heavy job on ephemeral runner"
+
+  # Always finalize so success, failure, and cancellation release capacity.
+  finalize:
+    needs: [allocate, work]
+    if: ${{ always() && needs.allocate.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: Josh-Archer/unified-ephemeral-runner-broker/actions/finalize-allocation@main
+        with:
+          broker_url: https://broker.example.com
+          allocation_id: ${{ needs.allocate.outputs.allocation_id }}
+          result: ${{ needs.work.result }}
+```
+
+Notes:
+
+- Grant `id-token: write` on the finalize job (or workflow) so OIDC matches
+  `allocate-runner`. Local/dev brokers may set `allow_unauthenticated: true`.
+- Transient HTTP failures (408/429/5xx and network errors) retry with bounded
+  exponential backoff (`max_retries`, `initial_backoff_seconds`,
+  `max_backoff_seconds`). Permanent failures (400/401/403/404) fail the step
+  with an actionable error.
+- Duplicate finalize runs for the same terminal state are safe; the broker
+  treats them as idempotent and does not double-release capacity.
+- If the finalize job cannot run (for example the workflow was deleted mid-run),
+  orphan cleanup still reclaims capacity after expiry—see below.
 
 ### Orphan cleanup and quarantine
 
@@ -233,7 +312,8 @@ the allocation until it becomes `ready` or `queue_wait_timeout` expires.
 - `docker/azure-functions`: published Azure Functions controller and runner container
 - `docker/lambda`: published AWS Lambda runner container handler
 - `charts/unified-ephemeral-runner-broker`: Helm chart
-- `actions/allocate-runner`: public workflow integration surface
+- `actions/allocate-runner`: public allocate workflow integration surface
+- `actions/finalize-allocation`: public complete/finalize workflow integration surface
 - `examples/`: generic Terraform and GitOps consumption examples
 - `docs/`: architecture notes, security boundary, and [OpenAPI](docs/openapi.yaml) for the allocation API
 - `observability/`: reusable Prometheus alert rules and Grafana dashboard artifacts
@@ -260,7 +340,8 @@ See [docs/architecture.md](docs/architecture.md) and [docs/security-boundary.md]
    `dispatch_token`: optional bearer token sent to dispatch, health, and cleanup endpoints.
    `cleanup_url` (optional): controller endpoint the broker POSTs on cancel/expire/release so the provider can tear down runners. When omitted, cleanup is skipped (capacity is still released); when set, launchers should treat cleanup as idempotent (2xx and 404 both OK).
 3. Point the `allocate-runner` action at the broker URL. The broker accepts `job_timeout` in the same duration-string format used by the action, for example `15m`.
-4. Start with the `full` pool or ARC-only `lite` pool. Only enable an external backend after you have supplied a real launcher integration for that platform and the matching `secretRef`.
+4. Add a cleanup job that always calls `finalize-allocation` with the allocation ID and the runner job result so capacity is released immediately (see [Workflow finalization pattern](#workflow-finalization-pattern)).
+5. Start with the `full` pool or ARC-only `lite` pool. Only enable an external backend after you have supplied a real launcher integration for that platform and the matching `secretRef`.
 
 ## Broker OIDC Authentication
 

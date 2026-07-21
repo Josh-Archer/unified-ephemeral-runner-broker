@@ -7,6 +7,10 @@
 - The broker runs in Kubernetes.
 - GitHub workflows call the `allocate-runner` action.
 - The action exchanges OIDC identity for a broker allocation request.
+- After the runner job finishes, workflows should call the `finalize-allocation`
+  action (cleanup job with `if: always()`) so capacity is released immediately
+  via `POST /v1/allocations/{id}/complete`. Orphan expiry remains the fallback
+  when the callback cannot run.
 - The broker verifies GitHub Actions OIDC tokens through the issuer discovery
   document and JWKS before authorizing allocation or completion requests.
 - The broker selects a backend, reserves capacity, provisions a runner, and returns the label that the heavy job should target.
