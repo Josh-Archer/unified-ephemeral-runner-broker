@@ -34,6 +34,10 @@ func TestPublishRuntimeImagesWorkflowAttestationContract(t *testing.T) {
 		"SYFT_VERSION:",
 		"syft-version:",
 
+		// Compact package-only SPDX under actions/attest 16 MiB predicate limit
+		"Compact SBOM for attestation size limit",
+		"16 * 1024 * 1024",
+
 		// GitHub artifact attestation flow bound to digest
 		"actions/attest@v4",
 		"subject-name:",

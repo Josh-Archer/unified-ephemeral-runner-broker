@@ -22,6 +22,10 @@ publishes digest-bound build provenance and SPDX SBOM attestations for:
   short-lived Sigstore certificates (OIDC) and stored in the GitHub Attestations
   API. They are also attached as OCI registry referrers without rewriting the
   subject Docker v2 manifest.
+- **SBOM size**: GitHub `actions/attest` rejects predicates larger than 16 MiB.
+  The workflow keeps the package inventory but strips SPDX `files` nodes (and
+  file relationships) before SBOM attestation so large bases such as Azure
+  Functions stay under the cap.
 - **Least-privilege permissions**: `contents: read`, `packages: write`,
   `id-token: write`, `attestations: write`.
 

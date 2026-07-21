@@ -117,6 +117,41 @@ jobs:
           upload-release-assets: false
           syft-version: ${{ env.SYFT_VERSION }}
 
+      # actions/attest rejects SBOM predicates larger than 16 MiB. Full Syft
+      # SPDX for fat runtime bases (especially Azure Functions) includes a
+      # per-file inventory that blows past that limit. Keep package inventory
+      # for consumers; strip file nodes so attestations stay within the API cap.
+      - name: Compact SBOM for attestation size limit
+        shell: bash
+        env:
+          SBOM_PATH: ${{ runner.temp }}/${{ matrix.image.package }}.spdx.json
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+
+          path = pathlib.Path(os.environ["SBOM_PATH"])
+          data = json.loads(path.read_text(encoding="utf-8"))
+          before = path.stat().st_size
+          data.pop("files", None)
+          relationships = data.get("relationships")
+          if isinstance(relationships, list):
+              data["relationships"] = [
+                  rel
+                  for rel in relationships
+                  if not str(rel.get("spdxElementId", "")).startswith("SPDXRef-File")
+                  and not str(rel.get("relatedSpdxElement", "")).startswith("SPDXRef-File")
+              ]
+          path.write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
+          after = path.stat().st_size
+          limit = 16 * 1024 * 1024
+          print(f"SBOM size before compact={before} after={after} limit={limit}")
+          if after > limit:
+              raise SystemExit(f"SBOM still exceeds attestation limit after compact: {after}")
+          PY
+
       - name: Attest build provenance
         uses: actions/attest@v4
         with:
