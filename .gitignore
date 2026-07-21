@@ -6,4 +6,7 @@ dist/
 coverage.out
 *.log
 *.tgz
+__pycache__/
+*.py[cod]
+.pytest_cache/
 
