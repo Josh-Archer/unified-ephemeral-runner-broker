@@ -582,3 +582,69 @@ func contains(values []string, target string) bool {
 	}
 	return false
 }
+
+func TestCapacityReadsProviderSnapshot(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("expected GET, got %s", r.Method)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer broker-secret" {
+			t.Fatalf("expected bearer token, got %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"max_runners":5,"active_runners":2,"pending_runners":1,"warm_runners":1}`))
+	}))
+	defer server.Close()
+
+	cfg := newRepoScopedConfig()
+	dispatchBackend := New(model.BackendCodeBuild, cfg, staticSecrets{
+		"uecb-codebuild": {
+			secretKeyCapacityURL:   server.URL,
+			secretKeyDispatchToken: "broker-secret",
+		},
+	})
+
+	status, err := dispatchBackend.Capacity(context.Background())
+	if err != nil {
+		t.Fatalf("capacity: %v", err)
+	}
+	if status.MaxRunners != 5 || status.ActiveRunners != 2 || status.PendingRunners != 1 || status.WarmRunners != 1 {
+		t.Fatalf("unexpected capacity %+v", status)
+	}
+	if backend.FreeSlots(status) != 1 {
+		t.Fatalf("expected 1 free slot, got %d", backend.FreeSlots(status))
+	}
+}
+
+func TestCapacityMissingURL(t *testing.T) {
+	cfg := newRepoScopedConfig()
+	dispatchBackend := New(model.BackendCodeBuild, cfg, staticSecrets{
+		"uecb-codebuild": {
+			secretKeyDispatchURL: "https://example.invalid/dispatch",
+		},
+	})
+	if _, err := dispatchBackend.Capacity(context.Background()); err == nil {
+		t.Fatal("expected error when capacity_url is missing")
+	}
+}
+
+func TestProvisionCapacityExhaustedConflict(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":"capacity exhausted"}`))
+	}))
+	defer server.Close()
+
+	cfg := newRepoScopedConfig()
+	dispatchBackend := New(model.BackendCodeBuild, cfg, staticSecrets{
+		"uecb-codebuild": {
+			secretKeyDispatchURL: server.URL,
+		},
+	})
+	_, err := dispatchBackend.Provision(context.Background(), model.AllocationRequest{
+		Pool: model.PoolLite, JobTimeout: time.Minute,
+	}, model.AllocationStatus{ID: "abc", Pool: model.PoolLite})
+	if !backend.IsCapacityExhausted(err) {
+		t.Fatalf("expected capacity exhausted classification, got %v", err)
+	}
+}

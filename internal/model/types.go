@@ -129,11 +129,26 @@ type BrokerRuntimeConfig struct {
 		Enabled       bool          `yaml:"enabled" json:"enabled"`
 		QuarantineTTL time.Duration `yaml:"quarantineTTL" json:"quarantineTTL"`
 	} `yaml:"orphanCleanup" json:"orphanCleanup"`
-	API         BrokerAPIConfig      `yaml:"api" json:"api"`
-	StateStore  StateStoreConfig     `yaml:"stateStore,omitempty" json:"stateStore,omitempty"`
-	HA          HAConfig             `yaml:"ha,omitempty" json:"ha,omitempty"`
-	Queue       AdmissionQueueConfig `yaml:"queue,omitempty" json:"queue,omitempty"`
-	TierRouting TierRoutingConfig    `yaml:"tierRouting,omitempty" json:"tierRouting,omitempty"`
+	API          BrokerAPIConfig      `yaml:"api" json:"api"`
+	StateStore   StateStoreConfig     `yaml:"stateStore,omitempty" json:"stateStore,omitempty"`
+	HA           HAConfig             `yaml:"ha,omitempty" json:"ha,omitempty"`
+	Queue        AdmissionQueueConfig `yaml:"queue,omitempty" json:"queue,omitempty"`
+	TierRouting  TierRoutingConfig    `yaml:"tierRouting,omitempty" json:"tierRouting,omitempty"`
+	LiveCapacity LiveCapacityConfig   `yaml:"liveCapacity,omitempty" json:"liveCapacity,omitempty"`
+}
+
+// LiveCapacityConfig controls optional provider-reported capacity routing.
+// When disabled, the broker uses only local scheduler accounting and
+// configured maxRunners. When enabled, backends that implement Capacity()
+// (SDK adapters and HTTP-dispatch capacity_url) are polled out of band and
+// exhausted providers are filtered before scheduler selection.
+type LiveCapacityConfig struct {
+	Enabled          bool          `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	RefreshInterval  time.Duration `yaml:"refreshInterval,omitempty" json:"refreshInterval,omitempty"`
+	StaleAfter       time.Duration `yaml:"staleAfter,omitempty" json:"staleAfter,omitempty"`
+	ProbeTimeout     time.Duration `yaml:"probeTimeout,omitempty" json:"probeTimeout,omitempty"`
+	FailureMode      string        `yaml:"failureMode,omitempty" json:"failureMode,omitempty"`
+	RefreshOnStartup bool          `yaml:"refreshOnStartup,omitempty" json:"refreshOnStartup,omitempty"`
 }
 
 type TierRoutingConfig struct {

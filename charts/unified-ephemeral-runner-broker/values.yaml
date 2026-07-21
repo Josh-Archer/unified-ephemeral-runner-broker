@@ -94,6 +94,18 @@ config:
         secretRef: ""
       providers: {}
       providerRules: []
+    # Optional provider-reported capacity routing. When enabled, backends that
+    # publish Capacity() (SDK) or capacity_url (HTTP dispatch) are polled out of
+    # band and exhausted providers are skipped before scheduler selection.
+    liveCapacity:
+      enabled: false
+      refreshInterval: 30s
+      staleAfter: 2m
+      probeTimeout: 2s
+      # pass-through: stale/failed capacity falls back to local maxRunners only
+      # block: stale/failed capacity treats the backend as unavailable
+      failureMode: pass-through
+      refreshOnStartup: true
   pools:
     - name: full
       labels:

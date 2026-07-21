@@ -52,6 +52,14 @@ func Default() model.BrokerConfig {
 					Timeout: 2 * time.Second,
 				},
 			},
+			LiveCapacity: model.LiveCapacityConfig{
+				Enabled:          false,
+				RefreshInterval:  30 * time.Second,
+				StaleAfter:       2 * time.Minute,
+				ProbeTimeout:     2 * time.Second,
+				FailureMode:      "pass-through",
+				RefreshOnStartup: true,
+			},
 		},
 		Pools: []model.PoolConfig{
 			{

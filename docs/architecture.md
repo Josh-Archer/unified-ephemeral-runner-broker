@@ -116,7 +116,7 @@ Recommended path: `fairShare.enabled: true` with `scheduler: weighted-round-robi
 
 Backends may opt into runtime admission controls with `circuitBreaker` and `rateLimit` under `pools[].backends.<name>`.
 
-Admission order is deterministic: static `enabled`/`healthy`, capability filtering, requested timeout filtering, runtime circuit and cold-launch rate limiting, scheduler reservation, then backend provisioning.
+Admission order is deterministic: static `enabled`/`healthy`, capability filtering, requested timeout filtering, runtime circuit and cold-launch rate limiting, optional tier and live-capacity filtering, scheduler reservation, then backend provisioning.
 
 Circuit and rate-limit runtime state is process-local for `memory`/`file` stores and
 shared through the state store when `type: postgres`. Keep broker replicas at `1`
@@ -134,6 +134,24 @@ throttled. If every remaining backend is rate-limited, the broker returns an
 explicit rate-limit exhaustion error instead of creating a pending allocation.
 
 The background backend-health loop probes open circuits and closes them after the configured recovery threshold. Backends without a probe implementation recover through the same success path once the circuit admits a half-open request.
+
+## Live Backend Capacity
+
+Optional live-capacity routing uses provider-reported free slots when selecting a backend, instead of relying only on configured `maxRunners` and local scheduler reservations.
+
+When `broker.liveCapacity.enabled` is true:
+
+1. Backends that implement `Capacity()` (SDK adapters) or publish `capacity_url` (HTTP dispatch secrets) are polled out of band on `refreshInterval`.
+2. Snapshots are cached in memory per broker process and marked stale after `staleAfter`.
+3. Before scheduler reservation, exhausted backends are filtered out and `MaxRunners` on the pool snapshot is clamped to the lower of configured and provider-reported limits, after combining provider free slots with local active reservations.
+4. Local scheduler reservation remains the broker concurrency authority. If a provider still rejects a provision/reserve for capacity, the broker falls back to another eligible backend (unpinned) or returns a deterministic live-capacity error (pinned).
+5. Stale or failed capacity reads follow `failureMode`: `pass-through` (default) uses local accounting only; `block` treats the backend as unavailable.
+
+Admission order with live capacity enabled:
+
+static `enabled`/`healthy` → capabilities → timeout → circuit/rate-limit → tier → **live capacity** → scheduler reservation → provision.
+
+See [adapter-sdk.md](adapter-sdk.md#publishing-capacity) for how SDK and HTTP-dispatch adapters publish capacity.
 
 ## Tier-Aware Routing
 

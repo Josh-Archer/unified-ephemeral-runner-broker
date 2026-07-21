@@ -303,6 +303,28 @@ only one replica drives warm/queue/expiry reconciliation at a time.
 On startup, active `reserved`, `ready`, and `warm` allocations are rehydrated
 into scheduler accounting so a restarted broker does not over-admit capacity.
 
+### Live Backend Capacity
+
+By default the broker routes using local scheduler accounting and configured
+`maxRunners` only. Enable provider-reported capacity so exhausted external
+providers are skipped without a config change:
+
+```yaml
+broker:
+  liveCapacity:
+    enabled: true
+    refreshInterval: 30s
+    staleAfter: 2m
+    probeTimeout: 2s
+    failureMode: pass-through   # or block
+    refreshOnStartup: true
+```
+
+HTTP-dispatch backends publish capacity via optional secret key `capacity_url`.
+SDK adapters implement `Adapter.Capacity`. See
+[docs/adapter-sdk.md](docs/adapter-sdk.md#publishing-capacity) and
+[docs/architecture.md](docs/architecture.md#live-backend-capacity).
+
 ### Queued Admission
 
 Queued admission is disabled by default. When enabled, retryable allocation
@@ -358,6 +380,7 @@ See [docs/architecture.md](docs/architecture.md) and [docs/security-boundary.md]
    `health_url`: health endpoint used by circuit-breaker recovery probes when the backend enables `circuitBreaker`.
    `dispatch_token`: optional bearer token sent to dispatch, health, and cleanup endpoints.
    `cleanup_url` (optional): controller endpoint the broker POSTs on cancel/expire/release so the provider can tear down runners. When omitted, cleanup is skipped (capacity is still released); when set, launchers should treat cleanup as idempotent (2xx and 404 both OK).
+   `capacity_url` (optional): GET endpoint returning provider free-slot JSON for live-capacity routing when `broker.liveCapacity.enabled` is true. See [docs/adapter-sdk.md](docs/adapter-sdk.md#publishing-capacity).
 3. Point the `allocate-runner` action at the broker URL. The broker accepts `job_timeout` in the same duration-string format used by the action, for example `15m`.
 4. Add a cleanup job that always calls `finalize-allocation` with the allocation ID and the runner job result so capacity is released immediately (see [Workflow finalization pattern](#workflow-finalization-pattern)).
 5. Start with the `full` pool or ARC-only `lite` pool. Only enable an external backend after you have supplied a real launcher integration for that platform and the matching `secretRef`.

@@ -22,9 +22,11 @@ const (
 	secretKeyDispatchURL          = "dispatch_url"
 	secretKeyCleanupURL           = "cleanup_url"
 	secretKeyHealthURL            = "health_url"
+	secretKeyCapacityURL          = "capacity_url"
 	secretKeyDispatchToken        = "dispatch_token"
 	defaultDispatchTimeout        = 20 * time.Second
 	azureFunctionsDispatchTimeout = 90 * time.Second
+	defaultCapacityTimeout        = 2 * time.Second
 )
 
 type HTTPClient interface {
@@ -68,6 +70,17 @@ type dispatchResponse struct {
 	StatusURL   string            `json:"status_url"`
 	DetailsURL  string            `json:"details_url"`
 	ExecutionID string            `json:"execution_id"`
+}
+
+// capacityResponse is the JSON body returned by optional capacity_url GET.
+// Controllers may also expose free_slots; when set it is preferred over
+// max - (active + pending + warm).
+type capacityResponse struct {
+	MaxRunners     int `json:"max_runners"`
+	ActiveRunners  int `json:"active_runners"`
+	PendingRunners int `json:"pending_runners"`
+	WarmRunners    int `json:"warm_runners"`
+	FreeSlots      int `json:"free_slots"`
 }
 
 // cleanupRequest is the JSON body POSTed to cleanup_url (or derived cleanup endpoint).
@@ -188,18 +201,27 @@ func (b *Backend) Provision(ctx context.Context, request model.AllocationRequest
 		reason := classifyStatus(resp.StatusCode)
 		baseErr := fmt.Errorf("dispatch backend %s: unexpected status %d", b.name, resp.StatusCode)
 		if readErr != nil {
+			if isCapacityStatus(resp.StatusCode, "") {
+				return backend.ProvisionedRunner{}, backend.NewAllocationError(baseErr, backend.ErrBackendCapacityExhausted, true)
+			}
 			if reason != "" {
 				return backend.ProvisionedRunner{}, backend.NewClassifiedError(reason, baseErr)
 			}
 			return backend.ProvisionedRunner{}, baseErr
 		}
 		if message == "" {
+			if isCapacityStatus(resp.StatusCode, "") {
+				return backend.ProvisionedRunner{}, backend.NewAllocationError(baseErr, backend.ErrBackendCapacityExhausted, true)
+			}
 			if reason != "" {
 				return backend.ProvisionedRunner{}, backend.NewClassifiedError(reason, baseErr)
 			}
 			return backend.ProvisionedRunner{}, baseErr
 		}
 		err := fmt.Errorf("dispatch backend %s: %s", b.name, message)
+		if isCapacityStatus(resp.StatusCode, message) {
+			return backend.ProvisionedRunner{}, backend.NewAllocationError(err, backend.ErrBackendCapacityExhausted, true)
+		}
 		if reason != "" {
 			return backend.ProvisionedRunner{}, backend.NewClassifiedError(reason, err)
 		}
@@ -243,6 +265,99 @@ func (b *Backend) Provision(ctx context.Context, request model.AllocationRequest
 		RunnerLabel: runnerLabel,
 		Metadata:    metadata,
 	}, nil
+}
+
+// Capacity reports provider-side free slots via optional secret key capacity_url.
+// When capacity_url is absent, Capacity returns an error so the live-capacity
+// manager treats the backend as not publishing capacity (local accounting only).
+func (b *Backend) Capacity(ctx context.Context) (backend.CapacityStatus, error) {
+	pool, backendCfg, err := b.firstConfiguredPool()
+	if err != nil {
+		return backend.CapacityStatus{}, err
+	}
+	_ = pool
+
+	secretRef := strings.TrimSpace(backendCfg.SecretRef)
+	if secretRef == "" {
+		return backend.CapacityStatus{}, fmt.Errorf("backend %s is missing secretRef", b.name)
+	}
+	secretData, err := b.secrets.ReadSecret(ctx, secretRef)
+	if err != nil {
+		return backend.CapacityStatus{}, fmt.Errorf("read backend secret %s: %w", secretRef, err)
+	}
+	capacityURL := strings.TrimSpace(secretData[secretKeyCapacityURL])
+	if capacityURL == "" {
+		return backend.CapacityStatus{}, fmt.Errorf("backend secret %s is missing %q", secretRef, secretKeyCapacityURL)
+	}
+	dispatchToken := strings.TrimSpace(secretData[secretKeyDispatchToken])
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, capacityURL, nil)
+	if err != nil {
+		return backend.CapacityStatus{}, err
+	}
+	req.Header.Set("X-UECB-Backend", string(b.name))
+	if dispatchToken != "" {
+		req.Header.Set("Authorization", "Bearer "+dispatchToken)
+	}
+
+	client := b.client
+	if client == nil {
+		client = &http.Client{Timeout: defaultCapacityTimeout}
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return backend.CapacityStatus{}, classifyDispatchError(b.name, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		message, readErr := readErrorMessage(resp.Body)
+		baseErr := fmt.Errorf("capacity backend %s: unexpected status %d", b.name, resp.StatusCode)
+		if readErr == nil && message != "" {
+			baseErr = fmt.Errorf("capacity backend %s: %s", b.name, message)
+		}
+		if reason := classifyStatus(resp.StatusCode); reason != "" {
+			return backend.CapacityStatus{}, backend.NewClassifiedError(reason, baseErr)
+		}
+		return backend.CapacityStatus{}, baseErr
+	}
+
+	var payload capacityResponse
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil && err != io.EOF {
+		return backend.CapacityStatus{}, fmt.Errorf("decode backend %s capacity response: %w", b.name, err)
+	}
+
+	status := backend.CapacityStatus{
+		MaxRunners:     payload.MaxRunners,
+		ActiveRunners:  payload.ActiveRunners,
+		PendingRunners: payload.PendingRunners,
+		WarmRunners:    payload.WarmRunners,
+	}
+	// Prefer explicit free_slots when controllers publish it without a max.
+	if payload.FreeSlots > 0 && status.MaxRunners <= 0 {
+		status.MaxRunners = payload.FreeSlots + status.ActiveRunners + status.PendingRunners + status.WarmRunners
+	}
+	if status.MaxRunners <= 0 && payload.FreeSlots == 0 {
+		// free_slots:0 with no max is a valid "full" signal.
+		if payload.FreeSlots == 0 && (payload.ActiveRunners > 0 || payload.PendingRunners > 0 || payload.WarmRunners > 0) {
+			status.MaxRunners = payload.ActiveRunners + payload.PendingRunners + payload.WarmRunners
+		}
+	}
+	return status, nil
+}
+
+func (b *Backend) firstConfiguredPool() (model.PoolConfig, model.BackendConfig, error) {
+	for _, pool := range b.cfg.Pools {
+		if cfg, ok := pool.Backends[b.name]; ok && cfg.Enabled {
+			return pool, cfg, nil
+		}
+	}
+	for _, pool := range b.cfg.Pools {
+		if cfg, ok := pool.Backends[b.name]; ok {
+			return pool, cfg, nil
+		}
+	}
+	return model.PoolConfig{}, model.BackendConfig{}, fmt.Errorf("backend %s is not configured in any pool", b.name)
 }
 
 func (b *Backend) Probe(ctx context.Context, pool model.PoolConfig, cfg model.BackendConfig) error {
@@ -410,6 +525,15 @@ func classifyStatus(status int) string {
 	default:
 		return ""
 	}
+}
+
+func isCapacityStatus(status int, message string) bool {
+	lower := strings.ToLower(message)
+	if strings.Contains(lower, "capacity") || strings.Contains(lower, "no free") || strings.Contains(lower, "no slot") {
+		return true
+	}
+	// 409 Conflict is a common "reservation rejected / full" signal from adapters.
+	return status == http.StatusConflict
 }
 
 func resolvePool(cfg model.BrokerConfig, name model.PoolName) (model.PoolConfig, error) {

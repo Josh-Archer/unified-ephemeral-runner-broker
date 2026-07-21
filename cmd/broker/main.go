@@ -20,6 +20,7 @@ import (
 	ec2backend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/ec2"
 	gcebackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/gce"
 	lambdabackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/lambda"
+	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/capacity"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/config"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/runtime"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/store"
@@ -73,6 +74,23 @@ func main() {
 			}
 		}
 		tier.StartRefreshLoop(context.Background(), tierManager, refresher, cfg.Broker.TierRouting.RefreshInterval)
+	}
+
+	var capacityManager *capacity.Manager
+	if cfg.Broker.LiveCapacity.Enabled {
+		capacityManager = capacity.NewManager()
+		service.SetCapacityManager(capacityManager)
+		reporter := capacity.RegistryReporter{Registry: registry}
+		probeTimeout := cfg.Broker.LiveCapacity.ProbeTimeout
+		if probeTimeout <= 0 {
+			probeTimeout = 2 * time.Second
+		}
+		if cfg.Broker.LiveCapacity.RefreshOnStartup {
+			ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+			capacity.Refresh(ctx, capacityManager, reporter, cfg, time.Now().UTC())
+			cancel()
+		}
+		capacity.StartRefreshLoop(context.Background(), capacityManager, reporter, cfg, cfg.Broker.LiveCapacity.RefreshInterval)
 	}
 	server := api.NewServerWithPolicy(
 		service,
@@ -131,6 +149,16 @@ func main() {
 			defer ticker.Stop()
 			for now := range ticker.C {
 				tierManager.MarkStale(cfg.Broker.TierRouting.StaleAfter, now)
+			}
+		}()
+	}
+
+	if capacityManager != nil {
+		go func() {
+			ticker := time.NewTicker(15 * time.Second)
+			defer ticker.Stop()
+			for now := range ticker.C {
+				capacityManager.MarkStale(cfg.Broker.LiveCapacity.StaleAfter, now)
 			}
 		}()
 	}

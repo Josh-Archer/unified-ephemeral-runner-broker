@@ -286,3 +286,48 @@ func contains(values []string, needle string) bool {
 	}
 	return false
 }
+
+func TestValidateLiveCapacity(t *testing.T) {
+	cfg := Default()
+	cfg.Broker.LiveCapacity.Enabled = true
+	cfg.Broker.LiveCapacity.FailureMode = "not-a-mode"
+	if err := Validate(cfg); err == nil {
+		t.Fatal("expected invalid failureMode to fail validation")
+	}
+	cfg.Broker.LiveCapacity.FailureMode = "block"
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("expected valid live capacity config: %v", err)
+	}
+}
+
+func TestLoadParsesLiveCapacity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "broker.yaml")
+	if err := os.WriteFile(path, []byte(`
+broker:
+  liveCapacity:
+    enabled: true
+    refreshInterval: 15s
+    staleAfter: 1m
+    probeTimeout: 1s
+    failureMode: block
+    refreshOnStartup: false
+`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if !cfg.Broker.LiveCapacity.Enabled {
+		t.Fatal("expected live capacity enabled")
+	}
+	if cfg.Broker.LiveCapacity.RefreshInterval != 15*time.Second {
+		t.Fatalf("unexpected refresh interval %s", cfg.Broker.LiveCapacity.RefreshInterval)
+	}
+	if cfg.Broker.LiveCapacity.FailureMode != "block" {
+		t.Fatalf("unexpected failure mode %q", cfg.Broker.LiveCapacity.FailureMode)
+	}
+	if cfg.Broker.LiveCapacity.RefreshOnStartup {
+		t.Fatal("expected refreshOnStartup false")
+	}
+}

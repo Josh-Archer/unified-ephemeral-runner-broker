@@ -37,6 +37,39 @@ func NewAllocationError(err error, reason error, capacityExhausted bool) error {
 	}
 }
 
+// IsCapacityExhausted reports whether err indicates the provider rejected the
+// allocation because it has no free runner slots.
+func IsCapacityExhausted(err error) bool {
+	if err == nil {
+		return false
+	}
+	var allocErr *AllocationError
+	if errors.As(err, &allocErr) && allocErr.CapacityExhausted {
+		return true
+	}
+	return errors.Is(err, ErrBackendCapacityExhausted)
+}
+
+// CapacityStatus is the broker-side view of provider-reported capacity.
+// It mirrors pkg/adapter.CapacityStatus so built-in backends and SDK adapters
+// publish the same counters.
+type CapacityStatus struct {
+	MaxRunners     int
+	ActiveRunners  int
+	PendingRunners int
+	WarmRunners    int
+}
+
+// FreeSlots returns non-negative free runner slots from a capacity snapshot.
+func FreeSlots(status CapacityStatus) int {
+	used := status.ActiveRunners + status.PendingRunners + status.WarmRunners
+	free := status.MaxRunners - used
+	if free < 0 {
+		return 0
+	}
+	return free
+}
+
 type ProvisionedRunner struct {
 	RunnerLabel string
 	Metadata    map[string]string
@@ -49,6 +82,12 @@ type Backend interface {
 
 type CleanupBackend interface {
 	Cleanup(ctx context.Context, status model.AllocationStatus) error
+}
+
+// CapacityBackend is an optional interface backends implement to publish
+// provider-reported live capacity for routing decisions.
+type CapacityBackend interface {
+	Capacity(ctx context.Context) (CapacityStatus, error)
 }
 
 type Registry struct {

@@ -44,5 +44,7 @@ data:
 {{ toYaml (.Values.config.broker.api.oidcPolicy | default dict) | indent 10 }}
       tierRouting:
 {{ toYaml .Values.config.broker.tierRouting | indent 8 }}
+      liveCapacity:
+{{ toYaml (.Values.config.broker.liveCapacity | default dict) | indent 8 }}
     pools:
 {{ toYaml .Values.config.pools | indent 6 }}
