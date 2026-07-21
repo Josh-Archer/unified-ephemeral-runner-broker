@@ -89,8 +89,30 @@ type BrokerAPIConfig struct {
 }
 
 type StateStoreConfig struct {
+	// Type selects the store backend: memory (default), file, or postgres.
+	// memory and file are single-replica development/restart-recovery options.
+	// postgres is the supported multi-replica shared store.
 	Type string `yaml:"type,omitempty" json:"type,omitempty"`
+	// Path is required when type is file.
 	Path string `yaml:"path,omitempty" json:"path,omitempty"`
+	// DSN is an optional direct PostgreSQL connection string when type is postgres.
+	DSN string `yaml:"dsn,omitempty" json:"dsn,omitempty"`
+	// DSNEnv names the environment variable that holds the PostgreSQL DSN when
+	// type is postgres and DSN is empty. Defaults to UECB_STATE_STORE_DSN.
+	DSNEnv string `yaml:"dsnEnv,omitempty" json:"dsnEnv,omitempty"`
+}
+
+// HAConfig controls multi-replica coordination. When empty, HA is implied by
+// stateStore.type=postgres.
+type HAConfig struct {
+	// Enabled forces HA coordination (leader election). Defaults to true when
+	// stateStore.type is postgres.
+	Enabled *bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	// LeaseTTL is how long a background-work leader lease is held before renewal.
+	LeaseTTL time.Duration `yaml:"leaseTTL,omitempty" json:"leaseTTL,omitempty"`
+	// Identity overrides the process identity used for leader election
+	// (defaults to HOSTNAME / pod name).
+	Identity string `yaml:"identity,omitempty" json:"identity,omitempty"`
 }
 
 type AdmissionQueueConfig struct {
@@ -109,6 +131,7 @@ type BrokerRuntimeConfig struct {
 	} `yaml:"orphanCleanup" json:"orphanCleanup"`
 	API         BrokerAPIConfig      `yaml:"api" json:"api"`
 	StateStore  StateStoreConfig     `yaml:"stateStore,omitempty" json:"stateStore,omitempty"`
+	HA          HAConfig             `yaml:"ha,omitempty" json:"ha,omitempty"`
 	Queue       AdmissionQueueConfig `yaml:"queue,omitempty" json:"queue,omitempty"`
 	TierRouting TierRoutingConfig    `yaml:"tierRouting,omitempty" json:"tierRouting,omitempty"`
 }
