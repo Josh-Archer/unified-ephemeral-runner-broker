@@ -46,7 +46,7 @@ CodeBuild warm capacity is configured with `warmMin: 1, warmMax: 2` to reduce co
 
 - `base/` — Kustomize base with CodeBuild enabled in the lite pool
 - `overlays/staging/` — staging overlay (1 broker replica, lower CodeBuild capacity)
-- `overlays/production/` — production overlay (2 broker replicas, full CodeBuild capacity)
+- `overlays/production/` — production overlay (1 broker replica; multi-replica requires postgres HA state store, full CodeBuild capacity)
 - `argocd/application.yaml` — ArgoCD Application manifest
 - `secrets.md` — required Kubernetes Secrets including the CodeBuild dispatcher secret
 - `rollout.md` — initial install, CodeBuild enablement, and rollback steps

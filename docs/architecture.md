@@ -36,8 +36,41 @@ Warm capacity currently applies only to external dispatch backends and intention
 
 ## State And Restart Recovery
 
-The default state store is in-memory. A file-backed state store can persist
-allocation records to a mounted volume for restart recovery.
+The default state store is in-memory. Supported store types:
+
+| Type | Scope | Use case |
+|------|--------|----------|
+| `memory` | Process-local | Development and single-replica |
+| `file` | Process-local file on a volume | Single-replica restart recovery |
+| `postgres` | Shared across replicas | Multi-replica high availability |
+
+`memory` and `file` must run with a single broker replica. The Helm chart rejects
+`replicaCount > 1` unless `stateStore.type` is `postgres`, and the broker process
+also refuses to start when `UECB_REPLICAS > 1` with a process-local store.
+
+### Shared transactional state (HA)
+
+With `broker.stateStore.type: postgres` the broker:
+
+- Persists allocations in PostgreSQL so GET, complete, and cancel work through any replica.
+- Reserves capacity with a transactional `SaveIfCapacity` check so concurrent
+  replicas cannot exceed `maxRunners` (or fair-share tenant quotas when set).
+- Claims warm runners with compare-and-swap state transitions.
+- Shares circuit-breaker and rate-limit runtime state across replicas.
+- Runs expiry sweeps, warm-pool, queue, and backend-health reconciliation only on
+  the elected leader (lease in PostgreSQL, renewed each background tick).
+
+```yaml
+broker:
+  stateStore:
+    type: postgres
+    dsnEnv: UECB_STATE_STORE_DSN
+  ha:
+    leaseTTL: 15s
+```
+
+Provide the DSN via `UECB_STATE_STORE_DSN` (chart `stateStore.secretRef`) rather
+than inline config when possible.
 
 On service startup, the broker rehydrates scheduler accounting from persisted
 `reserved`, `ready`, and `warm` allocations. Pending allocations remain queued
@@ -81,7 +114,14 @@ Backends may opt into runtime admission controls with `circuitBreaker` and `rate
 
 Admission order is deterministic: static `enabled`/`healthy`, capability filtering, requested timeout filtering, runtime circuit and cold-launch rate limiting, scheduler reservation, then backend provisioning.
 
-Circuit state is in-memory and scoped to a single `pool/backend` within one broker process. Keep broker replicas at `1` for this feature unless scheduler, allocation, and admission state are moved to shared storage together. Timeout-like provision failures, throttling, server errors, explicit `failure_class` completion callbacks, and allocation expiry can open the circuit for the failing backend only. Open backends are skipped for unpinned requests so another eligible backend can serve the allocation; pinned requests fail fast with a circuit-open error.
+Circuit and rate-limit runtime state is process-local for `memory`/`file` stores and
+shared through the state store when `type: postgres`. Keep broker replicas at `1`
+for process-local stores. With postgres HA, admission decisions reload shared state
+before consuming permits. Timeout-like provision failures, throttling, server errors,
+explicit `failure_class` completion callbacks, and allocation expiry can open the
+circuit for the failing backend only. Open backends are skipped for unpinned requests
+so another eligible backend can serve the allocation; pinned requests fail fast with
+a circuit-open error.
 
 Rate limiting only applies to cold launches. The broker consumes permits during
 admission, skips rate-limited backends for the current attempt, and may route a
