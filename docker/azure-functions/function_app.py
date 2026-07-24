@@ -254,6 +254,45 @@ def dispatch(req: func.HttpRequest) -> func.HttpResponse:
             return json_response({"ok": False, "error": "execution not found", "execution_id": execution_id}, status_code=404)
         return json_response(status)
 
+    if action == "capacity":
+        # Align with home broker-config-patch azure-functions maxRunners (2).
+        try:
+            max_runners = int(env("MAX_RUNNERS") or env("UECB_MAX_RUNNERS") or "2")
+        except ValueError:
+            max_runners = 2
+        active = 0
+        pending = 0
+        try:
+            container = status_container_client()
+            for blob in container.list_blobs():
+                name = str(blob.name or "")
+                if not name.endswith(".json"):
+                    continue
+                execution_id = name[: -len(".json")]
+                status = read_status(execution_id) or {}
+                state = str(status.get("state") or "").strip().lower()
+                if state in ("completed", "failed", "canceled", "cancelled", "expired"):
+                    continue
+                if state in ("accepted", "queued", "pending"):
+                    pending += 1
+                else:
+                    # running or unknown non-terminal
+                    active += 1
+        except Exception as exc:
+            logging.exception("capacity probe failed")
+            return json_response({"ok": False, "error": f"capacity probe failed: {exc}"}, status_code=500)
+
+        free_slots = max(0, max_runners - active - pending)
+        return json_response(
+            {
+                "max_runners": max_runners,
+                "active_runners": active,
+                "pending_runners": pending,
+                "warm_runners": 0,
+                "free_slots": free_slots,
+            }
+        )
+
     if action != "dispatch":
         return json_response({"ok": False, "error": "unsupported action"}, status_code=400)
 
