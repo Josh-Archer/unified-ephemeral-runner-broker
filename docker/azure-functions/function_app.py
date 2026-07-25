@@ -24,6 +24,12 @@ DEFAULT_DISPATCH_QUEUE = "uecb-azure-functions-dispatch"
 DEFAULT_STATUS_CONTAINER = "uecb-azure-functions-status"
 MAX_RUNNER_TIMEOUT_SECONDS = 8 * 60
 STATUS_UPDATE_INTERVAL_SECONDS = 15
+TERMINAL_STATES = frozenset({"completed", "failed", "canceled", "cancelled", "expired"})
+PENDING_STATES = frozenset({"accepted", "queued", "pending"})
+# Non-terminal statuses older than this are treated as free (and deleted).
+DEFAULT_STATUS_STALE_SECONDS = MAX_RUNNER_TIMEOUT_SECONDS + 300
+# Terminal status blobs older than this are deleted during capacity probes.
+DEFAULT_TERMINAL_TTL_SECONDS = 24 * 60 * 60
 
 
 def utc_now() -> str:
@@ -32,6 +38,53 @@ def utc_now() -> str:
 
 def env(name: str, default: str = "") -> str:
     return str(os.environ.get(name) or default)
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(env(name) or str(default))
+    except ValueError:
+        return default
+
+
+def status_stale_seconds() -> int:
+    return max(60, _int_env("UECB_STATUS_STALE_SECONDS", DEFAULT_STATUS_STALE_SECONDS))
+
+
+def terminal_ttl_seconds() -> int:
+    return max(60, _int_env("UECB_STATUS_TERMINAL_TTL_SECONDS", DEFAULT_TERMINAL_TTL_SECONDS))
+
+
+def classify_capacity_entry(
+    state: str,
+    age_seconds: float | None,
+    *,
+    stale_seconds: int,
+    terminal_ttl_seconds: int,
+) -> str:
+    """Return how capacity should treat one status blob.
+
+    Values: active | pending | skip | delete_stale | delete_terminal
+    """
+    normalized = (state or "").strip().lower()
+    age = age_seconds if age_seconds is not None and age_seconds >= 0 else 0.0
+
+    if normalized in TERMINAL_STATES:
+        if age >= terminal_ttl_seconds:
+            return "delete_terminal"
+        return "skip"
+
+    if age >= stale_seconds:
+        # Orphaned accepted/running must not pin free_slots at zero forever.
+        return "delete_stale"
+
+    if not normalized:
+        # Legacy blob without metadata: conservative active until stale TTL.
+        return "active"
+
+    if normalized in PENDING_STATES:
+        return "pending"
+    return "active"
 
 
 def storage_connection_string() -> str:
@@ -124,9 +177,39 @@ def write_status(execution_id: str, **changes: Any) -> dict[str, Any]:
     if "details_url" not in status:
         status["details_url"] = resource_details_url()
 
+    state = str(status.get("state") or "").strip().lower() or "unknown"
+    # Metadata keeps capacity O(list) — no body download per blob.
+    metadata = {
+        "state": state,
+        "updated_epoch": str(int(time.time())),
+    }
+
     blob_client = status_container_client().get_blob_client(f"{execution_id}.json")
-    blob_client.upload_blob(json.dumps(status), overwrite=True)
+    blob_client.upload_blob(json.dumps(status), overwrite=True, metadata=metadata)
     return status
+
+
+def _blob_age_seconds(blob: Any, now: datetime | None = None) -> float | None:
+    """Age of a status blob for capacity / TTL decisions."""
+    now = now or datetime.now(timezone.utc)
+    meta = getattr(blob, "metadata", None) or {}
+    epoch_raw = str(meta.get("updated_epoch") or meta.get("Updated_epoch") or "").strip()
+    if epoch_raw:
+        try:
+            return max(0.0, now.timestamp() - float(epoch_raw))
+        except ValueError:
+            pass
+    last_modified = getattr(blob, "last_modified", None)
+    if last_modified is None:
+        return None
+    if last_modified.tzinfo is None:
+        last_modified = last_modified.replace(tzinfo=timezone.utc)
+    return max(0.0, (now - last_modified).total_seconds())
+
+
+def _blob_state(blob: Any) -> str:
+    meta = getattr(blob, "metadata", None) or {}
+    return str(meta.get("state") or meta.get("State") or "").strip().lower()
 
 
 def tail_log(path: str, limit: int = 120) -> str:
@@ -256,28 +339,42 @@ def dispatch(req: func.HttpRequest) -> func.HttpResponse:
 
     if action == "capacity":
         # Align with home broker-config-patch azure-functions maxRunners (2).
+        # Use blob metadata only (no body download) so capacity stays fast with
+        # large status history. Opportunistically delete terminal/stale blobs.
         try:
             max_runners = int(env("MAX_RUNNERS") or env("UECB_MAX_RUNNERS") or "2")
         except ValueError:
             max_runners = 2
         active = 0
         pending = 0
+        reaped = 0
+        stale_s = status_stale_seconds()
+        terminal_ttl = terminal_ttl_seconds()
         try:
             container = status_container_client()
-            for blob in container.list_blobs():
+            now = datetime.now(timezone.utc)
+            for blob in container.list_blobs(include=["metadata"]):
                 name = str(blob.name or "")
                 if not name.endswith(".json"):
                     continue
-                execution_id = name[: -len(".json")]
-                status = read_status(execution_id) or {}
-                state = str(status.get("state") or "").strip().lower()
-                if state in ("completed", "failed", "canceled", "cancelled", "expired"):
+                decision = classify_capacity_entry(
+                    _blob_state(blob),
+                    _blob_age_seconds(blob, now=now),
+                    stale_seconds=stale_s,
+                    terminal_ttl_seconds=terminal_ttl,
+                )
+                if decision in ("delete_stale", "delete_terminal"):
+                    try:
+                        container.delete_blob(name)
+                        reaped += 1
+                    except Exception:
+                        logging.exception("failed to reap status blob %s", name)
                     continue
-                if state in ("accepted", "queued", "pending"):
+                if decision == "pending":
                     pending += 1
-                else:
-                    # running or unknown non-terminal
+                elif decision == "active":
                     active += 1
+                # skip → ignore
         except Exception as exc:
             logging.exception("capacity probe failed")
             return json_response({"ok": False, "error": f"capacity probe failed: {exc}"}, status_code=500)
@@ -290,6 +387,7 @@ def dispatch(req: func.HttpRequest) -> func.HttpResponse:
                 "pending_runners": pending,
                 "warm_runners": 0,
                 "free_slots": free_slots,
+                "reaped_status_blobs": reaped,
             }
         )
 
