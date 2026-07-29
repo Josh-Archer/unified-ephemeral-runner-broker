@@ -43,7 +43,7 @@ func main() {
 	}
 
 	registry := backend.NewRegistry(
-		arcbackend.New(cfg),
+		arcbackend.New(cfg, secretReader),
 		codebuildbackend.New(cfg, secretReader),
 		lambdabackend.New(cfg, secretReader),
 		cloudbackend.New(cfg, secretReader),

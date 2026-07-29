@@ -72,17 +72,6 @@ type dispatchResponse struct {
 	ExecutionID string            `json:"execution_id"`
 }
 
-// capacityResponse is the JSON body returned by optional capacity_url GET.
-// Controllers may also expose free_slots; when set it is preferred over
-// max - (active + pending + warm).
-type capacityResponse struct {
-	MaxRunners     int `json:"max_runners"`
-	ActiveRunners  int `json:"active_runners"`
-	PendingRunners int `json:"pending_runners"`
-	WarmRunners    int `json:"warm_runners"`
-	FreeSlots      int `json:"free_slots"`
-}
-
 // cleanupRequest is the JSON body POSTed to cleanup_url (or derived cleanup endpoint).
 // Launchers should treat cleanup as idempotent: 200/204 and 404 are success.
 type cleanupRequest struct {
@@ -322,26 +311,9 @@ func (b *Backend) Capacity(ctx context.Context) (backend.CapacityStatus, error) 
 		return backend.CapacityStatus{}, baseErr
 	}
 
-	var payload capacityResponse
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil && err != io.EOF {
+	status, err := backend.DecodeCapacityJSON(resp.Body)
+	if err != nil {
 		return backend.CapacityStatus{}, fmt.Errorf("decode backend %s capacity response: %w", b.name, err)
-	}
-
-	status := backend.CapacityStatus{
-		MaxRunners:     payload.MaxRunners,
-		ActiveRunners:  payload.ActiveRunners,
-		PendingRunners: payload.PendingRunners,
-		WarmRunners:    payload.WarmRunners,
-	}
-	// Prefer explicit free_slots when controllers publish it without a max.
-	if payload.FreeSlots > 0 && status.MaxRunners <= 0 {
-		status.MaxRunners = payload.FreeSlots + status.ActiveRunners + status.PendingRunners + status.WarmRunners
-	}
-	if status.MaxRunners <= 0 && payload.FreeSlots == 0 {
-		// free_slots:0 with no max is a valid "full" signal.
-		if payload.FreeSlots == 0 && (payload.ActiveRunners > 0 || payload.PendingRunners > 0 || payload.WarmRunners > 0) {
-			status.MaxRunners = payload.ActiveRunners + payload.PendingRunners + payload.WarmRunners
-		}
 	}
 	return status, nil
 }

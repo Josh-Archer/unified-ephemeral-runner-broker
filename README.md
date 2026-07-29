@@ -350,7 +350,9 @@ broker:
 ```
 
 HTTP-dispatch backends publish capacity via optional secret key `capacity_url`.
-SDK adapters implement `Adapter.Capacity`. See
+Built-in `arc` implements first-class `Capacity()` (optional `capacity_url` or
+configured runner-scale `maxRunners`); `desktop` reports `maxRunners` plus an
+optional host probe. SDK adapters implement `Adapter.Capacity`. See
 [docs/adapter-sdk.md](docs/adapter-sdk.md#publishing-capacity) and
 [docs/architecture.md](docs/architecture.md#live-backend-capacity).
 

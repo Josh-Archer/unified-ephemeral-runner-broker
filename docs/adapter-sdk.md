@@ -61,6 +61,20 @@ Recommended adapter behavior:
    a full backend should return `ActiveRunners + PendingRunners + WarmRunners >= MaxRunners`, not an error.
 4. Reject over-capacity `Reserve` calls so concurrent broker admits cannot overrun the provider.
 
+### Built-in ARC and desktop backends
+
+`arc` and `desktop` implement native `Capacity()` so live-capacity routing does
+not lag HTTP-dispatch backends:
+
+| Backend | Capacity source |
+| --- | --- |
+| `arc` | Optional secret key `capacity_url` (same JSON as HTTP-dispatch). When absent, publishes the sum of enabled pool `maxRunners` as the runner-scale ceiling. |
+| `desktop` | Configured `maxRunners` (default `1`). Optional `desktop.address` + `desktop.checkPort` host probe: offline hosts report exhaustion (`free_slots = 0`). |
+
+Wire ARC scale/node feeds through the same `capacity_url` secret shape used by
+cloud controllers so home GitOps can publish honest free slots without a broker
+restart.
+
 ### HTTP-dispatch controllers
 
 External dispatch backends (`codebuild`, `lambda`, `cloud-run`,
@@ -88,8 +102,10 @@ Successful responses (`2xx`) should return JSON:
   `free_slots` so the broker can reconstruct a ceiling).
 - `free_slots` is optional; when `max_runners` is omitted and `free_slots > 0`,
   the broker derives `max_runners = free_slots + active + pending + warm`.
-- Missing `capacity_url` means the backend does not publish live capacity; the
-  broker uses local `maxRunners` accounting only for that backend.
+- Missing `capacity_url` on HTTP-dispatch backends means that backend does not
+  publish live capacity; the broker uses local `maxRunners` accounting only for
+  that backend. Built-in `arc` falls back to configured scale instead of
+  treating Capacity as missing.
 
 When a dispatch/provision call is rejected for capacity, return HTTP `409`
 and/or an error body containing `capacity` so the broker can classify the

@@ -146,7 +146,7 @@ Optional live-capacity routing uses provider-reported free slots when selecting 
 
 When `broker.liveCapacity.enabled` is true:
 
-1. Backends that implement `Capacity()` (SDK adapters) or publish `capacity_url` (HTTP dispatch secrets) are polled out of band on `refreshInterval`.
+1. Backends that implement `Capacity()` (SDK adapters, built-in `arc` and `desktop`) or publish `capacity_url` (HTTP dispatch secrets, optional ARC secret feed) are polled out of band on `refreshInterval`.
 2. Snapshots are cached in memory per broker process and marked stale after `staleAfter`.
 3. Before scheduler reservation, exhausted backends are filtered out and `MaxRunners` on the pool snapshot is clamped to the lower of configured and provider-reported limits, after combining provider free slots with local active reservations.
 4. Local scheduler reservation remains the broker concurrency authority. If a provider still rejects a provision/reserve for capacity, the broker falls back to another eligible backend (unpinned) or returns a deterministic live-capacity error (pinned).
