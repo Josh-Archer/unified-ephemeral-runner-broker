@@ -354,6 +354,11 @@ SDK adapters implement `Adapter.Capacity`. See
 [docs/adapter-sdk.md](docs/adapter-sdk.md#publishing-capacity) and
 [docs/architecture.md](docs/architecture.md#live-backend-capacity).
 
+For local/dev and CI without cloud credentials, use
+`internal/capacity/fakecapacity` (`Capacity()` fixtures and an in-process
+`capacity_url` server). The live-capacity decision matrix is covered by
+`internal/capacity/decision_matrix_test.go`.
+
 ### Queued Admission
 
 Queued admission is disabled by default. When enabled, retryable allocation

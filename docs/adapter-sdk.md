@@ -118,6 +118,45 @@ broker:
 The broker never intentionally admits more than the lower of configured
 `maxRunners` and provider-reported limits when a fresh snapshot is available.
 
+### Fake capacity mode (local / CI)
+
+Broker unit and integration tests should not call real AWS, Azure, or GCP
+capacity APIs. The first-class fixtures under
+`internal/capacity/fakecapacity` cover both capacity publish paths:
+
+| Fixture | Use when |
+| --- | --- |
+| `fakecapacity.NewBackend` | In-process `Capacity()` for SDK-style backends and refresh-loop tests |
+| `fakecapacity.NewServer` | HTTP `capacity_url` server for external-dispatch backends |
+| `fakecapacity.LiveSnapshot` / `StaleSnapshot` / `ErrorSnapshot` | Seed `capacity.Manager` without running a refresh |
+| `fakecapacity.MapReporter` | Multi-backend `capacity.Refresh` without cloud credentials |
+
+Example: seed routing decisions directly:
+
+```go
+manager := capacity.NewManager()
+fakecapacity.SeedManager(manager,
+    fakecapacity.LiveSnapshot(model.BackendCodeBuild, fakecapacity.Full(2), time.Now().UTC()),
+    fakecapacity.LiveSnapshot(model.BackendARC, fakecapacity.Free(4, 2), time.Now().UTC()),
+)
+service.SetCapacityManager(manager)
+```
+
+Example: fake `capacity_url` for HTTP-dispatch controllers:
+
+```go
+srv := fakecapacity.NewServer(t,
+    fakecapacity.WithStatus(fakecapacity.Detailed(5, 2, 1, 1)),
+    fakecapacity.WithBearerAuth("broker-secret"),
+)
+// Put srv.URL into the backend secret as capacity_url.
+```
+
+Golden coverage of the live-capacity decision matrix (skip exhausted, stale
+pass-through / block, pin-style error handling, local-only fallback) lives in
+`internal/capacity/decision_matrix_test.go` and runs in CI with no outbound
+provider network.
+
 ## Compatibility
 
 The SDK follows the module version. Minor versions may add optional fields to
