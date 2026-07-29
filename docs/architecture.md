@@ -137,6 +137,61 @@ broker:
 Provide the DSN via `UECB_STATE_STORE_DSN` (chart `stateStore.secretRef`) rather
 than inline config when possible.
 
+On service startup, the broker rehydrates scheduler accounting from persisted
+`reserved`, `ready`, and `warm` allocations. Pending allocations remain queued
+and are retried by the queue reconciler when their `retryAfter` time is reached.
+
+## Allocation Lifecycle Webhooks
+
+Optional outbound webhooks notify external systems when an allocation becomes
+`ready` or reaches a terminal state (`failed`, `expired`, `completed`,
+`canceled`). Configure under `broker.webhooks`:
+
+```yaml
+broker:
+  webhooks:
+    enabled: true
+    timeout: 5s
+    maxAttempts: 3
+    initialBackoff: 500ms
+    maxBackoff: 10s
+    endpoints:
+      - url: https://hooks.example.com/uecb
+        signingSecretRef: uecb-webhook   # key signing_secret by default
+        # signingSecret: inline-dev-only
+        events:                          # empty = all lifecycle events
+          - ready
+          - failed
+          - expired
+          - completed
+          - canceled
+```
+
+Each delivery is an HTTP POST of a signed JSON envelope:
+
+```json
+{
+  "id": "<delivery-id>",
+  "event": "allocation.ready",
+  "occurred_at": "2026-07-28T12:00:00Z",
+  "allocation": { "...": "AllocationStatus fields" }
+}
+```
+
+Headers:
+
+| Header | Description |
+|--------|-------------|
+| `X-UECB-Event` | `allocation.<event>` |
+| `X-UECB-Delivery` | Unique delivery id |
+| `X-UECB-Timestamp` | Event time (RFC3339) |
+| `X-UECB-Signature` | `sha256=<hex HMAC-SHA256 of body>` |
+
+Deliveries are asynchronous and best-effort. Transient failures (network,
+408/429/5xx) retry with exponential backoff up to `maxAttempts`. Permanent
+client errors (4xx other than 408/429) are not retried. Webhook failures never
+block allocation state transitions.
+
 ## Queued Admission
 
 Queued admission is optional and disabled by default.

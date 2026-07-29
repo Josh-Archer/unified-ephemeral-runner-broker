@@ -35,41 +35,63 @@ func Validate(cfg model.BrokerConfig) error {
 	if err := validateLiveCapacity(cfg.Broker.LiveCapacity); err != nil {
 		return err
 	}
-	if err := validateFairShare(cfg); err != nil {
+	if err := validateWebhooks(cfg.Broker.Webhooks); err != nil {
 		return err
 	}
 	return nil
 }
 
-func validateFairShare(cfg model.BrokerConfig) error {
-	for _, pool := range cfg.Pools {
-		fs := pool.FairShare
-		for class, weight := range fs.PriorityClasses {
-			if strings.TrimSpace(class) == "" {
-				return fmt.Errorf("pools[%s].fairShare.priorityClasses includes an empty class name", pool.Name)
-			}
-			if weight <= 0 {
-				return fmt.Errorf("pools[%s].fairShare.priorityClasses[%s] must be positive", pool.Name, class)
-			}
+var supportedWebhookEvents = map[string]struct{}{
+	"ready":     {},
+	"failed":    {},
+	"expired":   {},
+	"completed": {},
+	"canceled":  {},
+	"cancelled": {}, // alias for canceled
+}
+
+func validateWebhooks(cfg model.WebhooksConfig) error {
+	if cfg.Timeout < 0 {
+		return fmt.Errorf("broker.webhooks.timeout must not be negative")
+	}
+	if cfg.MaxAttempts < 0 {
+		return fmt.Errorf("broker.webhooks.maxAttempts must not be negative")
+	}
+	if cfg.InitialBackoff < 0 {
+		return fmt.Errorf("broker.webhooks.initialBackoff must not be negative")
+	}
+	if cfg.MaxBackoff < 0 {
+		return fmt.Errorf("broker.webhooks.maxBackoff must not be negative")
+	}
+	if !cfg.Enabled {
+		return nil
+	}
+	if len(cfg.Endpoints) == 0 {
+		return fmt.Errorf("broker.webhooks.endpoints is required when webhooks are enabled")
+	}
+	for i, endpoint := range cfg.Endpoints {
+		if strings.TrimSpace(endpoint.URL) == "" {
+			return fmt.Errorf("broker.webhooks.endpoints[%d].url is required", i)
 		}
-		for class, slots := range fs.SoftReserves {
-			if strings.TrimSpace(class) == "" {
-				return fmt.Errorf("pools[%s].fairShare.softReserves includes an empty class name", pool.Name)
-			}
-			if slots < 0 {
-				return fmt.Errorf("pools[%s].fairShare.softReserves[%s] must not be negative", pool.Name, class)
-			}
+		if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(endpoint.URL)), "http://") &&
+			!strings.HasPrefix(strings.ToLower(strings.TrimSpace(endpoint.URL)), "https://") {
+			return fmt.Errorf("broker.webhooks.endpoints[%d].url must be an http(s) URL", i)
 		}
-		for tenant, quota := range fs.Quotas {
-			if strings.TrimSpace(tenant) == "" {
-				return fmt.Errorf("pools[%s].fairShare.quotas includes an empty tenant name", pool.Name)
-			}
-			if quota <= 0 {
-				return fmt.Errorf("pools[%s].fairShare.quotas[%s] must be positive", pool.Name, tenant)
-			}
+		hasInline := strings.TrimSpace(endpoint.SigningSecret) != ""
+		hasRef := strings.TrimSpace(endpoint.SigningSecretRef) != ""
+		if !hasInline && !hasRef {
+			return fmt.Errorf("broker.webhooks.endpoints[%d] requires signingSecret or signingSecretRef", i)
 		}
-		if len(fs.SoftReserves) > 0 && !fs.Enabled {
-			return fmt.Errorf("pools[%s].fairShare.softReserves requires fairShare.enabled", pool.Name)
+		for _, event := range endpoint.Events {
+			normalized := strings.ToLower(strings.TrimSpace(event))
+			if normalized == "" {
+				continue
+			}
+			// Accept bare names and allocation.<name> forms.
+			normalized = strings.TrimPrefix(normalized, "allocation.")
+			if _, ok := supportedWebhookEvents[normalized]; !ok {
+				return fmt.Errorf("broker.webhooks.endpoints[%d].events contains unsupported event %q", i, event)
+			}
 		}
 	}
 	return nil

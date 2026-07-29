@@ -247,6 +247,14 @@ func requiredSecretRefs(cfg model.BrokerConfig) []string {
 		}
 	}
 
+	if cfg.Broker.Webhooks.Enabled {
+		for _, endpoint := range cfg.Broker.Webhooks.Endpoints {
+			if ref := strings.TrimSpace(endpoint.SigningSecretRef); ref != "" {
+				refs[ref] = struct{}{}
+			}
+		}
+	}
+
 	ordered := make([]string, 0, len(refs))
 	for ref := range refs {
 		ordered = append(ordered, ref)

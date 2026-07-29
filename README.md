@@ -329,6 +329,31 @@ On startup the broker:
 Use `file` or `postgres` whenever cloud backends are enabled in production. See
 [docs/architecture.md](docs/architecture.md#failure-mode-in-memory--process-local-restart).
 
+### Allocation Lifecycle Webhooks
+
+Subscribe external systems to allocation lifecycle events (`ready`, `failed`,
+`expired`, `completed`, `canceled`). Each endpoint receives a signed JSON POST
+with exponential backoff retries. See
+[docs/architecture.md](docs/architecture.md#allocation-lifecycle-webhooks) and
+[docs/openapi.yaml](docs/openapi.yaml) for the envelope and signature contract.
+
+```yaml
+broker:
+  webhooks:
+    enabled: true
+    timeout: 5s
+    maxAttempts: 3
+    initialBackoff: 500ms
+    maxBackoff: 10s
+    endpoints:
+      - url: https://hooks.example.com/uecb
+        signingSecretRef: uecb-webhook
+        # events: []  # empty = all lifecycle events
+```
+
+Verify deliveries with HMAC-SHA256 of the raw body using the configured signing
+secret. The signature is sent as `X-UECB-Signature: sha256=<hex>`.
+
 ### Live Backend Capacity
 
 By default the broker routes using local scheduler accounting and configured

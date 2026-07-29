@@ -148,6 +148,31 @@ type BrokerRuntimeConfig struct {
 	Queue        AdmissionQueueConfig `yaml:"queue,omitempty" json:"queue,omitempty"`
 	TierRouting  TierRoutingConfig    `yaml:"tierRouting,omitempty" json:"tierRouting,omitempty"`
 	LiveCapacity LiveCapacityConfig   `yaml:"liveCapacity,omitempty" json:"liveCapacity,omitempty"`
+	Webhooks     WebhooksConfig       `yaml:"webhooks,omitempty" json:"webhooks,omitempty"`
+}
+
+// WebhooksConfig controls outbound allocation lifecycle event delivery.
+// When enabled, the broker POSTs signed JSON payloads to each endpoint for
+// ready and terminal transitions (failed, expired, completed, canceled).
+type WebhooksConfig struct {
+	Enabled        bool                    `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	Timeout        time.Duration           `yaml:"timeout,omitempty" json:"timeout,omitempty"`
+	MaxAttempts    int                     `yaml:"maxAttempts,omitempty" json:"maxAttempts,omitempty"`
+	InitialBackoff time.Duration           `yaml:"initialBackoff,omitempty" json:"initialBackoff,omitempty"`
+	MaxBackoff     time.Duration           `yaml:"maxBackoff,omitempty" json:"maxBackoff,omitempty"`
+	Endpoints      []WebhookEndpointConfig `yaml:"endpoints,omitempty" json:"endpoints,omitempty"`
+}
+
+// WebhookEndpointConfig describes one subscriber URL and how to sign deliveries.
+// Prefer signingSecretRef for production; signingSecret is useful for local tests.
+// Events filters which lifecycle names are sent; empty means all supported events.
+type WebhookEndpointConfig struct {
+	URL              string   `yaml:"url" json:"url"`
+	SigningSecret    string   `yaml:"signingSecret,omitempty" json:"signingSecret,omitempty"`
+	SigningSecretRef string   `yaml:"signingSecretRef,omitempty" json:"signingSecretRef,omitempty"`
+	// SigningSecretKey is the key inside SigningSecretRef (default: signing_secret).
+	SigningSecretKey string   `yaml:"signingSecretKey,omitempty" json:"signingSecretKey,omitempty"`
+	Events           []string `yaml:"events,omitempty" json:"events,omitempty"`
 }
 
 // LiveCapacityConfig controls optional provider-reported capacity routing.

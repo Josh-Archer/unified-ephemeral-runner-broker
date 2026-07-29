@@ -3590,3 +3590,101 @@ func TestLiveCapacityConcurrentProviderReject(t *testing.T) {
 		t.Fatalf("expected arc fallback, got %s", status.SelectedBackend)
 	}
 }
+
+type recordingLifecycle struct {
+	mu     sync.Mutex
+	events []model.AllocationStatus
+}
+
+func (r *recordingLifecycle) Notify(status model.AllocationStatus) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events = append(r.events, status)
+}
+
+func (r *recordingLifecycle) states() []model.AllocationState {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]model.AllocationState, len(r.events))
+	for i, e := range r.events {
+		out[i] = e.State
+	}
+	return out
+}
+
+func TestLifecycleWebhooksOnReadyCompleteCancel(t *testing.T) {
+	service := newService()
+	recorder := &recordingLifecycle{}
+	service.SetLifecycleNotifier(recorder)
+
+	allocated, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolFull,
+		JobTimeout: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("allocate: %v", err)
+	}
+	if got := recorder.states(); len(got) != 1 || got[0] != model.StateReady {
+		t.Fatalf("after allocate events = %v, want [ready]", got)
+	}
+
+	completed, ok, err := service.Complete(context.Background(), allocated.ID, completionRequest{State: "completed"})
+	if err != nil || !ok || completed.State != model.StateCompleted {
+		t.Fatalf("complete: ok=%v state=%s err=%v", ok, completed.State, err)
+	}
+	if got := recorder.states(); len(got) != 2 || got[1] != model.StateCompleted {
+		t.Fatalf("after complete events = %v, want [ready completed]", got)
+	}
+
+	// Idempotent complete should not re-emit.
+	_, _, err = service.Complete(context.Background(), allocated.ID, completionRequest{State: "completed"})
+	if err != nil {
+		t.Fatalf("idempotent complete: %v", err)
+	}
+	if got := recorder.states(); len(got) != 2 {
+		t.Fatalf("idempotent complete re-emitted: %v", got)
+	}
+
+	service2 := newService()
+	recorder2 := &recordingLifecycle{}
+	service2.SetLifecycleNotifier(recorder2)
+	allocated2, err := service2.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolFull,
+		JobTimeout: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("allocate2: %v", err)
+	}
+	canceled, ok := service2.Cancel(allocated2.ID)
+	if !ok || canceled.State != model.StateCanceled {
+		t.Fatalf("cancel: ok=%v state=%s", ok, canceled.State)
+	}
+	if got := recorder2.states(); len(got) != 2 || got[0] != model.StateReady || got[1] != model.StateCanceled {
+		t.Fatalf("cancel events = %v, want [ready canceled]", got)
+	}
+}
+
+func TestLifecycleWebhooksOnExpire(t *testing.T) {
+	service := newService()
+	recorder := &recordingLifecycle{}
+	service.SetLifecycleNotifier(recorder)
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	service.now = func() time.Time { return now }
+
+	allocated, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolFull,
+		JobTimeout: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("allocate: %v", err)
+	}
+
+	service.now = func() time.Time { return now.Add(2 * time.Minute) }
+	if n := service.SweepExpired(service.now()); n != 1 {
+		t.Fatalf("sweep updated = %d, want 1", n)
+	}
+	if got := recorder.states(); len(got) != 2 || got[1] != model.StateExpired {
+		t.Fatalf("expire events = %v, want [ready expired]", got)
+	}
+	_ = allocated
+}
