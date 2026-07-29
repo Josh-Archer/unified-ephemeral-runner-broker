@@ -128,6 +128,56 @@
       ],
       "title": "Capacity Utilization",
       "type": "timeseries"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "id": 6,
+      "targets": [
+        {
+          "expr": "sum by (pool, backend, action) (rate(uecb_orphan_cleanup_actions_total[5m]))",
+          "legendFormat": "orphan {{pool}}/{{backend}} {{action}}"
+        },
+        {
+          "expr": "sum by (pool, backend, result) (rate(uecb_label_garbage_total[5m]))",
+          "legendFormat": "label gc {{pool}}/{{backend}} {{result}}"
+        }
+      ],
+      "title": "Orphan Cleanup and Label Garbage",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
+      "id": 7,
+      "targets": [
+        {
+          "expr": "sum by (pool, backend, phase) (uecb_stale_runner_labels)",
+          "legendFormat": "{{pool}}/{{backend}} {{phase}}"
+        }
+      ],
+      "title": "Stale Runner Labels",
+      "type": "timeseries"
     }
   ],
   "refresh": "30s",

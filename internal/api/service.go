@@ -779,26 +779,36 @@ func (s *Service) SweepExpired(now time.Time) int {
 				continue
 			}
 
+			// Past job-timeout TTL without finalize: treat as stale runner label
+			// garbage (hard kill, cancelled workflow, or missing cleanup job).
 			nextState := model.StateExpired
-			nextMessage := "allocation expired"
+			nextMessage := "stale runner label reclaimed: allocation expired without finalize"
 			nextExpiresAt := now
+			orphanAction := orphanActionExpired
 			if s.cfg.Broker.OrphanCleanup.Enabled {
 				nextState = model.StateQuarantined
-				nextMessage = "allocation quarantined"
+				nextMessage = "stale runner label quarantined: allocation past job timeout without finalize"
 				nextExpiresAt = now
+				orphanAction = orphanActionQuarantined
 				if s.cfg.Broker.OrphanCleanup.QuarantineTTL > 0 {
 					nextExpiresAt = now.Add(s.cfg.Broker.OrphanCleanup.QuarantineTTL)
 				}
 			}
 			if _, ok := s.store.MarkState(status.ID, nextState, nextExpiresAt, nextMessage); ok {
 				if pool, err := s.resolvePool(status.Pool); err == nil {
-					s.release(context.Background(), pool, status.SelectedBackend, status)
+					s.releaseStaleLabel(context.Background(), pool, status.SelectedBackend, status)
 					s.recordBackendFailureClass(pool, status.SelectedBackend, backend.FailureReasonWaitTimeout, now)
+				} else {
+					// Still attempt provider cleanup when the pool config vanished.
+					s.reclaimStaleRunnerLabel(context.Background(), status)
 				}
+				s.observer.ObserveOrphanCleanup(status.Pool, status.SelectedBackend, orphanAction)
 				logAllocationEvent(context.Background(), "allocation_"+string(nextState), map[string]string{
 					"allocation_id": allocationIDLabel(status.ID),
 					"pool":          string(status.Pool),
 					"backend":       string(status.SelectedBackend),
+					"runner_label":  strings.TrimSpace(status.RunnerLabel),
+					"reason":        "stale_label_without_finalize",
 				})
 				updated++
 			}
@@ -812,11 +822,17 @@ func (s *Service) SweepExpired(now time.Time) int {
 		if status.ExpiresAt.After(now) {
 			continue
 		}
-		if _, ok := s.store.MarkState(status.ID, model.StateExpired, now, "allocation quarantine expired"); ok {
+		if _, ok := s.store.MarkState(status.ID, model.StateExpired, now, "stale runner label quarantine expired"); ok {
+			// Retry provider cleanup in case the quarantine transition failed to
+			// tear down the runner registration.
+			s.reclaimStaleRunnerLabel(context.Background(), status)
+			s.observer.ObserveOrphanCleanup(status.Pool, status.SelectedBackend, orphanActionQuarantineExpired)
 			logAllocationEvent(context.Background(), "allocation_expired", map[string]string{
 				"allocation_id": allocationIDLabel(status.ID),
 				"pool":          string(status.Pool),
 				"backend":       string(status.SelectedBackend),
+				"runner_label":  strings.TrimSpace(status.RunnerLabel),
+				"reason":        "quarantine_ttl_elapsed",
 			})
 			updated++
 		}
@@ -867,9 +883,54 @@ func (s *Service) observeState() {
 	statuses := s.store.List()
 	s.observer.ObserveActiveAllocations(statuses)
 	s.observer.ObserveCapacity(s.cfg, statuses)
+	s.observer.ObserveStaleRunnerLabels(staleRunnerLabelSnapshots(statuses, s.now()))
 	s.observeCircuitState()
 	s.observeTierState()
 	s.observeLiveCapacityState()
+}
+
+// staleRunnerLabelSnapshots reports allocations that still hold a runner label
+// past the job-timeout TTL (overdue for sweep) or while quarantined.
+func staleRunnerLabelSnapshots(statuses []model.AllocationStatus, now time.Time) []staleRunnerLabelSnapshot {
+	type key struct {
+		pool    model.PoolName
+		backend model.BackendName
+		phase   string
+	}
+	counts := map[key]int{}
+	for _, status := range statuses {
+		if strings.TrimSpace(status.RunnerLabel) == "" {
+			continue
+		}
+		switch {
+		case isActiveAllocationState(status.State) && !status.ExpiresAt.IsZero() && !status.ExpiresAt.After(now):
+			counts[key{status.Pool, status.SelectedBackend, stalePhaseOverdue}]++
+		case status.State == model.StateQuarantined:
+			counts[key{status.Pool, status.SelectedBackend, stalePhaseQuarantined}]++
+		}
+	}
+	if len(counts) == 0 {
+		return nil
+	}
+	out := make([]staleRunnerLabelSnapshot, 0, len(counts))
+	for k, n := range counts {
+		out = append(out, staleRunnerLabelSnapshot{
+			Pool:    k.pool,
+			Backend: k.backend,
+			Phase:   k.phase,
+			Count:   n,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Pool != out[j].Pool {
+			return out[i].Pool < out[j].Pool
+		}
+		if out[i].Backend != out[j].Backend {
+			return out[i].Backend < out[j].Backend
+		}
+		return out[i].Phase < out[j].Phase
+	})
+	return out
 }
 
 func (s *Service) observeLiveCapacityState() {
@@ -1691,34 +1752,71 @@ func (s *Service) reserve(pool model.PoolConfig, request model.AllocationRequest
 }
 
 func (s *Service) release(ctx context.Context, pool model.PoolConfig, backend model.BackendName, allocation model.AllocationStatus) {
+	s.releaseWithCleanup(ctx, pool, backend, allocation, false)
+}
+
+// releaseStaleLabel frees scheduler capacity and reclaims a runner label that
+// lingered after a hard kill or missing finalize callback.
+func (s *Service) releaseStaleLabel(ctx context.Context, pool model.PoolConfig, backend model.BackendName, allocation model.AllocationStatus) {
+	s.releaseWithCleanup(ctx, pool, backend, allocation, true)
+}
+
+func (s *Service) releaseWithCleanup(ctx context.Context, pool model.PoolConfig, backendName model.BackendName, allocation model.AllocationStatus, labelGarbage bool) {
 	if pool.FairShare.Enabled {
 		if s.fairShare != nil {
-			s.fairShare.Release(pool.Name, backend, allocation)
+			s.fairShare.Release(pool.Name, backendName, allocation)
 		}
-		s.cleanupAllocation(ctx, allocation)
+		s.cleanupAllocationWithMetrics(ctx, allocation, labelGarbage)
 		return
 	}
-	s.schedulerForPool(pool).Release(pool.Name, backend, allocation)
-	s.cleanupAllocation(ctx, allocation)
+	s.schedulerForPool(pool).Release(pool.Name, backendName, allocation)
+	s.cleanupAllocationWithMetrics(ctx, allocation, labelGarbage)
 }
 
 func (s *Service) cleanupAllocation(ctx context.Context, allocation model.AllocationStatus) {
+	s.cleanupAllocationWithMetrics(ctx, allocation, false)
+}
+
+// reclaimStaleRunnerLabel tears down provider-side resources for an allocation
+// that expired without finalize and records label-garbage metrics.
+func (s *Service) reclaimStaleRunnerLabel(ctx context.Context, allocation model.AllocationStatus) {
+	s.cleanupAllocationWithMetrics(ctx, allocation, true)
+}
+
+func (s *Service) cleanupAllocationWithMetrics(ctx context.Context, allocation model.AllocationStatus, labelGarbage bool) {
 	backendImpl, ok := s.registry.Get(allocation.SelectedBackend)
 	if !ok {
+		if labelGarbage {
+			s.observer.ObserveLabelGarbage(allocation.Pool, allocation.SelectedBackend, labelGarbageNoCleanupHook)
+		}
 		return
 	}
 	cleanupBackend, ok := backendImpl.(backend.CleanupBackend)
 	if !ok {
+		// Backends without Cleanup still free broker capacity; when reclaiming
+		// orphans, count the missing hook so operators can see hard-kill
+		// leftovers that only expire on job-timeout TTL.
+		if labelGarbage {
+			s.observer.ObserveLabelGarbage(allocation.Pool, allocation.SelectedBackend, labelGarbageNoCleanupHook)
+		}
 		return
 	}
 	if err := cleanupBackend.Cleanup(ctx, allocation); err != nil {
+		if labelGarbage {
+			s.observer.ObserveLabelGarbage(allocation.Pool, allocation.SelectedBackend, labelGarbageCleanupFailed)
+		}
 		logAllocationEvent(ctx, "allocation_cleanup_failed", map[string]string{
 			"allocation_id": allocationIDLabel(allocation.ID),
 			"pool":          string(allocation.Pool),
 			"backend":       string(allocation.SelectedBackend),
+			"runner_label":  strings.TrimSpace(allocation.RunnerLabel),
 			"error":         err.Error(),
 		})
 		log.Printf("allocation cleanup failed for %s: %v", allocation.ID, err)
+		return
+	}
+	if labelGarbage {
+		s.observer.ObserveLabelGarbage(allocation.Pool, allocation.SelectedBackend, labelGarbageReclaimed)
 	}
 }
 

@@ -2017,6 +2017,120 @@ func TestSweepExpiredMarksReadyAllocationsExpired(t *testing.T) {
 	if updated.State != model.StateExpired {
 		t.Fatalf("expected expired state, got %s", updated.State)
 	}
+	if !strings.Contains(updated.Error, "without finalize") {
+		t.Fatalf("expected stale-without-finalize message, got %q", updated.Error)
+	}
+}
+
+type recordingObserver struct {
+	noopObserver
+	orphanActions  []string
+	labelGarbage   []string
+	staleSnapshots [][]staleRunnerLabelSnapshot
+}
+
+func (o *recordingObserver) ObserveOrphanCleanup(_ model.PoolName, _ model.BackendName, action string) {
+	o.orphanActions = append(o.orphanActions, action)
+}
+
+func (o *recordingObserver) ObserveLabelGarbage(_ model.PoolName, _ model.BackendName, result string) {
+	o.labelGarbage = append(o.labelGarbage, result)
+}
+
+func (o *recordingObserver) ObserveStaleRunnerLabels(snapshots []staleRunnerLabelSnapshot) {
+	// Copy so later resets cannot mutate recorded history.
+	cp := append([]staleRunnerLabelSnapshot(nil), snapshots...)
+	o.staleSnapshots = append(o.staleSnapshots, cp)
+}
+
+func TestSweepExpiredReclaimsStaleRunnerLabelsWithMetrics(t *testing.T) {
+	cfg := config.Default()
+	cleanupCalled := false
+	observer := &recordingObserver{}
+
+	service := NewService(
+		cfg,
+		backend.NewRegistry(
+			&testCleanupBackend{
+				testBackend: testBackend{name: model.BackendARC},
+				cleanupSeen: &cleanupCalled,
+			},
+			testBackend{name: model.BackendCodeBuild},
+			testBackend{name: model.BackendLambda},
+			testBackend{name: model.BackendCloudRun},
+			testBackend{name: model.BackendAzureFunctions},
+		),
+		nil,
+	)
+	service.SetObserver(observer)
+	service.now = func() time.Time { return time.Unix(1000, 0) }
+
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolFull,
+		JobTimeout: 30 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("allocate failed: %v", err)
+	}
+	if strings.TrimSpace(allocation.RunnerLabel) == "" {
+		t.Fatal("expected runner label on allocation")
+	}
+
+	// Before the sweep, an overdue ready allocation should surface as stale.
+	stale := staleRunnerLabelSnapshots([]model.AllocationStatus{allocation}, time.Unix(1040, 0))
+	if len(stale) != 1 || stale[0].Phase != stalePhaseOverdue || stale[0].Count != 1 {
+		t.Fatalf("expected one overdue stale label, got %+v", stale)
+	}
+
+	// Hard kill / missing finalize: job timeout elapses with no complete callback.
+	swept := service.SweepExpired(time.Unix(1040, 0))
+	if swept != 1 {
+		t.Fatalf("expected 1 stale allocation reclaimed, got %d", swept)
+	}
+	if !cleanupCalled {
+		t.Fatal("expected backend cleanup for stale runner label")
+	}
+	if len(observer.orphanActions) != 1 || observer.orphanActions[0] != orphanActionExpired {
+		t.Fatalf("expected orphan expired action, got %v", observer.orphanActions)
+	}
+	if len(observer.labelGarbage) != 1 || observer.labelGarbage[0] != labelGarbageReclaimed {
+		t.Fatalf("expected label garbage reclaimed, got %v", observer.labelGarbage)
+	}
+
+	updated, ok := service.Get(allocation.ID)
+	if !ok {
+		t.Fatal("allocation disappeared after sweep")
+	}
+	if updated.State != model.StateExpired {
+		t.Fatalf("expected expired state, got %s", updated.State)
+	}
+
+	// Finalize path must not inflate label-garbage metrics.
+	observer2 := &recordingObserver{}
+	service2 := NewService(
+		cfg,
+		backend.NewRegistry(
+			&testCleanupBackend{testBackend: testBackend{name: model.BackendARC}},
+		),
+		nil,
+	)
+	service2.SetObserver(observer2)
+	allocation2, err := service2.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolFull,
+		JobTimeout: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("allocate failed: %v", err)
+	}
+	if _, _, err := service2.Complete(context.Background(), allocation2.ID, completionRequest{State: "completed"}); err != nil {
+		t.Fatalf("complete failed: %v", err)
+	}
+	if len(observer2.orphanActions) != 0 {
+		t.Fatalf("finalize must not record orphan cleanup actions, got %v", observer2.orphanActions)
+	}
+	if len(observer2.labelGarbage) != 0 {
+		t.Fatalf("finalize must not record label garbage, got %v", observer2.labelGarbage)
+	}
 }
 
 func TestSweepExpiredMarksReadyAllocationsQuarantinedWhenEnabled(t *testing.T) {
@@ -2069,6 +2183,67 @@ func TestSweepExpiredMarksReadyAllocationsQuarantinedWhenEnabled(t *testing.T) {
 	if updated.State != model.StateExpired {
 		t.Fatalf("expected expiry to clear quarantine, got %s", updated.State)
 	}
+	if !strings.Contains(updated.Error, "quarantine expired") {
+		t.Fatalf("expected quarantine-expired message, got %q", updated.Error)
+	}
+}
+
+func TestSweepExpiredQuarantinePathRecordsOrphanMetrics(t *testing.T) {
+	cfg := config.Default()
+	cfg.Broker.OrphanCleanup.Enabled = true
+	cfg.Broker.OrphanCleanup.QuarantineTTL = 10 * time.Second
+	observer := &recordingObserver{}
+	counting := &countingCleanupBackend{testBackend: testBackend{name: model.BackendARC}}
+
+	service := NewService(cfg, backend.NewRegistry(counting), nil)
+	service.SetObserver(observer)
+	service.now = func() time.Time { return time.Unix(1000, 0) }
+
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolFull,
+		JobTimeout: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("allocate failed: %v", err)
+	}
+
+	if n := service.SweepExpired(time.Unix(1015, 0)); n != 1 {
+		t.Fatalf("expected quarantine sweep count 1, got %d", n)
+	}
+	updated, ok := service.Get(allocation.ID)
+	if !ok || updated.State != model.StateQuarantined {
+		t.Fatalf("expected quarantined allocation, got %+v ok=%v", updated, ok)
+	}
+	stale := staleRunnerLabelSnapshots([]model.AllocationStatus{updated}, time.Unix(1015, 0))
+	if len(stale) != 1 || stale[0].Phase != stalePhaseQuarantined {
+		t.Fatalf("expected quarantined stale snapshot, got %+v", stale)
+	}
+	if counting.calls != 1 {
+		t.Fatalf("expected cleanup on quarantine, got %d", counting.calls)
+	}
+	if len(observer.orphanActions) != 1 || observer.orphanActions[0] != orphanActionQuarantined {
+		t.Fatalf("expected quarantined orphan action, got %v", observer.orphanActions)
+	}
+
+	if n := service.SweepExpired(time.Unix(1025, 0)); n != 1 {
+		t.Fatalf("expected quarantine expiry count 1, got %d", n)
+	}
+	if counting.calls != 2 {
+		t.Fatalf("expected cleanup retry on quarantine expiry, got %d", counting.calls)
+	}
+	if len(observer.orphanActions) != 2 || observer.orphanActions[1] != orphanActionQuarantineExpired {
+		t.Fatalf("expected quarantine_expired action, got %v", observer.orphanActions)
+	}
+}
+
+type countingCleanupBackend struct {
+	testBackend
+	calls int
+}
+
+func (b *countingCleanupBackend) Cleanup(_ context.Context, _ model.AllocationStatus) error {
+	b.calls++
+	return nil
 }
 
 func TestCompleteReturnsNotFoundForMissingAllocation(t *testing.T) {

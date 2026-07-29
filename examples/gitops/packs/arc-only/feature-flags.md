@@ -31,7 +31,10 @@ backends:
 
 ## Orphan Cleanup
 
-Stale allocations that have not received a completion callback are cleaned up during periodic sweeps.
+Stale allocations (and their unique runner labels) that never receive a
+`finalize-allocation` / complete callback are reclaimed after the allocation
+`job_timeout` TTL during the periodic expiry sweep. This covers hard job kills
+and cancelled workflows where the cleanup job never runs.
 
 ```yaml
 broker:
@@ -48,6 +51,10 @@ broker:
     enabled: true
     quarantineTTL: 10m
 ```
+
+Metrics: `uecb_orphan_cleanup_actions_total`, `uecb_label_garbage_total`,
+`uecb_stale_runner_labels`. Bound `job_timeout` to the maximum reclaim lag you
+accept when finalize is missing.
 
 ## Scheduler Selection
 

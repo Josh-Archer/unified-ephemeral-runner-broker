@@ -39,6 +39,10 @@ type Observer interface {
 	ObserveTierBlocked(model.PoolName, model.BackendName, string)
 	ObserveLiveCapacityState([]liveCapacitySnapshot)
 	ObserveLiveCapacityDecision(model.PoolName, model.BackendName, string, int)
+	// Orphan / label-garbage lifecycle (hard kill without finalize).
+	ObserveOrphanCleanup(model.PoolName, model.BackendName, string)
+	ObserveLabelGarbage(model.PoolName, model.BackendName, string)
+	ObserveStaleRunnerLabels([]staleRunnerLabelSnapshot)
 }
 
 type noopObserver struct{}
@@ -62,6 +66,9 @@ func (noopObserver) ObserveTierBlocked(model.PoolName, model.BackendName, string
 func (noopObserver) ObserveLiveCapacityState([]liveCapacitySnapshot)                           {}
 func (noopObserver) ObserveLiveCapacityDecision(model.PoolName, model.BackendName, string, int) {
 }
+func (noopObserver) ObserveOrphanCleanup(model.PoolName, model.BackendName, string) {}
+func (noopObserver) ObserveLabelGarbage(model.PoolName, model.BackendName, string)  {}
+func (noopObserver) ObserveStaleRunnerLabels([]staleRunnerLabelSnapshot)            {}
 
 type liveCapacitySnapshot struct {
 	Backend model.BackendName
@@ -72,23 +79,47 @@ type liveCapacitySnapshot struct {
 	Err     bool
 }
 
+// staleRunnerLabelSnapshot counts overdue ready/reserved allocations and
+// quarantined allocations still holding a runner label after finalize missed.
+type staleRunnerLabelSnapshot struct {
+	Pool    model.PoolName
+	Backend model.BackendName
+	// Phase is overdue (past ExpiresAt, pending sweep) or quarantined.
+	Phase string
+	Count int
+}
+
+const (
+	orphanActionExpired           = "expired"
+	orphanActionQuarantined       = "quarantined"
+	orphanActionQuarantineExpired = "quarantine_expired"
+	labelGarbageReclaimed         = "reclaimed"
+	labelGarbageCleanupFailed     = "cleanup_failed"
+	labelGarbageNoCleanupHook     = "no_cleanup_hook"
+	stalePhaseOverdue             = "overdue"
+	stalePhaseQuarantined         = "quarantined"
+)
+
 type PrometheusObserver struct {
-	allocationLatency   *prometheus.HistogramVec
-	launchLatency       *prometheus.HistogramVec
-	registrationLatency *prometheus.HistogramVec
-	allocations         *prometheus.CounterVec
-	queueDepth          *prometheus.GaugeVec
-	capacityUtilization *prometheus.GaugeVec
-	circuitState        *prometheus.GaugeVec
-	circuitTransitions  *prometheus.CounterVec
-	admissionRejections *prometheus.CounterVec
-	probeResults        *prometheus.CounterVec
-	tierState           *prometheus.GaugeVec
-	tierFallbacks       *prometheus.CounterVec
-	tierBlocked         *prometheus.CounterVec
-	liveCapacityFree    *prometheus.GaugeVec
-	liveCapacityStale   *prometheus.GaugeVec
+	allocationLatency     *prometheus.HistogramVec
+	launchLatency         *prometheus.HistogramVec
+	registrationLatency   *prometheus.HistogramVec
+	allocations           *prometheus.CounterVec
+	queueDepth            *prometheus.GaugeVec
+	capacityUtilization   *prometheus.GaugeVec
+	circuitState          *prometheus.GaugeVec
+	circuitTransitions    *prometheus.CounterVec
+	admissionRejections   *prometheus.CounterVec
+	probeResults          *prometheus.CounterVec
+	tierState             *prometheus.GaugeVec
+	tierFallbacks         *prometheus.CounterVec
+	tierBlocked           *prometheus.CounterVec
+	liveCapacityFree      *prometheus.GaugeVec
+	liveCapacityStale     *prometheus.GaugeVec
 	liveCapacityDecisions *prometheus.CounterVec
+	orphanCleanupActions  *prometheus.CounterVec
+	labelGarbage          *prometheus.CounterVec
+	staleRunnerLabels     *prometheus.GaugeVec
 }
 
 func NewPrometheusObserver(registerer prometheus.Registerer) *PrometheusObserver {
@@ -164,6 +195,18 @@ func NewPrometheusObserver(registerer prometheus.Registerer) *PrometheusObserver
 			Name: "uecb_live_capacity_decisions_total",
 			Help: "Live capacity routing decisions by pool, backend, and reason.",
 		}, []string{"pool", "backend", "reason"}),
+		orphanCleanupActions: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "uecb_orphan_cleanup_actions_total",
+			Help: "Orphan cleanup sweep actions for stale allocations (missing finalize / hard job kill).",
+		}, []string{"pool", "backend", "action"}),
+		labelGarbage: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "uecb_label_garbage_total",
+			Help: "Runner label garbage-collection outcomes during orphan cleanup.",
+		}, []string{"pool", "backend", "result"}),
+		staleRunnerLabels: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "uecb_stale_runner_labels",
+			Help: "Active or quarantined allocations holding runner labels past their job-timeout TTL.",
+		}, []string{"pool", "backend", "phase"}),
 	}
 }
 
@@ -188,6 +231,9 @@ func (o *PrometheusObserver) Register(registerer prometheus.Registerer) error {
 		o.liveCapacityFree,
 		o.liveCapacityStale,
 		o.liveCapacityDecisions,
+		o.orphanCleanupActions,
+		o.labelGarbage,
+		o.staleRunnerLabels,
 	} {
 		if err := registerer.Register(collector); err != nil {
 			if _, ok := err.(prometheus.AlreadyRegisteredError); !ok {
@@ -196,6 +242,31 @@ func (o *PrometheusObserver) Register(registerer prometheus.Registerer) error {
 		}
 	}
 	return nil
+}
+
+func (o *PrometheusObserver) ObserveOrphanCleanup(pool model.PoolName, backend model.BackendName, action string) {
+	if action == "" {
+		action = "unknown"
+	}
+	o.orphanCleanupActions.WithLabelValues(string(pool), string(backend), action).Inc()
+}
+
+func (o *PrometheusObserver) ObserveLabelGarbage(pool model.PoolName, backend model.BackendName, result string) {
+	if result == "" {
+		result = "unknown"
+	}
+	o.labelGarbage.WithLabelValues(string(pool), string(backend), result).Inc()
+}
+
+func (o *PrometheusObserver) ObserveStaleRunnerLabels(snapshots []staleRunnerLabelSnapshot) {
+	o.staleRunnerLabels.Reset()
+	for _, snapshot := range snapshots {
+		phase := snapshot.Phase
+		if phase == "" {
+			phase = "unknown"
+		}
+		o.staleRunnerLabels.WithLabelValues(string(snapshot.Pool), string(snapshot.Backend), phase).Set(float64(snapshot.Count))
+	}
 }
 
 func (o *PrometheusObserver) ObserveLiveCapacityState(snapshots []liveCapacitySnapshot) {

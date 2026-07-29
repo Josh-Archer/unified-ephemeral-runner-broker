@@ -57,3 +57,21 @@ groups:
         annotations:
           summary: "UECB backend admission is rate limited for {{ $labels.pool }}/{{ $labels.backend }}"
           description: "Cold-launch requests are being rejected by backend rate limiting."
+
+      - alert: UECBOrphanCleanupElevated
+        expr: sum by (pool, backend) (rate(uecb_orphan_cleanup_actions_total[15m])) > 0.01
+        for: 20m
+        labels:
+          severity: warning
+        annotations:
+          summary: "UECB orphan cleanup is reclaiming stale runner labels for {{ $labels.pool }}/{{ $labels.backend }}"
+          description: "Allocations are expiring without finalize (hard job kills or missing cleanup jobs). Check finalize-allocation usage and job_timeout bounds."
+
+      - alert: UECBStaleRunnerLabels
+        expr: sum by (pool, backend) (uecb_stale_runner_labels) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "UECB stale runner labels present for {{ $labels.pool }}/{{ $labels.backend }}"
+          description: "Runner labels are overdue for sweep or held in quarantine after job-timeout without finalize."
