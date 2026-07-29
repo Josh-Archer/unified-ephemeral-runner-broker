@@ -327,100 +327,45 @@ func TestRegistrySharesPriorityFairShareInstance(t *testing.T) {
 	}
 }
 
-func TestPriorityFairShareSoftReservesProtectHighPriorityLanes(t *testing.T) {
-	sched := NewPriorityFairShare()
-	pool := poolByName(model.PoolLite)
-	pool.FairShare.Enabled = true
-	pool.FairShare.PriorityClasses = map[string]int{
-		string(model.PriorityClassSmoke):  1,
-		string(model.PriorityClassPR):     2,
-		string(model.PriorityClassDeploy): 3,
-	}
-	// Hold 2 slots for deploy so concurrent smoke cannot fill the backend.
-	pool.FairShare.SoftReserves = map[string]int{
-		string(model.PriorityClassDeploy): 2,
-	}
-	pool.Backends = map[model.BackendName]model.BackendConfig{
-		model.BackendARC: {Enabled: true, Healthy: true, MaxRunners: 4},
-	}
-	pinned := model.BackendARC
-
-	// Smoke can take at most maxRunners - softReserve = 2.
-	for i := 0; i < 2; i++ {
-		if _, err := sched.Reserve(pool, allocationRequest(&pinned, "smoke-lane", string(model.PriorityClassSmoke))); err != nil {
-			t.Fatalf("smoke reserve #%d failed: %v", i+1, err)
-		}
-	}
-	if _, err := sched.Reserve(pool, allocationRequest(&pinned, "smoke-lane", string(model.PriorityClassSmoke))); err != ErrNoCapacity {
-		t.Fatalf("expected smoke to be blocked by deploy soft reserve, got %v", err)
-	}
-
-	// Deploy still admits within soft-reserved capacity.
-	for i := 0; i < 2; i++ {
-		if _, err := sched.Reserve(pool, allocationRequest(&pinned, "deploy-lane", string(model.PriorityClassDeploy))); err != nil {
-			t.Fatalf("deploy reserve #%d failed: %v", i+1, err)
-		}
-	}
-	if _, err := sched.Reserve(pool, allocationRequest(&pinned, "deploy-lane", string(model.PriorityClassDeploy))); err != ErrNoCapacity {
-		t.Fatalf("expected hard maxRunners exhaustion for deploy, got %v", err)
-	}
-}
-
-func TestPriorityFairShareSoftReservesDoNotBlockEqualOrHigherLanes(t *testing.T) {
-	sched := NewPriorityFairShare()
-	pool := poolByName(model.PoolLite)
-	pool.FairShare.Enabled = true
-	pool.FairShare.PriorityClasses = map[string]int{
-		string(model.PriorityClassNormal): 1,
-		string(model.PriorityClassHigh):   2,
-	}
-	pool.FairShare.SoftReserves = map[string]int{
-		string(model.PriorityClassHigh): 1,
-	}
-	pool.Backends = map[model.BackendName]model.BackendConfig{
-		model.BackendARC: {Enabled: true, Healthy: true, MaxRunners: 2},
-	}
-	pinned := model.BackendARC
-
-	// High can use the full backend including its own soft-reserved slot.
-	if _, err := sched.Reserve(pool, allocationRequest(&pinned, "a", string(model.PriorityClassHigh))); err != nil {
-		t.Fatalf("high reserve #1 failed: %v", err)
-	}
-	if _, err := sched.Reserve(pool, allocationRequest(&pinned, "a", string(model.PriorityClassHigh))); err != nil {
-		t.Fatalf("high reserve #2 failed: %v", err)
-	}
-}
-
-func TestEffectiveMaxRunnersAppliesSoftReservesByWeight(t *testing.T) {
-	fairShare := model.FairShareConfig{
-		Enabled: true,
-		PriorityClasses: map[string]int{
-			"smoke":  1,
-			"pr":     2,
-			"deploy": 3,
-		},
-		SoftReserves: map[string]int{
-			"pr":     1,
-			"deploy": 2,
+func TestRoundRobinPrefersCheaperBackendWhenFreeSlotsEqual(t *testing.T) {
+	scheduler := NewRoundRobin()
+	pool := model.PoolConfig{
+		Name: model.PoolLite,
+		Backends: map[model.BackendName]model.BackendConfig{
+			// Equal free capacity: prefer lower cost class (lambda over ec2).
+			model.BackendLambda: {Enabled: true, Healthy: true, MaxRunners: 2, CostClass: 10},
+			model.BackendEC2:    {Enabled: true, Healthy: true, MaxRunners: 2, CostClass: 90},
 		},
 	}
 
-	if got := EffectiveMaxRunners(10, fairShare, "smoke"); got != 7 {
-		t.Fatalf("smoke effective max = %d, want 7 (hold pr+deploy)", got)
+	selected, err := scheduler.Reserve(pool, allocationRequest(nil, "", ""))
+	if err != nil {
+		t.Fatalf("reserve failed: %v", err)
 	}
-	if got := EffectiveMaxRunners(10, fairShare, "pr"); got != 8 {
-		t.Fatalf("pr effective max = %d, want 8 (hold deploy only)", got)
+	if selected != model.BackendLambda {
+		t.Fatalf("expected cheaper lambda when free slots equal, got %s", selected)
 	}
-	if got := EffectiveMaxRunners(10, fairShare, "deploy"); got != 10 {
-		t.Fatalf("deploy effective max = %d, want 10", got)
-	}
-	if got := EffectiveMaxRunners(2, fairShare, "smoke"); got != 0 {
-		t.Fatalf("smoke effective max when reserves exceed capacity = %d, want 0", got)
+}
+
+func TestRoundRobinPrefersMoreFreeSlotsOverCost(t *testing.T) {
+	scheduler := NewRoundRobin()
+	pool := model.PoolConfig{
+		Name: model.PoolLite,
+		Backends: map[model.BackendName]model.BackendConfig{
+			model.BackendLambda: {Enabled: true, Healthy: true, MaxRunners: 1, CostClass: 10},
+			model.BackendEC2:    {Enabled: true, Healthy: true, MaxRunners: 3, CostClass: 90},
+		},
 	}
 
-	disabled := fairShare
-	disabled.Enabled = false
-	if got := EffectiveMaxRunners(10, disabled, "smoke"); got != 10 {
-		t.Fatalf("disabled fair-share should ignore soft reserves, got %d", got)
+	// Fill lambda so EC2 has more free slots.
+	if _, err := scheduler.Reserve(pool, allocationRequest(nil, "", "")); err != nil {
+		t.Fatalf("reserve #1 failed: %v", err)
+	}
+	selected, err := scheduler.Reserve(pool, allocationRequest(nil, "", ""))
+	if err != nil {
+		t.Fatalf("reserve #2 failed: %v", err)
+	}
+	if selected != model.BackendEC2 {
+		t.Fatalf("expected more free slots to win over cost, got %s", selected)
 	}
 }

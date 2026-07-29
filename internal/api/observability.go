@@ -42,8 +42,8 @@ type Observer interface {
 	ObserveTierBlocked(model.PoolName, model.BackendName, string)
 	ObserveLiveCapacityState([]liveCapacitySnapshot)
 	ObserveLiveCapacityDecision(model.PoolName, model.BackendName, string, int)
-	ObserveQualitySelection(model.PoolName, model.BackendName, string, float64)
-	ObserveQualityScore(model.PoolName, model.BackendName, float64, float64, time.Duration, int, int)
+	ObserveBudgetBlocked(model.PoolName, model.BackendName, string)
+	ObserveBudgetUsage(model.PoolName, model.BackendName, int, int, int, int)
 }
 
 type noopObserver struct{}
@@ -70,8 +70,8 @@ func (noopObserver) ObserveTierBlocked(model.PoolName, model.BackendName, string
 func (noopObserver) ObserveLiveCapacityState([]liveCapacitySnapshot)                           {}
 func (noopObserver) ObserveLiveCapacityDecision(model.PoolName, model.BackendName, string, int) {
 }
-func (noopObserver) ObserveQualitySelection(model.PoolName, model.BackendName, string, float64) {}
-func (noopObserver) ObserveQualityScore(model.PoolName, model.BackendName, float64, float64, time.Duration, int, int) {
+func (noopObserver) ObserveBudgetBlocked(model.PoolName, model.BackendName, string) {}
+func (noopObserver) ObserveBudgetUsage(model.PoolName, model.BackendName, int, int, int, int) {
 }
 
 type liveCapacitySnapshot struct {
@@ -105,32 +105,24 @@ const (
 )
 
 type PrometheusObserver struct {
-	allocationLatency     *prometheus.HistogramVec
-	launchLatency         *prometheus.HistogramVec
-	registrationLatency   *prometheus.HistogramVec
-	finalizationLatency   *prometheus.HistogramVec
-	cancellationLatency   *prometheus.HistogramVec
-	allocations           *prometheus.CounterVec
-	finalizations         *prometheus.CounterVec
-	cancellations         *prometheus.CounterVec
-	queueDepth            *prometheus.GaugeVec
-	capacityUtilization   *prometheus.GaugeVec
-	circuitState          *prometheus.GaugeVec
-	circuitTransitions    *prometheus.CounterVec
-	admissionRejections   *prometheus.CounterVec
-	probeResults          *prometheus.CounterVec
-	tierState             *prometheus.GaugeVec
-	tierFallbacks         *prometheus.CounterVec
-	tierBlocked           *prometheus.CounterVec
+	allocationLatency   *prometheus.HistogramVec
+	launchLatency       *prometheus.HistogramVec
+	registrationLatency *prometheus.HistogramVec
+	allocations         *prometheus.CounterVec
+	queueDepth          *prometheus.GaugeVec
+	capacityUtilization *prometheus.GaugeVec
+	circuitState        *prometheus.GaugeVec
+	circuitTransitions  *prometheus.CounterVec
+	admissionRejections *prometheus.CounterVec
+	probeResults        *prometheus.CounterVec
+	tierState           *prometheus.GaugeVec
+	tierFallbacks       *prometheus.CounterVec
+	tierBlocked         *prometheus.CounterVec
 	liveCapacityFree      *prometheus.GaugeVec
 	liveCapacityStale     *prometheus.GaugeVec
 	liveCapacityDecisions *prometheus.CounterVec
-	qualitySelections     *prometheus.CounterVec
-	qualityScore          *prometheus.GaugeVec
-	qualitySuccessRate    *prometheus.GaugeVec
-	qualityP95Ready       *prometheus.GaugeVec
-	qualityCapacityErrors *prometheus.GaugeVec
-	qualityFreeSlots      *prometheus.GaugeVec
+	budgetBlocked         *prometheus.CounterVec
+	budgetUsage           *prometheus.GaugeVec
 }
 
 func NewPrometheusObserver(registerer prometheus.Registerer) *PrometheusObserver {
@@ -225,30 +217,14 @@ func NewPrometheusObserver(registerer prometheus.Registerer) *PrometheusObserver
 			Name: "uecb_live_capacity_decisions_total",
 			Help: "Live capacity routing decisions by pool, backend, and reason.",
 		}, []string{"pool", "backend", "reason"}),
-		qualitySelections: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "uecb_quality_selection_total",
-			Help: "Quality-aware backend selection decisions by pool, backend, and reason.",
+		budgetBlocked: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "uecb_backend_budget_blocked_total",
+			Help: "Allocation attempts skipped because a backend daily/monthly budget was exceeded.",
 		}, []string{"pool", "backend", "reason"}),
-		qualityScore: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Name: "uecb_quality_score",
-			Help: "Latest quality-aware composite score observed for a pool/backend candidate.",
-		}, []string{"pool", "backend"}),
-		qualitySuccessRate: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Name: "uecb_quality_success_rate",
-			Help: "Rolling success rate used by quality-aware selection (0-1).",
-		}, []string{"pool", "backend"}),
-		qualityP95Ready: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Name: "uecb_quality_p95_ready_seconds",
-			Help: "Rolling p95 ready/launch latency used by quality-aware selection.",
-		}, []string{"pool", "backend"}),
-		qualityCapacityErrors: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Name: "uecb_quality_capacity_errors",
-			Help: "Recent capacity-error count in the quality-aware rolling window.",
-		}, []string{"pool", "backend"}),
-		qualityFreeSlots: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Name: "uecb_quality_free_slots",
-			Help: "Free slots considered by quality-aware selection for a pool/backend candidate.",
-		}, []string{"pool", "backend"}),
+		budgetUsage: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "uecb_backend_budget_usage",
+			Help: "Current backend budget usage against configured limits (window is daily or monthly).",
+		}, []string{"pool", "backend", "window", "kind"}),
 	}
 }
 
@@ -277,12 +253,8 @@ func (o *PrometheusObserver) Register(registerer prometheus.Registerer) error {
 		o.liveCapacityFree,
 		o.liveCapacityStale,
 		o.liveCapacityDecisions,
-		o.qualitySelections,
-		o.qualityScore,
-		o.qualitySuccessRate,
-		o.qualityP95Ready,
-		o.qualityCapacityErrors,
-		o.qualityFreeSlots,
+		o.budgetBlocked,
+		o.budgetUsage,
 	} {
 		if err := registerer.Register(collector); err != nil {
 			if _, ok := err.(prometheus.AlreadyRegisteredError); !ok {
@@ -336,11 +308,20 @@ func (o *PrometheusObserver) ObserveLiveCapacityDecision(pool model.PoolName, ba
 	o.liveCapacityDecisions.WithLabelValues(string(pool), string(backend), reason).Inc()
 }
 
-func (o *PrometheusObserver) ObserveAllocationReaped(pool model.PoolName, backend model.BackendName, result string) {
-	if result == "" {
-		result = "expired"
+func (o *PrometheusObserver) ObserveBudgetBlocked(pool model.PoolName, backend model.BackendName, reason string) {
+	if reason == "" {
+		reason = "unknown"
 	}
-	o.allocationsReaped.WithLabelValues(string(pool), string(backend), result).Inc()
+	o.budgetBlocked.WithLabelValues(string(pool), string(backend), reason).Inc()
+}
+
+func (o *PrometheusObserver) ObserveBudgetUsage(pool model.PoolName, backend model.BackendName, dailyUsed, dailyLimit, monthlyUsed, monthlyLimit int) {
+	poolLabel := string(pool)
+	backendLabel := string(backend)
+	o.budgetUsage.WithLabelValues(poolLabel, backendLabel, "daily", "used").Set(float64(dailyUsed))
+	o.budgetUsage.WithLabelValues(poolLabel, backendLabel, "daily", "limit").Set(float64(dailyLimit))
+	o.budgetUsage.WithLabelValues(poolLabel, backendLabel, "monthly", "used").Set(float64(monthlyUsed))
+	o.budgetUsage.WithLabelValues(poolLabel, backendLabel, "monthly", "limit").Set(float64(monthlyLimit))
 }
 
 type tierDecisionSnapshot struct {

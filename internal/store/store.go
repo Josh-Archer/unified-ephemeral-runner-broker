@@ -82,6 +82,16 @@ type AdmissionStateStore interface {
 type AdmissionStateDocument struct {
 	Circuits map[string]AdmissionCircuitState `json:"circuits,omitempty"`
 	Limits   map[string]AdmissionRateLimit    `json:"limits,omitempty"`
+	// Budgets tracks per-backend daily/monthly allocation quotas (UTC windows).
+	Budgets map[string]AdmissionBudgetState `json:"budgets,omitempty"`
+}
+
+// AdmissionBudgetState is a serializable per-backend budget counter snapshot.
+type AdmissionBudgetState struct {
+	DailyWindowStart   time.Time `json:"dailyWindowStart,omitempty"`
+	DailyUsed          int       `json:"dailyUsed,omitempty"`
+	MonthlyWindowStart time.Time `json:"monthlyWindowStart,omitempty"`
+	MonthlyUsed        int       `json:"monthlyUsed,omitempty"`
 }
 
 // AdmissionCircuitState is a serializable circuit snapshot.

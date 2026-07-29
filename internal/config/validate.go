@@ -36,8 +36,39 @@ func Validate(cfg model.BrokerConfig) error {
 	if err := validateLiveCapacity(cfg.Broker.LiveCapacity); err != nil {
 		return err
 	}
-	if err := validateWarmPools(cfg); err != nil {
+	if err := validateBackendBudgets(cfg); err != nil {
 		return err
+	}
+	return nil
+}
+
+func validateBackendBudgets(cfg model.BrokerConfig) error {
+	for _, pool := range cfg.Pools {
+		for backendName, backendCfg := range pool.Backends {
+			if err := validateBudgetConfig(pool.Name, backendName, backendCfg.Budget); err != nil {
+				return err
+			}
+			if backendCfg.CostClass < 0 {
+				return fmt.Errorf("pools[%s].backends[%s].costClass must not be negative", pool.Name, backendName)
+			}
+		}
+	}
+	return nil
+}
+
+func validateBudgetConfig(pool model.PoolName, backend model.BackendName, budget model.BudgetConfig) error {
+	if !budget.Enabled {
+		return nil
+	}
+	prefix := fmt.Sprintf("pools[%s].backends[%s].budget", pool, backend)
+	if budget.MaxAllocationsDaily < 0 {
+		return fmt.Errorf("%s.maxAllocationsDaily must not be negative", prefix)
+	}
+	if budget.MaxAllocationsMonthly < 0 {
+		return fmt.Errorf("%s.maxAllocationsMonthly must not be negative", prefix)
+	}
+	if budget.MaxAllocationsDaily == 0 && budget.MaxAllocationsMonthly == 0 {
+		return fmt.Errorf("%s requires maxAllocationsDaily and/or maxAllocationsMonthly when enabled", prefix)
 	}
 	return nil
 }

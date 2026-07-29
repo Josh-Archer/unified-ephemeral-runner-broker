@@ -123,9 +123,15 @@ func (a *backendAdmission) persistSharedLocked() {
 	if a == nil || a.shared == nil {
 		return
 	}
+	// Preserve budget counters written by the budget tracker in the same document.
+	budgets := map[string]store.AdmissionBudgetState{}
+	if existing, err := a.shared.LoadAdmissionState(context.Background()); err == nil && existing.Budgets != nil {
+		budgets = existing.Budgets
+	}
 	doc := store.AdmissionStateDocument{
 		Circuits: map[string]store.AdmissionCircuitState{},
 		Limits:   map[string]store.AdmissionRateLimit{},
+		Budgets:  budgets,
 	}
 	for key, circuit := range a.circuits {
 		doc.Circuits[store.AdmissionKey(key.pool, key.backend)] = store.AdmissionCircuitState{

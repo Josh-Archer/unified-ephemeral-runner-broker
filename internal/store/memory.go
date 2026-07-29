@@ -26,6 +26,7 @@ func NewMemory() *Memory {
 		admission: AdmissionStateDocument{
 			Circuits: map[string]AdmissionCircuitState{},
 			Limits:   map[string]AdmissionRateLimit{},
+			Budgets:  map[string]AdmissionBudgetState{},
 		},
 		leader: map[string]leaderLease{},
 	}
@@ -170,6 +171,7 @@ func cloneAdmission(doc AdmissionStateDocument) AdmissionStateDocument {
 	out := AdmissionStateDocument{
 		Circuits: map[string]AdmissionCircuitState{},
 		Limits:   map[string]AdmissionRateLimit{},
+		Budgets:  map[string]AdmissionBudgetState{},
 	}
 	for k, v := range doc.Circuits {
 		cp := v
@@ -180,6 +182,9 @@ func cloneAdmission(doc AdmissionStateDocument) AdmissionStateDocument {
 	}
 	for k, v := range doc.Limits {
 		out.Limits[k] = v
+	}
+	for k, v := range doc.Budgets {
+		out.Budgets[k] = v
 	}
 	return out
 }

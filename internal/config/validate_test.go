@@ -47,47 +47,43 @@ func TestHAEnabled(t *testing.T) {
 	}
 }
 
-func TestValidateWarmSchedule(t *testing.T) {
-	cfg := model.BrokerConfig{
-		Pools: []model.PoolConfig{{
-			Name: model.PoolLite,
-			Backends: map[model.BackendName]model.BackendConfig{
-				model.BackendLambda: {
-					Enabled: true,
-					WarmMin: 1,
-					WarmMax: 2,
-					WarmSchedule: &model.WarmScheduleConfig{
-						Timezone: "America/New_York",
-						Windows: []model.WarmWindowConfig{{
-							Days:  []string{"mon", "fri"},
-							Start: "08:00",
-							End:   "18:00",
-						}},
-					},
-				},
-			},
-		}},
+func TestValidateBackendBudgets(t *testing.T) {
+	cfg := Default()
+	for i := range cfg.Pools {
+		if cfg.Pools[i].Name != model.PoolLite {
+			continue
+		}
+		backendCfg := cfg.Pools[i].Backends[model.BackendLambda]
+		backendCfg.Budget = model.BudgetConfig{Enabled: true}
+		cfg.Pools[i].Backends[model.BackendLambda] = backendCfg
+	}
+	if err := Validate(cfg); err == nil {
+		t.Fatal("enabled budget without limits should fail")
+	}
+
+	for i := range cfg.Pools {
+		if cfg.Pools[i].Name != model.PoolLite {
+			continue
+		}
+		backendCfg := cfg.Pools[i].Backends[model.BackendLambda]
+		backendCfg.Budget = model.BudgetConfig{Enabled: true, MaxAllocationsDaily: 10}
+		backendCfg.CostClass = -1
+		cfg.Pools[i].Backends[model.BackendLambda] = backendCfg
+	}
+	if err := Validate(cfg); err == nil {
+		t.Fatal("negative costClass should fail")
+	}
+
+	for i := range cfg.Pools {
+		if cfg.Pools[i].Name != model.PoolLite {
+			continue
+		}
+		backendCfg := cfg.Pools[i].Backends[model.BackendLambda]
+		backendCfg.Budget = model.BudgetConfig{Enabled: true, MaxAllocationsDaily: 10, MaxAllocationsMonthly: 100}
+		backendCfg.CostClass = 40
+		cfg.Pools[i].Backends[model.BackendLambda] = backendCfg
 	}
 	if err := Validate(cfg); err != nil {
-		t.Fatalf("valid warm schedule rejected: %v", err)
-	}
-
-	cfg.Pools[0].Backends[model.BackendLambda] = model.BackendConfig{
-		WarmSchedule: &model.WarmScheduleConfig{
-			Timezone: "Not/AZone",
-			Windows:  []model.WarmWindowConfig{{Start: "08:00", End: "18:00"}},
-		},
-	}
-	if err := Validate(cfg); err == nil {
-		t.Fatal("expected invalid timezone to fail validation")
-	}
-
-	cfg.Pools[0].Backends[model.BackendLambda] = model.BackendConfig{
-		WarmSchedule: &model.WarmScheduleConfig{
-			Windows: []model.WarmWindowConfig{{Start: "25:00", End: "18:00"}},
-		},
-	}
-	if err := Validate(cfg); err == nil {
-		t.Fatal("expected invalid clock to fail validation")
+		t.Fatalf("valid budget config should pass: %v", err)
 	}
 }

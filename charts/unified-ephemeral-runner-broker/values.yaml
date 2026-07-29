@@ -238,6 +238,11 @@ config:
           #   permits: 6
           #   interval: 1m
           #   burst: 1
+          # costClass: 50  # lower is cheaper; used when free slots are equal
+          # budget:
+          #   enabled: false
+          #   maxAllocationsDaily: 50
+          #   maxAllocationsMonthly: 800
           # tierRules:
           #   - name: codebuild-free-tier
           #     providerRef: aws-main

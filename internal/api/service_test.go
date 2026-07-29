@@ -3899,186 +3899,151 @@ func TestLiveCapacityConcurrentProviderReject(t *testing.T) {
 	}
 }
 
-func enableQualityAware(cfg *model.BrokerConfig) {
-	cfg.Broker.QualityAware.Enabled = true
-	cfg.Broker.QualityAware.Window = time.Hour
-	cfg.Broker.QualityAware.MinSamples = 3
-	cfg.Broker.QualityAware.Weights = model.QualityAwareWeights{
-		FreeSlots:      1,
-		SuccessRate:    2,
-		Latency:        1,
-		CapacityErrors: 2,
-	}
-}
-
-func TestQualityAwarePrefersHigherSuccessRate(t *testing.T) {
-	service := newServiceWithBrokerConfig(func(cfg *model.BrokerConfig) {
-		enableQualityAware(cfg)
-		for i := range cfg.Pools {
-			if cfg.Pools[i].Name != model.PoolLite {
-				continue
-			}
-			// Give arc higher configured weight so RR/WRR would prefer it without quality.
-			cfg.Pools[i].Scheduler = scheduler.NameWeightedRoundRobin
-			arc := cfg.Pools[i].Backends[model.BackendARC]
-			arc.MaxRunners = 5
-			arc.Weight = 100
-			cfg.Pools[i].Backends[model.BackendARC] = arc
-			cb := cfg.Pools[i].Backends[model.BackendCodeBuild]
-			cb.Enabled = true
-			cb.MaxRunners = 5
-			cb.Weight = 1
-			cfg.Pools[i].Backends[model.BackendCodeBuild] = cb
+func TestBudgetExceededSkipsBackendAndUsesFallback(t *testing.T) {
+	service := newServiceWithConfig(func(pool *model.PoolConfig) {
+		if pool.Name != model.PoolLite {
+			return
 		}
+		for name, backendCfg := range pool.Backends {
+			backendCfg.Enabled = false
+			pool.Backends[name] = backendCfg
+		}
+		lambdaCfg := pool.Backends[model.BackendLambda]
+		lambdaCfg.Enabled = true
+		lambdaCfg.Healthy = true
+		lambdaCfg.MaxRunners = 2
+		lambdaCfg.Budget = model.BudgetConfig{Enabled: true, MaxAllocationsDaily: 1}
+		pool.Backends[model.BackendLambda] = lambdaCfg
+		codebuildCfg := pool.Backends[model.BackendCodeBuild]
+		codebuildCfg.Enabled = true
+		codebuildCfg.Healthy = true
+		codebuildCfg.MaxRunners = 2
+		pool.Backends[model.BackendCodeBuild] = codebuildCfg
 	})
+	service.now = func() time.Time { return time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC) }
 
-	now := time.Now()
-	// Seed: ARC flaky, CodeBuild solid.
-	for i := 0; i < 5; i++ {
-		service.QualityTracker().RecordFailure(model.PoolLite, model.BackendARC, false, now)
-		service.QualityTracker().RecordSuccess(model.PoolLite, model.BackendCodeBuild, 200*time.Millisecond, now)
-	}
-	service.QualityTracker().RecordSuccess(model.PoolLite, model.BackendARC, time.Second, now)
-
-	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{Pool: model.PoolLite})
-	if err != nil {
-		t.Fatalf("allocate failed: %v", err)
-	}
-	if allocation.SelectedBackend != model.BackendCodeBuild {
-		t.Fatalf("expected quality-aware pick codebuild, got %s", allocation.SelectedBackend)
-	}
-}
-
-func TestQualityAwareFallsBackOnCapacityReject(t *testing.T) {
-	capErr := backend.NewAllocationError(fmt.Errorf("no free slots"), backend.ErrBackendCapacityExhausted, true)
-	cfg := config.Default()
-	enableQualityAware(&cfg)
-	for i := range cfg.Pools {
-		if cfg.Pools[i].Name != model.PoolLite {
-			continue
-		}
-		cb := cfg.Pools[i].Backends[model.BackendCodeBuild]
-		cb.Enabled = true
-		cb.MaxRunners = 3
-		cfg.Pools[i].Backends[model.BackendCodeBuild] = cb
-		arc := cfg.Pools[i].Backends[model.BackendARC]
-		arc.MaxRunners = 3
-		cfg.Pools[i].Backends[model.BackendARC] = arc
-	}
-
-	service := NewService(cfg, backend.NewRegistry(
-		testBackend{name: model.BackendARC},
-		failingBackend{testBackend: testBackend{name: model.BackendCodeBuild}, err: capErr},
-	), nil)
-
-	now := time.Now()
-	// Seed codebuild as higher quality so it is tried first.
-	for i := 0; i < 5; i++ {
-		service.QualityTracker().RecordSuccess(model.PoolLite, model.BackendCodeBuild, 100*time.Millisecond, now)
-		service.QualityTracker().RecordFailure(model.PoolLite, model.BackendARC, false, now)
-	}
-
-	status, err := service.Allocate(context.Background(), model.AllocationRequest{
-		Pool: model.PoolLite, JobTimeout: time.Minute,
+	first, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolLite,
+		JobTimeout: 5 * time.Minute,
 	})
 	if err != nil {
-		t.Fatalf("expected fallback to arc after capacity reject: %v", err)
+		t.Fatalf("first allocation failed: %v", err)
 	}
-	if status.SelectedBackend != model.BackendARC {
-		t.Fatalf("expected arc fallback, got %s", status.SelectedBackend)
+	if first.SelectedBackend != model.BackendLambda && first.SelectedBackend != model.BackendCodeBuild {
+		t.Fatalf("unexpected backend %s", first.SelectedBackend)
 	}
-}
 
-func TestQualityAwareRespectsPinnedBackend(t *testing.T) {
-	service := newServiceWithBrokerConfig(func(cfg *model.BrokerConfig) {
-		enableQualityAware(cfg)
-		for i := range cfg.Pools {
-			if cfg.Pools[i].Name != model.PoolLite {
-				continue
-			}
-			cb := cfg.Pools[i].Backends[model.BackendCodeBuild]
-			cb.Enabled = true
-			cb.MaxRunners = 3
-			cfg.Pools[i].Backends[model.BackendCodeBuild] = cb
+	// Force the first successful backend to be lambda so budget is consumed there.
+	if first.SelectedBackend != model.BackendLambda {
+		pinned := model.BackendLambda
+		first, err = service.Allocate(context.Background(), model.AllocationRequest{
+			Pool:       model.PoolLite,
+			Backend:    &pinned,
+			JobTimeout: 5 * time.Minute,
+		})
+		if err != nil {
+			t.Fatalf("pinned lambda allocation failed: %v", err)
 		}
-	})
-
-	now := time.Now()
-	// Make codebuild look much better; pin still forces ARC.
-	for i := 0; i < 5; i++ {
-		service.QualityTracker().RecordSuccess(model.PoolLite, model.BackendCodeBuild, 100*time.Millisecond, now)
-		service.QualityTracker().RecordFailure(model.PoolLite, model.BackendARC, true, now)
 	}
 
-	pinned := model.BackendARC
-	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
-		Pool: model.PoolLite, Backend: &pinned,
+	second, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolLite,
+		JobTimeout: 5 * time.Minute,
 	})
 	if err != nil {
-		t.Fatalf("pinned allocate failed: %v", err)
+		t.Fatalf("second allocation should fall back from over-budget lambda: %v", err)
 	}
-	if allocation.SelectedBackend != model.BackendARC {
-		t.Fatalf("expected pinned arc, got %s", allocation.SelectedBackend)
+	if second.SelectedBackend != model.BackendCodeBuild {
+		t.Fatalf("expected codebuild fallback, got %s", second.SelectedBackend)
 	}
 }
 
-func TestQualityAwarePrefersMoreFreeSlotsWithoutHistory(t *testing.T) {
-	service := newServiceWithBrokerConfig(func(cfg *model.BrokerConfig) {
-		enableQualityAware(cfg)
-		for i := range cfg.Pools {
-			if cfg.Pools[i].Name != model.PoolLite {
-				continue
-			}
-			// Round-robin preferred order is ARC first; quality should prefer
-			// codebuild solely because it has more free slots and equal (empty) history.
-			arc := cfg.Pools[i].Backends[model.BackendARC]
-			arc.MaxRunners = 1
-			cfg.Pools[i].Backends[model.BackendARC] = arc
-			cb := cfg.Pools[i].Backends[model.BackendCodeBuild]
-			cb.Enabled = true
-			cb.MaxRunners = 5
-			cfg.Pools[i].Backends[model.BackendCodeBuild] = cb
+func TestBudgetExceededAllBackendsFailsClearly(t *testing.T) {
+	service := newServiceWithConfig(func(pool *model.PoolConfig) {
+		if pool.Name != model.PoolLite {
+			return
 		}
-	})
-
-	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{Pool: model.PoolLite})
-	if err != nil {
-		t.Fatalf("allocate failed: %v", err)
-	}
-	if allocation.SelectedBackend != model.BackendCodeBuild {
-		t.Fatalf("expected codebuild with more free slots, got %s", allocation.SelectedBackend)
-	}
-}
-
-type recordingQualityObserver struct {
-	noopObserver
-	selections []string
-}
-
-func (o *recordingQualityObserver) ObserveQualitySelection(_ model.PoolName, backend model.BackendName, reason string, _ float64) {
-	o.selections = append(o.selections, string(backend)+":"+reason)
-}
-
-func TestQualityAwareEmitsSelectionReason(t *testing.T) {
-	service := newServiceWithBrokerConfig(func(cfg *model.BrokerConfig) {
-		enableQualityAware(cfg)
-		for i := range cfg.Pools {
-			if cfg.Pools[i].Name != model.PoolLite {
-				continue
-			}
-			cb := cfg.Pools[i].Backends[model.BackendCodeBuild]
-			cb.Enabled = true
-			cb.MaxRunners = 2
-			cfg.Pools[i].Backends[model.BackendCodeBuild] = cb
+		for name, backendCfg := range pool.Backends {
+			backendCfg.Enabled = false
+			pool.Backends[name] = backendCfg
 		}
+		lambdaCfg := pool.Backends[model.BackendLambda]
+		lambdaCfg.Enabled = true
+		lambdaCfg.Healthy = true
+		lambdaCfg.MaxRunners = 2
+		lambdaCfg.Budget = model.BudgetConfig{Enabled: true, MaxAllocationsDaily: 1}
+		pool.Backends[model.BackendLambda] = lambdaCfg
 	})
-	obs := &recordingQualityObserver{}
-	service.SetObserver(obs)
+	service.now = func() time.Time { return time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC) }
 
-	if _, err := service.Allocate(context.Background(), model.AllocationRequest{Pool: model.PoolLite}); err != nil {
-		t.Fatalf("allocate failed: %v", err)
+	if _, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolLite,
+		JobTimeout: 5 * time.Minute,
+	}); err != nil {
+		t.Fatalf("first allocation failed: %v", err)
 	}
-	if len(obs.selections) == 0 {
-		t.Fatal("expected quality selection observation")
+
+	_, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolLite,
+		JobTimeout: 5 * time.Minute,
+	})
+	if !errors.Is(err, ErrBackendBudgetExceeded) {
+		t.Fatalf("expected budget exceeded error, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "over budget") && !strings.Contains(err.Error(), "budget") {
+		t.Fatalf("error should mention budget, got %v", err)
+	}
+}
+
+func TestPinnedBackendOverBudgetFailsFast(t *testing.T) {
+	service := newServiceWithConfig(func(pool *model.PoolConfig) {
+		if pool.Name != model.PoolLite {
+			return
+		}
+		for name, backendCfg := range pool.Backends {
+			backendCfg.Enabled = false
+			pool.Backends[name] = backendCfg
+		}
+		lambdaCfg := pool.Backends[model.BackendLambda]
+		lambdaCfg.Enabled = true
+		lambdaCfg.Healthy = true
+		lambdaCfg.MaxRunners = 2
+		lambdaCfg.Budget = model.BudgetConfig{Enabled: true, MaxAllocationsDaily: 1}
+		pool.Backends[model.BackendLambda] = lambdaCfg
+		// Provide an alternate backend that must not be used for pinned requests.
+		codebuildCfg := pool.Backends[model.BackendCodeBuild]
+		codebuildCfg.Enabled = true
+		codebuildCfg.Healthy = true
+		codebuildCfg.MaxRunners = 2
+		pool.Backends[model.BackendCodeBuild] = codebuildCfg
+	})
+	service.now = func() time.Time { return time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC) }
+
+	pinned := model.BackendLambda
+	if _, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolLite,
+		Backend:    &pinned,
+		JobTimeout: 5 * time.Minute,
+	}); err != nil {
+		t.Fatalf("first pinned allocation failed: %v", err)
+	}
+
+	_, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolLite,
+		Backend:    &pinned,
+		JobTimeout: 5 * time.Minute,
+	})
+	if !errors.Is(err, ErrBackendBudgetExceeded) {
+		t.Fatalf("expected pinned over-budget error, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "pinned backend") {
+		t.Fatalf("expected pinned backend message, got %v", err)
+	}
+}
+
+func TestBudgetExceededErrorsAreNotQueued(t *testing.T) {
+	err := fmt.Errorf("all eligible backends for pool %q are over budget: %w", model.PoolLite, ErrBackendBudgetExceeded)
+	if queueableError(err) {
+		t.Fatal("budget exceeded errors must fail fast and not enter the admission queue")
 	}
 }

@@ -56,76 +56,13 @@ Core metrics:
 - `uecb_live_capacity_free_slots{backend,source}`: cached provider-reported free runner slots.
 - `uecb_live_capacity_stale{backend}`: `1` when the cached live capacity reading is stale.
 - `uecb_live_capacity_decisions_total{pool,backend,reason}`: live capacity routing decisions (`live`, `provider-full`, `stale-pass-through`, `provider-reject`, …).
-- `uecb_quality_selection_total{pool,backend,reason}`: quality-aware selection decisions (`highest-score`, `insufficient-samples`, `single-candidate`, …).
-- `uecb_quality_score{pool,backend}`: latest composite quality score for a candidate.
-- `uecb_quality_success_rate{pool,backend}`: rolling success rate (0–1) used in scoring.
-- `uecb_quality_p95_ready_seconds{pool,backend}`: rolling p95 ready/launch latency used in scoring.
-- `uecb_quality_capacity_errors{pool,backend}`: recent capacity-error count in the quality window.
-- `uecb_quality_free_slots{pool,backend}`: free slots considered at selection time.
+- `uecb_backend_budget_blocked_total{pool,backend,reason}`: allocations skipped because a daily/monthly backend budget was exceeded.
+- `uecb_backend_budget_usage{pool,backend,window,kind}`: current budget counters (`window=daily|monthly`, `kind=used|limit`).
 
 Runtime admission metrics change only when a backend has opted into circuit breaking or rate limiting.
 Tier-routing metrics appear when cached decisions are present or tier policies affect allocation.
 Live-capacity metrics appear when `broker.liveCapacity.enabled` is true and backends publish capacity.
-Quality-aware metrics appear when `broker.qualityAware.enabled` is true and unpinned allocations score candidates.
-
-### Label policy (no PII / secrets)
-
-Metric labels are limited to operational dimensions: `pool`, `backend`, `result`, `launch_mode`, `state`, `reason`, `route`, `method`, `status`, `source`, `mode`, `from`, `to`, `stale`. The broker never labels metrics with repository, subject, owner, tenant identity, tokens, or secret material.
-
-## OpenTelemetry traces
-
-Tracing is **off by default** (noop provider). Enable OTLP/HTTP export with standard environment variables:
-
-| Variable | Purpose |
-| --- | --- |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | Collector host (`host:port` or `http://host:port`) |
-| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | Full traces endpoint override |
-| `UECB_OTEL_EXPORTER_OTLP_ENDPOINT` | Broker-specific alias for the OTLP endpoint |
-| `OTEL_SERVICE_NAME` | Resource service name (default `uecb-broker`) |
-| `OTEL_TRACES_SAMPLER_ARG` | Optional ratio sampler argument (`0.0`–`1.0`) |
-
-Lifecycle span tree for a cold allocation:
-
-```text
-POST /v1/allocations          (HTTP server span)
-└── uecb.allocate
-    └── uecb.backend.provision
-```
-
-Later finalize/cancel requests open their own server spans and nest:
-
-```text
-POST /v1/allocations/{id}/complete
-└── uecb.finalize
-
-POST /v1/allocations/{id}/cancel
-└── uecb.cancel
-```
-
-Cross-request correlation uses `uecb.correlation_id` / `X-Correlation-ID` and W3C `traceparent` propagation on responses so clients can continue a trace into finalize if desired.
-
-Span attributes follow the same non-PII policy as metrics: `uecb.pool`, `uecb.backend`, `uecb.result`, `uecb.launch_mode`, `uecb.correlation_id`, `uecb.allocation_id`, `uecb.state`.
-
-### Helm example
-
-```yaml
-observability:
-  prometheus:
-    scrape: true
-    path: /metrics
-  otel:
-    enabled: true
-    endpoint: otel-collector.observability.svc.cluster.local:4318
-    serviceName: uecb-broker
-    insecure: true
-    sampleRatio: "1.0"
-```
-
-### Manual scrape check
-
-```bash
-curl -s http://localhost:8080/metrics | grep -E 'uecb_(allocations|finalizations|cancellations|allocation_latency)'
-```
+Budget metrics appear when a backend enables `budget` and allocations are recorded or blocked.
 
 ## Artifacts
 
@@ -149,6 +86,8 @@ backend remains; check whether another backend should be enabled, warm capacity
 should be raised, or the backend `rateLimit` should be relaxed.
 
 Tier fallback activity means all eligible cloud backends were unavailable under the current tier policy or tier data was stale/unknown. Check `uecb_tier_state` first, then validate the Prometheus recording rules and provider budget/free-tier/credit API responses that feed the cache.
+
+Rising `uecb_backend_budget_blocked_total` means operator-set daily/monthly allocation quotas are exhausted for one or more backends. Check `uecb_backend_budget_usage` against configured `maxAllocationsDaily` / `maxAllocationsMonthly`, then either raise the quota, enable a cheaper fallback backend, or wait for the UTC day/month window to reset.
 
 Saturated capacity means the scheduler has few or no healthy slots available for a pool/backend. Check `maxRunners`, runner cleanup, and whether completed jobs are leaving allocations in `ready` or `reserved`.
 
