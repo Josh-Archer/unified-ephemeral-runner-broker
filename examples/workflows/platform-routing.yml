@@ -1,0 +1,85 @@
+# Example: request non-default runner platforms via OS/arch capability dimensions.
+#
+# Prerequisites:
+# - Broker has at least one backend advertising the requested platform tags.
+#   Default configs ship with os:linux + arch:amd64. For Windows/arm64, configure
+#   an operator-owned backend (for example a static VM label) such as:
+#
+#   pools:
+#     - name: lite
+#       backends:
+#         azure-vm:
+#           enabled: true
+#           runnerLabel: my-windows-arm64-runners
+#           capabilities:
+#             - os:windows
+#             - arch:arm64
+#             - vm
+#             - cloud:azure
+#
+# - Replace BROKER_URL (or set a repository variable) before running.
+#
+# See docs/capabilities.md for the full schema and alias table.
+
+name: platform-routing-example
+
+on:
+  workflow_dispatch:
+    inputs:
+      pool:
+        description: Broker pool name
+        required: true
+        default: lite
+      os:
+        description: Runner OS dimension (linux, windows, macos)
+        required: true
+        default: windows
+      arch:
+        description: Runner architecture dimension (amd64/x64, arm64)
+        required: true
+        default: arm64
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  allocate:
+    runs-on: ubuntu-latest
+    outputs:
+      allocation_id: ${{ steps.alloc.outputs.allocation_id }}
+      runner_label: ${{ steps.alloc.outputs.runner_label }}
+      selected_backend: ${{ steps.alloc.outputs.selected_backend }}
+    steps:
+      - id: alloc
+        # Pin to a released tag in real workflows; @main is fine for local docs.
+        uses: Josh-Archer/unified-ephemeral-runner-broker/actions/allocate-runner@main
+        with:
+          broker_url: ${{ vars.BROKER_URL }}
+          pool: ${{ inputs.pool }}
+          job_timeout: 30m
+          # First-class platform inputs merge into required_capabilities.
+          # Equivalent: required_capabilities: os:windows,arch:arm64
+          os: ${{ inputs.os }}
+          arch: ${{ inputs.arch }}
+
+  work:
+    needs: allocate
+    runs-on: ${{ needs.allocate.outputs.runner_label }}
+    steps:
+      - name: Show selected platform backend
+        shell: bash
+        run: |
+          echo "selected_backend=${{ needs.allocate.outputs.selected_backend }}"
+          uname -a || true
+
+  finalize:
+    needs: [allocate, work]
+    if: ${{ always() && needs.allocate.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: Josh-Archer/unified-ephemeral-runner-broker/actions/finalize-allocation@main
+        with:
+          broker_url: ${{ vars.BROKER_URL }}
+          allocation_id: ${{ needs.allocate.outputs.allocation_id }}
+          result: ${{ needs.work.result }}

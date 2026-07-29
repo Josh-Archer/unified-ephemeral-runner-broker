@@ -157,6 +157,50 @@ func DefaultRunnerLabel(name model.BackendName, allocationID string) string {
 	return fmt.Sprintf("uecb-%s-%s", sanitized, allocationID)
 }
 
+// Well-known platform capability dimensions. Backends advertise these so jobs
+// can require non-default runner OS/arch without inventing free-form tags.
+//
+// Canonical forms:
+//   - OS:   os:linux, os:windows, os:macos
+//   - Arch: arch:amd64, arch:arm64
+//
+// Bare aliases (linux, windows, arm64, x64, ...) normalize to the canonical
+// forms above so request filters and backend ads stay comparable.
+const (
+	CapabilityOSLinux   = "os:linux"
+	CapabilityOSWindows = "os:windows"
+	CapabilityOSMacOS   = "os:macos"
+	CapabilityArchAMD64 = "arch:amd64"
+	CapabilityArchARM64 = "arch:arm64"
+)
+
+// platformCapabilityAliases maps accepted shorthand tags to canonical
+// os:/arch: dimensions. Keys must be lowercase.
+var platformCapabilityAliases = map[string]string{
+	"linux":   CapabilityOSLinux,
+	"windows": CapabilityOSWindows,
+	"macos":   CapabilityOSMacOS,
+	"darwin":  CapabilityOSMacOS,
+	"amd64":   CapabilityArchAMD64,
+	"x64":     CapabilityArchAMD64,
+	"x86_64":  CapabilityArchAMD64,
+	"arm64":   CapabilityArchARM64,
+	"aarch64": CapabilityArchARM64,
+}
+
+// CanonicalCapability lowercases, trims, and expands well-known OS/arch aliases
+// to their os:/arch: forms. Unknown tags pass through unchanged (after lowercasing).
+func CanonicalCapability(value string) string {
+	capability := strings.ToLower(strings.TrimSpace(value))
+	if capability == "" {
+		return ""
+	}
+	if canonical, ok := platformCapabilityAliases[capability]; ok {
+		return canonical
+	}
+	return capability
+}
+
 func NormalizeCapabilities(values []string) []string {
 	if len(values) == 0 {
 		return nil
@@ -165,7 +209,7 @@ func NormalizeCapabilities(values []string) []string {
 	seen := make(map[string]struct{}, len(values))
 	normalized := make([]string, 0, len(values))
 	for _, value := range values {
-		capability := strings.ToLower(strings.TrimSpace(value))
+		capability := CanonicalCapability(value)
 		if capability == "" {
 			continue
 		}

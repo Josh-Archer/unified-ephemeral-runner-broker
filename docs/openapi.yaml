@@ -296,7 +296,14 @@ components:
           type: array
           items:
             type: string
-          description: Capability tags the selected backend must advertise
+          description: |
+            Capability tags the selected backend must advertise.
+            Platform dimensions use os:linux|os:windows|os:macos and
+            arch:amd64|arch:arm64. Bare aliases (linux, windows, macos,
+            amd64, x64, arm64, aarch64) expand to the canonical forms.
+          example:
+            - os:windows
+            - arch:arm64
         excluded_capabilities:
           type: array
           items:

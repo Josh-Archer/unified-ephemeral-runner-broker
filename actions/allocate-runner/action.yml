@@ -28,11 +28,19 @@ inputs:
     required: false
     default: ""
   required_capabilities:
-    description: Optional comma-separated capability tags that the selected backend must advertise
+    description: Optional comma-separated capability tags that the selected backend must advertise (for example docker, os:windows, arch:arm64)
     required: false
     default: ""
   excluded_capabilities:
     description: Optional comma-separated capability tags that the selected backend must not advertise
+    required: false
+    default: ""
+  os:
+    description: Optional runner OS dimension (linux, windows, macos). Merged into required_capabilities as os:<value> (aliases such as windows also work)
+    required: false
+    default: ""
+  arch:
+    description: Optional runner architecture dimension (amd64/x64, arm64). Merged into required_capabilities as arch:<value> (aliases such as arm64 and x64 also work)
     required: false
     default: ""
   oidc_audience:
@@ -77,6 +85,8 @@ runs:
         INPUT_PRIORITY_CLASS: ${{ inputs.priority_class }}
         INPUT_REQUIRED_CAPABILITIES: ${{ inputs.required_capabilities }}
         INPUT_EXCLUDED_CAPABILITIES: ${{ inputs.excluded_capabilities }}
+        INPUT_OS: ${{ inputs.os }}
+        INPUT_ARCH: ${{ inputs.arch }}
         INPUT_OIDC_AUDIENCE: ${{ inputs.oidc_audience }}
         INPUT_ALLOW_UNAUTHENTICATED: ${{ inputs.allow_unauthenticated }}
         INPUT_QUEUE_WAIT_TIMEOUT: ${{ inputs.queue_wait_timeout }}
@@ -121,6 +131,15 @@ runs:
             payload["priority_class"] = priority_class
 
         required_capabilities = [item.strip() for item in os.environ.get("INPUT_REQUIRED_CAPABILITIES", "").split(",") if item.strip()]
+
+        # First-class platform dimensions merge into required_capabilities.
+        # Bare values (windows, arm64) and canonical tags (os:windows, arch:arm64)
+        # are both accepted; the broker canonicalizes aliases before matching.
+        for env_name in ("INPUT_OS", "INPUT_ARCH"):
+            value = os.environ.get(env_name, "").strip()
+            if value and value not in required_capabilities:
+                required_capabilities.append(value)
+
         if required_capabilities:
             payload["required_capabilities"] = required_capabilities
 
