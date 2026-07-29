@@ -697,15 +697,16 @@ be retried in place.
 
 ## Warm Capacity
 
-Backend pools can maintain pre-initialized warm runners to reduce cold-start latency for external backends.
+Backend pools can maintain pre-initialized warm runners to reduce cold-start latency for **cold cloud backends** (`lambda`, `cloud-run`, `azure-functions`, plus other external dispatchers: `codebuild`, `ec2`, `gce`).
 
 Warm behavior is configured per backend:
 
 - `warmMin`: minimum number of warm allocations to keep for the backend.
 - `warmMax`: maximum number of warm allocations to keep for the backend.
 - `warmTTL`: how long a warm allocation stays idle before recycle.
+- `warmSchedule` (optional): calendar windows when warm targets apply. Outside every window the effective target is zero so capacity can stay cold off-hours.
 
-Warm allocations are created only for external backends that are enabled and healthy. `arc` and `azure-vm` are not included because they are not external dispatchers and are expected to launch quickly.
+Warm allocations are created only for warm-capable external backends that are enabled and healthy. `arc`, `azure-vm`, and `desktop` are excluded (fast or persistent runners).
 
 ```yaml
 pools:
@@ -719,15 +720,54 @@ pools:
         warmMax: 2
         warmTTL: 10m
         secretRef: uecb-codebuild
+      lambda:
+        enabled: true
+        maxRunners: 3
+        warmMin: 0          # baseline off-window
+        warmMax: 0
+        warmTTL: 10m
+        # Pre-warm only during weekday CI hours (cost control).
+        warmSchedule:
+          timezone: America/New_York
+          windows:
+            - days: [mon, tue, wed, thu, fri]
+              start: "08:00"
+              end: "18:00"
+              warmMin: 1
+              warmMax: 2
+        secretRef: uecb-lambda
 ```
 
 When warm capacity exists:
 
-- the broker prefers an available warm slot before provisioning cold;
-- idle warm runners are recycled on TTL expiry or capacity policy changes;
-- warm capacity may consume active runner quota while in warm state.
+- auto (unpinned) selection prefers a backend that already holds idle warm capacity;
+- the broker consumes an available warm slot before provisioning cold on that backend;
+- idle warm runners are recycled on TTL expiry, schedule off-window, or capacity policy changes;
+- warm capacity consumes active runner quota while in warm state;
+- with `broker.liveCapacity.enabled`, warm refill respects provider `Capacity()` / `free_slots` so pre-warm does not intentionally overrun live headroom.
 
 If a warm slot is unavailable or expired, the broker falls back to cold launch as before.
+
+### Cost controls
+
+Warm runners are **billed while idle** by the cloud provider (function instances, containers, or VMs held ready). Treat warm size as a cost dial:
+
+| Control | Effect |
+|---------|--------|
+| `warmMin: 0` / `warmMax: 0` | Disable warm for a backend without disabling the backend |
+| `warmMax` | Hard cap on concurrent idle warm runners |
+| `warmTTL` | Recycle idle warm slots so long-lived idle cost is bounded |
+| `warmSchedule` | Keep warm only during known CI windows; drain outside windows |
+| `maxRunners` | Global ceiling shared by warm + active jobs |
+| Live capacity | When enabled, warm growth stops when provider free slots are exhausted |
+| Tier routing | Warm refill is skipped when the backend is tier-blocked |
+
+**Guidance**
+
+- Free-tier or bursty Azure Functions lanes usually stay cold (`warmMin`/`warmMax` 0).
+- Prefer schedule windows over always-on warm when traffic is business-hours CI.
+- Keep `warmMax` small (1–2) unless p95 allocate→ready smoke shows cold starts dominating UX.
+- Monitor `uecb_launch_latency_seconds{launch_mode="warm"|"cold"}` and provider spend; shrink warm if idle cost exceeds latency benefit.
 
 Use warm pools where external cold-start latency dominates.
 

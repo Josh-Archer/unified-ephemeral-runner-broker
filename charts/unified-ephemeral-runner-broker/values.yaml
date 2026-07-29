@@ -197,9 +197,19 @@ config:
           enabled: false
           healthy: true
           maxRunners: 3
+          # Warm pool (cold cloud backends). Cost: idle runners are billed.
           # warmMin: 0
           # warmMax: 0
           # warmTTL: 15m
+          # Optional schedule: warm only during CI windows (else target=0).
+          # warmSchedule:
+          #   timezone: America/New_York
+          #   windows:
+          #     - days: [mon, tue, wed, thu, fri]
+          #       start: "08:00"
+          #       end: "18:00"
+          #       warmMin: 1
+          #       warmMax: 2
           # circuitBreaker:
           #   enabled: false
           #   failureThreshold: 3
@@ -240,9 +250,17 @@ config:
           enabled: false
           healthy: true
           maxRunners: 3
+          # Prefer warmSchedule for cost-aware pre-warm of cold Lambda starts.
           # warmMin: 0
           # warmMax: 0
           # warmTTL: 15m
+          # warmSchedule:
+          #   timezone: UTC
+          #   windows:
+          #     - start: "13:00"
+          #       end: "22:00"
+          #       warmMin: 1
+          #       warmMax: 1
           weight: 1
           maxJobDuration: 14m
           capabilities:
