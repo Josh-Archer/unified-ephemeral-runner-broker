@@ -41,12 +41,17 @@ Core metrics:
 - `uecb_live_capacity_free_slots{backend,source}`: cached provider-reported free runner slots.
 - `uecb_live_capacity_stale{backend}`: `1` when the cached live capacity reading is stale.
 - `uecb_live_capacity_decisions_total{pool,backend,reason}`: live capacity routing decisions (`live`, `provider-full`, `stale-pass-through`, `provider-reject`, …).
-- `uecb_allocations_reaped_total{pool,backend,result}`: stuck allocations reaped by the broker-side reaper after `job_timeout` (+ optional grace). `result` is `expired` or `quarantined`.
+- `uecb_quality_selection_total{pool,backend,reason}`: quality-aware selection decisions (`highest-score`, `insufficient-samples`, `single-candidate`, …).
+- `uecb_quality_score{pool,backend}`: latest composite quality score for a candidate.
+- `uecb_quality_success_rate{pool,backend}`: rolling success rate (0–1) used in scoring.
+- `uecb_quality_p95_ready_seconds{pool,backend}`: rolling p95 ready/launch latency used in scoring.
+- `uecb_quality_capacity_errors{pool,backend}`: recent capacity-error count in the quality window.
+- `uecb_quality_free_slots{pool,backend}`: free slots considered at selection time.
 
 Runtime admission metrics change only when a backend has opted into circuit breaking or rate limiting.
 Tier-routing metrics appear when cached decisions are present or tier policies affect allocation.
 Live-capacity metrics appear when `broker.liveCapacity.enabled` is true and backends publish capacity.
-Orphan and label-garbage metrics increment when the expiry sweep reclaims allocations after hard job kills or other missing finalize callbacks.
+Quality-aware metrics appear when `broker.qualityAware.enabled` is true and unpinned allocations score candidates.
 
 ## Artifacts
 

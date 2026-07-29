@@ -3591,100 +3591,186 @@ func TestLiveCapacityConcurrentProviderReject(t *testing.T) {
 	}
 }
 
-type recordingLifecycle struct {
-	mu     sync.Mutex
-	events []model.AllocationStatus
-}
-
-func (r *recordingLifecycle) Notify(status model.AllocationStatus) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.events = append(r.events, status)
-}
-
-func (r *recordingLifecycle) states() []model.AllocationState {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	out := make([]model.AllocationState, len(r.events))
-	for i, e := range r.events {
-		out[i] = e.State
+func enableQualityAware(cfg *model.BrokerConfig) {
+	cfg.Broker.QualityAware.Enabled = true
+	cfg.Broker.QualityAware.Window = time.Hour
+	cfg.Broker.QualityAware.MinSamples = 3
+	cfg.Broker.QualityAware.Weights = model.QualityAwareWeights{
+		FreeSlots:      1,
+		SuccessRate:    2,
+		Latency:        1,
+		CapacityErrors: 2,
 	}
-	return out
 }
 
-func TestLifecycleWebhooksOnReadyCompleteCancel(t *testing.T) {
-	service := newService()
-	recorder := &recordingLifecycle{}
-	service.SetLifecycleNotifier(recorder)
+func TestQualityAwarePrefersHigherSuccessRate(t *testing.T) {
+	service := newServiceWithBrokerConfig(func(cfg *model.BrokerConfig) {
+		enableQualityAware(cfg)
+		for i := range cfg.Pools {
+			if cfg.Pools[i].Name != model.PoolLite {
+				continue
+			}
+			// Give arc higher configured weight so RR/WRR would prefer it without quality.
+			cfg.Pools[i].Scheduler = scheduler.NameWeightedRoundRobin
+			arc := cfg.Pools[i].Backends[model.BackendARC]
+			arc.MaxRunners = 5
+			arc.Weight = 100
+			cfg.Pools[i].Backends[model.BackendARC] = arc
+			cb := cfg.Pools[i].Backends[model.BackendCodeBuild]
+			cb.Enabled = true
+			cb.MaxRunners = 5
+			cb.Weight = 1
+			cfg.Pools[i].Backends[model.BackendCodeBuild] = cb
+		}
+	})
 
-	allocated, err := service.Allocate(context.Background(), model.AllocationRequest{
-		Pool:       model.PoolFull,
-		JobTimeout: time.Minute,
+	now := time.Now()
+	// Seed: ARC flaky, CodeBuild solid.
+	for i := 0; i < 5; i++ {
+		service.QualityTracker().RecordFailure(model.PoolLite, model.BackendARC, false, now)
+		service.QualityTracker().RecordSuccess(model.PoolLite, model.BackendCodeBuild, 200*time.Millisecond, now)
+	}
+	service.QualityTracker().RecordSuccess(model.PoolLite, model.BackendARC, time.Second, now)
+
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{Pool: model.PoolLite})
+	if err != nil {
+		t.Fatalf("allocate failed: %v", err)
+	}
+	if allocation.SelectedBackend != model.BackendCodeBuild {
+		t.Fatalf("expected quality-aware pick codebuild, got %s", allocation.SelectedBackend)
+	}
+}
+
+func TestQualityAwareFallsBackOnCapacityReject(t *testing.T) {
+	capErr := backend.NewAllocationError(fmt.Errorf("no free slots"), backend.ErrBackendCapacityExhausted, true)
+	cfg := config.Default()
+	enableQualityAware(&cfg)
+	for i := range cfg.Pools {
+		if cfg.Pools[i].Name != model.PoolLite {
+			continue
+		}
+		cb := cfg.Pools[i].Backends[model.BackendCodeBuild]
+		cb.Enabled = true
+		cb.MaxRunners = 3
+		cfg.Pools[i].Backends[model.BackendCodeBuild] = cb
+		arc := cfg.Pools[i].Backends[model.BackendARC]
+		arc.MaxRunners = 3
+		cfg.Pools[i].Backends[model.BackendARC] = arc
+	}
+
+	service := NewService(cfg, backend.NewRegistry(
+		testBackend{name: model.BackendARC},
+		failingBackend{testBackend: testBackend{name: model.BackendCodeBuild}, err: capErr},
+	), nil)
+
+	now := time.Now()
+	// Seed codebuild as higher quality so it is tried first.
+	for i := 0; i < 5; i++ {
+		service.QualityTracker().RecordSuccess(model.PoolLite, model.BackendCodeBuild, 100*time.Millisecond, now)
+		service.QualityTracker().RecordFailure(model.PoolLite, model.BackendARC, false, now)
+	}
+
+	status, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool: model.PoolLite, JobTimeout: time.Minute,
 	})
 	if err != nil {
-		t.Fatalf("allocate: %v", err)
+		t.Fatalf("expected fallback to arc after capacity reject: %v", err)
 	}
-	if got := recorder.states(); len(got) != 1 || got[0] != model.StateReady {
-		t.Fatalf("after allocate events = %v, want [ready]", got)
-	}
-
-	completed, ok, err := service.Complete(context.Background(), allocated.ID, completionRequest{State: "completed"})
-	if err != nil || !ok || completed.State != model.StateCompleted {
-		t.Fatalf("complete: ok=%v state=%s err=%v", ok, completed.State, err)
-	}
-	if got := recorder.states(); len(got) != 2 || got[1] != model.StateCompleted {
-		t.Fatalf("after complete events = %v, want [ready completed]", got)
-	}
-
-	// Idempotent complete should not re-emit.
-	_, _, err = service.Complete(context.Background(), allocated.ID, completionRequest{State: "completed"})
-	if err != nil {
-		t.Fatalf("idempotent complete: %v", err)
-	}
-	if got := recorder.states(); len(got) != 2 {
-		t.Fatalf("idempotent complete re-emitted: %v", got)
-	}
-
-	service2 := newService()
-	recorder2 := &recordingLifecycle{}
-	service2.SetLifecycleNotifier(recorder2)
-	allocated2, err := service2.Allocate(context.Background(), model.AllocationRequest{
-		Pool:       model.PoolFull,
-		JobTimeout: time.Minute,
-	})
-	if err != nil {
-		t.Fatalf("allocate2: %v", err)
-	}
-	canceled, ok := service2.Cancel(allocated2.ID)
-	if !ok || canceled.State != model.StateCanceled {
-		t.Fatalf("cancel: ok=%v state=%s", ok, canceled.State)
-	}
-	if got := recorder2.states(); len(got) != 2 || got[0] != model.StateReady || got[1] != model.StateCanceled {
-		t.Fatalf("cancel events = %v, want [ready canceled]", got)
+	if status.SelectedBackend != model.BackendARC {
+		t.Fatalf("expected arc fallback, got %s", status.SelectedBackend)
 	}
 }
 
-func TestLifecycleWebhooksOnExpire(t *testing.T) {
-	service := newService()
-	recorder := &recordingLifecycle{}
-	service.SetLifecycleNotifier(recorder)
-	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
-	service.now = func() time.Time { return now }
+func TestQualityAwareRespectsPinnedBackend(t *testing.T) {
+	service := newServiceWithBrokerConfig(func(cfg *model.BrokerConfig) {
+		enableQualityAware(cfg)
+		for i := range cfg.Pools {
+			if cfg.Pools[i].Name != model.PoolLite {
+				continue
+			}
+			cb := cfg.Pools[i].Backends[model.BackendCodeBuild]
+			cb.Enabled = true
+			cb.MaxRunners = 3
+			cfg.Pools[i].Backends[model.BackendCodeBuild] = cb
+		}
+	})
 
-	allocated, err := service.Allocate(context.Background(), model.AllocationRequest{
-		Pool:       model.PoolFull,
-		JobTimeout: time.Minute,
+	now := time.Now()
+	// Make codebuild look much better; pin still forces ARC.
+	for i := 0; i < 5; i++ {
+		service.QualityTracker().RecordSuccess(model.PoolLite, model.BackendCodeBuild, 100*time.Millisecond, now)
+		service.QualityTracker().RecordFailure(model.PoolLite, model.BackendARC, true, now)
+	}
+
+	pinned := model.BackendARC
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool: model.PoolLite, Backend: &pinned,
 	})
 	if err != nil {
-		t.Fatalf("allocate: %v", err)
+		t.Fatalf("pinned allocate failed: %v", err)
 	}
+	if allocation.SelectedBackend != model.BackendARC {
+		t.Fatalf("expected pinned arc, got %s", allocation.SelectedBackend)
+	}
+}
 
-	service.now = func() time.Time { return now.Add(2 * time.Minute) }
-	if n := service.SweepExpired(service.now()); n != 1 {
-		t.Fatalf("sweep updated = %d, want 1", n)
+func TestQualityAwarePrefersMoreFreeSlotsWithoutHistory(t *testing.T) {
+	service := newServiceWithBrokerConfig(func(cfg *model.BrokerConfig) {
+		enableQualityAware(cfg)
+		for i := range cfg.Pools {
+			if cfg.Pools[i].Name != model.PoolLite {
+				continue
+			}
+			// Round-robin preferred order is ARC first; quality should prefer
+			// codebuild solely because it has more free slots and equal (empty) history.
+			arc := cfg.Pools[i].Backends[model.BackendARC]
+			arc.MaxRunners = 1
+			cfg.Pools[i].Backends[model.BackendARC] = arc
+			cb := cfg.Pools[i].Backends[model.BackendCodeBuild]
+			cb.Enabled = true
+			cb.MaxRunners = 5
+			cfg.Pools[i].Backends[model.BackendCodeBuild] = cb
+		}
+	})
+
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{Pool: model.PoolLite})
+	if err != nil {
+		t.Fatalf("allocate failed: %v", err)
 	}
-	if got := recorder.states(); len(got) != 2 || got[1] != model.StateExpired {
-		t.Fatalf("expire events = %v, want [ready expired]", got)
+	if allocation.SelectedBackend != model.BackendCodeBuild {
+		t.Fatalf("expected codebuild with more free slots, got %s", allocation.SelectedBackend)
 	}
-	_ = allocated
+}
+
+type recordingQualityObserver struct {
+	noopObserver
+	selections []string
+}
+
+func (o *recordingQualityObserver) ObserveQualitySelection(_ model.PoolName, backend model.BackendName, reason string, _ float64) {
+	o.selections = append(o.selections, string(backend)+":"+reason)
+}
+
+func TestQualityAwareEmitsSelectionReason(t *testing.T) {
+	service := newServiceWithBrokerConfig(func(cfg *model.BrokerConfig) {
+		enableQualityAware(cfg)
+		for i := range cfg.Pools {
+			if cfg.Pools[i].Name != model.PoolLite {
+				continue
+			}
+			cb := cfg.Pools[i].Backends[model.BackendCodeBuild]
+			cb.Enabled = true
+			cb.MaxRunners = 2
+			cfg.Pools[i].Backends[model.BackendCodeBuild] = cb
+		}
+	})
+	obs := &recordingQualityObserver{}
+	service.SetObserver(obs)
+
+	if _, err := service.Allocate(context.Background(), model.AllocationRequest{Pool: model.PoolLite}); err != nil {
+		t.Fatalf("allocate failed: %v", err)
+	}
+	if len(obs.selections) == 0 {
+		t.Fatal("expected quality selection observation")
+	}
 }

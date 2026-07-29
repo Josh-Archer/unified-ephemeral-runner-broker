@@ -337,3 +337,55 @@ broker:
 		t.Fatal("expected refreshOnStartup false")
 	}
 }
+
+func TestValidateQualityAware(t *testing.T) {
+	cfg := Default()
+	cfg.Broker.QualityAware.Enabled = true
+	cfg.Broker.QualityAware.Window = -1
+	if err := Validate(cfg); err == nil {
+		t.Fatal("expected negative window to fail validation")
+	}
+	cfg.Broker.QualityAware.Window = time.Minute
+	cfg.Broker.QualityAware.Weights.SuccessRate = -1
+	if err := Validate(cfg); err == nil {
+		t.Fatal("expected negative weight to fail validation")
+	}
+	cfg.Broker.QualityAware.Weights.SuccessRate = 1
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("expected valid qualityAware config: %v", err)
+	}
+}
+
+func TestLoadParsesQualityAware(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "broker.yaml")
+	if err := os.WriteFile(path, []byte(`
+broker:
+  qualityAware:
+    enabled: true
+    window: 10m
+    minSamples: 5
+    weights:
+      freeSlots: 2
+      successRate: 3
+      latency: 1.5
+      capacityErrors: 4
+`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if !cfg.Broker.QualityAware.Enabled {
+		t.Fatal("expected qualityAware enabled")
+	}
+	if cfg.Broker.QualityAware.Window != 10*time.Minute {
+		t.Fatalf("unexpected window %s", cfg.Broker.QualityAware.Window)
+	}
+	if cfg.Broker.QualityAware.MinSamples != 5 {
+		t.Fatalf("unexpected minSamples %d", cfg.Broker.QualityAware.MinSamples)
+	}
+	if cfg.Broker.QualityAware.Weights.FreeSlots != 2 || cfg.Broker.QualityAware.Weights.CapacityErrors != 4 {
+		t.Fatalf("unexpected weights %#v", cfg.Broker.QualityAware.Weights)
+	}
+}

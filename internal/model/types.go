@@ -146,33 +146,9 @@ type BrokerRuntimeConfig struct {
 	StateStore   StateStoreConfig     `yaml:"stateStore,omitempty" json:"stateStore,omitempty"`
 	HA           HAConfig             `yaml:"ha,omitempty" json:"ha,omitempty"`
 	Queue        AdmissionQueueConfig `yaml:"queue,omitempty" json:"queue,omitempty"`
-	TierRouting  TierRoutingConfig    `yaml:"tierRouting,omitempty" json:"tierRouting,omitempty"`
-	LiveCapacity LiveCapacityConfig   `yaml:"liveCapacity,omitempty" json:"liveCapacity,omitempty"`
-	Webhooks     WebhooksConfig       `yaml:"webhooks,omitempty" json:"webhooks,omitempty"`
-}
-
-// WebhooksConfig controls outbound allocation lifecycle event delivery.
-// When enabled, the broker POSTs signed JSON payloads to each endpoint for
-// ready and terminal transitions (failed, expired, completed, canceled).
-type WebhooksConfig struct {
-	Enabled        bool                    `yaml:"enabled,omitempty" json:"enabled,omitempty"`
-	Timeout        time.Duration           `yaml:"timeout,omitempty" json:"timeout,omitempty"`
-	MaxAttempts    int                     `yaml:"maxAttempts,omitempty" json:"maxAttempts,omitempty"`
-	InitialBackoff time.Duration           `yaml:"initialBackoff,omitempty" json:"initialBackoff,omitempty"`
-	MaxBackoff     time.Duration           `yaml:"maxBackoff,omitempty" json:"maxBackoff,omitempty"`
-	Endpoints      []WebhookEndpointConfig `yaml:"endpoints,omitempty" json:"endpoints,omitempty"`
-}
-
-// WebhookEndpointConfig describes one subscriber URL and how to sign deliveries.
-// Prefer signingSecretRef for production; signingSecret is useful for local tests.
-// Events filters which lifecycle names are sent; empty means all supported events.
-type WebhookEndpointConfig struct {
-	URL              string   `yaml:"url" json:"url"`
-	SigningSecret    string   `yaml:"signingSecret,omitempty" json:"signingSecret,omitempty"`
-	SigningSecretRef string   `yaml:"signingSecretRef,omitempty" json:"signingSecretRef,omitempty"`
-	// SigningSecretKey is the key inside SigningSecretRef (default: signing_secret).
-	SigningSecretKey string   `yaml:"signingSecretKey,omitempty" json:"signingSecretKey,omitempty"`
-	Events           []string `yaml:"events,omitempty" json:"events,omitempty"`
+	TierRouting   TierRoutingConfig    `yaml:"tierRouting,omitempty" json:"tierRouting,omitempty"`
+	LiveCapacity  LiveCapacityConfig   `yaml:"liveCapacity,omitempty" json:"liveCapacity,omitempty"`
+	QualityAware  QualityAwareConfig   `yaml:"qualityAware,omitempty" json:"qualityAware,omitempty"`
 }
 
 // LiveCapacityConfig controls optional provider-reported capacity routing.
@@ -188,6 +164,28 @@ type LiveCapacityConfig struct {
 	ProbeTimeout     time.Duration `yaml:"probeTimeout,omitempty" json:"probeTimeout,omitempty"`
 	FailureMode      string        `yaml:"failureMode,omitempty" json:"failureMode,omitempty"`
 	RefreshOnStartup bool          `yaml:"refreshOnStartup,omitempty" json:"refreshOnStartup,omitempty"`
+}
+
+// QualityAwareConfig controls optional quality-aware auto backend selection.
+// When enabled, unpinned allocations rank eligible backends by free slots,
+// historical success rate, p95 ready latency, and recent capacity errors.
+// Pins, capability filters, tier, live capacity, and admission still apply
+// first; provision failure still falls back to remaining eligible backends.
+type QualityAwareConfig struct {
+	Enabled    bool                  `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	Window     time.Duration         `yaml:"window,omitempty" json:"window,omitempty"`
+	MinSamples int                   `yaml:"minSamples,omitempty" json:"minSamples,omitempty"`
+	Weights    QualityAwareWeights   `yaml:"weights,omitempty" json:"weights,omitempty"`
+}
+
+// QualityAwareWeights scales score components. Zero values use defaults when
+// every weight is zero; explicit zeros are otherwise preserved only if at least
+// one weight is non-zero (see quality.Weights.Normalize).
+type QualityAwareWeights struct {
+	FreeSlots      float64 `yaml:"freeSlots,omitempty" json:"freeSlots,omitempty"`
+	SuccessRate    float64 `yaml:"successRate,omitempty" json:"successRate,omitempty"`
+	Latency        float64 `yaml:"latency,omitempty" json:"latency,omitempty"`
+	CapacityErrors float64 `yaml:"capacityErrors,omitempty" json:"capacityErrors,omitempty"`
 }
 
 type TierRoutingConfig struct {

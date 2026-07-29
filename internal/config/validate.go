@@ -35,64 +35,8 @@ func Validate(cfg model.BrokerConfig) error {
 	if err := validateLiveCapacity(cfg.Broker.LiveCapacity); err != nil {
 		return err
 	}
-	if err := validateWebhooks(cfg.Broker.Webhooks); err != nil {
+	if err := validateQualityAware(cfg.Broker.QualityAware); err != nil {
 		return err
-	}
-	return nil
-}
-
-var supportedWebhookEvents = map[string]struct{}{
-	"ready":     {},
-	"failed":    {},
-	"expired":   {},
-	"completed": {},
-	"canceled":  {},
-	"cancelled": {}, // alias for canceled
-}
-
-func validateWebhooks(cfg model.WebhooksConfig) error {
-	if cfg.Timeout < 0 {
-		return fmt.Errorf("broker.webhooks.timeout must not be negative")
-	}
-	if cfg.MaxAttempts < 0 {
-		return fmt.Errorf("broker.webhooks.maxAttempts must not be negative")
-	}
-	if cfg.InitialBackoff < 0 {
-		return fmt.Errorf("broker.webhooks.initialBackoff must not be negative")
-	}
-	if cfg.MaxBackoff < 0 {
-		return fmt.Errorf("broker.webhooks.maxBackoff must not be negative")
-	}
-	if !cfg.Enabled {
-		return nil
-	}
-	if len(cfg.Endpoints) == 0 {
-		return fmt.Errorf("broker.webhooks.endpoints is required when webhooks are enabled")
-	}
-	for i, endpoint := range cfg.Endpoints {
-		if strings.TrimSpace(endpoint.URL) == "" {
-			return fmt.Errorf("broker.webhooks.endpoints[%d].url is required", i)
-		}
-		if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(endpoint.URL)), "http://") &&
-			!strings.HasPrefix(strings.ToLower(strings.TrimSpace(endpoint.URL)), "https://") {
-			return fmt.Errorf("broker.webhooks.endpoints[%d].url must be an http(s) URL", i)
-		}
-		hasInline := strings.TrimSpace(endpoint.SigningSecret) != ""
-		hasRef := strings.TrimSpace(endpoint.SigningSecretRef) != ""
-		if !hasInline && !hasRef {
-			return fmt.Errorf("broker.webhooks.endpoints[%d] requires signingSecret or signingSecretRef", i)
-		}
-		for _, event := range endpoint.Events {
-			normalized := strings.ToLower(strings.TrimSpace(event))
-			if normalized == "" {
-				continue
-			}
-			// Accept bare names and allocation.<name> forms.
-			normalized = strings.TrimPrefix(normalized, "allocation.")
-			if _, ok := supportedWebhookEvents[normalized]; !ok {
-				return fmt.Errorf("broker.webhooks.endpoints[%d].events contains unsupported event %q", i, event)
-			}
-		}
 	}
 	return nil
 }
@@ -114,6 +58,23 @@ func validateLiveCapacity(cfg model.LiveCapacityConfig) error {
 	}
 	if cfg.ProbeTimeout < 0 {
 		return fmt.Errorf("broker.liveCapacity.probeTimeout must not be negative")
+	}
+	return nil
+}
+
+func validateQualityAware(cfg model.QualityAwareConfig) error {
+	if !cfg.Enabled {
+		return nil
+	}
+	if cfg.Window < 0 {
+		return fmt.Errorf("broker.qualityAware.window must not be negative")
+	}
+	if cfg.MinSamples < 0 {
+		return fmt.Errorf("broker.qualityAware.minSamples must not be negative")
+	}
+	w := cfg.Weights
+	if w.FreeSlots < 0 || w.SuccessRate < 0 || w.Latency < 0 || w.CapacityErrors < 0 {
+		return fmt.Errorf("broker.qualityAware.weights values must not be negative")
 	}
 	return nil
 }

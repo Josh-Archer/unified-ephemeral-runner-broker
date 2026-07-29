@@ -229,7 +229,7 @@ Recommended path: `fairShare.enabled: true` with `scheduler: weighted-round-robi
 
 Backends may opt into runtime admission controls with `circuitBreaker` and `rateLimit` under `pools[].backends.<name>`.
 
-Admission order is deterministic: static `enabled`/`healthy`, capability filtering, requested timeout filtering, runtime circuit and cold-launch rate limiting, optional tier and live-capacity filtering, scheduler reservation, then backend provisioning.
+Admission order is deterministic: static `enabled`/`healthy`, capability filtering, requested timeout filtering, runtime circuit and cold-launch rate limiting, optional tier and live-capacity filtering, optional quality-aware ranking, scheduler reservation, then backend provisioning.
 
 Circuit and rate-limit runtime state is process-local for `memory`/`file` stores and
 shared through the state store when `type: postgres`. Keep broker replicas at `1`
@@ -247,6 +247,32 @@ throttled. If every remaining backend is rate-limited, the broker returns an
 explicit rate-limit exhaustion error instead of creating a pending allocation.
 
 The background backend-health loop probes open circuits and closes them after the configured recovery threshold. Backends without a probe implementation recover through the same success path once the circuit admits a half-open request.
+
+## Quality-Aware Auto Backend Selection
+
+Optional quality-aware routing ranks eligible backends after capability, admission, tier, and live-capacity filtering. When `broker.qualityAware.enabled` is true and the allocation is not pinned:
+
+1. The broker keeps a process-local rolling window of per-pool/backend outcomes (success, failure, ready latency, capacity errors).
+2. Each schedulable candidate is scored from free slots, success rate, p95 ready latency, and recent capacity errors (weights are configurable).
+3. The highest-scoring candidate is reserved first. Scheduler fair-share quotas and active accounting still apply through a pinned reserve of that candidate.
+4. Provision or capacity rejection still falls back to remaining eligible backends (re-scored without the failed backend). Pinned requests never take the quality path.
+
+Selection reasons and component gauges are exported as Prometheus metrics (`uecb_quality_*`) and structured `quality_selection` logs.
+
+```yaml
+broker:
+  qualityAware:
+    enabled: true
+    window: 15m
+    minSamples: 3
+    weights:
+      freeSlots: 1
+      successRate: 1
+      latency: 1
+      capacityErrors: 1
+```
+
+With fewer than `minSamples` observations, success/latency/error components are treated as neutral so free slots remain the primary signal until history accumulates.
 
 ## Live Backend Capacity
 

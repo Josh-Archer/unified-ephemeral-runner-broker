@@ -15,6 +15,7 @@ import (
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/capacity"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
+	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/quality"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/scheduler"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/store"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/tier"
@@ -53,6 +54,7 @@ type Service struct {
 	admission   *backendAdmission
 	tierMgr     *tier.Manager
 	capacityMgr *capacity.Manager
+	quality     *quality.Tracker
 	warmMu      sync.Mutex
 	initErr     error
 	health      func(context.Context) error
@@ -91,6 +93,7 @@ func newServiceWithStore(cfg model.BrokerConfig, registry *backend.Registry, hea
 		}
 		return nil
 	}
+	qualityCfg := cfg.Broker.QualityAware
 	service := &Service{
 		cfg:      cfg,
 		registry: registry,
@@ -103,6 +106,7 @@ func newServiceWithStore(cfg model.BrokerConfig, registry *backend.Registry, hea
 		admission:   newBackendAdmission(store.AsAdmissionStateStore(stateStore)),
 		tierMgr:     tier.NewManager(),
 		capacityMgr: capacity.NewManager(),
+		quality:     quality.NewTracker(qualityCfg.Window, qualityCfg.MinSamples),
 		health:      health,
 		now:         time.Now,
 	}
@@ -136,6 +140,11 @@ func (s *Service) SetCapacityManager(manager *capacity.Manager) {
 
 func (s *Service) CapacityManager() *capacity.Manager {
 	return s.capacityMgr
+}
+
+// QualityTracker exposes rolling quality stats (tests and diagnostics).
+func (s *Service) QualityTracker() *quality.Tracker {
+	return s.quality
 }
 
 func (s *Service) SetObserver(observer Observer) {
@@ -740,6 +749,7 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 			launchLatency := time.Duration(0)
 			s.observer.ObserveLaunchLatency(pool.Name, selected, launchMode, launchLatency)
 			s.observer.ObserveRegistrationLatency(pool.Name, selected, launchLatency)
+			s.recordQualitySuccess(pool.Name, selected, launchLatency)
 			result = "success"
 			allocation = warmAllocation
 			logAllocationEvent(ctx, "allocation_ready", map[string]string{
@@ -758,21 +768,7 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 		s.observer.ObserveRegistrationLatency(pool.Name, selected, launchLatency)
 		if err != nil {
 			s.recordBackendFailure(pool, selected, err, s.now())
-			// Cancel may have already released capacity and marked the allocation
-			// terminal while provision was in flight. Only release/fail when the
-			// reservation is still ours.
-			if current, canceled := s.allocationCanceledDuringProvision(allocation.ID); canceled {
-				return current, ErrAllocationCanceled
-			}
-			abandoned, abandonedOK := s.abandonReservedAllocation(context.Background(), pool, allocation, model.StateFailed, err.Error())
-			if !abandonedOK {
-				if abandoned.State == model.StateCanceled {
-					return abandoned, ErrAllocationCanceled
-				}
-				if isTerminalAllocationState(abandoned.State) {
-					return abandoned, err
-				}
-			}
+			s.recordQualityFailure(pool.Name, selected, backend.IsCapacityExhausted(err))
 			if backend.IsCapacityExhausted(err) {
 				capacityFallback = selected
 				s.observer.ObserveLiveCapacityDecision(pool.Name, selected, "provider-reject", 0)
@@ -832,6 +828,7 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 		s.store.Save(allocation)
 		s.notifyReady(allocation)
 		s.recordBackendSuccess(pool, selected, s.now())
+		s.recordQualitySuccess(pool.Name, selected, launchLatency)
 		result = "success"
 		logAllocationEvent(ctx, "allocation_ready", map[string]string{
 			"allocation_id": allocation.ID,
@@ -2089,6 +2086,13 @@ func (s *Service) schedulerForPool(pool model.PoolConfig) scheduler.Scheduler {
 }
 
 func (s *Service) reserve(pool model.PoolConfig, request model.AllocationRequest) (model.BackendName, error) {
+	if s.qualityAwareEnabled() && request.Backend == nil {
+		return s.reserveQualityAware(pool, request)
+	}
+	return s.reserveScheduled(pool, request)
+}
+
+func (s *Service) reserveScheduled(pool model.PoolConfig, request model.AllocationRequest) (model.BackendName, error) {
 	if pool.FairShare.Enabled {
 		if s.fairShare == nil {
 			return scheduler.NewPriorityFairShare().Reserve(pool, request)
@@ -2096,6 +2100,106 @@ func (s *Service) reserve(pool model.PoolConfig, request model.AllocationRequest
 		return s.fairShare.Reserve(pool, request)
 	}
 	return s.schedulerForPool(pool).Reserve(pool, request)
+}
+
+func (s *Service) qualityAwareEnabled() bool {
+	return s != nil && s.cfg.Broker.QualityAware.Enabled && s.quality != nil
+}
+
+// reserveQualityAware ranks eligible backends by free slots and rolling quality
+// stats, then reserves the best candidate through the normal scheduler path
+// (preserving fair-share quotas and active accounting). Pins and prior
+// capability/tier/live-capacity filters still apply; provision fallbacks re-enter
+// this path with the failed backend removed from the pool snapshot.
+func (s *Service) reserveQualityAware(pool model.PoolConfig, request model.AllocationRequest) (model.BackendName, error) {
+	now := s.now()
+	candidates := make([]quality.Candidate, 0, len(pool.Backends))
+	snapshots := map[model.BackendName]quality.Snapshot{}
+
+	for name, cfg := range pool.Backends {
+		if !cfg.Enabled || !cfg.Healthy || cfg.MaxRunners <= 0 {
+			continue
+		}
+		active := s.backendActiveCount(pool, name)
+		free := cfg.MaxRunners - active
+		if free <= 0 {
+			continue
+		}
+		// When live capacity is enabled, MaxRunners on the pool snapshot is already
+		// clamped; free slots here therefore include that ceiling.
+		candidates = append(candidates, quality.Candidate{Backend: name, FreeSlots: free})
+		snapshots[name] = s.quality.Snapshot(pool.Name, name, now)
+	}
+
+	if len(candidates) == 0 {
+		return "", scheduler.ErrNoCapacity
+	}
+
+	weights := quality.Weights{
+		FreeSlots:      s.cfg.Broker.QualityAware.Weights.FreeSlots,
+		SuccessRate:    s.cfg.Broker.QualityAware.Weights.SuccessRate,
+		Latency:        s.cfg.Broker.QualityAware.Weights.Latency,
+		CapacityErrors: s.cfg.Broker.QualityAware.Weights.CapacityErrors,
+	}
+	ranked := quality.Score(candidates, snapshots, weights)
+	if len(ranked) == 0 {
+		return "", scheduler.ErrNoCapacity
+	}
+
+	// Try highest-score first; if the scheduler rejects (race on capacity or
+	// fair-share quota), walk the ranked list so quality still prefers better
+	// backends while respecting pins/capabilities already applied to the pool.
+	var lastErr error
+	for _, result := range ranked {
+		s.observer.ObserveQualityScore(pool.Name, result.Backend, result.Score, result.SuccessRate, result.P95Ready, result.CapacityErrors, result.FreeSlots)
+		pinned := result.Backend
+		attempt := request
+		attempt.Backend = &pinned
+		selected, err := s.reserveScheduled(pool, attempt)
+		if err == nil {
+			reason := result.Reason
+			if reason == "" {
+				reason = "highest-score"
+			}
+			s.observer.ObserveQualitySelection(pool.Name, selected, reason, result.Score)
+			logAllocationEvent(context.Background(), "quality_selection", map[string]string{
+				"pool":            string(pool.Name),
+				"backend":         string(selected),
+				"reason":          reason,
+				"score":           fmt.Sprintf("%.4f", result.Score),
+				"free_slots":      fmt.Sprintf("%d", result.FreeSlots),
+				"success_rate":    fmt.Sprintf("%.4f", result.SuccessRate),
+				"p95_ready_ms":    fmt.Sprintf("%d", result.P95Ready.Milliseconds()),
+				"capacity_errors": fmt.Sprintf("%d", result.CapacityErrors),
+				"samples":         fmt.Sprintf("%d", result.Samples),
+			})
+			return selected, nil
+		}
+		lastErr = err
+		// Quota or unknown-backend errors should not silently walk peers as if
+		// they were capacity misses when the request was effectively constrained.
+		if errors.Is(err, scheduler.ErrQuotaExceeded) || errors.Is(err, scheduler.ErrUnknownBackend) {
+			return "", err
+		}
+	}
+	if lastErr != nil {
+		return "", lastErr
+	}
+	return "", scheduler.ErrNoCapacity
+}
+
+func (s *Service) recordQualitySuccess(pool model.PoolName, backendName model.BackendName, readyLatency time.Duration) {
+	if s.quality == nil {
+		return
+	}
+	s.quality.RecordSuccess(pool, backendName, readyLatency, s.now())
+}
+
+func (s *Service) recordQualityFailure(pool model.PoolName, backendName model.BackendName, capacityError bool) {
+	if s.quality == nil {
+		return
+	}
+	s.quality.RecordFailure(pool, backendName, capacityError, s.now())
 }
 
 func (s *Service) release(ctx context.Context, pool model.PoolConfig, backend model.BackendName, allocation model.AllocationStatus) {
