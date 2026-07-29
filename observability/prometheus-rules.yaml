@@ -38,7 +38,16 @@ groups:
           severity: warning
         annotations:
           summary: "UECB allocations are not draining for pool {{ $labels.pool }}"
-          description: "Reserved or ready allocations have remained active long enough to suggest cleanup or runner completion is stuck."
+          description: "Reserved or ready allocations have remained active long enough to suggest cleanup or runner completion is stuck. Check finalize callbacks and uecb_allocations_reaped_total."
+
+      - alert: UECBHighAllocationReapRate
+        expr: sum by (pool) (rate(uecb_allocations_reaped_total[15m])) > 0.05
+        for: 20m
+        labels:
+          severity: warning
+        annotations:
+          summary: "UECB stuck-allocation reaper is active in pool {{ $labels.pool }}"
+          description: "The broker is reaping allocations past job_timeout (+ grace). Investigate missing finalize-allocation callbacks or jobs exceeding configured timeouts."
 
       - alert: UECBBackendCircuitOpen
         expr: uecb_backend_circuit_state{state="open"} == 1

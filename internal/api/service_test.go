@@ -2360,6 +2360,150 @@ func TestSweepExpiredReclaimsStaleRunnerLabelsWithMetrics(t *testing.T) {
 	}
 }
 
+type reapedObserver struct {
+	noopObserver
+	mu     sync.Mutex
+	reaped []string
+}
+
+func (o *reapedObserver) ObserveAllocationReaped(pool model.PoolName, backend model.BackendName, result string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.reaped = append(o.reaped, fmt.Sprintf("%s/%s/%s", pool, backend, result))
+}
+
+func TestSweepExpiredRespectsGracePeriod(t *testing.T) {
+	cfg := config.Default()
+	cfg.Broker.OrphanCleanup.GracePeriod = 30 * time.Second
+	service := NewService(
+		cfg,
+		backend.NewRegistry(
+			testBackend{name: model.BackendARC},
+			testBackend{name: model.BackendCodeBuild},
+			testBackend{name: model.BackendLambda},
+			testBackend{name: model.BackendCloudRun},
+			testBackend{name: model.BackendAzureFunctions},
+		),
+		nil,
+	)
+	service.now = func() time.Time { return time.Unix(1000, 0) }
+	observer := &reapedObserver{}
+	service.SetObserver(observer)
+
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolFull,
+		JobTimeout: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("allocate failed: %v", err)
+	}
+
+	// Past job_timeout but still within grace: do not reap.
+	if got := service.SweepExpired(time.Unix(1020, 0)); got != 0 {
+		t.Fatalf("expected no reaps inside grace, got %d", got)
+	}
+	if updated, ok := service.Get(allocation.ID); !ok || updated.State != model.StateReady {
+		t.Fatalf("expected ready during grace, got ok=%v state=%v", ok, updated.State)
+	}
+
+	// After job_timeout + grace: reap and free capacity.
+	if got := service.SweepExpired(time.Unix(1040, 0)); got != 1 {
+		t.Fatalf("expected 1 reaped allocation after grace, got %d", got)
+	}
+	updated, ok := service.Get(allocation.ID)
+	if !ok {
+		t.Fatal("allocation disappeared after reaper")
+	}
+	if updated.State != model.StateExpired {
+		t.Fatalf("expected expired state after grace, got %s", updated.State)
+	}
+	observer.mu.Lock()
+	defer observer.mu.Unlock()
+	if len(observer.reaped) != 1 || observer.reaped[0] != "full/arc/expired" {
+		t.Fatalf("expected reaped metric observation, got %#v", observer.reaped)
+	}
+}
+
+func TestSweepExpiredReleasesMaxRunnersCapacity(t *testing.T) {
+	cfg := config.Default()
+	arc := cfg.Pools[0].Backends[model.BackendARC]
+	arc.MaxRunners = 1
+	cfg.Pools[0].Backends[model.BackendARC] = arc
+
+	service := NewService(
+		cfg,
+		backend.NewRegistry(testBackend{name: model.BackendARC}),
+		nil,
+	)
+	service.now = func() time.Time { return time.Unix(1000, 0) }
+
+	first, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolFull,
+		JobTimeout: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("first allocate failed: %v", err)
+	}
+	if _, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolFull,
+		JobTimeout: 10 * time.Second,
+	}); err == nil {
+		t.Fatal("expected second allocate to fail while capacity is held")
+	}
+
+	if got := service.SweepExpired(time.Unix(1011, 0)); got != 1 {
+		t.Fatalf("expected reaper to free first allocation, got %d", got)
+	}
+	if updated, ok := service.Get(first.ID); !ok || updated.State != model.StateExpired {
+		t.Fatalf("expected first allocation expired, got ok=%v state=%v", ok, updated.State)
+	}
+
+	second, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolFull,
+		JobTimeout: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("allocate after reaper should succeed: %v", err)
+	}
+	if second.ID == first.ID {
+		t.Fatal("expected a new allocation after capacity was reaped")
+	}
+}
+
+func TestSweepExpiredInvokesProviderCleanup(t *testing.T) {
+	cfg := config.Default()
+	cleanupCalled := false
+	service := NewService(
+		cfg,
+		backend.NewRegistry(
+			&testCleanupBackend{
+				testBackend: testBackend{name: model.BackendARC},
+				cleanupSeen: &cleanupCalled,
+			},
+		),
+		nil,
+	)
+	service.now = func() time.Time { return time.Unix(1000, 0) }
+
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolFull,
+		JobTimeout: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("allocate failed: %v", err)
+	}
+
+	if got := service.SweepExpired(time.Unix(1010, 0)); got != 1 {
+		t.Fatalf("expected 1 reaped allocation, got %d", got)
+	}
+	if !cleanupCalled {
+		t.Fatal("expected provider cleanup hook on reaped allocation")
+	}
+	if updated, ok := service.Get(allocation.ID); !ok || updated.State != model.StateExpired {
+		t.Fatalf("expected expired allocation, got ok=%v state=%v", ok, updated.State)
+	}
+}
+
 func TestSweepExpiredMarksReadyAllocationsQuarantinedWhenEnabled(t *testing.T) {
 	cfg := config.Default()
 	cfg.Broker.OrphanCleanup.Enabled = true

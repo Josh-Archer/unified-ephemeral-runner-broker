@@ -29,27 +29,28 @@ backends:
     healthy: false   # scheduler skips this backend; re-enable when recovered
 ```
 
-## Orphan Cleanup
+## Stuck-Allocation Reaper (Orphan Cleanup)
 
-Stale allocations (and their unique runner labels) that never receive a
-`finalize-allocation` / complete callback are reclaimed after the allocation
-`job_timeout` TTL during the periodic expiry sweep. This covers hard job kills
-and cancelled workflows where the cleanup job never runs.
+Stale allocations that have not received a completion callback are reaped by a
+leader-only background loop so they cannot hold `maxRunners` forever.
 
 ```yaml
 broker:
   orphanCleanup:
-    enabled: false      # default: stale active allocations move directly to expired
+    enabled: false      # default: reaped allocations move directly to expired
     quarantineTTL: 15m  # only used when enabled: true
+    gracePeriod: 0s     # wait after job_timeout before reaping (default 0)
 ```
 
-Enable quarantine when you want to observe stale allocations before they expire:
+Enable quarantine when you want to observe stale allocations before they expire,
+and/or add grace when finalize may lag slightly past `job_timeout`:
 
 ```yaml
 broker:
   orphanCleanup:
     enabled: true
     quarantineTTL: 10m
+    gracePeriod: 2m
 ```
 
 Metrics: `uecb_orphan_cleanup_actions_total`, `uecb_label_garbage_total`,

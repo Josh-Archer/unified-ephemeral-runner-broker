@@ -20,6 +20,7 @@ data:
       orphanCleanup:
         enabled: false
         quarantineTTL: 15m
+        gracePeriod: 0s
       api:
         oidcAudience: uecb-broker
     pools:
