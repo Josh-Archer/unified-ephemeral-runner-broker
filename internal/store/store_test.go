@@ -80,6 +80,49 @@ func TestMemoryCompareAndMarkState(t *testing.T) {
 	}
 }
 
+func TestMemorySaveIfState(t *testing.T) {
+	s := NewMemory()
+	_ = s.Save(model.AllocationStatus{
+		ID:              "r1",
+		State:           model.StateReserved,
+		Pool:            model.PoolLite,
+		SelectedBackend: model.BackendCodeBuild,
+	})
+
+	ready := model.AllocationStatus{
+		ID:              "r1",
+		State:           model.StateReady,
+		Pool:            model.PoolLite,
+		SelectedBackend: model.BackendCodeBuild,
+		RunnerLabel:     "runner-r1",
+		Metadata:        map[string]string{"execution_id": "exec-1"},
+	}
+	ok, err := s.SaveIfState(ready, model.StateReserved)
+	if err != nil || !ok {
+		t.Fatalf("expected reserved->ready save, ok=%v err=%v", ok, err)
+	}
+	got, found := s.Get("r1")
+	if !found || got.State != model.StateReady || got.RunnerLabel != "runner-r1" {
+		t.Fatalf("unexpected saved allocation: found=%v %+v", found, got)
+	}
+
+	// Cancel wins: subsequent ready commit must not overwrite.
+	_, _ = s.MarkState("r1", model.StateCanceled, time.Now(), "")
+	overwrite := ready
+	overwrite.RunnerLabel = "orphan-label"
+	ok, err = s.SaveIfState(overwrite, model.StateReserved)
+	if err != nil {
+		t.Fatalf("SaveIfState error: %v", err)
+	}
+	if ok {
+		t.Fatal("expected SaveIfState to reject non-reserved state")
+	}
+	got, _ = s.Get("r1")
+	if got.State != model.StateCanceled || got.RunnerLabel != "runner-r1" {
+		t.Fatalf("canceled allocation was overwritten: %+v", got)
+	}
+}
+
 func TestMemoryLeaderElection(t *testing.T) {
 	s := NewMemory()
 	ctx := context.Background()

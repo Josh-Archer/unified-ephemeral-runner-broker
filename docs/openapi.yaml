@@ -163,7 +163,15 @@ paths:
       tags: [allocations]
       operationId: cancelAllocation
       summary: Cancel an allocation
-      description: Cancels a non-terminal allocation and releases reserved capacity when applicable.
+      description: |
+        Cancels a non-terminal allocation and releases reserved capacity when
+        applicable. Cancel is idempotent: repeating the call on an already
+        canceled (or otherwise terminal) allocation returns the current status.
+
+        If cancel races with an in-flight backend provision, the allocation stays
+        `canceled`. When provision later succeeds, the broker tears down the
+        provisioned runner via cleanup instead of promoting the allocation to
+        `ready`, so runner labels are not left registered after cancel.
       security:
         - bearerOIDC: []
       parameters:

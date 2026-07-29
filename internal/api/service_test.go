@@ -73,18 +73,67 @@ func (b *probeBackend) Probe(context.Context, model.PoolConfig, model.BackendCon
 
 type testCleanupBackend struct {
 	testBackend
-	failCleanup bool
-	cleanupSeen *bool
+	failCleanup  bool
+	cleanupSeen  *bool
+	cleanupCount *int
+	lastCleanup  *model.AllocationStatus
+	cleanupMu    sync.Mutex
 }
 
-func (b *testCleanupBackend) Cleanup(_ context.Context, _ model.AllocationStatus) error {
+func (b *testCleanupBackend) Cleanup(_ context.Context, status model.AllocationStatus) error {
+	b.cleanupMu.Lock()
+	defer b.cleanupMu.Unlock()
 	if b.cleanupSeen != nil {
 		*b.cleanupSeen = true
+	}
+	if b.cleanupCount != nil {
+		*b.cleanupCount++
+	}
+	if b.lastCleanup != nil {
+		*b.lastCleanup = status
 	}
 	if !b.failCleanup {
 		return nil
 	}
 	return errors.New("cleanup failed")
+}
+
+// blockingProvisionBackend holds Provision until release is closed (or ctx done).
+// Used to reproduce cancel-during-provision races.
+type blockingProvisionBackend struct {
+	testBackend
+	entered      chan struct{}
+	release      chan struct{}
+	cleanupCount int
+	lastCleanup  model.AllocationStatus
+	mu           sync.Mutex
+}
+
+func (b *blockingProvisionBackend) Provision(ctx context.Context, request model.AllocationRequest, allocation model.AllocationStatus) (backend.ProvisionedRunner, error) {
+	if b.entered != nil {
+		select {
+		case <-b.entered:
+			// already signaled
+		default:
+			close(b.entered)
+		}
+	}
+	if b.release != nil {
+		select {
+		case <-b.release:
+		case <-ctx.Done():
+			return backend.ProvisionedRunner{}, ctx.Err()
+		}
+	}
+	return b.testBackend.Provision(ctx, request, allocation)
+}
+
+func (b *blockingProvisionBackend) Cleanup(_ context.Context, status model.AllocationStatus) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.cleanupCount++
+	b.lastCleanup = status
+	return nil
 }
 
 type countingBackend struct {
@@ -1661,6 +1710,196 @@ func TestCancelReleasesCapacity(t *testing.T) {
 	}
 }
 
+func TestCancelIsIdempotent(t *testing.T) {
+	service := newService()
+	backendName := model.BackendARC
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolLite,
+		Backend:    &backendName,
+		JobTimeout: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("allocate failed: %v", err)
+	}
+
+	first, ok := service.Cancel(allocation.ID)
+	if !ok || first.State != model.StateCanceled {
+		t.Fatalf("first cancel failed: ok=%v state=%s", ok, first.State)
+	}
+	second, ok := service.Cancel(allocation.ID)
+	if !ok || second.State != model.StateCanceled {
+		t.Fatalf("second cancel should remain idempotent: ok=%v state=%s", ok, second.State)
+	}
+	if second.ID != first.ID {
+		t.Fatalf("expected same allocation id, got %s vs %s", second.ID, first.ID)
+	}
+}
+
+func TestCancelDuringProvisionCleansUpRunner(t *testing.T) {
+	cfg := config.Default()
+	// Pin full pool to a single blocking ARC backend with one slot.
+	cfg.Pools[0].Backends = map[model.BackendName]model.BackendConfig{
+		model.BackendARC: {
+			Enabled:    true,
+			Healthy:    true,
+			MaxRunners: 1,
+			Template:   "arc-full",
+		},
+	}
+
+	blocker := &blockingProvisionBackend{
+		testBackend: testBackend{name: model.BackendARC},
+		entered:     make(chan struct{}),
+		release:     make(chan struct{}),
+	}
+	service := NewService(cfg, backend.NewRegistry(blocker), nil)
+
+	type allocateResult struct {
+		status model.AllocationStatus
+		err    error
+	}
+	resultCh := make(chan allocateResult, 1)
+	go func() {
+		status, err := service.Allocate(context.Background(), model.AllocationRequest{
+			Pool:       model.PoolFull,
+			JobTimeout: 5 * time.Minute,
+		})
+		resultCh <- allocateResult{status: status, err: err}
+	}()
+
+	select {
+	case <-blocker.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for provision to start")
+	}
+
+	// Discover the reserved allocation id while provision is blocked.
+	var allocationID string
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, status := range service.store.List() {
+			if status.State == model.StateReserved {
+				allocationID = status.ID
+				break
+			}
+		}
+		if allocationID != "" {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if allocationID == "" {
+		t.Fatal("expected reserved allocation while provision is in flight")
+	}
+
+	canceled, ok := service.Cancel(allocationID)
+	if !ok {
+		t.Fatal("cancel should succeed during provision")
+	}
+	if canceled.State != model.StateCanceled {
+		t.Fatalf("expected canceled state, got %s", canceled.State)
+	}
+
+	// Let provision complete; ready commit must lose to cancel and trigger cleanup.
+	close(blocker.release)
+
+	var result allocateResult
+	select {
+	case result = <-resultCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for allocate to return")
+	}
+	if result.err == nil {
+		t.Fatal("expected allocate to fail after cancel during provision")
+	}
+	if !errors.Is(result.err, ErrAllocationCanceled) {
+		t.Fatalf("expected ErrAllocationCanceled, got %v", result.err)
+	}
+
+	// Allocation must remain canceled (not overwritten to ready).
+	final, ok := service.Get(allocationID)
+	if !ok {
+		t.Fatal("allocation should still exist")
+	}
+	if final.State != model.StateCanceled {
+		t.Fatalf("expected final state canceled, got %s", final.State)
+	}
+	if final.RunnerLabel != "" {
+		t.Fatalf("canceled allocation must not keep a live runner label, got %q", final.RunnerLabel)
+	}
+
+	blocker.mu.Lock()
+	cleanupCount := blocker.cleanupCount
+	lastCleanup := blocker.lastCleanup
+	blocker.mu.Unlock()
+	if cleanupCount < 1 {
+		t.Fatal("expected cleanup after late provision success")
+	}
+	if lastCleanup.RunnerLabel == "" {
+		t.Fatal("cleanup must receive the provisioned runner label")
+	}
+	if !strings.Contains(lastCleanup.RunnerLabel, allocationID) {
+		t.Fatalf("expected cleanup label to include allocation id, got %q", lastCleanup.RunnerLabel)
+	}
+
+	// Capacity must be reusable after cancel-during-provision.
+	// Swap in a non-blocking backend so the follow-up allocate does not hang.
+	service.registry = backend.NewRegistry(testBackend{name: model.BackendARC})
+	if _, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolFull,
+		JobTimeout: 5 * time.Minute,
+	}); err != nil {
+		t.Fatalf("expected capacity reusable after cancel-during-provision: %v", err)
+	}
+}
+
+func TestCancelAfterReadyStillCleansUp(t *testing.T) {
+	cfg := config.Default()
+	arcCfg := cfg.Pools[0].Backends[model.BackendARC]
+	arcCfg.MaxRunners = 1
+	cfg.Pools[0].Backends[model.BackendARC] = arcCfg
+
+	cleanupCount := 0
+	var lastCleanup model.AllocationStatus
+	service := NewService(
+		cfg,
+		backend.NewRegistry(&testCleanupBackend{
+			testBackend:  testBackend{name: model.BackendARC},
+			cleanupCount: &cleanupCount,
+			lastCleanup:  &lastCleanup,
+		}),
+		nil,
+	)
+
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolFull,
+		JobTimeout: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("allocate failed: %v", err)
+	}
+	if allocation.State != model.StateReady || allocation.RunnerLabel == "" {
+		t.Fatalf("expected ready allocation with label, got state=%s label=%q", allocation.State, allocation.RunnerLabel)
+	}
+
+	canceled, ok := service.Cancel(allocation.ID)
+	if !ok || canceled.State != model.StateCanceled {
+		t.Fatalf("cancel failed: ok=%v state=%s", ok, canceled.State)
+	}
+	if cleanupCount < 1 {
+		t.Fatal("expected cleanup on cancel after ready")
+	}
+	if lastCleanup.RunnerLabel != allocation.RunnerLabel {
+		t.Fatalf("cleanup label=%q want %q", lastCleanup.RunnerLabel, allocation.RunnerLabel)
+	}
+
+	// Duplicate cancel remains idempotent (may or may not re-run cleanup).
+	again, ok := service.Cancel(allocation.ID)
+	if !ok || again.State != model.StateCanceled {
+		t.Fatalf("duplicate cancel failed: ok=%v state=%s", ok, again.State)
+	}
+}
+
 func TestCompleteMarksAllocationCompletedAndReleasesCapacity(t *testing.T) {
 	service := newServiceWithConfig(func(pool *model.PoolConfig) {
 		if pool.Name != model.PoolFull {
@@ -2519,13 +2758,13 @@ func TestLiveCapacityFairShareStillRanks(t *testing.T) {
 	manager := capacity.NewManager()
 	// Both backends have free capacity.
 	manager.Set(capacity.Snapshot{
-		Backend: model.BackendARC,
-		Status:  backend.CapacityStatus{MaxRunners: 4, ActiveRunners: 0},
+		Backend:   model.BackendARC,
+		Status:    backend.CapacityStatus{MaxRunners: 4, ActiveRunners: 0},
 		UpdatedAt: time.Now().UTC(), Source: "live",
 	})
 	manager.Set(capacity.Snapshot{
-		Backend: model.BackendCodeBuild,
-		Status:  backend.CapacityStatus{MaxRunners: 4, ActiveRunners: 0},
+		Backend:   model.BackendCodeBuild,
+		Status:    backend.CapacityStatus{MaxRunners: 4, ActiveRunners: 0},
 		UpdatedAt: time.Now().UTC(), Source: "live",
 	})
 	service := NewService(cfg, backend.NewRegistry(

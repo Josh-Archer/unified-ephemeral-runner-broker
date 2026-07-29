@@ -207,6 +207,29 @@ func (p *Postgres) CompareAndMarkState(id string, expectedFrom model.AllocationS
 	return status, true
 }
 
+func (p *Postgres) SaveIfState(status model.AllocationStatus, expectedFrom model.AllocationState) (bool, error) {
+	tx, err := p.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	current, ok, err := p.getForUpdate(tx, status.ID)
+	if err != nil {
+		return false, err
+	}
+	if !ok || current.State != expectedFrom {
+		return false, nil
+	}
+	if err := p.saveTx(tx, status); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (p *Postgres) SaveIfCapacity(status model.AllocationStatus, maxRunners int, tenantQuota int) error {
 	tx, err := p.db.Begin()
 	if err != nil {

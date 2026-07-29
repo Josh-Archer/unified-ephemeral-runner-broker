@@ -24,6 +24,7 @@ var ErrUnknownPool = errors.New("pool is not configured")
 var ErrNoMatchingBackendCapabilities = errors.New("no backend matches the requested capabilities")
 var ErrAllocationNotFound = errors.New("allocation not found")
 var ErrAllocationAlreadyCompleted = errors.New("allocation already in terminal state")
+var ErrAllocationCanceled = errors.New("allocation canceled")
 var ErrInvalidCompletionState = errors.New("invalid completion state")
 var ErrBackendTierBlocked = errors.New("backend tier policy blocked allocation")
 var ErrBackendLiveCapacity = errors.New("backend live capacity exhausted")
@@ -436,8 +437,22 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 		s.observer.ObserveLaunchLatency(pool.Name, selected, launchMode, launchLatency)
 		s.observer.ObserveRegistrationLatency(pool.Name, selected, launchLatency)
 		if err != nil {
-			s.release(context.Background(), pool, selected, allocation)
 			s.recordBackendFailure(pool, selected, err, s.now())
+			// Cancel may have already released capacity and marked the allocation
+			// terminal while provision was in flight. Only release/fail when the
+			// reservation is still ours.
+			if current, canceled := s.allocationCanceledDuringProvision(allocation.ID); canceled {
+				return current, ErrAllocationCanceled
+			}
+			abandoned, abandonedOK := s.abandonReservedAllocation(context.Background(), pool, allocation, model.StateFailed, err.Error())
+			if !abandonedOK {
+				if abandoned.State == model.StateCanceled {
+					return abandoned, ErrAllocationCanceled
+				}
+				if isTerminalAllocationState(abandoned.State) {
+					return abandoned, err
+				}
+			}
 			if backend.IsCapacityExhausted(err) {
 				capacityFallback = selected
 				s.observer.ObserveLiveCapacityDecision(pool.Name, selected, "provider-reject", 0)
@@ -451,8 +466,6 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 					// Pinned requests are not silently rerouted on live-capacity rejection.
 					if existing.ID == "" {
 						_ = s.store.Delete(allocation.ID)
-					} else {
-						s.store.MarkState(allocation.ID, model.StateFailed, s.now(), err.Error())
 					}
 					return model.AllocationStatus{}, fmt.Errorf("pinned backend %q live capacity exhausted: %w", selected, ErrBackendLiveCapacity)
 				}
@@ -469,16 +482,16 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 				if len(reservePool.Backends) > 0 {
 					continue
 				}
-				if existing.ID != "" {
-					s.store.MarkState(existing.ID, model.StateFailed, s.now(), err.Error())
-				}
 				return model.AllocationStatus{}, fmt.Errorf("selected backend %q capacity exhausted and no fallback backend is available: %w", selected, ErrBackendLiveCapacity)
 			}
 			if queued, ok := s.queueAllocation(ctx, request, pool.Name, selected, err, allocation); ok {
 				result = "queued"
 				return queued, nil
 			}
-			s.store.MarkState(allocation.ID, model.StateFailed, s.now(), err.Error())
+			if !abandonedOK && abandoned.ID != "" {
+				// Reservation was taken by cancel/expire; surface that outcome.
+				return abandoned, err
+			}
 			logAllocationEvent(ctx, "allocation_failed", map[string]string{
 				"allocation_id": allocation.ID,
 				"pool":          string(pool.Name),
@@ -494,7 +507,17 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 			launchMode,
 		)
 		allocation.State = model.StateReady
-		s.store.Save(allocation)
+		// Commit ready only while still reserved so a concurrent cancel cannot be
+		// overwritten with a live runner label.
+		saved, saveErr := s.store.SaveIfState(allocation, model.StateReserved)
+		if saveErr != nil {
+			s.release(context.Background(), pool, selected, allocation)
+			s.cleanupAllocation(context.Background(), allocation)
+			return model.AllocationStatus{}, saveErr
+		}
+		if !saved {
+			return s.finalizeCanceledDuringProvision(ctx, allocation)
+		}
 		s.recordBackendSuccess(pool, selected, s.now())
 		result = "success"
 		logAllocationEvent(ctx, "allocation_ready", map[string]string{
@@ -672,22 +695,27 @@ func (s *Service) Get(id string) (model.AllocationStatus, bool) {
 }
 
 func (s *Service) Cancel(id string) (model.AllocationStatus, bool) {
-	status, ok := s.store.Get(id)
-	if !ok {
-		return model.AllocationStatus{}, false
+	// Cancel is idempotent: concurrent cancels and races with provision completion
+	// converge on a single terminal canceled record and one capacity release.
+	for {
+		status, ok := s.store.Get(id)
+		if !ok {
+			return model.AllocationStatus{}, false
+		}
+		if isTerminalAllocationState(status.State) {
+			return status, true
+		}
+		updated, ok := s.store.CompareAndMarkState(id, status.State, model.StateCanceled, s.now(), "")
+		if !ok {
+			// Lost a race with provision ready/complete/expire; retry for idempotency.
+			continue
+		}
+		if pool, err := s.resolvePool(updated.Pool); err == nil {
+			s.release(context.Background(), pool, updated.SelectedBackend, updated)
+		}
+		s.observeState()
+		return updated, true
 	}
-	if isTerminalAllocationState(status.State) {
-		return status, true
-	}
-	updated, ok := s.store.MarkState(id, model.StateCanceled, s.now(), "")
-	if !ok {
-		return model.AllocationStatus{}, false
-	}
-	if pool, err := s.resolvePool(updated.Pool); err == nil {
-		s.release(context.Background(), pool, updated.SelectedBackend, updated)
-	}
-	s.observeState()
-	return updated, true
 }
 
 type completionRequest struct {
@@ -1692,6 +1720,75 @@ func (s *Service) cleanupAllocation(ctx context.Context, allocation model.Alloca
 		})
 		log.Printf("allocation cleanup failed for %s: %v", allocation.ID, err)
 	}
+}
+
+// abandonReservedAllocation marks a still-reserved allocation terminal and
+// releases scheduler capacity. When the CAS loses (cancel/expire won), capacity
+// is left alone and the current status is returned with abandoned=false.
+func (s *Service) abandonReservedAllocation(ctx context.Context, pool model.PoolConfig, allocation model.AllocationStatus, terminalState model.AllocationState, message string) (model.AllocationStatus, bool) {
+	updated, ok := s.store.CompareAndMarkState(allocation.ID, model.StateReserved, terminalState, s.now(), message)
+	if ok {
+		s.release(ctx, pool, allocation.SelectedBackend, updated)
+		return updated, true
+	}
+	current, found := s.store.Get(allocation.ID)
+	if !found {
+		return model.AllocationStatus{}, false
+	}
+	return current, false
+}
+
+func (s *Service) allocationCanceledDuringProvision(id string) (model.AllocationStatus, bool) {
+	current, ok := s.store.Get(id)
+	if !ok {
+		return model.AllocationStatus{}, false
+	}
+	if current.State == model.StateCanceled {
+		return current, true
+	}
+	return current, false
+}
+
+// finalizeCanceledDuringProvision runs when provision succeeded but the
+// reserved→ready commit lost to cancel (or another terminal transition). Capacity
+// was already released by that transition; we still must tear down the runner
+// using the freshly provisioned label/metadata so labels are not left behind.
+func (s *Service) finalizeCanceledDuringProvision(ctx context.Context, allocation model.AllocationStatus) (model.AllocationStatus, error) {
+	// Prefer canceled state on the cleanup payload so launchers see the reason.
+	cleanupStatus := allocation
+	current, ok := s.store.Get(allocation.ID)
+	if ok {
+		cleanupStatus.State = current.State
+		if cleanupStatus.Error == "" {
+			cleanupStatus.Error = current.Error
+		}
+	} else {
+		cleanupStatus.State = model.StateCanceled
+	}
+	// Ensure provision metadata/label reach Cleanup even if cancel ran earlier
+	// without them (cancel during in-flight provision).
+	cleanupStatus.RunnerLabel = allocation.RunnerLabel
+	if allocation.Metadata != nil {
+		cleanupStatus.Metadata = allocation.Metadata
+	}
+	s.cleanupAllocation(ctx, cleanupStatus)
+	logAllocationEvent(ctx, "allocation_canceled_during_provision", map[string]string{
+		"allocation_id": allocationIDLabel(allocation.ID),
+		"pool":          string(allocation.Pool),
+		"backend":       string(allocation.SelectedBackend),
+		"runner_label":  allocation.RunnerLabel,
+		"state":         string(cleanupStatus.State),
+	})
+	if !ok {
+		return model.AllocationStatus{}, ErrAllocationNotFound
+	}
+	if current.State == model.StateCanceled {
+		return current, ErrAllocationCanceled
+	}
+	if isTerminalAllocationState(current.State) {
+		return current, fmt.Errorf("allocation %s during provision", current.State)
+	}
+	return current, fmt.Errorf("allocation state changed during provision: %s", current.State)
 }
 
 func allocationIDLabel(id string) string {

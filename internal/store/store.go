@@ -38,6 +38,12 @@ type Store interface {
 	// Returns false when the allocation is missing or the state does not match.
 	CompareAndMarkState(id string, expectedFrom model.AllocationState, to model.AllocationState, now time.Time, message string) (model.AllocationStatus, bool)
 
+	// SaveIfState replaces the full allocation record only when the current state
+	// equals expectedFrom. Returns false when the allocation is missing or the
+	// state does not match. Used to commit provisioned runner labels without
+	// overwriting a concurrent cancel/expire transition.
+	SaveIfState(status model.AllocationStatus, expectedFrom model.AllocationState) (bool, error)
+
 	// SaveIfCapacity saves status only when the number of scheduler-accounted
 	// allocations for the same pool/backend (reserved|ready|warm), excluding this
 	// allocation id, is strictly below maxRunners. When tenantQuota > 0 the same

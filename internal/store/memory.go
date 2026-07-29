@@ -89,6 +89,18 @@ func (m *Memory) CompareAndMarkState(id string, expectedFrom model.AllocationSta
 	return status, true
 }
 
+func (m *Memory) SaveIfState(status model.AllocationStatus, expectedFrom model.AllocationState) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	current, ok := m.allocations[status.ID]
+	if !ok || current.State != expectedFrom {
+		return false, nil
+	}
+	m.allocations[status.ID] = status
+	return true, nil
+}
+
 func (m *Memory) SaveIfCapacity(status model.AllocationStatus, maxRunners int, tenantQuota int) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
