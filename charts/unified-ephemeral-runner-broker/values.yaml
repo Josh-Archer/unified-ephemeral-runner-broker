@@ -118,9 +118,18 @@ config:
       scheduler: round-robin
       fairShare:
         enabled: false
+        # Lane weights (higher = higher priority). Example lanes: deploy > pr > smoke.
         priorityClasses:
           normal: 1
           high: 2
+          # smoke: 1
+          # pr: 2
+          # deploy: 3
+        # Soft-hold slots per backend for higher lanes so low traffic cannot
+        # fill maxRunners. Requires fairShare.enabled: true.
+        # softReserves:
+        #   high: 1
+        #   deploy: 1
       capabilityProfile: full
       backends:
         arc:
@@ -147,6 +156,12 @@ config:
         priorityClasses:
           normal: 1
           high: 2
+          # smoke: 1
+          # pr: 2
+          # deploy: 3
+        # softReserves:
+        #   high: 1
+        #   deploy: 1
       capabilityProfile: lite
       backends:
         arc:

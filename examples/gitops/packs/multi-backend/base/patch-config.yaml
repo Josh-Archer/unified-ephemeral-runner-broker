@@ -46,8 +46,14 @@ data:
         fairShare:
           enabled: true
           priorityClasses:
+            smoke: 1
+            pr: 2
+            deploy: 3
             normal: 1
             high: 2
+          softReserves:
+            deploy: 1
+            high: 1
         capabilityProfile: lite
         backends:
           arc:

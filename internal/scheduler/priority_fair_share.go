@@ -83,7 +83,7 @@ func (s *priorityFairShareState) Reserve(pool model.PoolConfig, request model.Al
 		if !ok {
 			return "", ErrUnknownBackend
 		}
-		if !backendAvailable(cfg, s.active[pool.Name][*pinned]) {
+		if !backendAvailableForPriority(cfg, s.active[pool.Name][*pinned], pool, request.PriorityClass) {
 			return "", ErrNoCapacity
 		}
 		s.active[pool.Name][*pinned]++
@@ -118,7 +118,7 @@ func (s *priorityFairShareState) Reserve(pool model.PoolConfig, request model.Al
 		candidate := backends[(start+offset)%len(backends)]
 		cfg := pool.Backends[candidate]
 		active := s.active[pool.Name][candidate]
-		if !backendAvailable(cfg, active) {
+		if !backendAvailableForPriority(cfg, active, pool, request.PriorityClass) {
 			continue
 		}
 
@@ -202,14 +202,66 @@ func priorityFairShareScore(activeTotal, tenantActive, weight int) int {
 	return activeTotal*priorityShareScale + tenantPenalty - (weight-1)*priorityShareClassBoost
 }
 
+// backendAvailableForPriority reports whether a backend has free capacity for
+// the given priority class after soft reserves for higher lanes are held back.
+func backendAvailableForPriority(cfg model.BackendConfig, active int, pool model.PoolConfig, priorityClass string) bool {
+	if !cfg.Enabled || !cfg.Healthy {
+		return false
+	}
+	return active < EffectiveMaxRunners(cfg.MaxRunners, pool.FairShare, priorityClass)
+}
+
+// SoftReserveHeld returns how many slots on each backend are soft-reserved for
+// priority classes (lanes) with weight strictly greater than the request.
+// Lower-weight traffic cannot consume those slots; higher-weight traffic sees
+// the full maxRunners budget.
+func SoftReserveHeld(fairShare model.FairShareConfig, requestPriorityClass string) int {
+	if !fairShare.Enabled || len(fairShare.SoftReserves) == 0 {
+		return 0
+	}
+	requestWeight := priorityClassWeight(fairShare, requestPriorityClass)
+	held := 0
+	for class, slots := range fairShare.SoftReserves {
+		if slots <= 0 {
+			continue
+		}
+		if priorityClassWeight(fairShare, class) > requestWeight {
+			held += slots
+		}
+	}
+	return held
+}
+
+// EffectiveMaxRunners is the per-backend concurrency limit visible to a request
+// after higher-lane soft reserves are subtracted. Never returns a negative value.
+// When fair-share is disabled or softReserves is empty, returns maxRunners unchanged.
+func EffectiveMaxRunners(maxRunners int, fairShare model.FairShareConfig, requestPriorityClass string) int {
+	if maxRunners <= 0 {
+		return 0
+	}
+	held := SoftReserveHeld(fairShare, requestPriorityClass)
+	if held <= 0 {
+		return maxRunners
+	}
+	effective := maxRunners - held
+	if effective < 0 {
+		return 0
+	}
+	return effective
+}
+
 func normalizePriorityClassWeight(pool model.PoolConfig, requestPriorityClass string) int {
+	return priorityClassWeight(pool.FairShare, requestPriorityClass)
+}
+
+func priorityClassWeight(fairShare model.FairShareConfig, requestPriorityClass string) int {
 	normalized := strings.TrimSpace(strings.ToLower(requestPriorityClass))
 	if normalized == "" {
 		return defaultNormalPriorityClass
 	}
 
-	if pool.FairShare.PriorityClasses != nil {
-		if weight, ok := pool.FairShare.PriorityClasses[normalized]; ok && weight > 0 {
+	if fairShare.PriorityClasses != nil {
+		if weight, ok := fairShare.PriorityClasses[normalized]; ok && weight > 0 {
 			return weight
 		}
 	}

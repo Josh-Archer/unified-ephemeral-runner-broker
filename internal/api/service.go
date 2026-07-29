@@ -171,7 +171,13 @@ func (s *Service) rehydrateSchedulerState() error {
 			Tenant:        status.Tenant,
 			PriorityClass: status.PriorityClass,
 		}
-		if _, err := s.reserve(pool, request); err != nil {
+		// Rehydrate under hard maxRunners only: soft reserves must not expire
+		// already-admitted lower-priority work after a restart.
+		rehydratePool := pool
+		if rehydratePool.FairShare.Enabled && len(rehydratePool.FairShare.SoftReserves) > 0 {
+			rehydratePool.FairShare.SoftReserves = nil
+		}
+		if _, err := s.reserve(rehydratePool, request); err != nil {
 			s.expireUnrehydratableAllocation(status, now, fmt.Sprintf("rehydrate skipped: %v", err))
 			continue
 		}
@@ -558,6 +564,8 @@ func (s *Service) prepareAllocation(ctx context.Context, request model.Allocatio
 
 // saveReservedAllocation persists a newly reserved/warm allocation under
 // transactional capacity limits so concurrent replicas cannot over-admit.
+// When fair-share soft reserves are configured, lower-priority lanes see a
+// reduced maxRunners so higher-lane slots remain free under shared capacity.
 func (s *Service) saveReservedAllocation(allocation model.AllocationStatus, pool model.PoolConfig) error {
 	maxRunners := 0
 	if cfg, ok := pool.Backends[allocation.SelectedBackend]; ok {
@@ -565,6 +573,7 @@ func (s *Service) saveReservedAllocation(allocation model.AllocationStatus, pool
 	}
 	tenantQuota := 0
 	if pool.FairShare.Enabled {
+		maxRunners = scheduler.EffectiveMaxRunners(maxRunners, pool.FairShare, allocation.PriorityClass)
 		tenant := strings.TrimSpace(allocation.Tenant)
 		if tenant == "" {
 			tenant = "default"

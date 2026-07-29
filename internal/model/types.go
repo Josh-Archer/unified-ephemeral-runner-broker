@@ -49,6 +49,12 @@ type PriorityClass string
 const (
 	PriorityClassNormal PriorityClass = "normal"
 	PriorityClassHigh   PriorityClass = "high"
+	// Optional lane names commonly used with fairShare.priorityClasses /
+	// fairShare.softReserves (for example deploy > pr > smoke). Configure weights
+	// and soft reserves explicitly; these constants are documentation aids only.
+	PriorityClassDeploy PriorityClass = "deploy"
+	PriorityClassPR     PriorityClass = "pr"
+	PriorityClassSmoke  PriorityClass = "smoke"
 )
 
 type GitHubScope struct {
@@ -257,8 +263,19 @@ type FairShareConfig struct {
 	Enabled         bool           `yaml:"enabled" json:"enabled"`
 	UsageWindow     time.Duration  `yaml:"usageWindow,omitempty" json:"usageWindow,omitempty"`
 	StarvationAfter time.Duration  `yaml:"starvationAfter,omitempty" json:"starvationAfter,omitempty"`
+	// PriorityClasses maps priority_class / lane names to positive weights.
+	// Higher weight ranks better under fair-share scoring and is treated as a
+	// higher lane for soft-reserve protection (for example deploy:3, pr:2, smoke:1).
 	PriorityClasses map[string]int `yaml:"priorityClasses,omitempty" json:"priorityClasses,omitempty"`
-	Quotas          map[string]int `yaml:"quotas,omitempty" json:"quotas,omitempty"`
+	// SoftReserves holds slots per priority class (or lane) on each backend so
+	// lower-weight classes cannot fill maxRunners and starve higher lanes.
+	// A request only sees soft reserves for classes with strictly higher weight
+	// as unavailable capacity: effectiveMax = maxRunners - sum(higher softReserves).
+	// Soft reserves never exceed hard maxRunners for the protected class itself.
+	SoftReserves map[string]int `yaml:"softReserves,omitempty" json:"softReserves,omitempty"`
+	// Quotas are optional hard caps on concurrent active allocations per tenant
+	// (repo, workflow label, or other queue identity passed as tenant).
+	Quotas map[string]int `yaml:"quotas,omitempty" json:"quotas,omitempty"`
 }
 
 type PoolConfig struct {

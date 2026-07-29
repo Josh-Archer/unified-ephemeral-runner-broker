@@ -59,9 +59,9 @@ pools:
 
 Backend weights continue to apply via `weighted-round-robin`.
 
-### Adjust priority class weights
+### Adjust priority class / lane weights
 
-Higher weight means that tenants using that priority class are penalized less and can dispatch sooner when capacity is available:
+Higher weight means a higher lane: better fair-share ranking and protection from lower-lane soft reserves. Use named lanes (for example `deploy` > `pr` > `smoke`) or the built-in `high` / `normal` aliases:
 
 ```yaml
 pools:
@@ -69,12 +69,34 @@ pools:
     fairShare:
       enabled: true
       priorityClasses:
+        smoke: 1
+        pr: 2
+        deploy: 3
         normal: 1
-        high: 3
-        critical: 5
+        high: 2
 ```
 
-Allocation requests must include `priority_class: critical` to benefit from the higher weight.
+Allocation requests must include matching `priority_class` values (for example `priority_class: deploy`).
+
+### Soft-reserve high-risk lanes
+
+Soft reserves hold per-backend slots that lower-weight classes cannot consume, so concurrent PR/smoke traffic does not starve deploy under shared `maxRunners`:
+
+```yaml
+pools:
+  - name: lite
+    fairShare:
+      enabled: true
+      priorityClasses:
+        smoke: 1
+        pr: 2
+        deploy: 3
+      softReserves:
+        deploy: 1
+        pr: 1
+```
+
+With `maxRunners: 4` and the reserves above, smoke sees `effectiveMax = 2` while deploy still sees the full 4. Soft reserves require `fairShare.enabled: true` and do not preempt running jobs.
 
 ### Cap concurrent allocations per tenant
 
@@ -88,7 +110,7 @@ pools:
         release: 10
 ```
 
-Once a tenant reaches its quota of active allocations, further reserves for that tenant fail with a quota error until capacity is released. Other tenants are unaffected.
+Once a tenant reaches its quota of active allocations, further reserves for that tenant fail with a quota error until capacity is released. Other tenants are unaffected. Use the allocate-runner `tenant` input for repo or workflow labels.
 
 ### Send tenant and priority in a workflow
 
@@ -98,10 +120,10 @@ Once a tenant reaches its quota of active allocations, further reserves for that
     broker_url: https://broker.example.com
     pool: lite
     tenant: release-pipeline
-    priority_class: high
+    priority_class: deploy
 ```
 
-Allocations without a `tenant` value use the `default` tenant bucket. The broker does not preempt active runners. Priority only affects dispatch choice when capacity is available.
+Allocations without a `tenant` value use the `default` tenant bucket. The broker does not preempt active runners. Soft reserves and priority weights shape new admissions only.
 
 ## Scheduler Selection
 
