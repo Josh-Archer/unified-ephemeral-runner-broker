@@ -29,6 +29,8 @@ type Observer interface {
 	ObserveAllocationResult(model.PoolName, model.BackendName, string, time.Duration)
 	ObserveLaunchLatency(model.PoolName, model.BackendName, string, time.Duration)
 	ObserveRegistrationLatency(model.PoolName, model.BackendName, time.Duration)
+	ObserveFinalization(model.PoolName, model.BackendName, string, time.Duration)
+	ObserveCancellation(model.PoolName, model.BackendName, string, time.Duration)
 	ObserveActiveAllocations([]model.AllocationStatus)
 	ObserveCapacity(model.BrokerConfig, []model.AllocationStatus)
 	ObserveBackendCircuitState([]backendCircuitSnapshot)
@@ -51,6 +53,9 @@ func (noopObserver) ObserveAllocationResult(model.PoolName, model.BackendName, s
 }
 func (noopObserver) ObserveLaunchLatency(model.PoolName, model.BackendName, string, time.Duration) {}
 func (noopObserver) ObserveRegistrationLatency(model.PoolName, model.BackendName, time.Duration) {
+}
+func (noopObserver) ObserveFinalization(model.PoolName, model.BackendName, string, time.Duration) {}
+func (noopObserver) ObserveCancellation(model.PoolName, model.BackendName, string, time.Duration) {
 }
 func (noopObserver) ObserveActiveAllocations([]model.AllocationStatus)            {}
 func (noopObserver) ObserveCapacity(model.BrokerConfig, []model.AllocationStatus) {}
@@ -100,19 +105,23 @@ const (
 )
 
 type PrometheusObserver struct {
-	allocationLatency   *prometheus.HistogramVec
-	launchLatency       *prometheus.HistogramVec
-	registrationLatency *prometheus.HistogramVec
-	allocations         *prometheus.CounterVec
-	queueDepth          *prometheus.GaugeVec
-	capacityUtilization *prometheus.GaugeVec
-	circuitState        *prometheus.GaugeVec
-	circuitTransitions  *prometheus.CounterVec
-	admissionRejections *prometheus.CounterVec
-	probeResults        *prometheus.CounterVec
-	tierState           *prometheus.GaugeVec
-	tierFallbacks       *prometheus.CounterVec
-	tierBlocked         *prometheus.CounterVec
+	allocationLatency     *prometheus.HistogramVec
+	launchLatency         *prometheus.HistogramVec
+	registrationLatency   *prometheus.HistogramVec
+	finalizationLatency   *prometheus.HistogramVec
+	cancellationLatency   *prometheus.HistogramVec
+	allocations           *prometheus.CounterVec
+	finalizations         *prometheus.CounterVec
+	cancellations         *prometheus.CounterVec
+	queueDepth            *prometheus.GaugeVec
+	capacityUtilization   *prometheus.GaugeVec
+	circuitState          *prometheus.GaugeVec
+	circuitTransitions    *prometheus.CounterVec
+	admissionRejections   *prometheus.CounterVec
+	probeResults          *prometheus.CounterVec
+	tierState             *prometheus.GaugeVec
+	tierFallbacks         *prometheus.CounterVec
+	tierBlocked           *prometheus.CounterVec
 	liveCapacityFree      *prometheus.GaugeVec
 	liveCapacityStale     *prometheus.GaugeVec
 	liveCapacityDecisions *prometheus.CounterVec
@@ -129,25 +138,44 @@ func NewPrometheusObserver(registerer prometheus.Registerer) *PrometheusObserver
 		registerer = prometheus.DefaultRegisterer
 	}
 
+	latencyBuckets := []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 90}
 	return &PrometheusObserver{
 		allocationLatency: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "uecb_allocation_latency_seconds",
 			Help:    "End-to-end allocation latency from broker admission through backend provisioning.",
-			Buckets: []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 90},
+			Buckets: latencyBuckets,
 		}, []string{"pool", "backend", "result"}),
 		launchLatency: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "uecb_launch_latency_seconds",
 			Help:    "Backend launch latency for a selected ephemeral runner.",
-			Buckets: []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 90},
+			Buckets: latencyBuckets,
 		}, []string{"pool", "backend", "launch_mode"}),
 		registrationLatency: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "uecb_registration_latency_seconds",
 			Help:    "Observed latency until a provisioned runner registration response is available to the broker.",
-			Buckets: []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 90},
+			Buckets: latencyBuckets,
 		}, []string{"pool", "backend"}),
+		finalizationLatency: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "uecb_finalization_latency_seconds",
+			Help:    "Latency of allocation finalize (complete/fail) callbacks.",
+			Buckets: latencyBuckets,
+		}, []string{"pool", "backend", "result"}),
+		cancellationLatency: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "uecb_cancellation_latency_seconds",
+			Help:    "Latency of allocation cancel requests.",
+			Buckets: latencyBuckets,
+		}, []string{"pool", "backend", "result"}),
 		allocations: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "uecb_allocations_total",
 			Help: "Allocation attempts by pool, backend, and result.",
+		}, []string{"pool", "backend", "result"}),
+		finalizations: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "uecb_finalizations_total",
+			Help: "Allocation finalize callbacks by pool, backend, and result (completed, failed, error).",
+		}, []string{"pool", "backend", "result"}),
+		cancellations: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "uecb_cancellations_total",
+			Help: "Allocation cancel requests by pool, backend, and result.",
 		}, []string{"pool", "backend", "result"}),
 		queueDepth: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "uecb_queue_depth",
@@ -232,7 +260,11 @@ func (o *PrometheusObserver) Register(registerer prometheus.Registerer) error {
 		o.allocationLatency,
 		o.launchLatency,
 		o.registrationLatency,
+		o.finalizationLatency,
+		o.cancellationLatency,
 		o.allocations,
+		o.finalizations,
+		o.cancellations,
 		o.queueDepth,
 		o.capacityUtilization,
 		o.circuitState,
@@ -383,6 +415,22 @@ func (o *PrometheusObserver) ObserveLaunchLatency(pool model.PoolName, backend m
 
 func (o *PrometheusObserver) ObserveRegistrationLatency(pool model.PoolName, backend model.BackendName, latency time.Duration) {
 	o.registrationLatency.WithLabelValues(string(pool), string(backend)).Observe(latency.Seconds())
+}
+
+func (o *PrometheusObserver) ObserveFinalization(pool model.PoolName, backend model.BackendName, result string, latency time.Duration) {
+	if result == "" {
+		result = "unknown"
+	}
+	o.finalizations.WithLabelValues(string(pool), string(backend), result).Inc()
+	o.finalizationLatency.WithLabelValues(string(pool), string(backend), result).Observe(latency.Seconds())
+}
+
+func (o *PrometheusObserver) ObserveCancellation(pool model.PoolName, backend model.BackendName, result string, latency time.Duration) {
+	if result == "" {
+		result = "unknown"
+	}
+	o.cancellations.WithLabelValues(string(pool), string(backend), result).Inc()
+	o.cancellationLatency.WithLabelValues(string(pool), string(backend), result).Observe(latency.Seconds())
 }
 
 func (o *PrometheusObserver) ObserveActiveAllocations(statuses []model.AllocationStatus) {

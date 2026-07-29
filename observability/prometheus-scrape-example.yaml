@@ -1,0 +1,35 @@
+# Example Prometheus scrape configuration for the UECB broker.
+# Prefer service annotations (Helm observability.prometheus.scrape=true) when
+# using prometheus-operator or annotation-based discovery.
+
+scrape_configs:
+  - job_name: uecb-broker
+    metrics_path: /metrics
+    scrape_interval: 30s
+    scrape_timeout: 10s
+    static_configs:
+      - targets:
+          - unified-ephemeral-runner-broker.arc-systems.svc.cluster.local:8080
+        labels:
+          service: uecb-broker
+    # Metric labels are limited to operational dimensions:
+    # pool, backend, result, launch_mode, state, reason, route, method, status.
+    # No repository, subject, owner, or secret values appear in labels.
+
+# kubernetes_sd alternative (ServiceMonitor-style):
+# - job_name: uecb-broker-k8s
+#   kubernetes_sd_configs:
+#     - role: service
+#   relabel_configs:
+#     - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scrape]
+#       action: keep
+#       regex: "true"
+#     - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_path]
+#       action: replace
+#       target_label: __metrics_path__
+#       regex: (.+)
+#     - source_labels: [__address__, __meta_kubernetes_service_annotation_prometheus_io_port]
+#       action: replace
+#       regex: ([^:]+)(?::\d+)?;(\d+)
+#       replacement: $1:$2
+#       target_label: __address__

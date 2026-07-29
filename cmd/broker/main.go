@@ -5,8 +5,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/api"
@@ -24,6 +26,7 @@ import (
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/config"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/runtime"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/store"
+	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/telemetry"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/tier"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/webhook"
 )
@@ -33,6 +36,18 @@ func main() {
 	if err != nil {
 		log.Fatalf("load config: %v", err)
 	}
+
+	shutdownTracing, err := telemetry.Setup(context.Background())
+	if err != nil {
+		log.Fatalf("configure tracing: %v", err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownTracing(ctx); err != nil {
+			log.Printf("otel shutdown: %v", err)
+		}
+	}()
 
 	if err := config.ValidateReplicaSafety(cfg, expectedReplicasFromEnv()); err != nil {
 		log.Fatalf("replica safety: %v", err)
@@ -173,8 +188,23 @@ func main() {
 		addr = ":8080"
 	}
 
-	log.Printf("listening on %s stateStore=%s ha=%v", addr, strings.TrimSpace(cfg.Broker.StateStore.Type), useLeaderElection)
-	log.Fatal(http.ListenAndServe(addr, server.Handler()))
+	httpServer := &http.Server{Addr: addr, Handler: server.Handler()}
+	go func() {
+		log.Printf("listening on %s stateStore=%s ha=%v", addr, strings.TrimSpace(cfg.Broker.StateStore.Type), useLeaderElection)
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("listen: %v", err)
+		}
+	}()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	<-stop
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		log.Printf("http shutdown: %v", err)
+	}
 }
 
 func expectedReplicasFromEnv() int {

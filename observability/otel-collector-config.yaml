@@ -1,0 +1,58 @@
+# Example OpenTelemetry Collector configuration for UECB broker traces.
+# Pair with broker env:
+#   OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+#   OTEL_SERVICE_NAME=uecb-broker
+#
+# Span names emitted by the broker:
+#   - HTTP: "METHOD /route" (server spans with W3C traceparent propagation)
+#   - uecb.allocate
+#   - uecb.backend.provision
+#   - uecb.finalize
+#   - uecb.cancel
+#
+# Span attributes (non-PII only):
+#   uecb.pool, uecb.backend, uecb.result, uecb.launch_mode,
+#   uecb.correlation_id, uecb.allocation_id, uecb.state
+# Never labeled with repository, subject, owner, tenant secrets, or tokens.
+
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  batch: {}
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 256
+  # Drop attributes that must never leave the broker boundary if a client
+  # accidentally injects them via baggage.
+  attributes:
+    actions:
+      - key: repository
+        action: delete
+      - key: subject
+        action: delete
+      - key: owner
+        action: delete
+      - key: authorization
+        action: delete
+
+exporters:
+  # Replace with your backend (Jaeger, Tempo, Grafana Cloud, etc.).
+  debug:
+    verbosity: basic
+  # otlp/tempo:
+  #   endpoint: tempo.observability.svc.cluster.local:4317
+  #   tls:
+  #     insecure: true
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, attributes, batch]
+      exporters: [debug]

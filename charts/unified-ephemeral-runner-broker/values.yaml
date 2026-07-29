@@ -23,6 +23,14 @@ observability:
   prometheus:
     scrape: false
     path: /metrics
+  # OpenTelemetry traces (OTLP/HTTP). Empty endpoint keeps the noop provider.
+  otel:
+    enabled: false
+    endpoint: "" # e.g. otel-collector.observability.svc.cluster.local:4318
+    serviceName: uecb-broker
+    insecure: true
+    # Optional sample ratio as OTEL_TRACES_SAMPLER_ARG (0.0-1.0). Empty = always on.
+    sampleRatio: ""
 
 resources:
   requests:
