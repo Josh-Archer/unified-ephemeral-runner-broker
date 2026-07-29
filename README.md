@@ -477,6 +477,7 @@ The published Azure Functions launcher image lives in `docker/azure-functions` a
 - The HTTP dispatch endpoint returns quickly and enqueues the allocation.
 - The broker waits up to 90 seconds for the Azure Functions dispatch controller so a cold-started Function App can return its admission response.
 - A queue-triggered function execution runs the ephemeral GitHub runner inside the same Function App container.
+- A timer-triggered status reaper deletes terminal blobs past TTL and non-terminal blobs past runner timeout + grace so the status container stays bounded without relying only on capacity probes. Capacity GETs still reap opportunistically using the same metadata rules.
 - Use a hosting plan that supports long-running non-HTTP executions, such as Premium or Dedicated with `alwaysOn` enabled. The HTTP request still needs to finish quickly even when the runner job itself can run longer.
 
 ## Provider Runner Images
