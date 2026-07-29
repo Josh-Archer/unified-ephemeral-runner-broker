@@ -21,6 +21,7 @@ import (
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/config"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/scheduler"
+	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/store"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/tier"
 )
 
@@ -278,6 +279,232 @@ func TestFileStoreRehydratesSchedulerCapacity(t *testing.T) {
 	}
 	if _, err := restarted.Allocate(context.Background(), model.AllocationRequest{Pool: model.PoolFull, JobTimeout: time.Minute}); !errors.Is(err, scheduler.ErrNoCapacity) {
 		t.Fatalf("expected persisted active allocation to consume capacity, got %v", err)
+	}
+}
+
+// recordingRestartObserver captures restart-orphan metrics for tests.
+type recordingRestartObserver struct {
+	noopObserver
+	stateLoss   []string
+	orphanCalls []struct {
+		backend model.BackendName
+		reason  string
+		count   int
+	}
+}
+
+func (o *recordingRestartObserver) ObserveProcessLocalStateLoss(storeType string) {
+	o.stateLoss = append(o.stateLoss, storeType)
+}
+
+func (o *recordingRestartObserver) ObserveRestartOrphans(backend model.BackendName, reason string, count int) {
+	o.orphanCalls = append(o.orphanCalls, struct {
+		backend model.BackendName
+		reason  string
+		count   int
+	}{backend: backend, reason: reason, count: count})
+}
+
+func TestMemoryStoreRestartLosesInFlightAllocations(t *testing.T) {
+	// Chaos-style drill: allocate under in-memory store, simulate process
+	// restart with a new Service, and assert the prior ready runner is gone so
+	// capacity is free again (the core failure mode of non-HA memory).
+	cfg := config.Default()
+	cfg.Broker.StateStore = model.StateStoreConfig{Type: store.TypeMemory}
+	cfg.Pools[0].Backends[model.BackendARC] = model.BackendConfig{
+		Enabled:    true,
+		Healthy:    true,
+		MaxRunners: 1,
+		Template:   "arc-full",
+	}
+
+	first := NewService(cfg, backend.NewRegistry(testBackend{name: model.BackendARC}), nil)
+	observer := &recordingRestartObserver{}
+	first.SetObserver(observer)
+
+	allocation, err := first.Allocate(context.Background(), model.AllocationRequest{Pool: model.PoolFull, JobTimeout: time.Minute})
+	if err != nil {
+		t.Fatalf("allocate: %v", err)
+	}
+	if allocation.State != model.StateReady {
+		t.Fatalf("expected ready, got %s", allocation.State)
+	}
+
+	// "Restart": brand-new memory store, no shared state.
+	restarted := NewService(cfg, backend.NewRegistry(testBackend{name: model.BackendARC}), nil)
+	restartObserver := &recordingRestartObserver{}
+	restarted.SetObserver(restartObserver)
+	// Observer is attached after construction; re-run reconcile under the recorder.
+	if err := restarted.reconcileRestartOrphans(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if len(restartObserver.stateLoss) != 1 || restartObserver.stateLoss[0] != store.TypeMemory {
+		t.Fatalf("expected process-local memory state-loss metric, got %#v", restartObserver.stateLoss)
+	}
+	if _, ok := restarted.Get(allocation.ID); ok {
+		t.Fatal("memory restart must forget prior allocation ids")
+	}
+	// Capacity free again (over-admit risk without capacity-gap holds).
+	second, err := restarted.Allocate(context.Background(), model.AllocationRequest{Pool: model.PoolFull, JobTimeout: time.Minute})
+	if err != nil {
+		t.Fatalf("expected capacity free after memory restart, got %v", err)
+	}
+	if second.ID == allocation.ID {
+		t.Fatal("expected a new allocation id after memory restart")
+	}
+}
+
+func TestFileStoreRestartMidAllocateQuarantinesAndCleansUp(t *testing.T) {
+	statePath := t.TempDir() + "/allocations.json"
+	cfg := config.Default()
+	cfg.Broker.StateStore = model.StateStoreConfig{Type: "file", Path: statePath}
+	cfg.Broker.OrphanCleanup.Enabled = true
+	cfg.Broker.OrphanCleanup.QuarantineTTL = 10 * time.Minute
+	cfg.Pools[0].Backends[model.BackendARC] = model.BackendConfig{
+		Enabled:    true,
+		Healthy:    true,
+		MaxRunners: 1,
+		Template:   "arc-full",
+	}
+
+	cleanupSeen := false
+	writerBackend := &testCleanupBackend{
+		testBackend: testBackend{name: model.BackendARC},
+		cleanupSeen: &cleanupSeen,
+	}
+	writer := NewService(cfg, backend.NewRegistry(writerBackend), nil)
+	// Simulate crash after Save(reserved) and after Provision returned a label
+	// that never made it into the ready Save.
+	if err := writer.store.Save(model.AllocationStatus{
+		ID:              "mid-alloc-1",
+		Pool:            model.PoolFull,
+		SelectedBackend: model.BackendARC,
+		State:           model.StateReserved,
+		ExpiresAt:       time.Now().Add(30 * time.Minute),
+	}); err != nil {
+		t.Fatalf("seed reserved: %v", err)
+	}
+
+	cleanupSeen = false
+	restartedBackend := &testCleanupBackend{
+		testBackend: testBackend{name: model.BackendARC},
+		cleanupSeen: &cleanupSeen,
+	}
+	restartObserver := &recordingRestartObserver{}
+	restarted := NewService(cfg, backend.NewRegistry(restartedBackend), nil)
+	// Construction already ran reconcile; attach observer and assert store outcome.
+	restarted.SetObserver(restartObserver)
+
+	status, ok := restarted.Get("mid-alloc-1")
+	if !ok {
+		t.Fatal("expected mid-allocate record to remain visible")
+	}
+	if status.State != model.StateQuarantined {
+		t.Fatalf("expected quarantined mid-allocate record, got %s (%q)", status.State, status.Error)
+	}
+	if !strings.Contains(status.Error, "mid-allocate") && !strings.Contains(status.Error, "restart reconcile") {
+		t.Fatalf("expected restart reconcile reason, got %q", status.Error)
+	}
+	if status.RunnerLabel == "" {
+		t.Fatal("expected reconstructed runner label for cleanup")
+	}
+	if !cleanupSeen {
+		t.Fatal("expected CleanupBackend.Cleanup for reconstructed mid-allocate runner")
+	}
+	// Slot freed: new allocate should succeed against maxRunners=1.
+	if _, err := restarted.Allocate(context.Background(), model.AllocationRequest{Pool: model.PoolFull, JobTimeout: time.Minute}); err != nil {
+		t.Fatalf("expected capacity released after mid-allocate quarantine, got %v", err)
+	}
+}
+
+func TestMemoryStoreRestartCapacityGapCreatesHolds(t *testing.T) {
+	cfg := config.Default()
+	cfg.Broker.StateStore = model.StateStoreConfig{Type: store.TypeMemory}
+	cfg.Broker.DefaultJobTimeout = 15 * time.Minute
+	// Enable codebuild on lite with capacity reporter claiming 2 active runners
+	// while the local memory store is empty after "restart".
+	for i := range cfg.Pools {
+		if cfg.Pools[i].Name != model.PoolLite {
+			continue
+		}
+		for name, backendCfg := range cfg.Pools[i].Backends {
+			backendCfg.Enabled = name == model.BackendCodeBuild
+			backendCfg.Healthy = true
+			if name == model.BackendCodeBuild {
+				backendCfg.MaxRunners = 3
+			}
+			cfg.Pools[i].Backends[name] = backendCfg
+		}
+	}
+
+	capBackend := &capacityTestBackend{
+		testBackend: testBackend{name: model.BackendCodeBuild},
+		status: backend.CapacityStatus{
+			MaxRunners:    3,
+			ActiveRunners: 2,
+		},
+	}
+	// Construction runs restart reconciliation against the capacity backend.
+	service := NewService(cfg, backend.NewRegistry(testBackend{name: model.BackendARC}, capBackend), nil)
+
+	holds := 0
+	for _, status := range service.store.List() {
+		if status.Metadata[restartOrphanHoldMetadataKey] == restartOrphanHoldMetadataVal {
+			holds++
+			if status.State != model.StateReserved {
+				t.Fatalf("expected reserved hold, got %s", status.State)
+			}
+			if status.SelectedBackend != model.BackendCodeBuild {
+				t.Fatalf("unexpected hold backend %s", status.SelectedBackend)
+			}
+		}
+	}
+	if holds != 2 {
+		t.Fatalf("expected 2 restart orphan holds, got %d", holds)
+	}
+
+	// Only one free local slot remains (max 3, 2 holds) so a third allocate works
+	// and a fourth must fail.
+	if _, err := service.Allocate(context.Background(), model.AllocationRequest{Pool: model.PoolLite, JobTimeout: time.Minute}); err != nil {
+		t.Fatalf("expected one free slot after holds, got %v", err)
+	}
+	if _, err := service.Allocate(context.Background(), model.AllocationRequest{Pool: model.PoolLite, JobTimeout: time.Minute}); !errors.Is(err, scheduler.ErrNoCapacity) {
+		t.Fatalf("expected no capacity after holds absorb orphans, got %v", err)
+	}
+
+	// Metrics fire when reconcile runs with an observer attached. Drop holds so
+	// the capacity gap is visible again, then re-run.
+	observer := &recordingRestartObserver{}
+	service.SetObserver(observer)
+	for _, status := range service.store.List() {
+		if status.Metadata[restartOrphanHoldMetadataKey] != restartOrphanHoldMetadataVal {
+			continue
+		}
+		if pool, err := service.resolvePool(status.Pool); err == nil {
+			service.release(context.Background(), pool, status.SelectedBackend, status)
+		}
+		_ = service.store.Delete(status.ID)
+	}
+	// Also drop the live allocation so local accounted is 0.
+	for _, status := range service.store.List() {
+		if status.State == model.StateReady {
+			if pool, err := service.resolvePool(status.Pool); err == nil {
+				service.release(context.Background(), pool, status.SelectedBackend, status)
+			}
+			_ = service.store.Delete(status.ID)
+		}
+	}
+	if err := service.reconcileRestartOrphans(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	var gapCount int
+	for _, call := range observer.orphanCalls {
+		if call.reason == orphanReasonCapacityGap && call.backend == model.BackendCodeBuild {
+			gapCount += call.count
+		}
+	}
+	if gapCount != 2 {
+		t.Fatalf("expected capacity_gap orphan count 2, got %d calls=%#v", gapCount, observer.orphanCalls)
 	}
 }
 

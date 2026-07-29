@@ -48,13 +48,67 @@ The default state store is in-memory. Supported store types:
 
 | Type | Scope | Use case |
 |------|--------|----------|
-| `memory` | Process-local | Development and single-replica |
+| `memory` | Process-local | Development only (no restart recovery) |
 | `file` | Process-local file on a volume | Single-replica restart recovery |
 | `postgres` | Shared across replicas | Multi-replica high availability |
 
 `memory` and `file` must run with a single broker replica. The Helm chart rejects
 `replicaCount > 1` unless `stateStore.type` is `postgres`, and the broker process
 also refuses to start when `UECB_REPLICAS > 1` with a process-local store.
+
+### Failure mode: in-memory / process-local restart
+
+**`memory` (default) does not survive process restart.** Every allocation record is
+lost when the broker process exits. That creates a concrete failure mode:
+
+1. Workflow allocates a runner; broker admits capacity and provisions a cloud
+   runner (CodeBuild, Lambda, Azure Functions, VM, …).
+2. Broker pod restarts (deploy, OOM, node drain) before
+   `POST /v1/allocations/{id}/complete` or normal expiry.
+3. The new process has an empty store and empty scheduler accounting, so it can
+   **over-admit** new work against the same backend while the previous runners
+   are still executing.
+4. Completions for forgotten allocation IDs return not-found; provider runners
+   stay up until their own job timeout, launcher TTL, or a later capacity-based
+   signal.
+
+A related **mid-allocate** window exists for durable stores (`file` / `postgres`):
+the broker persists `reserved` before `Provision`, then writes `ready` with the
+runner label. A crash between those steps leaves a reserved record without a
+label (and may leave a provider runner already started).
+
+Mitigations:
+
+| Store | What survives restart | Recommended for |
+|-------|----------------------|-----------------|
+| `memory` | Nothing | Local dev only |
+| `file` | Allocation JSON on a mounted volume | Single-replica production |
+| `postgres` | Shared transactional state | Multi-replica / HA |
+
+Prefer `finalize-allocation` in workflow cleanup (`if: always()`) so capacity is
+released even when the broker stays up. Prefer `file` or `postgres` whenever
+cloud backends are enabled.
+
+### Startup restart reconciliation
+
+On service startup the broker:
+
+1. **Rehydrates** scheduler accounting from persisted `reserved`, `ready`, and
+   `warm` allocations (no-op for empty memory). Pending allocations remain
+   queued and are retried by the queue reconciler when `retryAfter` is reached.
+2. **Terminalizes incomplete reserved records** (empty runner label): reconstructs
+   a deterministic default runner label when possible, moves the allocation to
+   `quarantined` (when `orphanCleanup.enabled`) or `expired`, releases capacity,
+   and best-effort `CleanupBackend.Cleanup`.
+3. For **process-local** stores, **probes `Capacity()`** on backends that publish
+   live capacity. When the provider reports more active/pending/warm runners
+   than the local store accounts for, the broker creates synthetic reserved
+   **capacity holds** (`restart-orphan-<backend>-N`) so it does not immediately
+   over-admit, and emits orphan metrics (see [observability.md](observability.md)).
+
+Lost allocation IDs under pure memory cannot be reconstructed; capacity holds and
+metrics/alerts bound the damage until provider runners exit or holds expire
+(`defaultJobTimeout`).
 
 ### Shared transactional state (HA)
 
@@ -79,10 +133,6 @@ broker:
 
 Provide the DSN via `UECB_STATE_STORE_DSN` (chart `stateStore.secretRef`) rather
 than inline config when possible.
-
-On service startup, the broker rehydrates scheduler accounting from persisted
-`reserved`, `ready`, and `warm` allocations. Pending allocations remain queued
-and are retried by the queue reconciler when their `retryAfter` time is reached.
 
 ## Queued Admission
 

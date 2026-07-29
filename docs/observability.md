@@ -41,9 +41,9 @@ Core metrics:
 - `uecb_live_capacity_free_slots{backend,source}`: cached provider-reported free runner slots.
 - `uecb_live_capacity_stale{backend}`: `1` when the cached live capacity reading is stale.
 - `uecb_live_capacity_decisions_total{pool,backend,reason}`: live capacity routing decisions (`live`, `provider-full`, `stale-pass-through`, `provider-reject`, …).
-- `uecb_orphan_cleanup_actions_total{pool,backend,action}`: orphan sweep outcomes for allocations past job-timeout without finalize (`expired`, `quarantined`, `quarantine_expired`).
-- `uecb_label_garbage_total{pool,backend,result}`: runner-label reclaim results during orphan cleanup (`reclaimed`, `cleanup_failed`, `no_cleanup_hook`).
-- `uecb_stale_runner_labels{pool,backend,phase}`: gauge of labels still held past TTL (`overdue` before sweep, `quarantined` while held for inspection).
+- `uecb_process_local_state_loss_total{store}`: startups that use a process-local store with no durable allocation history (`memory`). Increments once per broker process start.
+- `uecb_restart_orphans_total{backend,reason}`: orphans detected during startup restart reconciliation (`mid_allocate`, `capacity_gap`, `unrehydratable`).
+- `uecb_orphaned_runners{backend,reason}`: estimated orphaned runners observed at the last startup reconciliation.
 
 Runtime admission metrics change only when a backend has opted into circuit breaking or rate limiting.
 Tier-routing metrics appear when cached decisions are present or tier policies affect allocation.
@@ -75,7 +75,7 @@ Saturated capacity means the scheduler has few or no healthy slots available for
 
 Stuck queue depth means allocations are not moving to terminal states. Check expiration sweeps, backend cancellation behavior, explicit completion callbacks, and quarantine transitions (`quarantined` -> `expired`).
 
-Rising `uecb_orphan_cleanup_actions_total` or non-zero `uecb_stale_runner_labels` usually means workflows are hard-killed or skip `finalize-allocation`. Confirm cleanup jobs use `if: always()`, bound `job_timeout`, and (for cloud backends) that `cleanup_url` is configured so provider runners are torn down with the label.
+Non-zero `uecb_orphaned_runners` or a jump in `uecb_restart_orphans_total` after a broker restart means the process lost (or could not rehydrate) in-flight allocations while providers still report active runners. With `stateStore.type: memory` this is expected on every restart—switch to `file` or `postgres`, keep `finalize-allocation` in workflow cleanup, and inspect synthetic `restart-orphan-*` capacity holds until they expire.
 
 ## Example SLOs
 
