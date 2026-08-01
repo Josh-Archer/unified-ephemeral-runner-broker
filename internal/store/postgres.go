@@ -358,6 +358,7 @@ func (p *Postgres) LoadAdmissionState(ctx context.Context) (AdmissionStateDocume
 		return AdmissionStateDocument{
 			Circuits: map[string]AdmissionCircuitState{},
 			Limits:   map[string]AdmissionRateLimit{},
+			Budgets:  map[string]AdmissionBudgetState{},
 		}, nil
 	}
 	if err != nil {
@@ -373,6 +374,9 @@ func (p *Postgres) LoadAdmissionState(ctx context.Context) (AdmissionStateDocume
 	if doc.Limits == nil {
 		doc.Limits = map[string]AdmissionRateLimit{}
 	}
+	if doc.Budgets == nil {
+		doc.Budgets = map[string]AdmissionBudgetState{}
+	}
 	return doc, nil
 }
 
@@ -382,6 +386,9 @@ func (p *Postgres) SaveAdmissionState(ctx context.Context, doc AdmissionStateDoc
 	}
 	if doc.Limits == nil {
 		doc.Limits = map[string]AdmissionRateLimit{}
+	}
+	if doc.Budgets == nil {
+		doc.Budgets = map[string]AdmissionBudgetState{}
 	}
 	payload, err := json.Marshal(doc)
 	if err != nil {

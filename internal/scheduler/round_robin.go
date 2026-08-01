@@ -2,7 +2,9 @@ package scheduler
 
 import (
 	"errors"
+	"sort"
 
+	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/budget"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 )
 
@@ -33,23 +35,54 @@ func (r *RoundRobin) Active(pool model.PoolName, backend model.BackendName) int 
 	return r.state.Active(pool, backend)
 }
 
+// preferredBackendOrder is the stable default order before cost-class sorting.
+// Cost class is applied as a primary key so cheaper backends are preferred when
+// free capacity is otherwise equal (round-robin still rotates within the order).
+var preferredBackendOrder = []model.BackendName{
+	model.BackendARC,
+	model.BackendCodeBuild,
+	model.BackendLambda,
+	model.BackendCloudRun,
+	model.BackendAzureFunctions,
+	model.BackendAzureVM,
+	model.BackendEC2,
+	model.BackendGCE,
+	model.BackendDesktop,
+}
+
 func orderedBackends(pool model.PoolConfig) []model.BackendName {
-	preferred := []model.BackendName{
-		model.BackendARC,
-		model.BackendCodeBuild,
-		model.BackendLambda,
-		model.BackendCloudRun,
-		model.BackendAzureFunctions,
-		model.BackendAzureVM,
-		model.BackendEC2,
-		model.BackendGCE,
+	type ranked struct {
+		name  model.BackendName
+		cost  int
+		order int
+	}
+	rankIndex := map[model.BackendName]int{}
+	for i, name := range preferredBackendOrder {
+		rankIndex[name] = i
 	}
 
-	result := make([]model.BackendName, 0, len(pool.Backends))
-	for _, candidate := range preferred {
-		if _, ok := pool.Backends[candidate]; ok {
-			result = append(result, candidate)
+	candidates := make([]ranked, 0, len(pool.Backends))
+	for name, cfg := range pool.Backends {
+		order, ok := rankIndex[name]
+		if !ok {
+			order = len(preferredBackendOrder)
 		}
+		candidates = append(candidates, ranked{
+			name:  name,
+			cost:  budget.CostClass(name, cfg),
+			order: order,
+		})
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		if candidates[i].cost != candidates[j].cost {
+			return candidates[i].cost < candidates[j].cost
+		}
+		return candidates[i].order < candidates[j].order
+	})
+
+	result := make([]model.BackendName, 0, len(candidates))
+	for _, candidate := range candidates {
+		result = append(result, candidate.name)
 	}
 	return result
 }

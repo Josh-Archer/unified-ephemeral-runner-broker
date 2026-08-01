@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend"
+	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/budget"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/capacity"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/quality"
@@ -31,6 +32,7 @@ var ErrAllocationCanceled = errors.New("allocation canceled")
 var ErrInvalidCompletionState = errors.New("invalid completion state")
 var ErrBackendTierBlocked = errors.New("backend tier policy blocked allocation")
 var ErrBackendLiveCapacity = errors.New("backend live capacity exhausted")
+var ErrBackendBudgetExceeded = errors.New("backend allocation budget exceeded")
 
 const (
 	defaultWarmTTL = 15 * time.Minute
@@ -56,7 +58,7 @@ type Service struct {
 	admission   *backendAdmission
 	tierMgr     *tier.Manager
 	capacityMgr *capacity.Manager
-	quality     *quality.Tracker
+	budgets     *budget.Tracker
 	warmMu      sync.Mutex
 	initErr     error
 	health      func(context.Context) error
@@ -95,7 +97,7 @@ func newServiceWithStore(cfg model.BrokerConfig, registry *backend.Registry, hea
 		}
 		return nil
 	}
-	qualityCfg := cfg.Broker.QualityAware
+	admissionStore := store.AsAdmissionStateStore(stateStore)
 	service := &Service{
 		cfg:      cfg,
 		registry: registry,
@@ -105,10 +107,10 @@ func newServiceWithStore(cfg model.BrokerConfig, registry *backend.Registry, hea
 		fairShare:   schedulerRegistry.PriorityFairShare(),
 		store:       stateStore,
 		observer:    noopObserver{},
-		admission:   newBackendAdmission(store.AsAdmissionStateStore(stateStore)),
+		admission:   newBackendAdmission(admissionStore),
 		tierMgr:     tier.NewManager(),
 		capacityMgr: capacity.NewManager(),
-		quality:     quality.NewTracker(qualityCfg.Window, qualityCfg.MinSamples),
+		budgets:     budget.NewTracker(admissionStore),
 		health:      health,
 		now:         time.Now,
 	}
@@ -624,6 +626,14 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 		}
 		return model.AllocationStatus{}, err
 	}
+	pool, err = s.filterBackendsByBudget(pool, request)
+	if err != nil {
+		if queued, ok := s.queueAllocation(ctx, request, resultPool, "", err, existing); ok {
+			result = "queued"
+			return queued, nil
+		}
+		return model.AllocationStatus{}, err
+	}
 
 	// Auto (unpinned) selection prefers a backend that already holds idle warm
 	// capacity so cold cloud backends can serve allocate→ready without a cold start.
@@ -774,7 +784,7 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 				launchMode,
 			)
 			s.store.Save(warmAllocation)
-			s.notifyReady(warmAllocation)
+			s.recordBudgetUsage(pool, selected)
 			launchLatency := time.Duration(0)
 			s.observer.ObserveLaunchLatency(pool.Name, selected, launchMode, launchLatency)
 			s.observer.ObserveRegistrationLatency(pool.Name, selected, launchLatency)
@@ -869,7 +879,7 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 		s.store.Save(allocation)
 		s.notifyReady(allocation)
 		s.recordBackendSuccess(pool, selected, s.now())
-		s.recordQualitySuccess(pool.Name, selected, launchLatency)
+		s.recordBudgetUsage(pool, selected)
 		result = "success"
 		allocationID = allocation.ID
 		logAllocationEvent(ctx, "allocation_ready", map[string]string{
@@ -1913,6 +1923,93 @@ func (s *Service) backendActiveCount(pool model.PoolConfig, backendName model.Ba
 	return s.schedulerForPool(pool).Active(pool.Name, backendName)
 }
 
+// filterBackendsByBudget removes backends whose daily/monthly allocation budget
+// is exhausted. Pinned over-budget requests fail with ErrBackendBudgetExceeded.
+// When every remaining backend is over budget the request fails with a clear error.
+func (s *Service) filterBackendsByBudget(pool model.PoolConfig, request model.AllocationRequest) (model.PoolConfig, error) {
+	if s.budgets == nil {
+		return pool, nil
+	}
+	now := s.now()
+	filtered := pool
+	filtered.Backends = make(map[model.BackendName]model.BackendConfig, len(pool.Backends))
+	overBudget := 0
+	budgeted := 0
+	for name, cfg := range pool.Backends {
+		if !cfg.Budget.Enabled {
+			// Keep non-budgeted backends so they remain selectable fallbacks.
+			filtered.Backends[name] = cfg
+			continue
+		}
+		budgeted++
+		decision := s.budgets.Allow(pool.Name, name, cfg.Budget, now)
+		if decision.Allowed {
+			filtered.Backends[name] = cfg
+			continue
+		}
+		overBudget++
+		s.observer.ObserveBudgetBlocked(pool.Name, name, decision.Reason)
+		logAllocationEvent(context.Background(), "budget_skip", map[string]string{
+			"pool":    string(pool.Name),
+			"backend": string(name),
+			"reason":  decision.Reason,
+			"daily":   fmt.Sprintf("%d/%d", decision.DailyUsed, decision.DailyLimit),
+			"monthly": fmt.Sprintf("%d/%d", decision.MonthlyUsed, decision.MonthlyLimit),
+		})
+	}
+	// When every budgeted backend is exhausted, drop remaining entries that are
+	// disabled/unhealthy so the caller gets a clear budget error rather than a
+	// generic no-capacity miss on leftover disabled map entries.
+	if budgeted > 0 && overBudget == budgeted {
+		usable := 0
+		for _, cfg := range filtered.Backends {
+			if cfg.Enabled && cfg.Healthy && cfg.MaxRunners > 0 {
+				usable++
+			}
+		}
+		if usable == 0 {
+			filtered.Backends = map[model.BackendName]model.BackendConfig{}
+		}
+	}
+
+	if request.Backend != nil {
+		cfg, ok := pool.Backends[*request.Backend]
+		if !ok {
+			return model.PoolConfig{}, scheduler.ErrUnknownBackend
+		}
+		if !cfg.Budget.Enabled {
+			return filtered, nil
+		}
+		decision := s.budgets.Allow(pool.Name, *request.Backend, cfg.Budget, now)
+		if decision.Allowed {
+			return filtered, nil
+		}
+		s.observer.ObserveBudgetBlocked(pool.Name, *request.Backend, decision.Reason)
+		return model.PoolConfig{}, fmt.Errorf("pinned backend %q is over budget (%s): %w", *request.Backend, decision.Reason, ErrBackendBudgetExceeded)
+	}
+
+	if len(filtered.Backends) == 0 {
+		if budgeted > 0 && overBudget == budgeted {
+			return model.PoolConfig{}, fmt.Errorf("all eligible backends for pool %q are over budget: %w", pool.Name, ErrBackendBudgetExceeded)
+		}
+		return model.PoolConfig{}, fmt.Errorf("%w for pool %q after budget filtering", scheduler.ErrNoCapacity, pool.Name)
+	}
+	return filtered, nil
+}
+
+func (s *Service) recordBudgetUsage(pool model.PoolConfig, backendName model.BackendName) {
+	if s.budgets == nil {
+		return
+	}
+	cfg, ok := pool.Backends[backendName]
+	if !ok || !cfg.Budget.Enabled {
+		return
+	}
+	s.budgets.Record(pool.Name, backendName, cfg.Budget, s.now())
+	decision := s.budgets.Snapshot(pool.Name, backendName, cfg.Budget, s.now())
+	s.observer.ObserveBudgetUsage(pool.Name, backendName, decision.DailyUsed, decision.DailyLimit, decision.MonthlyUsed, decision.MonthlyLimit)
+}
+
 // filterBackendsByLiveCapacity removes backends whose cached provider capacity
 // reports no free slots, and clamps MaxRunners on the pool snapshot so the
 // scheduler never intentionally exceeds the lower of configured and provider
@@ -2516,6 +2613,9 @@ func queueableError(err error) bool {
 	if errors.Is(err, ErrBackendLiveCapacity) {
 		return false
 	}
+	if errors.Is(err, ErrBackendBudgetExceeded) {
+		return false
+	}
 	if errors.Is(err, scheduler.ErrNoCapacity) {
 		return false
 	}
@@ -2546,6 +2646,9 @@ func queueReason(err error) string {
 	}
 	if errors.Is(err, ErrBackendRateLimited) {
 		return "rate-limited"
+	}
+	if errors.Is(err, ErrBackendBudgetExceeded) {
+		return "budget-exceeded"
 	}
 	if errors.Is(err, ErrBackendCircuitOpen) {
 		return "circuit-open"

@@ -238,6 +238,21 @@ type RateLimitConfig struct {
 	Burst    int           `yaml:"burst,omitempty" json:"burst,omitempty"`
 }
 
+// BudgetConfig is an optional per-backend allocation budget guardrail.
+// When enabled, the broker tracks successful ready allocations against daily
+// and/or monthly operator-set quotas (UTC calendar windows) and marks the
+// backend ineligible once either limit is exceeded. This is orthogonal to
+// tierRouting (provider billing APIs) and rateLimit (short cold-launch windows).
+//
+// Counters are local by default and can be shared across replicas via the
+// admission state document. Pluggable external sources (metrics/cloud APIs)
+// may override reported usage when wired into the budget tracker.
+type BudgetConfig struct {
+	Enabled               bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	MaxAllocationsDaily   int  `yaml:"maxAllocationsDaily,omitempty" json:"maxAllocationsDaily,omitempty"`
+	MaxAllocationsMonthly int  `yaml:"maxAllocationsMonthly,omitempty" json:"maxAllocationsMonthly,omitempty"`
+}
+
 type DesktopConfig struct {
 	Address   string `yaml:"address" json:"address"`
 	CheckPort int    `yaml:"checkPort" json:"checkPort"`
@@ -255,6 +270,10 @@ type BackendConfig struct {
 	// during known CI periods and stay at zero otherwise for cost control.
 	WarmSchedule   *WarmScheduleConfig  `yaml:"warmSchedule,omitempty" json:"warmSchedule,omitempty"`
 	Weight         int                  `yaml:"weight,omitempty" json:"weight,omitempty"`
+	// CostClass ranks relative expense for scheduler tie-breaking when free
+	// capacity is equal. Lower is cheaper. Zero means use the built-in default
+	// for the backend name (cluster-local first, then free-tier cloud, then VMs).
+	CostClass      int                  `yaml:"costClass,omitempty" json:"costClass,omitempty"`
 	MaxJobDuration time.Duration        `yaml:"maxJobDuration,omitempty" json:"maxJobDuration,omitempty"`
 	Capabilities   []string             `yaml:"capabilities,omitempty" json:"capabilities,omitempty"`
 	RunnerLabel    string               `yaml:"runnerLabel,omitempty" json:"runnerLabel,omitempty"`
@@ -262,6 +281,7 @@ type BackendConfig struct {
 	SecretRef      string               `yaml:"secretRef,omitempty" json:"secretRef,omitempty"`
 	CircuitBreaker CircuitBreakerConfig `yaml:"circuitBreaker,omitempty" json:"circuitBreaker,omitempty"`
 	RateLimit      RateLimitConfig      `yaml:"rateLimit,omitempty" json:"rateLimit,omitempty"`
+	Budget         BudgetConfig         `yaml:"budget,omitempty" json:"budget,omitempty"`
 	TierRules      []TierRuleConfig     `yaml:"tierRules,omitempty" json:"tierRules,omitempty"`
 	Desktop        *DesktopConfig       `yaml:"desktop,omitempty" json:"desktop,omitempty"`
 }

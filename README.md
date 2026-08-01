@@ -658,6 +658,41 @@ Supported fallback modes:
 
 Use `observe-only` first, then move a provider or backend rule to `deprioritize` or `disable` after validating Prometheus queries and provider snapshots. Pinned requests fail clearly when the requested backend is tier-blocked.
 
+## Per-Backend Budget and Cost Guardrails
+
+Optional daily/monthly allocation budgets protect free-tier and student backends from retries and stuck runners. Configure per backend; disabled by default.
+
+```yaml
+pools:
+  - name: lite
+    backends:
+      lambda:
+        enabled: true
+        maxRunners: 3
+        costClass: 40   # lower is cheaper; used when free slots are equal
+        budget:
+          enabled: true
+          maxAllocationsDaily: 50
+          maxAllocationsMonthly: 800
+      codebuild:
+        enabled: true
+        maxRunners: 3
+        costClass: 50
+        budget:
+          enabled: true
+          maxAllocationsDaily: 20
+```
+
+Behavior:
+
+- Successful ready allocations (cold or warm consume) count against UTC calendar day/month windows.
+- Over-budget backends are skipped for unpinned requests; pinned over-budget requests fail with a clear error.
+- When only over-budget backends remain, allocation fails fast (not queued).
+- Schedulers order candidates by lower `costClass` first so cheaper backends win when free capacity is otherwise equal; RR/WRR still rotate over that order.
+- Counters share the admission-state document (memory/file/postgres) so multi-replica brokers stay aligned. External metrics/cloud sources can be plugged into the budget tracker for reported usage overrides.
+
+This is complementary to [tier-aware routing](#tier-aware-routing) (provider billing APIs) and per-backend `rateLimit` (short cold-launch windows).
+
 ## Runtime Backend Admission
 
 Backends can opt into circuit breaking and cold-launch rate limiting. This is separate from static `enabled` and `healthy`: operator config is still the hard source of truth, while circuit state is learned at runtime per `pool/backend`.

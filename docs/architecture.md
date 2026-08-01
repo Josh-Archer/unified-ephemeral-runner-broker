@@ -289,11 +289,27 @@ When `broker.liveCapacity.enabled` is true:
 4. Local scheduler reservation remains the broker concurrency authority. If a provider still rejects a provision/reserve for capacity, the broker falls back to another eligible backend (unpinned) or returns a deterministic live-capacity error (pinned).
 5. Stale or failed capacity reads follow `failureMode`: `pass-through` (default) uses local accounting only; `block` treats the backend as unavailable.
 
-Admission order with live capacity enabled:
+Admission order with live capacity and budget guardrails enabled:
 
-static `enabled`/`healthy` → capabilities → timeout → circuit/rate-limit → tier → **live capacity** → scheduler reservation → provision.
+static `enabled`/`healthy` → capabilities → timeout → circuit/rate-limit → tier → live capacity → **budget** → scheduler reservation → provision.
 
 See [adapter-sdk.md](adapter-sdk.md#publishing-capacity) for how SDK and HTTP-dispatch adapters publish capacity.
+
+## Per-Backend Budget and Cost Guardrails
+
+Optional per-backend budgets protect free-tier and student cloud backends from retries and runaway allocation volume. They are independent of `tierRouting` (provider billing APIs) and `rateLimit` (short cold-launch windows).
+
+When `pools[].backends.<name>.budget.enabled` is true:
+
+1. The broker counts **successful ready allocations** (cold provision and warm consume) against UTC calendar windows.
+2. `maxAllocationsDaily` and/or `maxAllocationsMonthly` mark the backend ineligible once either limit is reached.
+3. Unpinned requests skip over-budget backends and continue on cheaper or remaining eligible backends.
+4. Pinned over-budget requests fail immediately with a clear `backend allocation budget exceeded` error.
+5. When every remaining backend is over budget, allocation fails fast (not queued).
+
+Counters are process-local by default and shared across replicas through the same admission-state document used for circuit breakers and rate limits. Operators can also plug an external usage `Source` (metrics scrape or cloud billing API) so reported usage can override local counters without changing the allocation filter path.
+
+Scheduler candidate order is sorted by `costClass` (lower is cheaper) so cheaper backends are preferred when free capacity is otherwise equal; round-robin and weighted rotation still apply over that order. Built-in defaults rank cluster-local (`arc`, `desktop`) cheapest, then free-tier cloud functions, then build services, then VMs. Override with `costClass` on any backend.
 
 ## Tier-Aware Routing
 

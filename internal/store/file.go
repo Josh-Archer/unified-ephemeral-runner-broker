@@ -41,6 +41,7 @@ func NewFile(path string) (*File, error) {
 		admission: AdmissionStateDocument{
 			Circuits: map[string]AdmissionCircuitState{},
 			Limits:   map[string]AdmissionRateLimit{},
+			Budgets:  map[string]AdmissionBudgetState{},
 		},
 		leader: map[string]leaderLeaseSnapshot{},
 	}
