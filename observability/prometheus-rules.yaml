@@ -58,20 +58,20 @@ groups:
           summary: "UECB backend admission is rate limited for {{ $labels.pool }}/{{ $labels.backend }}"
           description: "Cold-launch requests are being rejected by backend rate limiting."
 
-      - alert: UECBOrphanCleanupElevated
-        expr: sum by (pool, backend) (rate(uecb_orphan_cleanup_actions_total[15m])) > 0.01
-        for: 20m
+      - alert: UECBRestartOrphansDetected
+        expr: sum by (backend, reason) (uecb_orphaned_runners) > 0
+        for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "UECB orphan cleanup is reclaiming stale runner labels for {{ $labels.pool }}/{{ $labels.backend }}"
-          description: "Allocations are expiring without finalize (hard job kills or missing cleanup jobs). Check finalize-allocation usage and job_timeout bounds."
+          summary: "UECB restart reconciliation found orphaned runners for {{ $labels.backend }} ({{ $labels.reason }})"
+          description: "Startup detected mid-allocate leftovers or a provider capacity gap after process restart. Prefer file/postgres state stores and finalize-allocation callbacks; inspect restart-orphan capacity holds."
 
-      - alert: UECBStaleRunnerLabels
-        expr: sum by (pool, backend) (uecb_stale_runner_labels) > 0
-        for: 15m
+      - alert: UECBProcessLocalStateLoss
+        expr: increase(uecb_process_local_state_loss_total[15m]) > 0
+        for: 0m
         labels:
           severity: warning
         annotations:
-          summary: "UECB stale runner labels present for {{ $labels.pool }}/{{ $labels.backend }}"
-          description: "Runner labels are overdue for sweep or held in quarantine after job-timeout without finalize."
+          summary: "UECB started with process-local memory state store"
+          description: "In-memory mode forgets in-flight allocations on restart and can orphan cloud runners. Use stateStore.type file (single-replica) or postgres (HA) for production."

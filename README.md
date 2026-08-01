@@ -302,7 +302,9 @@ approximately `job_timeout` plus at most one sweep interval (plus
 
 The broker keeps allocation state in memory by default. Supported modes:
 
-- `memory` — process-local (default, single-replica)
+- `memory` — process-local (default). **Development only:** a process restart
+  drops every in-flight allocation. Cloud runners keep running until provider
+  timeout or workflow finalize, while the new process can over-admit work.
 - `file` — process-local JSON file for single-replica restart recovery
 - `postgres` — shared transactional store for multi-replica HA
 
@@ -329,8 +331,18 @@ reachable Postgres DSN. The chart fails when `replicaCount > 1` unless
 `stateStore.type` is `postgres`. Background sweeps run under a leader lease so
 only one replica drives warm/queue/expiry reconciliation at a time.
 
-On startup, active `reserved`, `ready`, and `warm` allocations are rehydrated
-into scheduler accounting so a restarted broker does not over-admit capacity.
+On startup the broker:
+
+1. Rehydrates active `reserved`, `ready`, and `warm` allocations into scheduler
+   accounting (no-op for empty memory).
+2. Quarantines or expires incomplete mid-allocate `reserved` records (no runner
+   label), releases capacity, and best-effort cleans up reconstructed labels.
+3. For process-local stores, compares provider `Capacity()` with local counts
+   and installs short-lived capacity holds plus metrics when a gap suggests
+   orphaned cloud runners after restart.
+
+Use `file` or `postgres` whenever cloud backends are enabled in production. See
+[docs/architecture.md](docs/architecture.md#failure-mode-in-memory--process-local-restart).
 
 ### Live Backend Capacity
 

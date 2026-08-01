@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
+	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/store"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -39,10 +40,12 @@ type Observer interface {
 	ObserveTierBlocked(model.PoolName, model.BackendName, string)
 	ObserveLiveCapacityState([]liveCapacitySnapshot)
 	ObserveLiveCapacityDecision(model.PoolName, model.BackendName, string, int)
-	// Orphan / label-garbage lifecycle (hard kill without finalize).
-	ObserveOrphanCleanup(model.PoolName, model.BackendName, string)
-	ObserveLabelGarbage(model.PoolName, model.BackendName, string)
-	ObserveStaleRunnerLabels([]staleRunnerLabelSnapshot)
+	// ObserveProcessLocalStateLoss records that a process-local (non-HA) store
+	// started without durable allocation history (typical for memory).
+	ObserveProcessLocalStateLoss(storeType string)
+	// ObserveRestartOrphans records orphans detected during startup reconciliation.
+	// reason is mid_allocate | capacity_gap | unrehydratable.
+	ObserveRestartOrphans(backend model.BackendName, reason string, count int)
 }
 
 type noopObserver struct{}
@@ -66,9 +69,8 @@ func (noopObserver) ObserveTierBlocked(model.PoolName, model.BackendName, string
 func (noopObserver) ObserveLiveCapacityState([]liveCapacitySnapshot)                           {}
 func (noopObserver) ObserveLiveCapacityDecision(model.PoolName, model.BackendName, string, int) {
 }
-func (noopObserver) ObserveOrphanCleanup(model.PoolName, model.BackendName, string) {}
-func (noopObserver) ObserveLabelGarbage(model.PoolName, model.BackendName, string)  {}
-func (noopObserver) ObserveStaleRunnerLabels([]staleRunnerLabelSnapshot)            {}
+func (noopObserver) ObserveProcessLocalStateLoss(string)                            {}
+func (noopObserver) ObserveRestartOrphans(model.BackendName, string, int)           {}
 
 type liveCapacitySnapshot struct {
 	Backend model.BackendName
@@ -117,9 +119,9 @@ type PrometheusObserver struct {
 	liveCapacityFree      *prometheus.GaugeVec
 	liveCapacityStale     *prometheus.GaugeVec
 	liveCapacityDecisions *prometheus.CounterVec
-	orphanCleanupActions  *prometheus.CounterVec
-	labelGarbage          *prometheus.CounterVec
-	staleRunnerLabels     *prometheus.GaugeVec
+	processLocalStateLoss *prometheus.CounterVec
+	restartOrphansTotal   *prometheus.CounterVec
+	orphanedRunners       *prometheus.GaugeVec
 }
 
 func NewPrometheusObserver(registerer prometheus.Registerer) *PrometheusObserver {
@@ -195,18 +197,18 @@ func NewPrometheusObserver(registerer prometheus.Registerer) *PrometheusObserver
 			Name: "uecb_live_capacity_decisions_total",
 			Help: "Live capacity routing decisions by pool, backend, and reason.",
 		}, []string{"pool", "backend", "reason"}),
-		orphanCleanupActions: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "uecb_orphan_cleanup_actions_total",
-			Help: "Orphan cleanup sweep actions for stale allocations (missing finalize / hard job kill).",
-		}, []string{"pool", "backend", "action"}),
-		labelGarbage: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "uecb_label_garbage_total",
-			Help: "Runner label garbage-collection outcomes during orphan cleanup.",
-		}, []string{"pool", "backend", "result"}),
-		staleRunnerLabels: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Name: "uecb_stale_runner_labels",
-			Help: "Active or quarantined allocations holding runner labels past their job-timeout TTL.",
-		}, []string{"pool", "backend", "phase"}),
+		processLocalStateLoss: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "uecb_process_local_state_loss_total",
+			Help: "Broker startups that use a process-local state store with no durable allocation history (memory).",
+		}, []string{"store"}),
+		restartOrphansTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "uecb_restart_orphans_total",
+			Help: "Orphaned allocations or provider runners detected during startup restart reconciliation.",
+		}, []string{"backend", "reason"}),
+		orphanedRunners: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "uecb_orphaned_runners",
+			Help: "Estimated orphaned runners observed at the last startup reconciliation (capacity gap or mid-allocate).",
+		}, []string{"backend", "reason"}),
 	}
 }
 
@@ -231,9 +233,9 @@ func (o *PrometheusObserver) Register(registerer prometheus.Registerer) error {
 		o.liveCapacityFree,
 		o.liveCapacityStale,
 		o.liveCapacityDecisions,
-		o.orphanCleanupActions,
-		o.labelGarbage,
-		o.staleRunnerLabels,
+		o.processLocalStateLoss,
+		o.restartOrphansTotal,
+		o.orphanedRunners,
 	} {
 		if err := registerer.Register(collector); err != nil {
 			if _, ok := err.(prometheus.AlreadyRegisteredError); !ok {
@@ -294,6 +296,30 @@ func (o *PrometheusObserver) ObserveLiveCapacityDecision(pool model.PoolName, ba
 		reason = "unknown"
 	}
 	o.liveCapacityDecisions.WithLabelValues(string(pool), string(backend), reason).Inc()
+}
+
+func (o *PrometheusObserver) ObserveProcessLocalStateLoss(storeType string) {
+	if storeType == "" {
+		storeType = store.TypeMemory
+	}
+	o.processLocalStateLoss.WithLabelValues(storeType).Inc()
+}
+
+func (o *PrometheusObserver) ObserveRestartOrphans(backend model.BackendName, reason string, count int) {
+	if count <= 0 {
+		return
+	}
+	if reason == "" {
+		reason = "unknown"
+	}
+	backendLabel := string(backend)
+	if backendLabel == "" {
+		backendLabel = "unknown"
+	}
+	o.restartOrphansTotal.WithLabelValues(backendLabel, reason).Add(float64(count))
+	// Gauge accumulates across mid-allocate / unrehydratable detections during
+	// a single startup pass; capacity_gap is reported once per backend.
+	o.orphanedRunners.WithLabelValues(backendLabel, reason).Add(float64(count))
 }
 
 type tierDecisionSnapshot struct {

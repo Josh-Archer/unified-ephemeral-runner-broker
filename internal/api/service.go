@@ -98,7 +98,12 @@ func newServiceWithStore(cfg model.BrokerConfig, registry *backend.Registry, hea
 		health:      health,
 		now:         time.Now,
 	}
-	service.initErr = firstErr(storeErr, validateSchedulers(cfg.Pools, schedulerRegistry), service.rehydrateSchedulerState())
+	service.initErr = firstErr(
+		storeErr,
+		validateSchedulers(cfg.Pools, schedulerRegistry),
+		service.rehydrateSchedulerState(),
+		service.reconcileRestartOrphans(context.Background()),
+	)
 	return service
 }
 
@@ -194,6 +199,7 @@ func (s *Service) expireUnrehydratableAllocation(status model.AllocationStatus, 
 		nextState = model.StateFailed
 	}
 	_, _ = s.store.MarkState(status.ID, nextState, now, reason)
+	s.observer.ObserveRestartOrphans(status.SelectedBackend, "unrehydratable", 1)
 	logAllocationEvent(context.Background(), "allocation_rehydrate_skipped", map[string]string{
 		"allocation_id": allocationIDLabel(status.ID),
 		"pool":          string(status.Pool),
@@ -201,6 +207,270 @@ func (s *Service) expireUnrehydratableAllocation(status model.AllocationStatus, 
 		"state":         string(status.State),
 		"reason":        reason,
 	})
+}
+
+const (
+	restartOrphanHoldMetadataKey = "restart_orphan_hold"
+	restartOrphanHoldMetadataVal = "true"
+	orphanReasonMidAllocate      = "mid_allocate"
+	orphanReasonCapacityGap      = "capacity_gap"
+)
+
+// reconcileRestartOrphans runs once at service construction after scheduler
+// rehydration. It covers the process-local / non-HA failure mode where a
+// restart forgets in-flight work or leaves incomplete reserved records:
+//
+//  1. Incomplete reserved allocations (empty runner label) are treated as
+//     mid-allocate crashes: reconstruct a deterministic runner label when
+//     possible, quarantine or expire them, release capacity, and best-effort
+//     Cleanup so provider runners are not left forever.
+//  2. For process-local stores, backends that publish Capacity() are probed.
+//     When the provider reports more active/pending/warm runners than the
+//     local store accounts for, synthetic reserved holds absorb the gap so
+//     the broker does not over-admit while orphans drain, and metrics/alerts
+//     surface the condition.
+//
+// Memory stores always lose allocation history on restart; this path cannot
+// recover lost IDs, only detect capacity gaps and bound over-admission.
+func (s *Service) reconcileRestartOrphans(ctx context.Context) error {
+	if s == nil || s.store == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	now := s.now()
+	storeType := strings.ToLower(strings.TrimSpace(s.cfg.Broker.StateStore.Type))
+	if storeType == "" {
+		storeType = store.TypeMemory
+	}
+
+	if store.IsProcessLocal(storeType) {
+		logAllocationEvent(ctx, "state_store_process_local_startup", map[string]string{
+			"store":   storeType,
+			"warning": "process-local state does not survive multi-replica failover; memory loses all in-flight allocations on restart",
+		})
+		if storeType == store.TypeMemory {
+			s.observer.ObserveProcessLocalStateLoss(storeType)
+			logAllocationEvent(ctx, "state_store_memory_restart", map[string]string{
+				"store":  storeType,
+				"effect": "in-flight allocations forgotten; cloud runners may be orphaned until provider timeout, finalize, or capacity-gap holds expire",
+			})
+		}
+	}
+
+	_ = s.terminalizeIncompleteReserved(ctx, now)
+
+	if store.IsProcessLocal(storeType) {
+		s.reconcileProviderCapacityGaps(ctx, now)
+	}
+
+	s.observeState()
+	return nil
+}
+
+func (s *Service) terminalizeIncompleteReserved(ctx context.Context, now time.Time) int {
+	updated := 0
+	for _, status := range s.store.List() {
+		if status.State != model.StateReserved {
+			continue
+		}
+		if strings.TrimSpace(status.RunnerLabel) != "" {
+			// Reserved with a label is unusual but treat as known work; leave it
+			// for the normal expiry path.
+			continue
+		}
+		// Skip synthetic capacity holds created by this same reconcile pass.
+		if status.Metadata[restartOrphanHoldMetadataKey] == restartOrphanHoldMetadataVal {
+			continue
+		}
+
+		if strings.TrimSpace(status.RunnerLabel) == "" && status.SelectedBackend != "" && status.ID != "" {
+			status.RunnerLabel = backend.DefaultRunnerLabel(status.SelectedBackend, status.ID)
+		}
+
+		nextState := model.StateExpired
+		nextMessage := "restart reconcile: incomplete reserved allocation (mid-allocate)"
+		nextExpiresAt := now
+		if s.cfg.Broker.OrphanCleanup.Enabled {
+			nextState = model.StateQuarantined
+			nextMessage = "restart reconcile: incomplete reserved allocation quarantined"
+			if s.cfg.Broker.OrphanCleanup.QuarantineTTL > 0 {
+				nextExpiresAt = now.Add(s.cfg.Broker.OrphanCleanup.QuarantineTTL)
+			}
+		}
+
+		// Persist reconstructed label before the state transition so Cleanup
+		// receives the best available identity.
+		if err := s.store.Save(status); err != nil {
+			logAllocationEvent(ctx, "allocation_restart_reconcile_failed", map[string]string{
+				"allocation_id": allocationIDLabel(status.ID),
+				"pool":          string(status.Pool),
+				"backend":       string(status.SelectedBackend),
+				"error":         err.Error(),
+			})
+			continue
+		}
+		if _, ok := s.store.MarkState(status.ID, nextState, nextExpiresAt, nextMessage); !ok {
+			continue
+		}
+		if pool, err := s.resolvePool(status.Pool); err == nil {
+			// release frees scheduler capacity rehydrated earlier and best-effort
+			// CleanupBackend.Cleanup for the reconstructed label.
+			s.release(ctx, pool, status.SelectedBackend, status)
+		}
+		s.observer.ObserveRestartOrphans(status.SelectedBackend, orphanReasonMidAllocate, 1)
+		logAllocationEvent(ctx, "allocation_restart_"+string(nextState), map[string]string{
+			"allocation_id": allocationIDLabel(status.ID),
+			"pool":          string(status.Pool),
+			"backend":       string(status.SelectedBackend),
+			"reason":        orphanReasonMidAllocate,
+		})
+		updated++
+	}
+	return updated
+}
+
+func (s *Service) reconcileProviderCapacityGaps(ctx context.Context, now time.Time) {
+	if s.registry == nil {
+		return
+	}
+	seen := map[model.BackendName]struct{}{}
+	for _, pool := range s.cfg.Pools {
+		for backendName, cfg := range pool.Backends {
+			if !cfg.Enabled || !cfg.Healthy {
+				continue
+			}
+			if _, ok := seen[backendName]; ok {
+				continue
+			}
+			seen[backendName] = struct{}{}
+
+			impl, ok := s.registry.Get(backendName)
+			if !ok {
+				continue
+			}
+			capacityBackend, ok := impl.(backend.CapacityBackend)
+			if !ok {
+				continue
+			}
+
+			probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			capStatus, err := capacityBackend.Capacity(probeCtx)
+			cancel()
+			if err != nil {
+				logAllocationEvent(ctx, "restart_capacity_probe_failed", map[string]string{
+					"backend": string(backendName),
+					"error":   err.Error(),
+				})
+				continue
+			}
+
+			providerUsed := capStatus.ActiveRunners + capStatus.PendingRunners + capStatus.WarmRunners
+			if providerUsed < 0 {
+				providerUsed = 0
+			}
+			localUsed := s.countLocalAccounted(backendName)
+			gap := providerUsed - localUsed
+			if gap <= 0 {
+				continue
+			}
+
+			s.observer.ObserveRestartOrphans(backendName, orphanReasonCapacityGap, gap)
+			created := s.createRestartOrphanHolds(pool, backendName, gap, now)
+			logAllocationEvent(ctx, "restart_capacity_gap", map[string]string{
+				"backend":       string(backendName),
+				"provider_used": fmt.Sprintf("%d", providerUsed),
+				"local_used":    fmt.Sprintf("%d", localUsed),
+				"gap":           fmt.Sprintf("%d", gap),
+				"holds_created": fmt.Sprintf("%d", created),
+			})
+		}
+	}
+}
+
+func (s *Service) countLocalAccounted(backendName model.BackendName) int {
+	count := 0
+	for _, status := range s.store.List() {
+		if status.SelectedBackend != backendName {
+			continue
+		}
+		if isSchedulerAccountedState(status.State) {
+			count++
+		}
+	}
+	return count
+}
+
+// createRestartOrphanHolds reserves synthetic slots so a process-local restart
+// that forgot allocation IDs does not immediately over-admit against provider
+// runners that are still running. Holds expire with the default job timeout
+// (or quarantine TTL when orphan cleanup is enabled) and are reaped by SweepExpired.
+func (s *Service) createRestartOrphanHolds(pool model.PoolConfig, backendName model.BackendName, gap int, now time.Time) int {
+	if gap <= 0 {
+		return 0
+	}
+	timeout := s.cfg.Broker.DefaultJobTimeout
+	if timeout <= 0 {
+		timeout = 60 * time.Minute
+	}
+	created := 0
+	for i := 0; i < gap; i++ {
+		id := fmt.Sprintf("restart-orphan-%s-%d", backendName, i)
+		if existing, exists := s.store.Get(id); exists {
+			// Refresh expiry on repeated restarts with the same synthetic id.
+			existing.ExpiresAt = now.Add(timeout)
+			existing.Error = "restart orphan capacity hold refreshed"
+			existing.State = model.StateReserved
+			if existing.Metadata == nil {
+				existing.Metadata = map[string]string{}
+			}
+			existing.Metadata[restartOrphanHoldMetadataKey] = restartOrphanHoldMetadataVal
+			_ = s.store.Save(existing)
+			created++
+			continue
+		}
+
+		hold := model.AllocationStatus{
+			ID:              id,
+			Pool:            pool.Name,
+			SelectedBackend: backendName,
+			Tenant:          "restart-orphan",
+			State:           model.StateReserved,
+			Error:           "capacity hold for provider runners detected after process restart (lost local allocation state)",
+			ExpiresAt:       now.Add(timeout),
+			Metadata: map[string]string{
+				restartOrphanHoldMetadataKey: restartOrphanHoldMetadataVal,
+			},
+		}
+
+		// Prefer reserving into the scheduler so over-admission is bounded.
+		request := model.AllocationRequest{
+			Pool:    pool.Name,
+			Backend: &backendName,
+			Tenant:  hold.Tenant,
+		}
+		if _, err := s.reserve(pool, request); err != nil {
+			// No local scheduler room left; still record a quarantined marker for
+			// observability when orphan cleanup is on.
+			if s.cfg.Broker.OrphanCleanup.Enabled {
+				hold.State = model.StateQuarantined
+				hold.ExpiresAt = now
+				if s.cfg.Broker.OrphanCleanup.QuarantineTTL > 0 {
+					hold.ExpiresAt = now.Add(s.cfg.Broker.OrphanCleanup.QuarantineTTL)
+				}
+				_ = s.store.Save(hold)
+				created++
+			}
+			continue
+		}
+		if err := s.store.Save(hold); err != nil {
+			s.release(context.Background(), pool, backendName, hold)
+			continue
+		}
+		created++
+	}
+	return created
 }
 
 func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest) (model.AllocationStatus, error) {
