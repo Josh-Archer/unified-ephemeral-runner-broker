@@ -21,9 +21,9 @@ type File struct {
 }
 
 type fileSnapshot struct {
-	Allocations map[string]model.AllocationStatus   `json:"allocations"`
-	Admission   AdmissionStateDocument              `json:"admission,omitempty"`
-	Leader      map[string]leaderLeaseSnapshot      `json:"leader,omitempty"`
+	Allocations map[string]model.AllocationStatus `json:"allocations"`
+	Admission   AdmissionStateDocument            `json:"admission,omitempty"`
+	Leader      map[string]leaderLeaseSnapshot    `json:"leader,omitempty"`
 }
 
 type leaderLeaseSnapshot struct {
@@ -115,6 +115,21 @@ func (f *File) CompareAndMarkState(id string, expectedFrom model.AllocationState
 		f.allocations[id] = status
 	}
 	return status, true
+}
+
+func (f *File) SaveIfState(status model.AllocationStatus, expectedFrom model.AllocationState) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	current, ok := f.allocations[status.ID]
+	if !ok || current.State != expectedFrom {
+		return false, nil
+	}
+	f.allocations[status.ID] = status
+	if err := f.persistLocked(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (f *File) SaveIfCapacity(status model.AllocationStatus, maxRunners int, tenantQuota int) error {
