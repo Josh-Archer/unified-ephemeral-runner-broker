@@ -688,13 +688,24 @@ Use warm pools where external cold-start latency dominates.
 
 ### Priority And Fair-Share Scheduling
 
-Pools can opt into tenant-aware dispatch with `fairShare.enabled`. Fair-share **composes** with the pool's backend scheduler (`round-robin` or `weighted-round-robin`):
+Pools can opt into tenant- and lane-aware dispatch with `fairShare.enabled`. Fair-share **composes** with the pool's backend scheduler (`round-robin` or `weighted-round-robin`):
 
-1. **Tenant admission** — enforce optional per-tenant `quotas`, track active usage by tenant and priority class.
-2. **Fair-share ranking** — prefer backends with lower active load and lower active usage for the requesting tenant; higher priority classes reduce the tenant penalty when capacity is available.
-3. **Backend pick** — among backends with equal fair-share scores and free capacity, select using the pool scheduler. With `weighted-round-robin`, backend `weight` values still shape selection; with `round-robin`, each eligible backend gets one slot.
+1. **Tenant admission** — enforce optional per-tenant `quotas` (repo, workflow label, or other queue identity), track active usage by tenant and priority class.
+2. **Soft reserves** — optional `softReserves` hold slots on each backend for higher-weight lanes so concurrent low-priority load cannot fill `maxRunners` and starve deploy/PR gates.
+3. **Fair-share ranking** — prefer backends with lower active load and lower active usage for the requesting tenant; higher priority classes reduce the tenant penalty when capacity is available.
+4. **Backend pick** — among backends with equal fair-share scores and free capacity, select using the pool scheduler. With `weighted-round-robin`, backend `weight` values still shape selection; with `round-robin`, each eligible backend gets one slot.
 
-Recommended configuration (matches the multi-backend pack):
+#### Priority rules
+
+| Rule | Behavior |
+|------|----------|
+| `priorityClasses` weights | Higher weight = higher lane (example: `deploy: 3` > `pr: 2` > `smoke: 1`). Built-in defaults: `high=2`, `normal=1` (and empty). |
+| Soft reserve admission | For a request, `effectiveMax = maxRunners - sum(softReserves[class] where weight(class) > weight(request))`. Lower lanes cannot use those slots. |
+| Higher lane access | Protected classes still see the full `maxRunners` budget (soft reserves do not shrink their own capacity). |
+| Tenant quotas | Hard concurrent caps per `tenant` string across backends in the pool. |
+| No preemption | Active runners are never cancelled for a higher lane; soft reserves only shape *new* admissions. |
+
+Recommended configuration (lane priorities + soft reserve + tenant fair-share):
 
 ```yaml
 pools:
@@ -702,9 +713,15 @@ pools:
     scheduler: weighted-round-robin   # weights apply when fair-share scores tie
     fairShare:
       enabled: true
-      priorityClasses:
-        normal: 1
+      priorityClasses:                # lane / risk tiers (home-style deploy > pr > smoke)
+        smoke: 1
+        pr: 2
+        deploy: 3
+        normal: 1                     # aliases still accepted
         high: 2
+      softReserves:                   # hold slots so low lanes cannot starve high
+        deploy: 1
+        pr: 1
       quotas:                         # optional hard caps on concurrent active allocations
         noisy-team: 4
         release: 20
@@ -719,12 +736,14 @@ pools:
         weight: 2
 ```
 
+With `maxRunners: 4`, `softReserves.deploy: 1`, and `softReserves.pr: 1`, smoke traffic can use at most 2 slots per backend while deploy and pr can still admit into the held capacity.
+
 Allocation requests may include:
 
-- `tenant`: queue, team, or workflow owner used for fair-share accounting
-- `priority_class`: priority class such as `normal` or `high`
+- `tenant`: queue, team, repo, or workflow owner used for fair-share accounting and optional quotas
+- `priority_class`: lane / priority class such as `deploy`, `pr`, `smoke`, `normal`, or `high`
 
-Fair-share does not preempt active runners. Allocations without a tenant use the `default` tenant bucket. Optional `fairShare.quotas` reject new reservations for a tenant once its concurrent active count reaches the configured limit (other tenants are unaffected).
+Fair-share does not preempt active runners. Allocations without a tenant use the `default` tenant bucket. Optional `fairShare.quotas` reject new reservations for a tenant once its concurrent active count reaches the configured limit (other tenants are unaffected). Soft reserves require `fairShare.enabled: true`.
 
 `usageWindow` and `starvationAfter` are reserved config keys and are not applied yet.
 
@@ -733,6 +752,9 @@ Fair-share does not preempt active runners. Allocations without a tenant use the
 | Knob | Role |
 |------|------|
 | `pools[].fairShare.enabled: true` | **Recommended** enable path for tenant/priority admission and ranking |
+| `pools[].fairShare.priorityClasses` | Named lane weights (`deploy` / `pr` / `smoke` or `high` / `normal`) |
+| `pools[].fairShare.softReserves` | Soft-held slots per higher lane so low-priority load cannot block them |
+| `pools[].fairShare.quotas` | Optional hard concurrent caps keyed by `tenant` (repo/workflow label) |
 | `pools[].scheduler: weighted-round-robin` / `round-robin` | Backend selection among equal fair-share scores (weights only for WRR) |
 | `pools[].scheduler: priority-fair-share` | Standalone fair-share backend pick (no weight expansion); same shared scheduler instance as `fairShare.enabled` |
 
@@ -744,7 +766,7 @@ Prefer `fairShare.enabled` plus `weighted-round-robin` or `round-robin`. Setting
     broker_url: https://broker.example.com
     pool: lite
     tenant: release
-    priority_class: high
+    priority_class: deploy
 ```
 
 ## Capability-Aware Routing

@@ -108,13 +108,14 @@ Pools can opt into `weighted-round-robin` instead. Backend weights are configure
 
 Pools can also enable `fairShare`. Fair-share **composes** with the pool backend scheduler rather than replacing it:
 
-1. Optional per-tenant `fairShare.quotas` reject over-quota tenants before backend pick.
-2. Fair-share ranks eligible backends by active load and per-tenant usage; higher `priority_class` weights reduce the tenant penalty when capacity exists.
-3. Among backends with equal fair-share scores and free capacity, the pool scheduler chooses the backend. With `weighted-round-robin`, backend `weight` values still influence the pick; with `round-robin`, each backend has one slot.
+1. Optional per-tenant `fairShare.quotas` reject over-quota tenants before backend pick (`tenant` is typically a repo or workflow label).
+2. Optional `fairShare.softReserves` hold per-backend slots for higher-weight priority classes / lanes (`deploy` > `pr` > `smoke`). Lower lanes see `effectiveMax = maxRunners - sum(higher softReserves)` so concurrent low-priority load cannot fill shared capacity and block high-priority within policy. Higher lanes still see the full `maxRunners` budget.
+3. Fair-share ranks eligible backends by active load and per-tenant usage; higher `priority_class` weights reduce the tenant penalty when capacity exists.
+4. Among backends with equal fair-share scores and free capacity, the pool scheduler chooses the backend. With `weighted-round-robin`, backend `weight` values still influence the pick; with `round-robin`, each backend has one slot.
 
-Allocation requests may include `tenant` and `priority_class`. Priority only affects dispatch choice when capacity is available. The broker does not preempt active runners. `usageWindow` and `starvationAfter` are reserved and unused today.
+Allocation requests may include `tenant` and `priority_class`. Soft reserves and priority weights shape *new* admissions only; the broker does not preempt active runners. Restart rehydration accounts existing work under hard `maxRunners` (soft reserves are not applied) so already-admitted low-priority runners are not expired. `usageWindow` and `starvationAfter` are reserved and unused today.
 
-Recommended path: `fairShare.enabled: true` with `scheduler: weighted-round-robin` or `round-robin`. `scheduler: priority-fair-share` is a standalone fair-share mode without weight expansion and shares the same fair-share state instance as `fairShare.enabled`.
+Recommended path: `fairShare.enabled: true` with `scheduler: weighted-round-robin` or `round-robin`, named `priorityClasses`, and `softReserves` for high-risk lanes. `scheduler: priority-fair-share` is a standalone fair-share mode without weight expansion and shares the same fair-share state instance as `fairShare.enabled`.
 
 ## Runtime Backend Admission
 

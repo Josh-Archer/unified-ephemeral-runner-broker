@@ -24,7 +24,7 @@ inputs:
     required: false
     default: ""
   priority_class:
-    description: Optional priority class, for example normal or high
+    description: Optional priority class / lane, for example normal, high, deploy, pr, or smoke
     required: false
     default: ""
   required_capabilities:

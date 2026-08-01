@@ -46,3 +46,41 @@ func TestHAEnabled(t *testing.T) {
 		t.Fatal("explicit false should disable HA")
 	}
 }
+
+func TestValidateFairShareSoftReserves(t *testing.T) {
+	cfg := Default()
+	for i := range cfg.Pools {
+		if cfg.Pools[i].Name != model.PoolLite {
+			continue
+		}
+		cfg.Pools[i].FairShare.Enabled = true
+		cfg.Pools[i].FairShare.PriorityClasses = map[string]int{
+			"smoke": 1, "deploy": 3,
+		}
+		cfg.Pools[i].FairShare.SoftReserves = map[string]int{"deploy": 1}
+	}
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("valid soft reserves should pass: %v", err)
+	}
+
+	for i := range cfg.Pools {
+		if cfg.Pools[i].Name != model.PoolLite {
+			continue
+		}
+		cfg.Pools[i].FairShare.Enabled = false
+	}
+	if err := Validate(cfg); err == nil {
+		t.Fatal("softReserves without fairShare.enabled should fail")
+	}
+
+	for i := range cfg.Pools {
+		if cfg.Pools[i].Name != model.PoolLite {
+			continue
+		}
+		cfg.Pools[i].FairShare.Enabled = true
+		cfg.Pools[i].FairShare.SoftReserves = map[string]int{"deploy": -1}
+	}
+	if err := Validate(cfg); err == nil {
+		t.Fatal("negative softReserves should fail")
+	}
+}

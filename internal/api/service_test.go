@@ -2545,6 +2545,70 @@ func TestAllocateEnforcesTenantQuotas(t *testing.T) {
 	}
 }
 
+func TestAllocateSoftReservesKeepHighPriorityCapacityUnderLowPriorityLoad(t *testing.T) {
+	// Acceptance: concurrent low-priority load does not block high-priority within policy.
+	service := newServiceWithConfig(func(pool *model.PoolConfig) {
+		if pool.Name != model.PoolLite {
+			return
+		}
+		pool.FairShare.Enabled = true
+		pool.FairShare.PriorityClasses = map[string]int{
+			string(model.PriorityClassSmoke):  1,
+			string(model.PriorityClassPR):     2,
+			string(model.PriorityClassDeploy): 3,
+		}
+		pool.FairShare.SoftReserves = map[string]int{
+			string(model.PriorityClassDeploy): 1,
+		}
+		// Single backend so soft-reserve policy is unambiguous.
+		pool.Backends = map[model.BackendName]model.BackendConfig{
+			model.BackendARC: {
+				Enabled: true, Healthy: true, MaxRunners: 3,
+				Capabilities: []string{"cluster-local"},
+			},
+		}
+	})
+
+	// Fill all non-reserved slots with smoke (low) traffic.
+	for i := 0; i < 2; i++ {
+		_, err := service.Allocate(context.Background(), model.AllocationRequest{
+			Pool:          model.PoolLite,
+			Tenant:        "repo/smoke",
+			PriorityClass: string(model.PriorityClassSmoke),
+			JobTimeout:    5 * time.Minute,
+		})
+		if err != nil {
+			t.Fatalf("smoke allocate #%d failed: %v", i+1, err)
+		}
+	}
+	_, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:          model.PoolLite,
+		Tenant:        "repo/smoke",
+		PriorityClass: string(model.PriorityClassSmoke),
+		JobTimeout:    5 * time.Minute,
+	})
+	if !errors.Is(err, scheduler.ErrNoCapacity) {
+		t.Fatalf("expected smoke to hit soft-reserve wall, got %v", err)
+	}
+
+	// Deploy (high) still gets the soft-reserved slot.
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:          model.PoolLite,
+		Tenant:        "repo/deploy",
+		PriorityClass: string(model.PriorityClassDeploy),
+		JobTimeout:    5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("deploy allocate should use soft-reserved capacity: %v", err)
+	}
+	if allocation.PriorityClass != string(model.PriorityClassDeploy) {
+		t.Fatalf("expected deploy priority metadata, got %q", allocation.PriorityClass)
+	}
+	if allocation.SelectedBackend != model.BackendARC {
+		t.Fatalf("expected arc, got %s", allocation.SelectedBackend)
+	}
+}
+
 type capacityTestBackend struct {
 	testBackend
 	status backend.CapacityStatus

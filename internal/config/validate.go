@@ -35,6 +35,43 @@ func Validate(cfg model.BrokerConfig) error {
 	if err := validateLiveCapacity(cfg.Broker.LiveCapacity); err != nil {
 		return err
 	}
+	if err := validateFairShare(cfg); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateFairShare(cfg model.BrokerConfig) error {
+	for _, pool := range cfg.Pools {
+		fs := pool.FairShare
+		for class, weight := range fs.PriorityClasses {
+			if strings.TrimSpace(class) == "" {
+				return fmt.Errorf("pools[%s].fairShare.priorityClasses includes an empty class name", pool.Name)
+			}
+			if weight <= 0 {
+				return fmt.Errorf("pools[%s].fairShare.priorityClasses[%s] must be positive", pool.Name, class)
+			}
+		}
+		for class, slots := range fs.SoftReserves {
+			if strings.TrimSpace(class) == "" {
+				return fmt.Errorf("pools[%s].fairShare.softReserves includes an empty class name", pool.Name)
+			}
+			if slots < 0 {
+				return fmt.Errorf("pools[%s].fairShare.softReserves[%s] must not be negative", pool.Name, class)
+			}
+		}
+		for tenant, quota := range fs.Quotas {
+			if strings.TrimSpace(tenant) == "" {
+				return fmt.Errorf("pools[%s].fairShare.quotas includes an empty tenant name", pool.Name)
+			}
+			if quota <= 0 {
+				return fmt.Errorf("pools[%s].fairShare.quotas[%s] must be positive", pool.Name, tenant)
+			}
+		}
+		if len(fs.SoftReserves) > 0 && !fs.Enabled {
+			return fmt.Errorf("pools[%s].fairShare.softReserves requires fairShare.enabled", pool.Name)
+		}
+	}
 	return nil
 }
 

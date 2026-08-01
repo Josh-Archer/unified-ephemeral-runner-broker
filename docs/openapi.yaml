@@ -275,11 +275,18 @@ components:
               description: Nanoseconds
         tenant:
           type: string
-          description: Optional tenant or queue identity for fair-share scheduling
+          description: |
+            Optional tenant or queue identity for fair-share scheduling and
+            optional per-tenant quotas (for example a repo name, team, or
+            workflow label).
         priority_class:
           type: string
-          description: Optional priority class (for example normal or high)
-          example: high
+          description: |
+            Optional priority class / lane for fair-share ranking and soft
+            reserves. Common values: `normal`, `high`, or named lanes such as
+            `deploy`, `pr`, and `smoke` when configured under
+            `pools[].fairShare.priorityClasses` and `softReserves`.
+          example: deploy
         labels:
           type: array
           items:
