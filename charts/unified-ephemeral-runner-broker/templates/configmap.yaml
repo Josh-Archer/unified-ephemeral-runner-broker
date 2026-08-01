@@ -18,6 +18,7 @@ data:
       orphanCleanup:
         enabled: {{ .Values.config.broker.orphanCleanup.enabled }}
         quarantineTTL: {{ .Values.config.broker.orphanCleanup.quarantineTTL }}
+        gracePeriod: {{ .Values.config.broker.orphanCleanup.gracePeriod | default "0s" }}
       stateStore:
         type: {{ .Values.config.broker.stateStore.type }}
         {{- if .Values.config.broker.stateStore.path }}

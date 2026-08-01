@@ -74,13 +74,14 @@ pools:
 
 Leaving the `weight` values in place is safe because `round-robin` ignores them. Switch back to `weighted-round-robin` at any time without removing weights.
 
-## Orphan Cleanup
+## Stuck-Allocation Reaper (Orphan Cleanup)
 
 ```yaml
 broker:
   orphanCleanup:
     enabled: false      # default
     quarantineTTL: 15m
+    gracePeriod: 0s     # wait after job_timeout before reaping
 ```
 
 Enable quarantine to hold stale allocations before expiry:
@@ -90,6 +91,7 @@ broker:
   orphanCleanup:
     enabled: true
     quarantineTTL: 10m
+    gracePeriod: 2m
 ```
 
 ## Backend Pinning

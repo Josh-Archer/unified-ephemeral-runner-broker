@@ -27,9 +27,11 @@ func Default() model.BrokerConfig {
 			OrphanCleanup: struct {
 				Enabled       bool          `yaml:"enabled" json:"enabled"`
 				QuarantineTTL time.Duration `yaml:"quarantineTTL" json:"quarantineTTL"`
+				GracePeriod   time.Duration `yaml:"gracePeriod,omitempty" json:"gracePeriod,omitempty"`
 			}{
 				Enabled:       false,
 				QuarantineTTL: 15 * time.Minute,
+				GracePeriod:   0,
 			},
 			API: model.BrokerAPIConfig{
 				OIDCAudience: "uecb-broker",

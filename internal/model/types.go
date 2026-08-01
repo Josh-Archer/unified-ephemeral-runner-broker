@@ -131,9 +131,16 @@ type BrokerRuntimeConfig struct {
 	DefaultPool          PoolName      `yaml:"defaultPool" json:"defaultPool"`
 	DefaultJobTimeout    time.Duration `yaml:"defaultJobTimeout" json:"defaultJobTimeout"`
 	AllowUnauthenticated bool          `yaml:"allowUnauthenticated" json:"allowUnauthenticated"`
-	OrphanCleanup        struct {
+	// OrphanCleanup is the broker-side stuck-allocation reaper. Active
+	// reserved/ready allocations past expires_at (+ optional gracePeriod) are
+	// marked terminal so maxRunners capacity is released when finalize never runs.
+	OrphanCleanup struct {
 		Enabled       bool          `yaml:"enabled" json:"enabled"`
 		QuarantineTTL time.Duration `yaml:"quarantineTTL" json:"quarantineTTL"`
+		// GracePeriod is extra time after job_timeout (allocation expires_at)
+		// before the reaper marks the allocation terminal and releases capacity.
+		// Zero (default) reaps immediately when expires_at is reached.
+		GracePeriod time.Duration `yaml:"gracePeriod,omitempty" json:"gracePeriod,omitempty"`
 	} `yaml:"orphanCleanup" json:"orphanCleanup"`
 	API          BrokerAPIConfig      `yaml:"api" json:"api"`
 	StateStore   StateStoreConfig     `yaml:"stateStore,omitempty" json:"stateStore,omitempty"`

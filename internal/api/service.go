@@ -166,7 +166,7 @@ func (s *Service) rehydrateSchedulerState() error {
 			s.expireUnrehydratableAllocation(status, now, "rehydrate skipped: selected backend is empty")
 			continue
 		}
-		if !status.ExpiresAt.IsZero() && !status.ExpiresAt.After(now) {
+		if !status.ExpiresAt.IsZero() && !status.ExpiresAt.Add(s.reaperGrace()).After(now) {
 			s.expireUnrehydratableAllocation(status, now, "rehydrate skipped: allocation expired")
 			continue
 		}
@@ -1050,11 +1050,28 @@ func (s *Service) Complete(ctx context.Context, id string, request completionReq
 	return updated, true, nil
 }
 
+func (s *Service) reaperGrace() time.Duration {
+	if s == nil {
+		return 0
+	}
+	grace := s.cfg.Broker.OrphanCleanup.GracePeriod
+	if grace < 0 {
+		return 0
+	}
+	return grace
+}
+
+// SweepExpired is the broker-side stuck-allocation reaper. It runs on the HA
+// leader (when multi-replica) and marks reserved/ready allocations past
+// expires_at + gracePeriod as expired (or quarantined), releasing scheduler
+// capacity and invoking provider cleanup hooks.
 func (s *Service) SweepExpired(now time.Time) int {
 	updated := 0
+	grace := s.reaperGrace()
 	for _, status := range s.store.List() {
 		if isActiveAllocationState(status.State) {
-			if status.ExpiresAt.After(now) {
+			// Reap only after job_timeout (expires_at) plus optional grace.
+			if status.ExpiresAt.IsZero() || status.ExpiresAt.Add(grace).After(now) {
 				continue
 			}
 
@@ -1081,7 +1098,13 @@ func (s *Service) SweepExpired(now time.Time) int {
 					// Still attempt provider cleanup when the pool config vanished.
 					s.reclaimStaleRunnerLabel(context.Background(), status)
 				}
-				s.observer.ObserveOrphanCleanup(status.Pool, status.SelectedBackend, orphanAction)
+				s.observer.ObserveAllocationReaped(status.Pool, status.SelectedBackend, string(nextState))
+				logAllocationEvent(context.Background(), "allocation_reaped", map[string]string{
+					"allocation_id": allocationIDLabel(status.ID),
+					"pool":          string(status.Pool),
+					"backend":       string(status.SelectedBackend),
+					"state":         string(nextState),
+				})
 				logAllocationEvent(context.Background(), "allocation_"+string(nextState), map[string]string{
 					"allocation_id": allocationIDLabel(status.ID),
 					"pool":          string(status.Pool),

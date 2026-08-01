@@ -41,9 +41,7 @@ Core metrics:
 - `uecb_live_capacity_free_slots{backend,source}`: cached provider-reported free runner slots.
 - `uecb_live_capacity_stale{backend}`: `1` when the cached live capacity reading is stale.
 - `uecb_live_capacity_decisions_total{pool,backend,reason}`: live capacity routing decisions (`live`, `provider-full`, `stale-pass-through`, `provider-reject`, …).
-- `uecb_process_local_state_loss_total{store}`: startups that use a process-local store with no durable allocation history (`memory`). Increments once per broker process start.
-- `uecb_restart_orphans_total{backend,reason}`: orphans detected during startup restart reconciliation (`mid_allocate`, `capacity_gap`, `unrehydratable`).
-- `uecb_orphaned_runners{backend,reason}`: estimated orphaned runners observed at the last startup reconciliation.
+- `uecb_allocations_reaped_total{pool,backend,result}`: stuck allocations reaped by the broker-side reaper after `job_timeout` (+ optional grace). `result` is `expired` or `quarantined`.
 
 Runtime admission metrics change only when a backend has opted into circuit breaking or rate limiting.
 Tier-routing metrics appear when cached decisions are present or tier policies affect allocation.
@@ -73,7 +71,7 @@ Tier fallback activity means all eligible cloud backends were unavailable under 
 
 Saturated capacity means the scheduler has few or no healthy slots available for a pool/backend. Check `maxRunners`, runner cleanup, and whether completed jobs are leaving allocations in `ready` or `reserved`.
 
-Stuck queue depth means allocations are not moving to terminal states. Check expiration sweeps, backend cancellation behavior, explicit completion callbacks, and quarantine transitions (`quarantined` -> `expired`).
+Stuck queue depth means allocations are not moving to terminal states. Check the stuck-allocation reaper (`SweepExpired` / `uecb_allocations_reaped_total`), backend cancellation behavior, explicit completion callbacks, and quarantine transitions (`quarantined` -> `expired`). A rising reaped rate usually means finalize callbacks are missing or jobs outlive `job_timeout` + `orphanCleanup.gracePeriod`.
 
 Non-zero `uecb_orphaned_runners` or a jump in `uecb_restart_orphans_total` after a broker restart means the process lost (or could not rehydrate) in-flight allocations while providers still report active runners. With `stateStore.type: memory` this is expected on every restart—switch to `file` or `postgres`, keep `finalize-allocation` in workflow cleanup, and inspect synthetic `restart-orphan-*` capacity holds until they expire.
 

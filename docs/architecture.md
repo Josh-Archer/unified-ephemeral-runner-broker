@@ -119,8 +119,11 @@ With `broker.stateStore.type: postgres` the broker:
   replicas cannot exceed `maxRunners` (or fair-share tenant quotas when set).
 - Claims warm runners with compare-and-swap state transitions.
 - Shares circuit-breaker and rate-limit runtime state across replicas.
-- Runs expiry sweeps, warm-pool, queue, and backend-health reconciliation only on
-  the elected leader (lease in PostgreSQL, renewed each background tick).
+- Runs the stuck-allocation reaper (expiry sweeps), warm-pool, queue, and
+  backend-health reconciliation only on the elected leader (lease in PostgreSQL,
+  renewed each background tick). The reaper marks active allocations past
+  `job_timeout` + optional `orphanCleanup.gracePeriod` terminal, releases
+  `maxRunners` capacity, and calls provider cleanup hooks.
 
 ```yaml
 broker:

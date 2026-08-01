@@ -54,6 +54,9 @@ config:
     orphanCleanup:
       enabled: false
       quarantineTTL: 15m
+      # Extra time after job_timeout (expires_at) before the stuck-allocation
+      # reaper marks capacity terminal and invokes provider cleanup.
+      gracePeriod: 0s
     stateStore:
       # memory and file are single-replica only. Use postgres for multi-replica HA.
       type: memory

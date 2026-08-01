@@ -40,12 +40,7 @@ type Observer interface {
 	ObserveTierBlocked(model.PoolName, model.BackendName, string)
 	ObserveLiveCapacityState([]liveCapacitySnapshot)
 	ObserveLiveCapacityDecision(model.PoolName, model.BackendName, string, int)
-	// ObserveProcessLocalStateLoss records that a process-local (non-HA) store
-	// started without durable allocation history (typical for memory).
-	ObserveProcessLocalStateLoss(storeType string)
-	// ObserveRestartOrphans records orphans detected during startup reconciliation.
-	// reason is mid_allocate | capacity_gap | unrehydratable.
-	ObserveRestartOrphans(backend model.BackendName, reason string, count int)
+	ObserveAllocationReaped(model.PoolName, model.BackendName, string)
 }
 
 type noopObserver struct{}
@@ -69,8 +64,7 @@ func (noopObserver) ObserveTierBlocked(model.PoolName, model.BackendName, string
 func (noopObserver) ObserveLiveCapacityState([]liveCapacitySnapshot)                           {}
 func (noopObserver) ObserveLiveCapacityDecision(model.PoolName, model.BackendName, string, int) {
 }
-func (noopObserver) ObserveProcessLocalStateLoss(string)                            {}
-func (noopObserver) ObserveRestartOrphans(model.BackendName, string, int)           {}
+func (noopObserver) ObserveAllocationReaped(model.PoolName, model.BackendName, string) {}
 
 type liveCapacitySnapshot struct {
 	Backend model.BackendName
@@ -103,25 +97,23 @@ const (
 )
 
 type PrometheusObserver struct {
-	allocationLatency     *prometheus.HistogramVec
-	launchLatency         *prometheus.HistogramVec
-	registrationLatency   *prometheus.HistogramVec
-	allocations           *prometheus.CounterVec
-	queueDepth            *prometheus.GaugeVec
-	capacityUtilization   *prometheus.GaugeVec
-	circuitState          *prometheus.GaugeVec
-	circuitTransitions    *prometheus.CounterVec
-	admissionRejections   *prometheus.CounterVec
-	probeResults          *prometheus.CounterVec
-	tierState             *prometheus.GaugeVec
-	tierFallbacks         *prometheus.CounterVec
-	tierBlocked           *prometheus.CounterVec
+	allocationLatency   *prometheus.HistogramVec
+	launchLatency       *prometheus.HistogramVec
+	registrationLatency *prometheus.HistogramVec
+	allocations         *prometheus.CounterVec
+	queueDepth          *prometheus.GaugeVec
+	capacityUtilization *prometheus.GaugeVec
+	circuitState        *prometheus.GaugeVec
+	circuitTransitions  *prometheus.CounterVec
+	admissionRejections *prometheus.CounterVec
+	probeResults        *prometheus.CounterVec
+	tierState           *prometheus.GaugeVec
+	tierFallbacks       *prometheus.CounterVec
+	tierBlocked         *prometheus.CounterVec
 	liveCapacityFree      *prometheus.GaugeVec
 	liveCapacityStale     *prometheus.GaugeVec
 	liveCapacityDecisions *prometheus.CounterVec
-	processLocalStateLoss *prometheus.CounterVec
-	restartOrphansTotal   *prometheus.CounterVec
-	orphanedRunners       *prometheus.GaugeVec
+	allocationsReaped     *prometheus.CounterVec
 }
 
 func NewPrometheusObserver(registerer prometheus.Registerer) *PrometheusObserver {
@@ -197,18 +189,10 @@ func NewPrometheusObserver(registerer prometheus.Registerer) *PrometheusObserver
 			Name: "uecb_live_capacity_decisions_total",
 			Help: "Live capacity routing decisions by pool, backend, and reason.",
 		}, []string{"pool", "backend", "reason"}),
-		processLocalStateLoss: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "uecb_process_local_state_loss_total",
-			Help: "Broker startups that use a process-local state store with no durable allocation history (memory).",
-		}, []string{"store"}),
-		restartOrphansTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "uecb_restart_orphans_total",
-			Help: "Orphaned allocations or provider runners detected during startup restart reconciliation.",
-		}, []string{"backend", "reason"}),
-		orphanedRunners: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Name: "uecb_orphaned_runners",
-			Help: "Estimated orphaned runners observed at the last startup reconciliation (capacity gap or mid-allocate).",
-		}, []string{"backend", "reason"}),
+		allocationsReaped: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "uecb_allocations_reaped_total",
+			Help: "Stuck allocations reaped by the broker-side reaper after job_timeout (+ grace), by pool, backend, and terminal result.",
+		}, []string{"pool", "backend", "result"}),
 	}
 }
 
@@ -233,9 +217,7 @@ func (o *PrometheusObserver) Register(registerer prometheus.Registerer) error {
 		o.liveCapacityFree,
 		o.liveCapacityStale,
 		o.liveCapacityDecisions,
-		o.processLocalStateLoss,
-		o.restartOrphansTotal,
-		o.orphanedRunners,
+		o.allocationsReaped,
 	} {
 		if err := registerer.Register(collector); err != nil {
 			if _, ok := err.(prometheus.AlreadyRegisteredError); !ok {
@@ -298,28 +280,11 @@ func (o *PrometheusObserver) ObserveLiveCapacityDecision(pool model.PoolName, ba
 	o.liveCapacityDecisions.WithLabelValues(string(pool), string(backend), reason).Inc()
 }
 
-func (o *PrometheusObserver) ObserveProcessLocalStateLoss(storeType string) {
-	if storeType == "" {
-		storeType = store.TypeMemory
+func (o *PrometheusObserver) ObserveAllocationReaped(pool model.PoolName, backend model.BackendName, result string) {
+	if result == "" {
+		result = "expired"
 	}
-	o.processLocalStateLoss.WithLabelValues(storeType).Inc()
-}
-
-func (o *PrometheusObserver) ObserveRestartOrphans(backend model.BackendName, reason string, count int) {
-	if count <= 0 {
-		return
-	}
-	if reason == "" {
-		reason = "unknown"
-	}
-	backendLabel := string(backend)
-	if backendLabel == "" {
-		backendLabel = "unknown"
-	}
-	o.restartOrphansTotal.WithLabelValues(backendLabel, reason).Add(float64(count))
-	// Gauge accumulates across mid-allocate / unrehydratable detections during
-	// a single startup pass; capacity_gap is reported once per backend.
-	o.orphanedRunners.WithLabelValues(backendLabel, reason).Add(float64(count))
+	o.allocationsReaped.WithLabelValues(string(pool), string(backend), result).Inc()
 }
 
 type tierDecisionSnapshot struct {

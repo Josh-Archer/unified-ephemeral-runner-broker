@@ -137,13 +137,14 @@ pools:
 
 Weights are preserved in config and take effect again when `weighted-round-robin` is restored. Prefer this dual-knob shape (`fairShare.enabled` + `scheduler`) over `scheduler: priority-fair-share`, which is standalone fair-share without weight expansion.
 
-## Orphan Cleanup
+## Stuck-Allocation Reaper (Orphan Cleanup)
 
 ```yaml
 broker:
   orphanCleanup:
     enabled: false
     quarantineTTL: 15m
+    gracePeriod: 0s     # wait after job_timeout before reaping
 ```
 
 Enable quarantine to observe stale allocations before expiry:
@@ -153,6 +154,7 @@ broker:
   orphanCleanup:
     enabled: true
     quarantineTTL: 10m
+    gracePeriod: 2m
 ```
 
 ## Backend Pinning
