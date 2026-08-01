@@ -2118,7 +2118,7 @@ func TestWarmPoolReducesAllocateReadyLatencySmoke(t *testing.T) {
 				t.Fatalf("allocate #%d expected cold launch, got %q", i+1, allocation.Metadata[backend.MetadataLaunchModeKey])
 			}
 			latencies = append(latencies, elapsed)
-			service.Cancel(allocation.ID)
+			service.Cancel(context.Background(), allocation.ID)
 		}
 		return latencies
 	}
@@ -2257,11 +2257,11 @@ func TestCancelIsIdempotent(t *testing.T) {
 		t.Fatalf("allocate failed: %v", err)
 	}
 
-	first, ok := service.Cancel(allocation.ID)
+	first, ok := service.Cancel(context.Background(), allocation.ID)
 	if !ok || first.State != model.StateCanceled {
 		t.Fatalf("first cancel failed: ok=%v state=%s", ok, first.State)
 	}
-	second, ok := service.Cancel(allocation.ID)
+	second, ok := service.Cancel(context.Background(), allocation.ID)
 	if !ok || second.State != model.StateCanceled {
 		t.Fatalf("second cancel should remain idempotent: ok=%v state=%s", ok, second.State)
 	}
@@ -2327,7 +2327,7 @@ func TestCancelDuringProvisionCleansUpRunner(t *testing.T) {
 		t.Fatal("expected reserved allocation while provision is in flight")
 	}
 
-	canceled, ok := service.Cancel(allocationID)
+	canceled, ok := service.Cancel(context.Background(), allocationID)
 	if !ok {
 		t.Fatal("cancel should succeed during provision")
 	}
@@ -2417,7 +2417,7 @@ func TestCancelAfterReadyStillCleansUp(t *testing.T) {
 		t.Fatalf("expected ready allocation with label, got state=%s label=%q", allocation.State, allocation.RunnerLabel)
 	}
 
-	canceled, ok := service.Cancel(allocation.ID)
+	canceled, ok := service.Cancel(context.Background(), allocation.ID)
 	if !ok || canceled.State != model.StateCanceled {
 		t.Fatalf("cancel failed: ok=%v state=%s", ok, canceled.State)
 	}
@@ -2429,7 +2429,7 @@ func TestCancelAfterReadyStillCleansUp(t *testing.T) {
 	}
 
 	// Duplicate cancel remains idempotent (may or may not re-run cleanup).
-	again, ok := service.Cancel(allocation.ID)
+	again, ok := service.Cancel(context.Background(), allocation.ID)
 	if !ok || again.State != model.StateCanceled {
 		t.Fatalf("duplicate cancel failed: ok=%v state=%s", ok, again.State)
 	}
