@@ -41,10 +41,14 @@ Core metrics:
 - `uecb_live_capacity_free_slots{backend,source}`: cached provider-reported free runner slots.
 - `uecb_live_capacity_stale{backend}`: `1` when the cached live capacity reading is stale.
 - `uecb_live_capacity_decisions_total{pool,backend,reason}`: live capacity routing decisions (`live`, `provider-full`, `stale-pass-through`, `provider-reject`, …).
+- `uecb_orphan_cleanup_actions_total{pool,backend,action}`: orphan sweep outcomes for allocations past job-timeout without finalize (`expired`, `quarantined`, `quarantine_expired`).
+- `uecb_label_garbage_total{pool,backend,result}`: runner-label reclaim results during orphan cleanup (`reclaimed`, `cleanup_failed`, `no_cleanup_hook`).
+- `uecb_stale_runner_labels{pool,backend,phase}`: gauge of labels still held past TTL (`overdue` before sweep, `quarantined` while held for inspection).
 
 Runtime admission metrics change only when a backend has opted into circuit breaking or rate limiting.
 Tier-routing metrics appear when cached decisions are present or tier policies affect allocation.
 Live-capacity metrics appear when `broker.liveCapacity.enabled` is true and backends publish capacity.
+Orphan and label-garbage metrics increment when the expiry sweep reclaims allocations after hard job kills or other missing finalize callbacks.
 
 ## Artifacts
 
@@ -70,6 +74,8 @@ Tier fallback activity means all eligible cloud backends were unavailable under 
 Saturated capacity means the scheduler has few or no healthy slots available for a pool/backend. Check `maxRunners`, runner cleanup, and whether completed jobs are leaving allocations in `ready` or `reserved`.
 
 Stuck queue depth means allocations are not moving to terminal states. Check expiration sweeps, backend cancellation behavior, explicit completion callbacks, and quarantine transitions (`quarantined` -> `expired`).
+
+Rising `uecb_orphan_cleanup_actions_total` or non-zero `uecb_stale_runner_labels` usually means workflows are hard-killed or skip `finalize-allocation`. Confirm cleanup jobs use `if: always()`, bound `job_timeout`, and (for cloud backends) that `cleanup_url` is configured so provider runners are torn down with the label.
 
 ## Example SLOs
 

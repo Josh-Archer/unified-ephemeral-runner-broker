@@ -253,11 +253,15 @@ Notes:
 - Duplicate finalize runs for the same terminal state are safe; the broker
   treats them as idempotent and does not double-release capacity.
 - If the finalize job cannot run (for example the workflow was deleted mid-run),
-  orphan cleanup still reclaims capacity after expiry—see below.
+  orphan cleanup still reclaims capacity and runner labels after the job-timeout
+  TTL—see below.
 
 ### Orphan cleanup and quarantine
 
-Stale active allocations are reclaimed during periodic sweep.
+Stale active allocations (and their unique runner labels) are reclaimed during
+the periodic expiry sweep. The detection TTL is the allocation `job_timeout`
+(broker `defaultJobTimeout` when omitted). After that deadline without a
+finalize/complete callback, the broker treats the runner label as garbage.
 
 ```yaml
 broker:
@@ -268,6 +272,31 @@ broker:
 
 - `enabled: false` (default): active stale allocations move directly to `expired`.
 - `enabled: true`: active stale allocations move to `quarantined` for `quarantineTTL` (or immediately when `0`), then to `expired`.
+- On either transition the broker releases scheduler capacity and invokes
+  backend `Cleanup` when implemented (external-dispatch `cleanup_url`, etc.).
+- Quarantine expiry retries provider cleanup in case the first attempt failed.
+
+#### Hard job kill without finalize (operator notes)
+
+GitHub hard-cancels, runner process kills, and deleted workflows can skip the
+`finalize-allocation` cleanup job. Until the job-timeout TTL elapses:
+
+1. The allocation stays `ready`/`reserved` and continues to consume capacity.
+2. The unique `runner_label` may still match a registered runner.
+
+Mitigations:
+
+| Control | Guidance |
+| --- | --- |
+| Always-run finalize | Keep a `finalize` job with `if: always()` after allocate+work (see pattern above). |
+| Bound job timeout | Set `job_timeout` (or `defaultJobTimeout`) to the maximum you are willing to wait for label/capacity reclaim when finalize is missing. |
+| Quarantine | Enable `orphanCleanup` to hold stale labels in `quarantined` for inspection before `expired`. |
+| Metrics | Watch `uecb_orphan_cleanup_actions_total`, `uecb_label_garbage_total`, and `uecb_stale_runner_labels` (see [docs/observability.md](docs/observability.md)). |
+| Provider cleanup | Configure `cleanup_url` on external backends so orphan reclaim tears down cloud runners, not only broker capacity. |
+
+The sweep runs about every 30s on the leader replica, so reclaim latency is
+approximately `job_timeout` plus at most one sweep interval (plus
+`quarantineTTL` when quarantine is enabled).
 
 ### Durable State Store
 

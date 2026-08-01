@@ -10,7 +10,10 @@
 - After the runner job finishes, workflows should call the `finalize-allocation`
   action (cleanup job with `if: always()`) so capacity is released immediately
   via `POST /v1/allocations/{id}/complete`. Orphan expiry remains the fallback
-  when the callback cannot run.
+  when the callback cannot run (hard job kill, cancelled workflow, missing
+  cleanup job): after the allocation `job_timeout` TTL the leader sweep
+  expires or quarantines the allocation, reclaims the runner label, and invokes
+  backend `Cleanup` when implemented.
 - The broker verifies GitHub Actions OIDC tokens through the issuer discovery
   document and JWKS before authorizing allocation or completion requests.
 - The broker selects a backend, reserves capacity, provisions a runner, and returns the label that the heavy job should target.
