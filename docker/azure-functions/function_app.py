@@ -27,9 +27,13 @@ STATUS_UPDATE_INTERVAL_SECONDS = 15
 TERMINAL_STATES = frozenset({"completed", "failed", "canceled", "cancelled", "expired"})
 PENDING_STATES = frozenset({"accepted", "queued", "pending"})
 # Non-terminal statuses older than this are treated as free (and deleted).
+# DEFAULT = max runner timeout + 5m grace (issue: expire non-terminal past timeout+grace).
 DEFAULT_STATUS_STALE_SECONDS = MAX_RUNNER_TIMEOUT_SECONDS + 300
-# Terminal status blobs older than this are deleted during capacity probes.
+# Terminal status blobs older than this are deleted by capacity probes and the timer reaper.
 DEFAULT_TERMINAL_TTL_SECONDS = 24 * 60 * 60
+# Periodic reaper so cleanup does not depend only on capacity GET traffic.
+# NCRONTAB: second minute hour day month day-of-week
+DEFAULT_STATUS_REAPER_SCHEDULE = "0 */5 * * * *"
 
 
 def utc_now() -> str:
@@ -62,7 +66,7 @@ def classify_capacity_entry(
     stale_seconds: int,
     terminal_ttl_seconds: int,
 ) -> str:
-    """Return how capacity should treat one status blob.
+    """Return how capacity / reaper should treat one status blob.
 
     Values: active | pending | skip | delete_stale | delete_terminal
     """
@@ -85,6 +89,90 @@ def classify_capacity_entry(
     if normalized in PENDING_STATES:
         return "pending"
     return "active"
+
+
+def should_reap_decision(decision: str) -> bool:
+    """True when classify_capacity_entry says the blob should be deleted."""
+    return decision in ("delete_stale", "delete_terminal")
+
+
+def scan_status_blobs(
+    container: Any,
+    *,
+    stale_seconds: int,
+    terminal_ttl_seconds: int,
+    now: datetime | None = None,
+    delete: bool = True,
+) -> dict[str, int]:
+    """List status blobs via metadata, optionally delete expired ones.
+
+    Compatible with metadata-based capacity (#82): never downloads blob bodies.
+    Used by the capacity probe (opportunistic reap) and the timer reaper.
+
+    Returns counters: scanned, active, pending, skipped, delete_stale,
+    delete_terminal, reaped, errors.
+    """
+    counts = {
+        "scanned": 0,
+        "active": 0,
+        "pending": 0,
+        "skipped": 0,
+        "delete_stale": 0,
+        "delete_terminal": 0,
+        "reaped": 0,
+        "errors": 0,
+    }
+    now = now or datetime.now(timezone.utc)
+    for blob in container.list_blobs(include=["metadata"]):
+        name = str(getattr(blob, "name", None) or "")
+        if not name.endswith(".json"):
+            continue
+        counts["scanned"] += 1
+        decision = classify_capacity_entry(
+            _blob_state(blob),
+            _blob_age_seconds(blob, now=now),
+            stale_seconds=stale_seconds,
+            terminal_ttl_seconds=terminal_ttl_seconds,
+        )
+        if should_reap_decision(decision):
+            counts[decision] = counts.get(decision, 0) + 1
+            if delete:
+                try:
+                    container.delete_blob(name)
+                    counts["reaped"] += 1
+                except Exception:
+                    counts["errors"] += 1
+                    logging.exception("failed to reap status blob %s", name)
+            continue
+        if decision == "pending":
+            counts["pending"] += 1
+        elif decision == "active":
+            counts["active"] += 1
+        else:
+            counts["skipped"] += 1
+    return counts
+
+
+def reap_status_blobs(
+    container: Any | None = None,
+    *,
+    stale_seconds: int | None = None,
+    terminal_ttl: int | None = None,
+    now: datetime | None = None,
+) -> dict[str, int]:
+    """Delete terminal-past-TTL and non-terminal-past-stale status blobs.
+
+    Timer path entrypoint; capacity probe calls scan_status_blobs directly so
+    it can also report active/pending counts in the same pass.
+    """
+    client = container if container is not None else status_container_client()
+    return scan_status_blobs(
+        client,
+        stale_seconds=status_stale_seconds() if stale_seconds is None else stale_seconds,
+        terminal_ttl_seconds=terminal_ttl_seconds() if terminal_ttl is None else terminal_ttl,
+        now=now,
+        delete=True,
+    )
 
 
 def storage_connection_string() -> str:
@@ -340,54 +428,32 @@ def dispatch(req: func.HttpRequest) -> func.HttpResponse:
     if action == "capacity":
         # Align with home broker-config-patch azure-functions maxRunners (2).
         # Use blob metadata only (no body download) so capacity stays fast with
-        # large status history. Opportunistically delete terminal/stale blobs.
+        # large status history. Opportunistically delete terminal/stale blobs
+        # (same rules as the timer reaper).
         try:
             max_runners = int(env("MAX_RUNNERS") or env("UECB_MAX_RUNNERS") or "2")
         except ValueError:
             max_runners = 2
-        active = 0
-        pending = 0
-        reaped = 0
-        stale_s = status_stale_seconds()
-        terminal_ttl = terminal_ttl_seconds()
         try:
-            container = status_container_client()
-            now = datetime.now(timezone.utc)
-            for blob in container.list_blobs(include=["metadata"]):
-                name = str(blob.name or "")
-                if not name.endswith(".json"):
-                    continue
-                decision = classify_capacity_entry(
-                    _blob_state(blob),
-                    _blob_age_seconds(blob, now=now),
-                    stale_seconds=stale_s,
-                    terminal_ttl_seconds=terminal_ttl,
-                )
-                if decision in ("delete_stale", "delete_terminal"):
-                    try:
-                        container.delete_blob(name)
-                        reaped += 1
-                    except Exception:
-                        logging.exception("failed to reap status blob %s", name)
-                    continue
-                if decision == "pending":
-                    pending += 1
-                elif decision == "active":
-                    active += 1
-                # skip → ignore
+            counts = scan_status_blobs(
+                status_container_client(),
+                stale_seconds=status_stale_seconds(),
+                terminal_ttl_seconds=terminal_ttl_seconds(),
+                delete=True,
+            )
         except Exception as exc:
             logging.exception("capacity probe failed")
             return json_response({"ok": False, "error": f"capacity probe failed: {exc}"}, status_code=500)
 
-        free_slots = max(0, max_runners - active - pending)
+        free_slots = max(0, max_runners - counts["active"] - counts["pending"])
         return json_response(
             {
                 "max_runners": max_runners,
-                "active_runners": active,
-                "pending_runners": pending,
+                "active_runners": counts["active"],
+                "pending_runners": counts["pending"],
                 "warm_runners": 0,
                 "free_slots": free_slots,
-                "reaped_status_blobs": reaped,
+                "reaped_status_blobs": counts["reaped"],
             }
         )
 
@@ -420,6 +486,38 @@ def dispatch(req: func.HttpRequest) -> func.HttpResponse:
             },
         },
         status_code=202,
+    )
+
+
+@app.timer_trigger(
+    schedule=DEFAULT_STATUS_REAPER_SCHEDULE,
+    arg_name="timer",
+    run_on_startup=False,
+    use_monitor=False,
+)
+def reap_status_timer(timer: func.TimerRequest) -> None:
+    """Periodic reaper for status blobs (independent of capacity GET traffic).
+
+    Rules (shared with capacity opportunistic reap via classify_capacity_entry):
+    - delete terminal blobs past terminal TTL
+    - delete non-terminal blobs past runner timeout + grace (stale seconds)
+    """
+    past_due = bool(getattr(timer, "past_due", False))
+    try:
+        counts = reap_status_blobs()
+    except Exception:
+        logging.exception("status blob timer reaper failed (past_due=%s)", past_due)
+        raise
+    logging.info(
+        "status blob timer reaper finished schedule=%s past_due=%s scanned=%s reaped=%s "
+        "delete_stale=%s delete_terminal=%s errors=%s",
+        DEFAULT_STATUS_REAPER_SCHEDULE,
+        past_due,
+        counts.get("scanned", 0),
+        counts.get("reaped", 0),
+        counts.get("delete_stale", 0),
+        counts.get("delete_terminal", 0),
+        counts.get("errors", 0),
     )
 
 
