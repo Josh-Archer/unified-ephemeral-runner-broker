@@ -86,3 +86,19 @@ func TestLambdaHandlerSetsProviderAndCapturesRunnerLog(t *testing.T) {
 		}
 	}
 }
+
+func TestBrokerImageCrossCompilesFromBuildPlatform(t *testing.T) {
+	// Multi-arch publish must cross-compile from BUILDPLATFORM. Running the Go
+	// toolchain under QEMU for arm64 makes broker publish take hours.
+	content := readFile(t, "Dockerfile.broker")
+	for _, needle := range []string{
+		"FROM --platform=$BUILDPLATFORM golang:",
+		"ARG TARGETARCH",
+		"GOARCH=${TARGETARCH}",
+		"CGO_ENABLED=0",
+	} {
+		if !strings.Contains(content, needle) {
+			t.Fatalf("Dockerfile.broker missing multi-arch contract %q", needle)
+		}
+	}
+}
