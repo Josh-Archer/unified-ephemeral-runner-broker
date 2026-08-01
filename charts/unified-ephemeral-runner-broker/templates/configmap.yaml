@@ -47,7 +47,7 @@ data:
 {{ toYaml .Values.config.broker.tierRouting | indent 8 }}
       liveCapacity:
 {{ toYaml (.Values.config.broker.liveCapacity | default dict) | indent 8 }}
-      webhooks:
-{{ toYaml (.Values.config.broker.webhooks | default dict) | indent 8 }}
+      qualityAware:
+{{ toYaml (.Values.config.broker.qualityAware | default dict) | indent 8 }}
     pools:
 {{ toYaml .Values.config.pools | indent 6 }}

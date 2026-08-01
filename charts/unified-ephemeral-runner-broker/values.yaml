@@ -109,26 +109,18 @@ config:
       # block: stale/failed capacity treats the backend as unavailable
       failureMode: pass-through
       refreshOnStartup: true
-    # Optional outbound webhooks for allocation lifecycle events
-    # (ready, failed, expired, completed, canceled).
-    webhooks:
+    # Optional quality-aware auto selection. When enabled, unpinned allocations
+    # rank eligible backends by free slots, rolling success rate, p95 ready
+    # latency, and recent capacity errors. Pins and capability filters still win.
+    qualityAware:
       enabled: false
-      timeout: 5s
-      maxAttempts: 3
-      initialBackoff: 500ms
-      maxBackoff: 10s
-      endpoints: []
-      # Example:
-      # endpoints:
-      #   - url: https://hooks.example.com/uecb
-      #     signingSecretRef: uecb-webhook
-      #     # signingSecretKey: signing_secret
-      #     events:
-      #       - ready
-      #       - failed
-      #       - expired
-      #       - completed
-      #       - canceled
+      window: 15m
+      minSamples: 3
+      weights:
+        freeSlots: 1
+        successRate: 1
+        latency: 1
+        capacityErrors: 1
   pools:
     - name: full
       labels:

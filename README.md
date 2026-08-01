@@ -378,10 +378,31 @@ optional host probe. SDK adapters implement `Adapter.Capacity`. See
 [docs/adapter-sdk.md](docs/adapter-sdk.md#publishing-capacity) and
 [docs/architecture.md](docs/architecture.md#live-backend-capacity).
 
-For local/dev and CI without cloud credentials, use
-`internal/capacity/fakecapacity` (`Capacity()` fixtures and an in-process
-`capacity_url` server). The live-capacity decision matrix is covered by
-`internal/capacity/decision_matrix_test.go`.
+### Quality-Aware Auto Backend Selection
+
+Beyond free slots alone, enable quality-aware ranking so unpinned allocations
+prefer backends with better historical success rate, lower p95 ready latency,
+and fewer recent capacity errors. Pins, capability filters, tier policy, and
+live capacity still apply first; provision failure still falls back to other
+eligible backends.
+
+```yaml
+broker:
+  qualityAware:
+    enabled: true
+    window: 15m
+    minSamples: 3
+    weights:
+      freeSlots: 1
+      successRate: 1
+      latency: 1
+      capacityErrors: 1
+```
+
+Selection reasons are exported as `uecb_quality_selection_total` and logged as
+`quality_selection` events. See
+[docs/architecture.md](docs/architecture.md#quality-aware-auto-backend-selection)
+and [docs/observability.md](docs/observability.md).
 
 ### Queued Admission
 

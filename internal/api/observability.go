@@ -40,7 +40,8 @@ type Observer interface {
 	ObserveTierBlocked(model.PoolName, model.BackendName, string)
 	ObserveLiveCapacityState([]liveCapacitySnapshot)
 	ObserveLiveCapacityDecision(model.PoolName, model.BackendName, string, int)
-	ObserveAllocationReaped(model.PoolName, model.BackendName, string)
+	ObserveQualitySelection(model.PoolName, model.BackendName, string, float64)
+	ObserveQualityScore(model.PoolName, model.BackendName, float64, float64, time.Duration, int, int)
 }
 
 type noopObserver struct{}
@@ -64,7 +65,9 @@ func (noopObserver) ObserveTierBlocked(model.PoolName, model.BackendName, string
 func (noopObserver) ObserveLiveCapacityState([]liveCapacitySnapshot)                           {}
 func (noopObserver) ObserveLiveCapacityDecision(model.PoolName, model.BackendName, string, int) {
 }
-func (noopObserver) ObserveAllocationReaped(model.PoolName, model.BackendName, string) {}
+func (noopObserver) ObserveQualitySelection(model.PoolName, model.BackendName, string, float64) {}
+func (noopObserver) ObserveQualityScore(model.PoolName, model.BackendName, float64, float64, time.Duration, int, int) {
+}
 
 type liveCapacitySnapshot struct {
 	Backend model.BackendName
@@ -113,7 +116,12 @@ type PrometheusObserver struct {
 	liveCapacityFree      *prometheus.GaugeVec
 	liveCapacityStale     *prometheus.GaugeVec
 	liveCapacityDecisions *prometheus.CounterVec
-	allocationsReaped     *prometheus.CounterVec
+	qualitySelections     *prometheus.CounterVec
+	qualityScore          *prometheus.GaugeVec
+	qualitySuccessRate    *prometheus.GaugeVec
+	qualityP95Ready       *prometheus.GaugeVec
+	qualityCapacityErrors *prometheus.GaugeVec
+	qualityFreeSlots      *prometheus.GaugeVec
 }
 
 func NewPrometheusObserver(registerer prometheus.Registerer) *PrometheusObserver {
@@ -189,10 +197,30 @@ func NewPrometheusObserver(registerer prometheus.Registerer) *PrometheusObserver
 			Name: "uecb_live_capacity_decisions_total",
 			Help: "Live capacity routing decisions by pool, backend, and reason.",
 		}, []string{"pool", "backend", "reason"}),
-		allocationsReaped: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "uecb_allocations_reaped_total",
-			Help: "Stuck allocations reaped by the broker-side reaper after job_timeout (+ grace), by pool, backend, and terminal result.",
-		}, []string{"pool", "backend", "result"}),
+		qualitySelections: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "uecb_quality_selection_total",
+			Help: "Quality-aware backend selection decisions by pool, backend, and reason.",
+		}, []string{"pool", "backend", "reason"}),
+		qualityScore: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "uecb_quality_score",
+			Help: "Latest quality-aware composite score observed for a pool/backend candidate.",
+		}, []string{"pool", "backend"}),
+		qualitySuccessRate: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "uecb_quality_success_rate",
+			Help: "Rolling success rate used by quality-aware selection (0-1).",
+		}, []string{"pool", "backend"}),
+		qualityP95Ready: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "uecb_quality_p95_ready_seconds",
+			Help: "Rolling p95 ready/launch latency used by quality-aware selection.",
+		}, []string{"pool", "backend"}),
+		qualityCapacityErrors: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "uecb_quality_capacity_errors",
+			Help: "Recent capacity-error count in the quality-aware rolling window.",
+		}, []string{"pool", "backend"}),
+		qualityFreeSlots: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "uecb_quality_free_slots",
+			Help: "Free slots considered by quality-aware selection for a pool/backend candidate.",
+		}, []string{"pool", "backend"}),
 	}
 }
 
@@ -217,7 +245,12 @@ func (o *PrometheusObserver) Register(registerer prometheus.Registerer) error {
 		o.liveCapacityFree,
 		o.liveCapacityStale,
 		o.liveCapacityDecisions,
-		o.allocationsReaped,
+		o.qualitySelections,
+		o.qualityScore,
+		o.qualitySuccessRate,
+		o.qualityP95Ready,
+		o.qualityCapacityErrors,
+		o.qualityFreeSlots,
 	} {
 		if err := registerer.Register(collector); err != nil {
 			if _, ok := err.(prometheus.AlreadyRegisteredError); !ok {
@@ -228,29 +261,20 @@ func (o *PrometheusObserver) Register(registerer prometheus.Registerer) error {
 	return nil
 }
 
-func (o *PrometheusObserver) ObserveOrphanCleanup(pool model.PoolName, backend model.BackendName, action string) {
-	if action == "" {
-		action = "unknown"
+func (o *PrometheusObserver) ObserveQualitySelection(pool model.PoolName, backend model.BackendName, reason string, score float64) {
+	if reason == "" {
+		reason = "unknown"
 	}
-	o.orphanCleanupActions.WithLabelValues(string(pool), string(backend), action).Inc()
+	o.qualitySelections.WithLabelValues(string(pool), string(backend), reason).Inc()
+	o.qualityScore.WithLabelValues(string(pool), string(backend)).Set(score)
 }
 
-func (o *PrometheusObserver) ObserveLabelGarbage(pool model.PoolName, backend model.BackendName, result string) {
-	if result == "" {
-		result = "unknown"
-	}
-	o.labelGarbage.WithLabelValues(string(pool), string(backend), result).Inc()
-}
-
-func (o *PrometheusObserver) ObserveStaleRunnerLabels(snapshots []staleRunnerLabelSnapshot) {
-	o.staleRunnerLabels.Reset()
-	for _, snapshot := range snapshots {
-		phase := snapshot.Phase
-		if phase == "" {
-			phase = "unknown"
-		}
-		o.staleRunnerLabels.WithLabelValues(string(snapshot.Pool), string(snapshot.Backend), phase).Set(float64(snapshot.Count))
-	}
+func (o *PrometheusObserver) ObserveQualityScore(pool model.PoolName, backend model.BackendName, score, successRate float64, p95Ready time.Duration, capacityErrors, freeSlots int) {
+	o.qualityScore.WithLabelValues(string(pool), string(backend)).Set(score)
+	o.qualitySuccessRate.WithLabelValues(string(pool), string(backend)).Set(successRate)
+	o.qualityP95Ready.WithLabelValues(string(pool), string(backend)).Set(p95Ready.Seconds())
+	o.qualityCapacityErrors.WithLabelValues(string(pool), string(backend)).Set(float64(capacityErrors))
+	o.qualityFreeSlots.WithLabelValues(string(pool), string(backend)).Set(float64(freeSlots))
 }
 
 func (o *PrometheusObserver) ObserveLiveCapacityState(snapshots []liveCapacitySnapshot) {

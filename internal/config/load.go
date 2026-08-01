@@ -62,12 +62,16 @@ func Default() model.BrokerConfig {
 				FailureMode:      "pass-through",
 				RefreshOnStartup: true,
 			},
-			Webhooks: model.WebhooksConfig{
-				Enabled:        false,
-				Timeout:        5 * time.Second,
-				MaxAttempts:    3,
-				InitialBackoff: 500 * time.Millisecond,
-				MaxBackoff:     10 * time.Second,
+			QualityAware: model.QualityAwareConfig{
+				Enabled:    false,
+				Window:     15 * time.Minute,
+				MinSamples: 3,
+				Weights: model.QualityAwareWeights{
+					FreeSlots:      1,
+					SuccessRate:    1,
+					Latency:        1,
+					CapacityErrors: 1,
+				},
 			},
 		},
 		Pools: []model.PoolConfig{
