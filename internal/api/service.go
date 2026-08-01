@@ -19,6 +19,8 @@ import (
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/scheduler"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/store"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/tier"
+
+	"go.opentelemetry.io/otel/codes"
 )
 
 var ErrUnknownPool = errors.New("pool is not configured")
@@ -535,7 +537,25 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 	var resultBackend model.BackendName
 	launchMode := launchModeCold
 	result := "failure"
+	var allocationID string
+	ctx, span := startSpan(ctx, spanAllocate,
+		spanAttrPool(string(request.Pool)),
+		spanAttrCorrelationID(correlationIDFromContext(ctx)),
+	)
 	defer func() {
+		span.SetAttributes(
+			spanAttrPool(string(resultPool)),
+			spanAttrBackend(string(resultBackend)),
+			spanAttrResult(result),
+			spanAttrLaunchMode(launchMode),
+		)
+		if allocationID != "" {
+			span.SetAttributes(spanAttrAllocationID(allocationID))
+		}
+		if result == "failure" {
+			span.SetStatus(codes.Error, "allocation failed")
+		}
+		span.End()
 		s.observer.ObserveAllocationResult(resultPool, resultBackend, result, s.now().Sub(started))
 		s.observeState()
 	}()
@@ -689,6 +709,7 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 		})
 
 		allocation := s.prepareAllocation(ctx, request, existing, pool.Name, selected, timeout)
+		allocationID = allocation.ID
 
 		if err := s.saveReservedAllocation(allocation, pool); err != nil {
 			s.release(context.Background(), pool, selected, allocation)
@@ -760,6 +781,7 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 			s.recordQualitySuccess(pool.Name, selected, launchLatency)
 			result = "success"
 			allocation = warmAllocation
+			allocationID = allocation.ID
 			logAllocationEvent(ctx, "allocation_ready", map[string]string{
 				"allocation_id": allocation.ID,
 				"pool":          string(pool.Name),
@@ -770,11 +792,20 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 		}
 
 		launchStarted := s.now()
-		provisioned, err := backendImpl.Provision(ctx, request, allocation)
+		provisionCtx, provisionSpan := startSpan(ctx, spanBackendProvision,
+			spanAttrPool(string(pool.Name)),
+			spanAttrBackend(string(selected)),
+			spanAttrAllocationID(allocation.ID),
+			spanAttrLaunchMode(launchMode),
+			spanAttrCorrelationID(correlationIDFromContext(ctx)),
+		)
+		provisioned, err := backendImpl.Provision(provisionCtx, request, allocation)
 		launchLatency := s.now().Sub(launchStarted)
 		s.observer.ObserveLaunchLatency(pool.Name, selected, launchMode, launchLatency)
 		s.observer.ObserveRegistrationLatency(pool.Name, selected, launchLatency)
 		if err != nil {
+			endSpan(provisionSpan, err)
+			s.release(context.Background(), pool, selected, allocation)
 			s.recordBackendFailure(pool, selected, err, s.now())
 			s.recordQualityFailure(pool.Name, selected, backend.IsCapacityExhausted(err))
 			if backend.IsCapacityExhausted(err) {
@@ -826,6 +857,8 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 			})
 			return model.AllocationStatus{}, err
 		}
+		provisionSpan.SetAttributes(spanAttrResult("success"))
+		endSpan(provisionSpan, nil)
 
 		allocation.RunnerLabel = provisioned.RunnerLabel
 		allocation.Metadata = withLaunchModeMetadata(
@@ -838,6 +871,7 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 		s.recordBackendSuccess(pool, selected, s.now())
 		s.recordQualitySuccess(pool.Name, selected, launchLatency)
 		result = "success"
+		allocationID = allocation.ID
 		logAllocationEvent(ctx, "allocation_ready", map[string]string{
 			"allocation_id": allocation.ID,
 			"pool":          string(pool.Name),
@@ -1015,38 +1049,62 @@ func (s *Service) Get(id string) (model.AllocationStatus, bool) {
 	return s.store.Get(id)
 }
 
-func (s *Service) Cancel(id string) (model.AllocationStatus, bool) {
-	// Cancel is idempotent: concurrent cancels and races with provision completion
-	// converge on a single terminal canceled record and one capacity release.
-	for {
-		status, ok := s.store.Get(id)
-		if !ok {
-			return model.AllocationStatus{}, false
-		}
-		if isTerminalAllocationState(status.State) {
-			return status, true
-		}
-		updated, ok := s.store.CompareAndMarkState(id, status.State, model.StateCanceled, s.now(), "")
-		if !ok {
-			// Lost a race with provision ready/complete/expire; retry for idempotency.
-			continue
-		}
-		if pool, err := s.resolvePool(updated.Pool); err == nil {
-			s.release(context.Background(), pool, updated.SelectedBackend, updated)
-		}
-		s.observeState()
-		return updated, true
+func (s *Service) Cancel(ctx context.Context, id string) (model.AllocationStatus, bool) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
+	started := s.now()
+	result := "not_found"
+	var poolName model.PoolName
+	var backendName model.BackendName
+	ctx, span := startSpan(ctx, spanCancel,
+		spanAttrAllocationID(id),
+		spanAttrCorrelationID(correlationIDFromContext(ctx)),
+	)
+	defer func() {
+		span.SetAttributes(
+			spanAttrPool(string(poolName)),
+			spanAttrBackend(string(backendName)),
+			spanAttrResult(result),
+		)
+		if result == "not_found" {
+			span.SetStatus(codes.Error, "allocation not found")
+		}
+		span.End()
+		s.observer.ObserveCancellation(poolName, backendName, result, s.now().Sub(started))
+	}()
+
+	status, ok := s.store.Get(id)
+	if !ok {
+		return model.AllocationStatus{}, false
+	}
+	poolName = status.Pool
+	backendName = status.SelectedBackend
+	span.SetAttributes(
+		spanAttrPool(string(status.Pool)),
+		spanAttrBackend(string(status.SelectedBackend)),
+		spanAttrState(string(status.State)),
+		spanAttrCorrelationID(firstNonEmpty(status.CorrelationID, correlationIDFromContext(ctx))),
+	)
 	if isTerminalAllocationState(status.State) {
+		result = "already_terminal"
 		return status, true
 	}
 	updated, ok := s.markState(id, model.StateCanceled, s.now(), "")
 	if !ok {
+		result = "conflict"
 		return model.AllocationStatus{}, false
 	}
 	if pool, err := s.resolvePool(updated.Pool); err == nil {
-		s.release(context.Background(), pool, updated.SelectedBackend, updated)
+		s.release(ctx, pool, updated.SelectedBackend, updated)
 	}
+	result = "success"
+	logAllocationEvent(ctx, "allocation_canceled", map[string]string{
+		"allocation_id": allocationIDLabel(updated.ID),
+		"pool":          string(updated.Pool),
+		"backend":       string(updated.SelectedBackend),
+		"state":         string(updated.State),
+	})
 	s.observeState()
 	return updated, true
 }
@@ -1059,13 +1117,45 @@ type completionRequest struct {
 }
 
 func (s *Service) Complete(ctx context.Context, id string, request completionRequest) (model.AllocationStatus, bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	started := s.now()
+	result := "not_found"
+	var poolName model.PoolName
+	var backendName model.BackendName
+	var completeErr error
+	ctx, span := startSpan(ctx, spanFinalize,
+		spanAttrAllocationID(id),
+		spanAttrCorrelationID(correlationIDFromContext(ctx)),
+	)
+	defer func() {
+		span.SetAttributes(
+			spanAttrPool(string(poolName)),
+			spanAttrBackend(string(backendName)),
+			spanAttrResult(result),
+		)
+		endSpan(span, completeErr)
+		s.observer.ObserveFinalization(poolName, backendName, result, s.now().Sub(started))
+	}()
+
 	status, ok := s.store.Get(id)
 	if !ok {
 		return model.AllocationStatus{}, false, nil
 	}
+	poolName = status.Pool
+	backendName = status.SelectedBackend
+	span.SetAttributes(
+		spanAttrPool(string(status.Pool)),
+		spanAttrBackend(string(status.SelectedBackend)),
+		spanAttrState(string(status.State)),
+		spanAttrCorrelationID(firstNonEmpty(status.CorrelationID, correlationIDFromContext(ctx))),
+	)
 
 	targetState, message, err := parseCompletionState(request)
 	if err != nil {
+		result = "error"
+		completeErr = err
 		return model.AllocationStatus{}, false, err
 	}
 	if strings.TrimSpace(message) == "" {
@@ -1073,16 +1163,21 @@ func (s *Service) Complete(ctx context.Context, id string, request completionReq
 	}
 	if isTerminalAllocationState(status.State) {
 		if status.State == targetState {
+			result = string(targetState)
 			return status, true, nil
 		}
-		return status, true, fmt.Errorf("%w: current=%s requested=%s", ErrAllocationAlreadyCompleted, status.State, targetState)
+		result = "already_terminal"
+		completeErr = fmt.Errorf("%w: current=%s requested=%s", ErrAllocationAlreadyCompleted, status.State, targetState)
+		return status, true, completeErr
 	}
 	if status.State == targetState {
+		result = string(targetState)
 		return status, true, nil
 	}
 
 	updated, ok := s.markState(id, targetState, s.now(), message)
 	if !ok {
+		result = "conflict"
 		return model.AllocationStatus{}, false, nil
 	}
 	if isActiveAllocationState(status.State) {
@@ -1093,6 +1188,8 @@ func (s *Service) Complete(ctx context.Context, id string, request completionReq
 			}
 		}
 	}
+	result = string(targetState)
+	span.SetAttributes(spanAttrState(string(targetState)))
 	logAllocationEvent(ctx, completionEventName(targetState), map[string]string{
 		"allocation_id": allocationIDLabel(status.ID),
 		"pool":          string(status.Pool),
@@ -1104,21 +1201,15 @@ func (s *Service) Complete(ctx context.Context, id string, request completionReq
 	return updated, true, nil
 }
 
-func (s *Service) reaperGrace() time.Duration {
-	if s == nil {
-		return 0
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
 	}
-	grace := s.cfg.Broker.OrphanCleanup.GracePeriod
-	if grace < 0 {
-		return 0
-	}
-	return grace
+	return ""
 }
 
-// SweepExpired is the broker-side stuck-allocation reaper. It runs on the HA
-// leader (when multi-replica) and marks reserved/ready allocations past
-// expires_at + gracePeriod as expired (or quarantined), releasing scheduler
-// capacity and invoking provider cleanup hooks.
 func (s *Service) SweepExpired(now time.Time) int {
 	updated := 0
 	grace := s.reaperGrace()

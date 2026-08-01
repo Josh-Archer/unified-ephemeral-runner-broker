@@ -977,13 +977,28 @@ If no backend matches the requested capability filters, the broker rejects the a
 
 ## Observability
 
-The broker exposes Prometheus metrics on `/metrics` and uses a shared `X-Correlation-ID` model across HTTP responses, allocation responses, and structured lifecycle logs. The reusable pack includes:
+The broker exposes Prometheus metrics on `/metrics`, optional OpenTelemetry traces (OTLP/HTTP), and a shared `X-Correlation-ID` model across HTTP responses, allocation responses, structured lifecycle logs, and span attributes. Metric labels and span attributes use only operational dimensions (pool, backend, result, launch mode, state)—never repository, subject, owner, or secrets.
+
+The reusable pack includes:
 
 - `observability/grafana-dashboard.json`
 - `observability/prometheus-rules.yaml`
+- `observability/prometheus-scrape-example.yaml`
+- `observability/otel-collector-config.yaml`
 - [docs/observability.md](docs/observability.md)
 
-The pack observes allocation and backend lifecycle events without changing scheduling behavior.
+Enable Prometheus scrape annotations and OTLP export from Helm:
+
+```yaml
+observability:
+  prometheus:
+    scrape: true
+  otel:
+    enabled: true
+    endpoint: otel-collector.observability.svc.cluster.local:4318
+```
+
+The pack observes allocate, backend dispatch, finalize, and cancel lifecycle events without changing scheduling behavior.
 
 ## License
 

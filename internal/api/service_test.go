@@ -680,7 +680,7 @@ func TestAllocateUsesWeightedSchedulerForPool(t *testing.T) {
 		if allocation.SelectedBackend != expected {
 			t.Fatalf("allocate #%d selected %s, want %s", index+1, allocation.SelectedBackend, expected)
 		}
-		if _, ok := service.Cancel(allocation.ID); !ok {
+		if _, ok := service.Cancel(context.Background(), allocation.ID); !ok {
 			t.Fatalf("cancel #%d failed", index+1)
 		}
 	}
@@ -890,7 +890,7 @@ func TestAllocateUsesPriorityFairShareScheduler(t *testing.T) {
 		t.Fatalf("expected priority metadata on allocation, got %q", allocation.PriorityClass)
 	}
 
-	if _, ok := service.Cancel(allocation.ID); !ok {
+	if _, ok := service.Cancel(context.Background(), allocation.ID); !ok {
 		t.Fatal("expected cancel to succeed")
 	}
 }
@@ -933,7 +933,7 @@ func TestAllocateFairShareComposesWithWeightedRoundRobin(t *testing.T) {
 		if allocation.SelectedBackend != expected {
 			t.Fatalf("allocate #%d selected %s, want %s (weights under fairShare)", index+1, allocation.SelectedBackend, expected)
 		}
-		if _, ok := service.Cancel(allocation.ID); !ok {
+		if _, ok := service.Cancel(context.Background(), allocation.ID); !ok {
 			t.Fatalf("cancel #%d failed", index+1)
 		}
 	}
@@ -1167,7 +1167,7 @@ func TestRateLimitedPinnedBackendFallsBackToAnotherBackend(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first allocation failed: %v", err)
 	}
-	if _, ok := service.Cancel(allocation.ID); !ok {
+	if _, ok := service.Cancel(context.Background(), allocation.ID); !ok {
 		t.Fatal("cancel failed")
 	}
 
@@ -1217,7 +1217,7 @@ func TestRateLimitedPinnedBackendFailsFastWhenNoFallbackBackendAvailable(t *test
 	if err != nil {
 		t.Fatalf("first allocation failed: %v", err)
 	}
-	if _, ok := service.Cancel(allocation.ID); !ok {
+	if _, ok := service.Cancel(context.Background(), allocation.ID); !ok {
 		t.Fatal("cancel failed")
 	}
 
@@ -1694,7 +1694,7 @@ func TestAllocateWarmHitDoesNotLeakFairShareCapacity(t *testing.T) {
 		if active := service.fairShare.Active(model.PoolLite, model.BackendCodeBuild); active != 1 {
 			t.Fatalf("after warm hit #%d: expected fair-share active=1 (no cold leak), got %d", i+1, active)
 		}
-		if _, ok := service.Cancel(allocation.ID); !ok {
+		if _, ok := service.Cancel(context.Background(), allocation.ID); !ok {
 			t.Fatalf("cancel #%d failed", i+1)
 		}
 		if active := service.fairShare.Active(model.PoolLite, model.BackendCodeBuild); active != 0 {
@@ -1710,7 +1710,7 @@ func TestAllocateWarmHitDoesNotLeakFairShareCapacity(t *testing.T) {
 	// is still enforced (proves earlier warm hits did not leave active elevated).
 	for _, status := range service.store.List() {
 		if status.State == model.StateWarm || status.State == model.StateReady {
-			service.Cancel(status.ID)
+			service.Cancel(context.Background(), status.ID)
 		}
 	}
 	a1, err := service.Allocate(context.Background(), model.AllocationRequest{
@@ -1733,8 +1733,8 @@ func TestAllocateWarmHitDoesNotLeakFairShareCapacity(t *testing.T) {
 	}); !errors.Is(err, scheduler.ErrNoCapacity) {
 		t.Fatalf("expected ErrNoCapacity at max runners, got %v", err)
 	}
-	service.Cancel(a1.ID)
-	service.Cancel(a2.ID)
+	service.Cancel(context.Background(), a1.ID)
+	service.Cancel(context.Background(), a2.ID)
 	if active := service.fairShare.Active(model.PoolLite, model.BackendCodeBuild); active != 0 {
 		t.Fatalf("expected fair-share active=0 after draining, got %d", active)
 	}
@@ -2232,7 +2232,7 @@ func TestCancelReleasesCapacity(t *testing.T) {
 		t.Fatalf("first allocation failed: %v", err)
 	}
 
-	if _, ok := service.Cancel(first.ID); !ok {
+	if _, ok := service.Cancel(context.Background(), first.ID); !ok {
 		t.Fatal("expected cancel to succeed")
 	}
 

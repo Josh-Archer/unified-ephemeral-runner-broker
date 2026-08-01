@@ -1,8 +1,10 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -11,6 +13,9 @@ import (
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type Server struct {
@@ -147,7 +152,7 @@ func (s *Server) handleAllocationByID(w http.ResponseWriter, r *http.Request) {
 			s.writeOwnershipError(w, err)
 			return
 		}
-		status, ok := s.service.Cancel(id)
+		status, ok := s.service.Cancel(r.Context(), id)
 		if !ok {
 			s.writeError(w, http.StatusNotFound, errors.New("allocation not found"))
 			return
@@ -279,10 +284,35 @@ func (s *Server) withRequestObservability(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		correlationID := correlationIDFromRequest(r)
 		w.Header().Set(correlationIDHeader, correlationID)
+
+		ctx := withCorrelationID(r.Context(), correlationID)
+		ctx = extractTraceContext(ctx, r.Header)
+		route := routeName(r.URL.Path)
+		ctx, span := startSpan(ctx, fmt.Sprintf("%s %s", r.Method, route),
+			attribute.String("http.request.method", r.Method),
+			attribute.String("http.route", route),
+			spanAttrCorrelationID(correlationID),
+		)
+		span.SetAttributes(attribute.String("server.address", r.Host))
+		// Propagate W3C trace context on the response for clients that continue
+		// the allocate → finalize chain across HTTP calls.
+		injectTraceContext(ctx, w.Header())
+
 		recorder := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
-		next.ServeHTTP(recorder, r.WithContext(withCorrelationID(r.Context(), correlationID)))
-		s.record(routeName(r.URL.Path), recorder.status, r.Method)
+		next.ServeHTTP(recorder, r.WithContext(ctx))
+
+		span.SetAttributes(attribute.Int("http.response.status_code", recorder.status))
+		if recorder.status >= 500 {
+			span.SetStatus(codes.Error, http.StatusText(recorder.status))
+		}
+		span.End()
+		s.record(route, recorder.status, r.Method)
 	})
+}
+
+// SpanFromContext exposes the active request span for tests.
+func SpanFromContext(ctx context.Context) trace.Span {
+	return trace.SpanFromContext(ctx)
 }
 
 type statusRecorder struct {

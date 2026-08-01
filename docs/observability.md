@@ -1,14 +1,24 @@
 # Observability Pack
 
-The broker exposes Prometheus metrics on `/metrics` and propagates a shared correlation ID through HTTP responses, allocation state, and structured log fields.
+The broker exposes Prometheus metrics on `/metrics`, optional OpenTelemetry traces over OTLP/HTTP, and a shared correlation ID through HTTP responses, allocation state, structured logs, and span attributes.
 
-Prometheus scrape annotations can be enabled in the Helm chart without changing broker scheduling behavior:
+Prometheus scrape annotations and OTLP export can be enabled in the Helm chart without changing broker scheduling behavior:
 
 ```yaml
 observability:
   prometheus:
     scrape: true
+  otel:
+    enabled: true
+    endpoint: otel-collector.observability.svc.cluster.local:4318
+    serviceName: uecb-broker
+    insecure: true
 ```
+
+Standalone scrape and collector examples live in the pack:
+
+- `observability/prometheus-scrape-example.yaml`
+- `observability/otel-collector-config.yaml`
 
 ## Correlation Model
 
@@ -17,8 +27,9 @@ observability:
 - The broker returns the same value in the `X-Correlation-ID` response header.
 - Allocation responses include `correlation_id`.
 - Broker lifecycle logs include `correlation_id=<value>` with allocation, pool, backend, and error fields where available.
+- Trace spans carry `uecb.correlation_id` so logs and traces join without PII.
 
-Use the correlation ID as the join key across HTTP access logs, broker lifecycle logs, backend controller logs, and trace spans from downstream adapters.
+Use the correlation ID as the join key across HTTP access logs, broker lifecycle logs, backend controller logs, and OpenTelemetry spans for allocate → backend dispatch → finalize/cancel.
 
 ## Metrics
 
@@ -29,6 +40,10 @@ Core metrics:
 - `uecb_allocation_latency_seconds{pool,backend,result}`: end-to-end broker allocation latency.
 - `uecb_launch_latency_seconds{pool,backend,launch_mode}`: backend launch handoff latency by launch mode (`cold` or `warm`).
 - `uecb_registration_latency_seconds{pool,backend}`: time until the broker has a provisioned runner label.
+- `uecb_finalizations_total{pool,backend,result}`: finalize callbacks (`completed`, `failed`, `error`, …).
+- `uecb_finalization_latency_seconds{pool,backend,result}`: finalize callback latency.
+- `uecb_cancellations_total{pool,backend,result}`: cancel requests (`success`, `already_terminal`, `not_found`, …).
+- `uecb_cancellation_latency_seconds{pool,backend,result}`: cancel request latency.
 - `uecb_queue_depth{pool,state}`: current allocations by state.
 - `uecb_capacity_utilization_ratio{pool,backend}`: active allocation count divided by configured backend capacity.
 - `uecb_backend_circuit_state{pool,backend,state}`: active runtime circuit state for opt-in backends.
@@ -53,10 +68,71 @@ Tier-routing metrics appear when cached decisions are present or tier policies a
 Live-capacity metrics appear when `broker.liveCapacity.enabled` is true and backends publish capacity.
 Quality-aware metrics appear when `broker.qualityAware.enabled` is true and unpinned allocations score candidates.
 
+### Label policy (no PII / secrets)
+
+Metric labels are limited to operational dimensions: `pool`, `backend`, `result`, `launch_mode`, `state`, `reason`, `route`, `method`, `status`, `source`, `mode`, `from`, `to`, `stale`. The broker never labels metrics with repository, subject, owner, tenant identity, tokens, or secret material.
+
+## OpenTelemetry traces
+
+Tracing is **off by default** (noop provider). Enable OTLP/HTTP export with standard environment variables:
+
+| Variable | Purpose |
+| --- | --- |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Collector host (`host:port` or `http://host:port`) |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | Full traces endpoint override |
+| `UECB_OTEL_EXPORTER_OTLP_ENDPOINT` | Broker-specific alias for the OTLP endpoint |
+| `OTEL_SERVICE_NAME` | Resource service name (default `uecb-broker`) |
+| `OTEL_TRACES_SAMPLER_ARG` | Optional ratio sampler argument (`0.0`–`1.0`) |
+
+Lifecycle span tree for a cold allocation:
+
+```text
+POST /v1/allocations          (HTTP server span)
+└── uecb.allocate
+    └── uecb.backend.provision
+```
+
+Later finalize/cancel requests open their own server spans and nest:
+
+```text
+POST /v1/allocations/{id}/complete
+└── uecb.finalize
+
+POST /v1/allocations/{id}/cancel
+└── uecb.cancel
+```
+
+Cross-request correlation uses `uecb.correlation_id` / `X-Correlation-ID` and W3C `traceparent` propagation on responses so clients can continue a trace into finalize if desired.
+
+Span attributes follow the same non-PII policy as metrics: `uecb.pool`, `uecb.backend`, `uecb.result`, `uecb.launch_mode`, `uecb.correlation_id`, `uecb.allocation_id`, `uecb.state`.
+
+### Helm example
+
+```yaml
+observability:
+  prometheus:
+    scrape: true
+    path: /metrics
+  otel:
+    enabled: true
+    endpoint: otel-collector.observability.svc.cluster.local:4318
+    serviceName: uecb-broker
+    insecure: true
+    sampleRatio: "1.0"
+```
+
+### Manual scrape check
+
+```bash
+curl -s http://localhost:8080/metrics | grep -E 'uecb_(allocations|finalizations|cancellations|allocation_latency)'
+```
+
 ## Artifacts
 
 - `observability/grafana-dashboard.json`: importable Grafana dashboard for latency, allocation rate, queue depth, and capacity utilization.
 - `observability/prometheus-rules.yaml`: Prometheus alert rules for dispatch latency, failure rate, saturated capacity, and stuck allocations.
+- `observability/prometheus-scrape-example.yaml`: example Prometheus scrape config.
+- `observability/otel-collector-config.yaml`: example OTLP collector pipeline for broker traces.
 
 ## Failure Modes
 
