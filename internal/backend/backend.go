@@ -2,8 +2,10 @@ package backend
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 
@@ -68,6 +70,49 @@ func FreeSlots(status CapacityStatus) int {
 		return 0
 	}
 	return free
+}
+
+// CapacityJSON is the HTTP capacity feed body used by capacity_url endpoints
+// and by native Capacity() implementations that speak the same contract.
+// Controllers may also expose free_slots; when set without max_runners the
+// broker reconstructs a ceiling.
+type CapacityJSON struct {
+	MaxRunners     int `json:"max_runners"`
+	ActiveRunners  int `json:"active_runners"`
+	PendingRunners int `json:"pending_runners"`
+	WarmRunners    int `json:"warm_runners"`
+	FreeSlots      int `json:"free_slots"`
+}
+
+// CapacityStatusFromJSON maps a capacity feed payload into CapacityStatus,
+// reconstructing MaxRunners from free_slots when needed.
+func CapacityStatusFromJSON(payload CapacityJSON) CapacityStatus {
+	status := CapacityStatus{
+		MaxRunners:     payload.MaxRunners,
+		ActiveRunners:  payload.ActiveRunners,
+		PendingRunners: payload.PendingRunners,
+		WarmRunners:    payload.WarmRunners,
+	}
+	// Prefer explicit free_slots when controllers publish it without a max.
+	if payload.FreeSlots > 0 && status.MaxRunners <= 0 {
+		status.MaxRunners = payload.FreeSlots + status.ActiveRunners + status.PendingRunners + status.WarmRunners
+	}
+	if status.MaxRunners <= 0 && payload.FreeSlots == 0 {
+		// free_slots:0 with no max is a valid "full" signal when work is in flight.
+		if payload.ActiveRunners > 0 || payload.PendingRunners > 0 || payload.WarmRunners > 0 {
+			status.MaxRunners = payload.ActiveRunners + payload.PendingRunners + payload.WarmRunners
+		}
+	}
+	return status
+}
+
+// DecodeCapacityJSON decodes a capacity_url response body into CapacityStatus.
+func DecodeCapacityJSON(r io.Reader) (CapacityStatus, error) {
+	var payload CapacityJSON
+	if err := json.NewDecoder(r).Decode(&payload); err != nil && err != io.EOF {
+		return CapacityStatus{}, err
+	}
+	return CapacityStatusFromJSON(payload), nil
 }
 
 type ProvisionedRunner struct {

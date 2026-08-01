@@ -146,8 +146,9 @@ type BrokerRuntimeConfig struct {
 // LiveCapacityConfig controls optional provider-reported capacity routing.
 // When disabled, the broker uses only local scheduler accounting and
 // configured maxRunners. When enabled, backends that implement Capacity()
-// (SDK adapters and HTTP-dispatch capacity_url) are polled out of band and
-// exhausted providers are filtered before scheduler selection.
+// (SDK adapters, built-in arc/desktop, and HTTP-dispatch capacity_url) are
+// polled out of band and exhausted providers are filtered before scheduler
+// selection.
 type LiveCapacityConfig struct {
 	Enabled          bool          `yaml:"enabled,omitempty" json:"enabled,omitempty"`
 	RefreshInterval  time.Duration `yaml:"refreshInterval,omitempty" json:"refreshInterval,omitempty"`
