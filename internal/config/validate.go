@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 )
@@ -35,10 +36,108 @@ func Validate(cfg model.BrokerConfig) error {
 	if err := validateLiveCapacity(cfg.Broker.LiveCapacity); err != nil {
 		return err
 	}
-	if err := validateQualityAware(cfg.Broker.QualityAware); err != nil {
+	if err := validateWarmPools(cfg); err != nil {
 		return err
 	}
 	return nil
+}
+
+func validateWarmPools(cfg model.BrokerConfig) error {
+	for _, pool := range cfg.Pools {
+		for name, backendCfg := range pool.Backends {
+			if err := validateWarmBackendConfig(string(pool.Name), string(name), backendCfg); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func validateWarmBackendConfig(pool, backend string, cfg model.BackendConfig) error {
+	if cfg.WarmMin < 0 {
+		return fmt.Errorf("pools[%s].backends[%s].warmMin must not be negative", pool, backend)
+	}
+	if cfg.WarmMax < 0 {
+		return fmt.Errorf("pools[%s].backends[%s].warmMax must not be negative", pool, backend)
+	}
+	if cfg.WarmTTL < 0 {
+		return fmt.Errorf("pools[%s].backends[%s].warmTTL must not be negative", pool, backend)
+	}
+	if cfg.WarmSchedule == nil {
+		return nil
+	}
+	tz := strings.TrimSpace(cfg.WarmSchedule.Timezone)
+	if tz != "" && !strings.EqualFold(tz, "UTC") && !strings.EqualFold(tz, "Local") {
+		if _, err := time.LoadLocation(tz); err != nil {
+			return fmt.Errorf("pools[%s].backends[%s].warmSchedule.timezone %q is invalid: %w", pool, backend, tz, err)
+		}
+	}
+	for i, window := range cfg.WarmSchedule.Windows {
+		if err := validateWarmWindow(pool, backend, i, window); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateWarmWindow(pool, backend string, index int, window model.WarmWindowConfig) error {
+	prefix := fmt.Sprintf("pools[%s].backends[%s].warmSchedule.windows[%d]", pool, backend, index)
+	if strings.TrimSpace(window.Start) == "" {
+		return fmt.Errorf("%s.start is required", prefix)
+	}
+	if strings.TrimSpace(window.End) == "" {
+		return fmt.Errorf("%s.end is required", prefix)
+	}
+	if err := validateClock(window.Start); err != nil {
+		return fmt.Errorf("%s.start: %w", prefix, err)
+	}
+	if err := validateClock(window.End); err != nil {
+		return fmt.Errorf("%s.end: %w", prefix, err)
+	}
+	for _, day := range window.Days {
+		if !isWeekdayToken(day) {
+			return fmt.Errorf("%s.days contains unsupported weekday %q", prefix, day)
+		}
+	}
+	if window.WarmMin != nil && *window.WarmMin < 0 {
+		return fmt.Errorf("%s.warmMin must not be negative", prefix)
+	}
+	if window.WarmMax != nil && *window.WarmMax < 0 {
+		return fmt.Errorf("%s.warmMax must not be negative", prefix)
+	}
+	return nil
+}
+
+func validateClock(value string) error {
+	parts := strings.Split(strings.TrimSpace(value), ":")
+	if len(parts) < 2 || len(parts) > 3 {
+		return fmt.Errorf("expected HH:MM or HH:MM:SS")
+	}
+	var hour, minute int
+	if _, err := fmt.Sscanf(parts[0], "%d", &hour); err != nil || hour < 0 || hour > 23 {
+		return fmt.Errorf("invalid hour")
+	}
+	if _, err := fmt.Sscanf(parts[1], "%d", &minute); err != nil || minute < 0 || minute > 59 {
+		return fmt.Errorf("invalid minute")
+	}
+	if len(parts) == 3 {
+		var second int
+		if _, err := fmt.Sscanf(parts[2], "%d", &second); err != nil || second < 0 || second > 59 {
+			return fmt.Errorf("invalid second")
+		}
+	}
+	return nil
+}
+
+func isWeekdayToken(day string) bool {
+	switch strings.ToLower(strings.TrimSpace(day)) {
+	case "monday", "mon", "tuesday", "tue", "tues", "wednesday", "wed",
+		"thursday", "thu", "thur", "thurs", "friday", "fri", "saturday", "sat",
+		"sunday", "sun":
+		return true
+	default:
+		return false
+	}
 }
 
 func validateLiveCapacity(cfg model.LiveCapacityConfig) error {

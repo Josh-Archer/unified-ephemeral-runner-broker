@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -1844,6 +1845,313 @@ func TestReconcileWarmPoolsRecyclesExpiredWarmAllocation(t *testing.T) {
 	}
 	if _, ok := service.Get(service.store.List()[0].ID); !ok {
 		t.Fatal("expected active warm allocation to be stored")
+	}
+}
+
+func TestWarmScheduleGatesColdCloudPrewarm(t *testing.T) {
+	// Monday 10:00 UTC is inside the weekday 08:00–18:00 window.
+	inWindow := time.Date(2026, 7, 27, 10, 0, 0, 0, time.UTC)
+	// Sunday 10:00 UTC is outside weekdays.
+	outWindow := time.Date(2026, 7, 26, 10, 0, 0, 0, time.UTC)
+
+	counting := &countingBackend{testBackend: testBackend{name: model.BackendLambda}}
+	service := newServiceWithBrokerConfig(func(cfg *model.BrokerConfig) {
+		for index := range cfg.Pools {
+			pool := &cfg.Pools[index]
+			if pool.Name != model.PoolLite {
+				continue
+			}
+			for name, backendCfg := range pool.Backends {
+				backendCfg.Enabled = false
+				pool.Backends[name] = backendCfg
+			}
+			lambdaCfg := pool.Backends[model.BackendLambda]
+			lambdaCfg.Enabled = true
+			lambdaCfg.Healthy = true
+			lambdaCfg.MaxRunners = 2
+			lambdaCfg.WarmMin = 1
+			lambdaCfg.WarmMax = 1
+			lambdaCfg.WarmTTL = 15 * time.Minute
+			lambdaCfg.WarmSchedule = &model.WarmScheduleConfig{
+				Timezone: "UTC",
+				Windows: []model.WarmWindowConfig{{
+					Days:  []string{"mon", "tue", "wed", "thu", "fri"},
+					Start: "08:00",
+					End:   "18:00",
+				}},
+			}
+			pool.Backends[model.BackendLambda] = lambdaCfg
+		}
+	})
+	service.registry = backend.NewRegistry(
+		testBackend{name: model.BackendARC},
+		testBackend{name: model.BackendCodeBuild},
+		counting,
+		testBackend{name: model.BackendCloudRun},
+		testBackend{name: model.BackendAzureFunctions},
+		testBackend{name: model.BackendAzureVM},
+		testBackend{name: model.BackendEC2},
+		testBackend{name: model.BackendGCE},
+	)
+
+	service.now = func() time.Time { return inWindow }
+	service.ReconcileWarmPools()
+	if counting.provisionCount != 1 {
+		t.Fatalf("expected warm provision inside schedule window, got %d", counting.provisionCount)
+	}
+	if got := len(filterWarmAllocations(service.store.List(), model.PoolLite, model.BackendLambda)); got != 1 {
+		t.Fatalf("expected one warm allocation in window, got %d", got)
+	}
+
+	service.now = func() time.Time { return outWindow }
+	service.ReconcileWarmPools()
+	if got := len(filterWarmAllocations(service.store.List(), model.PoolLite, model.BackendLambda)); got != 0 {
+		t.Fatalf("expected warm pool drained outside schedule window, got %d", got)
+	}
+}
+
+func TestWarmPoolRespectsLiveCapacityFreeSlots(t *testing.T) {
+	counting := &countingBackend{testBackend: testBackend{name: model.BackendCloudRun}}
+	cfg := config.Default()
+	enableLiveCapacity(&cfg)
+	for index := range cfg.Pools {
+		pool := &cfg.Pools[index]
+		if pool.Name != model.PoolLite {
+			continue
+		}
+		for name, backendCfg := range pool.Backends {
+			backendCfg.Enabled = false
+			pool.Backends[name] = backendCfg
+		}
+		cloud := pool.Backends[model.BackendCloudRun]
+		cloud.Enabled = true
+		cloud.Healthy = true
+		cloud.MaxRunners = 5
+		cloud.WarmMin = 2
+		cloud.WarmMax = 2
+		pool.Backends[model.BackendCloudRun] = cloud
+	}
+	service := NewService(cfg, backend.NewRegistry(
+		testBackend{name: model.BackendARC},
+		testBackend{name: model.BackendCodeBuild},
+		testBackend{name: model.BackendLambda},
+		counting,
+		testBackend{name: model.BackendAzureFunctions},
+		testBackend{name: model.BackendAzureVM},
+		testBackend{name: model.BackendEC2},
+		testBackend{name: model.BackendGCE},
+	), nil)
+	manager := capacity.NewManager()
+	manager.Set(capacity.Snapshot{
+		Backend: model.BackendCloudRun,
+		Status: backend.CapacityStatus{
+			MaxRunners:     5,
+			ActiveRunners:  5,
+			PendingRunners: 0,
+			WarmRunners:    0,
+		},
+		UpdatedAt: time.Now(),
+		Source:    "live",
+	})
+	service.SetCapacityManager(manager)
+
+	service.ReconcileWarmPools()
+	if counting.provisionCount != 0 {
+		t.Fatalf("expected no warm provision when free_slots=0, got %d", counting.provisionCount)
+	}
+
+	manager.Set(capacity.Snapshot{
+		Backend: model.BackendCloudRun,
+		Status: backend.CapacityStatus{
+			MaxRunners:     5,
+			ActiveRunners:  4,
+			PendingRunners: 0,
+			WarmRunners:    0,
+		},
+		UpdatedAt: time.Now(),
+		Source:    "live",
+	})
+	service.ReconcileWarmPools()
+	if counting.provisionCount != 1 {
+		t.Fatalf("expected single warm provision limited by free_slots=1, got %d", counting.provisionCount)
+	}
+}
+
+func TestAutoAllocatePrefersWarmColdCloudBackend(t *testing.T) {
+	// ARC is faster to schedule by weight but has no warm pool; Lambda holds warm.
+	// Auto selection should pin to the warm Lambda so launch_mode=warm.
+	lambda := &countingBackend{testBackend: testBackend{name: model.BackendLambda}}
+	service := newServiceWithCountingBackend(func(pool *model.PoolConfig) {
+		if pool.Name != model.PoolLite {
+			return
+		}
+		for name, backendCfg := range pool.Backends {
+			backendCfg.Enabled = false
+			pool.Backends[name] = backendCfg
+		}
+		arc := pool.Backends[model.BackendARC]
+		arc.Enabled = true
+		arc.Healthy = true
+		arc.MaxRunners = 4
+		arc.Weight = 100
+		pool.Backends[model.BackendARC] = arc
+
+		cfg := pool.Backends[model.BackendLambda]
+		cfg.Enabled = true
+		cfg.Healthy = true
+		cfg.MaxRunners = 2
+		cfg.Weight = 1
+		cfg.WarmMin = 1
+		cfg.WarmMax = 1
+		pool.Backends[model.BackendLambda] = cfg
+	}, lambda)
+	// Register ARC as real test backend and replace lambda with counting.
+	service.registry = backend.NewRegistry(
+		testBackend{name: model.BackendARC},
+		testBackend{name: model.BackendCodeBuild},
+		lambda,
+		testBackend{name: model.BackendCloudRun},
+		testBackend{name: model.BackendAzureFunctions},
+		testBackend{name: model.BackendAzureVM},
+		testBackend{name: model.BackendEC2},
+		testBackend{name: model.BackendGCE},
+	)
+
+	service.ReconcileWarmPools()
+	if lambda.provisionCount != 1 {
+		t.Fatalf("expected lambda warm prewarm, got %d", lambda.provisionCount)
+	}
+
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolLite,
+		JobTimeout: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("allocate failed: %v", err)
+	}
+	if allocation.SelectedBackend != model.BackendLambda {
+		t.Fatalf("expected auto allocate to prefer warm lambda, got %s", allocation.SelectedBackend)
+	}
+	if allocation.Metadata[backend.MetadataLaunchModeKey] != launchModeWarm {
+		t.Fatalf("expected warm launch mode, got %q", allocation.Metadata[backend.MetadataLaunchModeKey])
+	}
+}
+
+type delayedBackend struct {
+	testBackend
+	delay          time.Duration
+	provisionCount int
+}
+
+func (b *delayedBackend) Provision(ctx context.Context, request model.AllocationRequest, allocation model.AllocationStatus) (backend.ProvisionedRunner, error) {
+	b.provisionCount++
+	if b.delay > 0 {
+		timer := time.NewTimer(b.delay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return backend.ProvisionedRunner{}, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return b.testBackend.Provision(ctx, request, allocation)
+}
+
+func TestWarmPoolReducesAllocateReadyLatencySmoke(t *testing.T) {
+	// Smoke: warm hit must skip cold Provision delay so p95 ready time collapses.
+	const coldDelay = 40 * time.Millisecond
+	const samples = 8
+
+	coldBackend := &delayedBackend{testBackend: testBackend{name: model.BackendAzureFunctions}, delay: coldDelay}
+	warmBackend := &delayedBackend{testBackend: testBackend{name: model.BackendAzureFunctions}, delay: coldDelay}
+
+	measure := func(withWarm bool, impl *delayedBackend) []time.Duration {
+		service := newServiceWithBrokerConfig(func(cfg *model.BrokerConfig) {
+			for index := range cfg.Pools {
+				pool := &cfg.Pools[index]
+				if pool.Name != model.PoolLite {
+					continue
+				}
+				for name, backendCfg := range pool.Backends {
+					backendCfg.Enabled = false
+					pool.Backends[name] = backendCfg
+				}
+				cfgBackend := pool.Backends[model.BackendAzureFunctions]
+				cfgBackend.Enabled = true
+				cfgBackend.Healthy = true
+				cfgBackend.MaxRunners = samples + 2
+				if withWarm {
+					cfgBackend.WarmMin = 1
+					cfgBackend.WarmMax = 1
+				}
+				pool.Backends[model.BackendAzureFunctions] = cfgBackend
+			}
+		})
+		service.registry = backend.NewRegistry(
+			testBackend{name: model.BackendARC},
+			testBackend{name: model.BackendCodeBuild},
+			testBackend{name: model.BackendLambda},
+			testBackend{name: model.BackendCloudRun},
+			impl,
+			testBackend{name: model.BackendAzureVM},
+			testBackend{name: model.BackendEC2},
+			testBackend{name: model.BackendGCE},
+		)
+		latencies := make([]time.Duration, 0, samples)
+		for i := 0; i < samples; i++ {
+			if withWarm {
+				service.ReconcileWarmPools()
+			}
+			start := time.Now()
+			allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+				Pool:       model.PoolLite,
+				JobTimeout: 5 * time.Minute,
+			})
+			elapsed := time.Since(start)
+			if err != nil {
+				t.Fatalf("allocate #%d failed: %v", i+1, err)
+			}
+			if withWarm && allocation.Metadata[backend.MetadataLaunchModeKey] != launchModeWarm {
+				t.Fatalf("allocate #%d expected warm launch, got %q", i+1, allocation.Metadata[backend.MetadataLaunchModeKey])
+			}
+			if !withWarm && allocation.Metadata[backend.MetadataLaunchModeKey] != launchModeCold {
+				t.Fatalf("allocate #%d expected cold launch, got %q", i+1, allocation.Metadata[backend.MetadataLaunchModeKey])
+			}
+			latencies = append(latencies, elapsed)
+			service.Cancel(allocation.ID)
+		}
+		return latencies
+	}
+
+	coldLatencies := measure(false, coldBackend)
+	warmLatencies := measure(true, warmBackend)
+
+	p95 := func(values []time.Duration) time.Duration {
+		sorted := append([]time.Duration(nil), values...)
+		sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+		idx := int(float64(len(sorted)-1) * 0.95)
+		return sorted[idx]
+	}
+	coldP95 := p95(coldLatencies)
+	warmP95 := p95(warmLatencies)
+	if warmP95 >= coldP95/2 {
+		t.Fatalf("expected warm p95 (%v) to be substantially lower than cold p95 (%v); warm=%v cold=%v",
+			warmP95, coldP95, warmLatencies, coldLatencies)
+	}
+	if warmP95 >= coldDelay/2 {
+		t.Fatalf("expected warm p95 %v well below cold delay %v", warmP95, coldDelay)
+	}
+}
+
+func TestAzureVMIsNotWarmProvisionable(t *testing.T) {
+	if isWarmProvisionableBackend(model.BackendAzureVM) {
+		t.Fatal("azure-vm must not participate in warm pools")
+	}
+	if isWarmProvisionableBackend(model.BackendARC) {
+		t.Fatal("arc must not participate in warm pools")
+	}
+	if !isWarmProvisionableBackend(model.BackendLambda) {
+		t.Fatal("lambda should be warm provisionable")
 	}
 }
 

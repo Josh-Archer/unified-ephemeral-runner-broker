@@ -32,15 +32,18 @@
 
 ## Warm Capacity
 
-Each pool backend may define a warm policy:
+Each pool backend may define a warm policy for cold-start cloud backends:
 
 - `warmMin`: minimum warm instances to keep reserved.
 - `warmMax`: maximum warm instances allowed.
 - `warmTTL`: maximum idle lifetime for a warm allocation.
+- `warmSchedule`: optional timezone + windows so warm targets apply only during known CI periods (effective target is zero outside all windows).
 
-The broker keeps warm allocations in the background when enabled and recycles them on TTL expiry or policy violations. Allocation requests consume warm capacity first when available, then fallback to cold launch.
+The broker keeps warm allocations in the background when enabled and recycles them on TTL expiry, schedule off-window, or policy violations. Auto selection prefers backends that already hold idle warm capacity; allocation then consumes that warm slot before cold launch.
 
-Warm capacity currently applies only to external dispatch backends and intentionally excludes `arc` and `azure-vm`.
+Warm refill integrates with live `Capacity()` / free-slot snapshots when `broker.liveCapacity` is enabled so pre-warm does not intentionally exceed provider headroom.
+
+Warm capacity applies to external dispatch backends (`codebuild`, `lambda`, `cloud-run`, `azure-functions`, `ec2`, `gce`) and intentionally excludes `arc`, `azure-vm`, and `desktop`. Cost controls (`warmMax`, `warmTTL`, `warmSchedule`, live capacity, tier block) are documented in the README Warm Capacity section.
 
 ## State And Restart Recovery
 

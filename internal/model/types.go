@@ -250,6 +250,10 @@ type BackendConfig struct {
 	WarmMin        int                  `yaml:"warmMin" json:"warmMin"`
 	WarmMax        int                  `yaml:"warmMax" json:"warmMax"`
 	WarmTTL        time.Duration        `yaml:"warmTTL,omitempty" json:"warmTTL,omitempty"`
+	// WarmSchedule optionally gates warmMin/warmMax to calendar windows so cold
+	// cloud backends (Lambda, Cloud Run, Azure Functions, …) can pre-warm only
+	// during known CI periods and stay at zero otherwise for cost control.
+	WarmSchedule   *WarmScheduleConfig  `yaml:"warmSchedule,omitempty" json:"warmSchedule,omitempty"`
 	Weight         int                  `yaml:"weight,omitempty" json:"weight,omitempty"`
 	MaxJobDuration time.Duration        `yaml:"maxJobDuration,omitempty" json:"maxJobDuration,omitempty"`
 	Capabilities   []string             `yaml:"capabilities,omitempty" json:"capabilities,omitempty"`
@@ -260,6 +264,30 @@ type BackendConfig struct {
 	RateLimit      RateLimitConfig      `yaml:"rateLimit,omitempty" json:"rateLimit,omitempty"`
 	TierRules      []TierRuleConfig     `yaml:"tierRules,omitempty" json:"tierRules,omitempty"`
 	Desktop        *DesktopConfig       `yaml:"desktop,omitempty" json:"desktop,omitempty"`
+}
+
+// WarmScheduleConfig controls when warm pool targets apply. With no windows,
+// warmMin/warmMax apply continuously. With one or more windows, warm capacity
+// is maintained only while "now" falls inside a matching window; outside all
+// windows the effective warm target is zero (idle warm runners are recycled).
+type WarmScheduleConfig struct {
+	// Timezone is an IANA name such as "America/New_York". Empty means UTC.
+	Timezone string `yaml:"timezone,omitempty" json:"timezone,omitempty"`
+	// Windows are OR-ed: any matching window activates warm capacity.
+	Windows []WarmWindowConfig `yaml:"windows,omitempty" json:"windows,omitempty"`
+}
+
+// WarmWindowConfig is a local-time interval when warm capacity is desired.
+// Start and End use 24h "HH:MM" or "HH:MM:SS". When End is before or equal to
+// Start, the window crosses midnight (e.g. 22:00–06:00).
+type WarmWindowConfig struct {
+	// Days lists weekday names (mon..sun). Empty means every day.
+	Days []string `yaml:"days,omitempty" json:"days,omitempty"`
+	Start string  `yaml:"start" json:"start"`
+	End   string  `yaml:"end" json:"end"`
+	// Optional per-window overrides of backend warmMin/warmMax.
+	WarmMin *int `yaml:"warmMin,omitempty" json:"warmMin,omitempty"`
+	WarmMax *int `yaml:"warmMax,omitempty" json:"warmMax,omitempty"`
 }
 
 type TierRuleConfig struct {

@@ -605,6 +605,14 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 		return model.AllocationStatus{}, err
 	}
 
+	// Auto (unpinned) selection prefers a backend that already holds idle warm
+	// capacity so cold cloud backends can serve allocate→ready without a cold start.
+	if request.Backend == nil {
+		if preferred, ok := s.preferredWarmBackend(pool); ok {
+			request.Backend = &preferred
+		}
+	}
+
 	// Outer loop retries selection when a provider rejects reservation due to
 	// live capacity exhaustion. Local scheduler reservations remain the broker
 	// concurrency authority; provider rejection is the final capacity check.
@@ -1379,7 +1387,16 @@ func (s *Service) reconcileWarmForPool(pool model.PoolConfig, statuses []model.A
 }
 
 func (s *Service) reconcileWarmForBackend(pool model.PoolConfig, backendName model.BackendName, cfg model.BackendConfig, statuses []model.AllocationStatus, now time.Time) {
-	warmMin, warmMax := normalizeWarmBounds(cfg)
+	warmMin, warmMax, err := effectiveWarmBounds(cfg, now)
+	if err != nil {
+		logAllocationEvent(context.Background(), "warm_schedule_invalid", map[string]string{
+			"pool":    string(pool.Name),
+			"backend": string(backendName),
+			"error":   err.Error(),
+		})
+		// Fail closed on schedule parse errors: do not grow the pool; still recycle TTL.
+		warmMin, warmMax = 0, 0
+	}
 	ttl := resolveWarmTTL(cfg)
 
 	warm := filterWarmAllocations(statuses, pool.Name, backendName)
@@ -1421,12 +1438,79 @@ func (s *Service) reconcileWarmForBackend(pool model.PoolConfig, backendName mod
 	}
 
 	target := normalizeWarmTarget(warmMin, warmMax, cfg.MaxRunners)
+	// Cap warm refill by live Capacity()/free_slots so pre-warm never intentionally
+	// overruns provider-reported headroom when live capacity routing is enabled.
+	if remaining, ok := s.warmLiveCapacityHeadroom(pool, backendName, cfg); ok {
+		if remaining <= 0 {
+			return
+		}
+		if len(warm)+remaining < target {
+			target = len(warm) + remaining
+		}
+	}
 	for len(warm) < target {
 		if err := s.createWarmAllocation(pool, backendName, now); err != nil {
 			return
 		}
 		warm = append(warm, model.AllocationStatus{})
 	}
+}
+
+// preferredWarmBackend picks a deterministic eligible backend that currently
+// holds at least one non-expired warm allocation. Used for auto selection so
+// warm capacity is consumed before cold launch when multiple backends are open.
+func (s *Service) preferredWarmBackend(pool model.PoolConfig) (model.BackendName, bool) {
+	now := s.now()
+	statuses := s.store.List()
+	var candidates []model.BackendName
+	for name, cfg := range pool.Backends {
+		if !cfg.Enabled || !cfg.Healthy || !isWarmProvisionableBackend(name) {
+			continue
+		}
+		ttl := resolveWarmTTL(cfg)
+		if len(filterFreshWarm(statuses, pool.Name, name, now, ttl)) == 0 {
+			continue
+		}
+		candidates = append(candidates, name)
+	}
+	if len(candidates) == 0 {
+		return "", false
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		return string(candidates[i]) < string(candidates[j])
+	})
+	return candidates[0], true
+}
+
+// warmLiveCapacityHeadroom returns remaining provider free slots for warm refill.
+// ok is false when live capacity is disabled or should not constrain warm growth
+// (missing snapshot under pass-through).
+func (s *Service) warmLiveCapacityHeadroom(pool model.PoolConfig, backendName model.BackendName, cfg model.BackendConfig) (int, bool) {
+	if !s.cfg.Broker.LiveCapacity.Enabled || s.capacityMgr == nil {
+		return 0, false
+	}
+	active := s.backendActiveCount(pool, backendName)
+	snap, hasSnap := s.capacityMgr.Get(backendName)
+	if !hasSnap {
+		// Mirror allocation routing: missing data does not block under pass-through.
+		return 0, false
+	}
+	effectiveMax, available, _ := capacity.EffectiveMaxRunners(cfg.MaxRunners, active, snap, true, s.cfg.Broker.LiveCapacity.FailureMode)
+	if !available {
+		return 0, true
+	}
+	remaining := effectiveMax - active
+	if remaining < 0 {
+		remaining = 0
+	}
+	// Also respect free_slots from the snapshot when present and healthy.
+	if !snap.Stale && snap.Err == "" && snap.Source != "error" {
+		free := backend.FreeSlots(snap.Status)
+		if free < remaining {
+			remaining = free
+		}
+	}
+	return remaining, true
 }
 
 func (s *Service) createWarmAllocation(pool model.PoolConfig, backendName model.BackendName, now time.Time) error {
@@ -1436,6 +1520,9 @@ func (s *Service) createWarmAllocation(pool model.PoolConfig, backendName model.
 	}
 	if err := s.validateWarmBackend(pool, backendName); err != nil {
 		return err
+	}
+	if remaining, constrained := s.warmLiveCapacityHeadroom(pool, backendName, cfg); constrained && remaining <= 0 {
+		return fmt.Errorf("warm backend %q has no live capacity headroom", backendName)
 	}
 	if s.admission != nil {
 		decision := s.admission.allow(pool.Name, backendName, cfg, now, false, true)
@@ -1945,96 +2032,6 @@ func (s *Service) validateWarmBackend(pool model.PoolConfig, backendName model.B
 		return fmt.Errorf("backend %q does not support warm provisioning", backendName)
 	}
 	return nil
-}
-
-func resolveWarmTTL(cfg model.BackendConfig) time.Duration {
-	if cfg.WarmTTL > 0 {
-		return cfg.WarmTTL
-	}
-	return defaultWarmTTL
-}
-
-func normalizeWarmBounds(cfg model.BackendConfig) (int, int) {
-	min := cfg.WarmMin
-	max := cfg.WarmMax
-	if min < 0 {
-		min = 0
-	}
-	if max < 0 {
-		max = 0
-	}
-	if max < min {
-		max = min
-	}
-	return min, max
-}
-
-func normalizeWarmTarget(min, max, maxRunners int) int {
-	if maxRunners <= 0 {
-		return 0
-	}
-	if max > maxRunners {
-		max = maxRunners
-	}
-	if min < 0 {
-		min = 0
-	}
-	if min > max {
-		min = max
-	}
-	return min
-}
-
-func isWarmExpired(status model.AllocationStatus, now time.Time, ttl time.Duration) bool {
-	if ttl <= 0 {
-		return false
-	}
-	return !status.ExpiresAt.IsZero() && !now.Before(status.ExpiresAt)
-}
-
-func isWarmProvisionableBackend(backendName model.BackendName) bool {
-	switch backendName {
-	case model.BackendARC:
-		return false
-	default:
-		return true
-	}
-}
-
-func filterWarmAllocations(statuses []model.AllocationStatus, poolName model.PoolName, backendName model.BackendName) []model.AllocationStatus {
-	result := make([]model.AllocationStatus, 0)
-	for _, status := range statuses {
-		if status.Pool != poolName {
-			continue
-		}
-		if status.SelectedBackend != backendName {
-			continue
-		}
-		if status.State != model.StateWarm {
-			continue
-		}
-		result = append(result, status)
-	}
-	return result
-}
-
-func filterFreshWarm(statuses []model.AllocationStatus, poolName model.PoolName, backendName model.BackendName, now time.Time, ttl time.Duration) []model.AllocationStatus {
-	result := make([]model.AllocationStatus, 0)
-	for _, status := range statuses {
-		if status.Pool != poolName {
-			continue
-		}
-		if status.SelectedBackend != backendName {
-			continue
-		}
-		if status.State != model.StateWarm {
-			continue
-		}
-		if !isWarmExpired(status, now, ttl) {
-			result = append(result, status)
-		}
-	}
-	return result
 }
 
 func sortWarmByExpiration(warm []model.AllocationStatus) {

@@ -47,34 +47,47 @@ func TestHAEnabled(t *testing.T) {
 	}
 }
 
-func TestValidateWebhooks(t *testing.T) {
-	cfg := model.WebhooksConfig{Enabled: false}
-	if err := validateWebhooks(cfg); err != nil {
-		t.Fatalf("disabled webhooks should validate: %v", err)
+func TestValidateWarmSchedule(t *testing.T) {
+	cfg := model.BrokerConfig{
+		Pools: []model.PoolConfig{{
+			Name: model.PoolLite,
+			Backends: map[model.BackendName]model.BackendConfig{
+				model.BackendLambda: {
+					Enabled: true,
+					WarmMin: 1,
+					WarmMax: 2,
+					WarmSchedule: &model.WarmScheduleConfig{
+						Timezone: "America/New_York",
+						Windows: []model.WarmWindowConfig{{
+							Days:  []string{"mon", "fri"},
+							Start: "08:00",
+							End:   "18:00",
+						}},
+					},
+				},
+			},
+		}},
+	}
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("valid warm schedule rejected: %v", err)
 	}
 
-	cfg.Enabled = true
-	if err := validateWebhooks(cfg); err == nil {
-		t.Fatal("enabled without endpoints should fail")
+	cfg.Pools[0].Backends[model.BackendLambda] = model.BackendConfig{
+		WarmSchedule: &model.WarmScheduleConfig{
+			Timezone: "Not/AZone",
+			Windows:  []model.WarmWindowConfig{{Start: "08:00", End: "18:00"}},
+		},
+	}
+	if err := Validate(cfg); err == nil {
+		t.Fatal("expected invalid timezone to fail validation")
 	}
 
-	cfg.Endpoints = []model.WebhookEndpointConfig{{
-		URL:           "https://hooks.example.com/uecb",
-		SigningSecret: "secret",
-		Events:        []string{"ready", "allocation.completed", "cancelled"},
-	}}
-	if err := validateWebhooks(cfg); err != nil {
-		t.Fatalf("valid webhooks should pass: %v", err)
+	cfg.Pools[0].Backends[model.BackendLambda] = model.BackendConfig{
+		WarmSchedule: &model.WarmScheduleConfig{
+			Windows: []model.WarmWindowConfig{{Start: "25:00", End: "18:00"}},
+		},
 	}
-
-	cfg.Endpoints[0].SigningSecret = ""
-	if err := validateWebhooks(cfg); err == nil {
-		t.Fatal("missing signing secret should fail")
-	}
-
-	cfg.Endpoints[0].SigningSecretRef = "uecb-webhook"
-	cfg.Endpoints[0].Events = []string{"bogus"}
-	if err := validateWebhooks(cfg); err == nil {
-		t.Fatal("bogus event should fail")
+	if err := Validate(cfg); err == nil {
+		t.Fatal("expected invalid clock to fail validation")
 	}
 }

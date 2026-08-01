@@ -234,12 +234,21 @@ backends:
     warmMin: 0    # disable warm for cost savings
     warmMax: 0
   lambda:
-    warmMin: 2    # keep more warm Lambda slots
-    warmMax: 4
+    warmMin: 0
+    warmMax: 0
     warmTTL: 5m
+    # Cost control: pre-warm only during CI hours.
+    warmSchedule:
+      timezone: America/New_York
+      windows:
+        - days: [mon, tue, wed, thu, fri]
+          start: "08:00"
+          end: "18:00"
+          warmMin: 1
+          warmMax: 2
 ```
 
-Set `warmMin: 0` and `warmMax: 0` to disable warm capacity for a backend without disabling the backend itself.
+Set `warmMin: 0` and `warmMax: 0` to disable warm capacity for a backend without disabling the backend itself. Use `warmSchedule` when always-on warm is too expensive; outside all windows the broker drains warm slots. With live capacity enabled, warm refill also stops when provider `free_slots` are exhausted.
 
 ## Staged Rollout
 
