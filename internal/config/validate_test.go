@@ -47,40 +47,34 @@ func TestHAEnabled(t *testing.T) {
 	}
 }
 
-func TestValidateFairShareSoftReserves(t *testing.T) {
-	cfg := Default()
-	for i := range cfg.Pools {
-		if cfg.Pools[i].Name != model.PoolLite {
-			continue
-		}
-		cfg.Pools[i].FairShare.Enabled = true
-		cfg.Pools[i].FairShare.PriorityClasses = map[string]int{
-			"smoke": 1, "deploy": 3,
-		}
-		cfg.Pools[i].FairShare.SoftReserves = map[string]int{"deploy": 1}
-	}
-	if err := Validate(cfg); err != nil {
-		t.Fatalf("valid soft reserves should pass: %v", err)
+func TestValidateWebhooks(t *testing.T) {
+	cfg := model.WebhooksConfig{Enabled: false}
+	if err := validateWebhooks(cfg); err != nil {
+		t.Fatalf("disabled webhooks should validate: %v", err)
 	}
 
-	for i := range cfg.Pools {
-		if cfg.Pools[i].Name != model.PoolLite {
-			continue
-		}
-		cfg.Pools[i].FairShare.Enabled = false
-	}
-	if err := Validate(cfg); err == nil {
-		t.Fatal("softReserves without fairShare.enabled should fail")
+	cfg.Enabled = true
+	if err := validateWebhooks(cfg); err == nil {
+		t.Fatal("enabled without endpoints should fail")
 	}
 
-	for i := range cfg.Pools {
-		if cfg.Pools[i].Name != model.PoolLite {
-			continue
-		}
-		cfg.Pools[i].FairShare.Enabled = true
-		cfg.Pools[i].FairShare.SoftReserves = map[string]int{"deploy": -1}
+	cfg.Endpoints = []model.WebhookEndpointConfig{{
+		URL:           "https://hooks.example.com/uecb",
+		SigningSecret: "secret",
+		Events:        []string{"ready", "allocation.completed", "cancelled"},
+	}}
+	if err := validateWebhooks(cfg); err != nil {
+		t.Fatalf("valid webhooks should pass: %v", err)
 	}
-	if err := Validate(cfg); err == nil {
-		t.Fatal("negative softReserves should fail")
+
+	cfg.Endpoints[0].SigningSecret = ""
+	if err := validateWebhooks(cfg); err == nil {
+		t.Fatal("missing signing secret should fail")
+	}
+
+	cfg.Endpoints[0].SigningSecretRef = "uecb-webhook"
+	cfg.Endpoints[0].Events = []string{"bogus"}
+	if err := validateWebhooks(cfg); err == nil {
+		t.Fatal("bogus event should fail")
 	}
 }

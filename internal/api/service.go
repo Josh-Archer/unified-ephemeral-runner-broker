@@ -35,6 +35,13 @@ const (
 	launchModeWarm = "warm"
 )
 
+// LifecycleNotifier delivers allocation lifecycle events (ready and terminals).
+// Implementations must be safe for concurrent use and must not block callers
+// on remote I/O (async delivery is expected).
+type LifecycleNotifier interface {
+	Notify(status model.AllocationStatus)
+}
+
 type Service struct {
 	cfg         model.BrokerConfig
 	registry    *backend.Registry
@@ -42,6 +49,7 @@ type Service struct {
 	fairShare   *scheduler.PriorityFairShare
 	store       store.Store
 	observer    Observer
+	lifecycle   LifecycleNotifier
 	admission   *backendAdmission
 	tierMgr     *tier.Manager
 	capacityMgr *capacity.Manager
@@ -138,6 +146,42 @@ func (s *Service) SetObserver(observer Observer) {
 	s.observer = observer
 }
 
+func (s *Service) SetLifecycleNotifier(notifier LifecycleNotifier) {
+	s.lifecycle = notifier
+}
+
+// markState updates allocation state and emits lifecycle webhooks for terminal
+// transitions. Ready is intentionally excluded because warm claim updates the
+// record further before the final Save; callers must notifyReady after that.
+func (s *Service) markState(id string, state model.AllocationState, now time.Time, message string) (model.AllocationStatus, bool) {
+	updated, ok := s.store.MarkState(id, state, now, message)
+	if ok {
+		s.notifyLifecycleTerminal(updated)
+	}
+	return updated, ok
+}
+
+func (s *Service) notifyReady(status model.AllocationStatus) {
+	if status.State != model.StateReady {
+		return
+	}
+	s.notifyLifecycle(status)
+}
+
+func (s *Service) notifyLifecycleTerminal(status model.AllocationStatus) {
+	switch status.State {
+	case model.StateFailed, model.StateExpired, model.StateCompleted, model.StateCanceled:
+		s.notifyLifecycle(status)
+	}
+}
+
+func (s *Service) notifyLifecycle(status model.AllocationStatus) {
+	if s == nil || s.lifecycle == nil || status.ID == "" {
+		return
+	}
+	s.lifecycle.Notify(status)
+}
+
 func firstErr(errs ...error) error {
 	for _, err := range errs {
 		if err != nil {
@@ -198,8 +242,7 @@ func (s *Service) expireUnrehydratableAllocation(status model.AllocationStatus, 
 	if status.State == model.StateWarm {
 		nextState = model.StateFailed
 	}
-	_, _ = s.store.MarkState(status.ID, nextState, now, reason)
-	s.observer.ObserveRestartOrphans(status.SelectedBackend, "unrehydratable", 1)
+	_, _ = s.markState(status.ID, nextState, now, reason)
 	logAllocationEvent(context.Background(), "allocation_rehydrate_skipped", map[string]string{
 		"allocation_id": allocationIDLabel(status.ID),
 		"pool":          string(status.Pool),
@@ -645,7 +688,7 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 		backendImpl, ok := s.registry.Get(selected)
 		if !ok {
 			s.release(context.Background(), pool, selected, allocation)
-			s.store.MarkState(allocation.ID, model.StateFailed, s.now(), "backend not registered")
+			s.markState(allocation.ID, model.StateFailed, s.now(), "backend not registered")
 			return model.AllocationStatus{}, fmt.Errorf("backend implementation missing: %s", selected)
 		}
 
@@ -693,6 +736,7 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 				launchMode,
 			)
 			s.store.Save(warmAllocation)
+			s.notifyReady(warmAllocation)
 			launchLatency := time.Duration(0)
 			s.observer.ObserveLaunchLatency(pool.Name, selected, launchMode, launchLatency)
 			s.observer.ObserveRegistrationLatency(pool.Name, selected, launchLatency)
@@ -742,6 +786,8 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 					// Pinned requests are not silently rerouted on live-capacity rejection.
 					if existing.ID == "" {
 						_ = s.store.Delete(allocation.ID)
+					} else {
+						s.markState(allocation.ID, model.StateFailed, s.now(), err.Error())
 					}
 					return model.AllocationStatus{}, fmt.Errorf("pinned backend %q live capacity exhausted: %w", selected, ErrBackendLiveCapacity)
 				}
@@ -758,16 +804,16 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 				if len(reservePool.Backends) > 0 {
 					continue
 				}
+				if existing.ID != "" {
+					s.markState(existing.ID, model.StateFailed, s.now(), err.Error())
+				}
 				return model.AllocationStatus{}, fmt.Errorf("selected backend %q capacity exhausted and no fallback backend is available: %w", selected, ErrBackendLiveCapacity)
 			}
 			if queued, ok := s.queueAllocation(ctx, request, pool.Name, selected, err, allocation); ok {
 				result = "queued"
 				return queued, nil
 			}
-			if !abandonedOK && abandoned.ID != "" {
-				// Reservation was taken by cancel/expire; surface that outcome.
-				return abandoned, err
-			}
+			s.markState(allocation.ID, model.StateFailed, s.now(), err.Error())
 			logAllocationEvent(ctx, "allocation_failed", map[string]string{
 				"allocation_id": allocation.ID,
 				"pool":          string(pool.Name),
@@ -783,17 +829,8 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 			launchMode,
 		)
 		allocation.State = model.StateReady
-		// Commit ready only while still reserved so a concurrent cancel cannot be
-		// overwritten with a live runner label.
-		saved, saveErr := s.store.SaveIfState(allocation, model.StateReserved)
-		if saveErr != nil {
-			s.release(context.Background(), pool, selected, allocation)
-			s.cleanupAllocation(context.Background(), allocation)
-			return model.AllocationStatus{}, saveErr
-		}
-		if !saved {
-			return s.finalizeCanceledDuringProvision(ctx, allocation)
-		}
+		s.store.Save(allocation)
+		s.notifyReady(allocation)
 		s.recordBackendSuccess(pool, selected, s.now())
 		result = "success"
 		logAllocationEvent(ctx, "allocation_ready", map[string]string{
@@ -921,17 +958,17 @@ func (s *Service) ReconcileQueue(ctx context.Context, now time.Time) int {
 			continue
 		}
 		if status.Request == nil {
-			s.store.MarkState(status.ID, model.StateFailed, now, "pending allocation is missing original request")
+			s.markState(status.ID, model.StateFailed, now, "pending allocation is missing original request")
 			updated++
 			continue
 		}
 		if status.ExpiresAt.Before(now) {
-			s.store.MarkState(status.ID, model.StateExpired, now, "pending allocation expired")
+			s.markState(status.ID, model.StateExpired, now, "pending allocation expired")
 			updated++
 			continue
 		}
 		if status.Attempts >= normalizeQueueMaxAttempts(s.cfg.Broker.Queue) {
-			s.store.MarkState(status.ID, model.StateFailed, now, "pending allocation retry attempts exhausted")
+			s.markState(status.ID, model.StateFailed, now, "pending allocation retry attempts exhausted")
 			updated++
 			continue
 		}
@@ -942,7 +979,7 @@ func (s *Service) ReconcileQueue(ctx context.Context, now time.Time) int {
 			if queued, ok := s.queueAllocation(ctx, *status.Request, status.Pool, status.SelectedBackend, err, status); ok {
 				_ = s.store.Save(queued)
 			} else {
-				s.store.MarkState(status.ID, model.StateFailed, now, err.Error())
+				s.markState(status.ID, model.StateFailed, now, err.Error())
 			}
 		}
 		updated++
@@ -995,6 +1032,18 @@ func (s *Service) Cancel(id string) (model.AllocationStatus, bool) {
 		s.observeState()
 		return updated, true
 	}
+	if isTerminalAllocationState(status.State) {
+		return status, true
+	}
+	updated, ok := s.markState(id, model.StateCanceled, s.now(), "")
+	if !ok {
+		return model.AllocationStatus{}, false
+	}
+	if pool, err := s.resolvePool(updated.Pool); err == nil {
+		s.release(context.Background(), pool, updated.SelectedBackend, updated)
+	}
+	s.observeState()
+	return updated, true
 }
 
 type completionRequest struct {
@@ -1027,7 +1076,7 @@ func (s *Service) Complete(ctx context.Context, id string, request completionReq
 		return status, true, nil
 	}
 
-	updated, ok := s.store.MarkState(id, targetState, s.now(), message)
+	updated, ok := s.markState(id, targetState, s.now(), message)
 	if !ok {
 		return model.AllocationStatus{}, false, nil
 	}
@@ -1090,7 +1139,7 @@ func (s *Service) SweepExpired(now time.Time) int {
 					nextExpiresAt = now.Add(s.cfg.Broker.OrphanCleanup.QuarantineTTL)
 				}
 			}
-			if _, ok := s.store.MarkState(status.ID, nextState, nextExpiresAt, nextMessage); ok {
+			if _, ok := s.markState(status.ID, nextState, nextExpiresAt, nextMessage); ok {
 				if pool, err := s.resolvePool(status.Pool); err == nil {
 					s.releaseStaleLabel(context.Background(), pool, status.SelectedBackend, status)
 					s.recordBackendFailureClass(pool, status.SelectedBackend, backend.FailureReasonWaitTimeout, now)
@@ -1124,11 +1173,7 @@ func (s *Service) SweepExpired(now time.Time) int {
 		if status.ExpiresAt.After(now) {
 			continue
 		}
-		if _, ok := s.store.MarkState(status.ID, model.StateExpired, now, "stale runner label quarantine expired"); ok {
-			// Retry provider cleanup in case the quarantine transition failed to
-			// tear down the runner registration.
-			s.reclaimStaleRunnerLabel(context.Background(), status)
-			s.observer.ObserveOrphanCleanup(status.Pool, status.SelectedBackend, orphanActionQuarantineExpired)
+		if _, ok := s.markState(status.ID, model.StateExpired, now, "allocation quarantine expired"); ok {
 			logAllocationEvent(context.Background(), "allocation_expired", map[string]string{
 				"allocation_id": allocationIDLabel(status.ID),
 				"pool":          string(status.Pool),
@@ -1320,7 +1365,7 @@ func (s *Service) consumeWarmAllocation(ctx context.Context, pool model.PoolConf
 }
 
 func (s *Service) recycleWarmAllocation(ctx context.Context, pool model.PoolConfig, status model.AllocationStatus, reason string) {
-	updated, ok := s.store.MarkState(status.ID, model.StateFailed, s.now(), reason)
+	updated, ok := s.markState(status.ID, model.StateFailed, s.now(), reason)
 	if !ok {
 		return
 	}

@@ -9,6 +9,21 @@ info:
 
     Clients may send `X-Correlation-ID`; the broker always echoes it on the
     response (generating a value when the request omits one).
+
+    ## Outbound lifecycle webhooks
+
+    When `broker.webhooks.enabled` is true the broker POSTs signed JSON
+    envelopes to each configured endpoint on `ready` and terminal transitions
+    (`failed`, `expired`, `completed`, `canceled`). See the
+    `AllocationLifecycleWebhook` schema. Deliveries include:
+
+    - `X-UECB-Event`: `allocation.<event>`
+    - `X-UECB-Delivery`: unique delivery id
+    - `X-UECB-Timestamp`: event time (RFC3339)
+    - `X-UECB-Signature`: `sha256=<hex HMAC-SHA256 of raw body>`
+
+    Transient HTTP failures retry with exponential backoff
+    (`maxAttempts`, `initialBackoff`, `maxBackoff`).
   version: 1.0.0
 
 servers:
@@ -18,6 +33,8 @@ servers:
 tags:
   - name: allocations
     description: Allocate, poll, complete, and cancel runner capacity
+  - name: webhooks
+    description: Outbound allocation lifecycle event contract (broker → subscriber)
 
 paths:
   /v1/allocations:
@@ -395,6 +412,37 @@ components:
         - failed
         - completed
         - quarantined
+
+    AllocationLifecycleWebhook:
+      type: object
+      description: |
+        JSON body POSTed to each configured `broker.webhooks.endpoints[].url`
+        when an allocation becomes ready or reaches a terminal lifecycle state.
+        Verify `X-UECB-Signature` as HMAC-SHA256 hex of the raw request body
+        using the endpoint signing secret.
+      required:
+        - id
+        - event
+        - occurred_at
+        - allocation
+      properties:
+        id:
+          type: string
+          description: Unique delivery identifier (also in X-UECB-Delivery)
+        event:
+          type: string
+          enum:
+            - allocation.ready
+            - allocation.failed
+            - allocation.expired
+            - allocation.completed
+            - allocation.canceled
+          example: allocation.ready
+        occurred_at:
+          type: string
+          format: date-time
+        allocation:
+          $ref: '#/components/schemas/AllocationStatus'
 
     Error:
       type: object

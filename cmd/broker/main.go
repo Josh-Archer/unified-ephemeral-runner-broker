@@ -25,6 +25,7 @@ import (
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/runtime"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/store"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/tier"
+	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/webhook"
 )
 
 func main() {
@@ -59,6 +60,10 @@ func main() {
 	}
 
 	service := api.NewService(cfg, registry, healthChecker.Check)
+	if cfg.Broker.Webhooks.Enabled {
+		service.SetLifecycleNotifier(webhook.New(cfg.Broker.Webhooks, secretReader, nil))
+		log.Printf("allocation lifecycle webhooks enabled endpoints=%d", len(cfg.Broker.Webhooks.Endpoints))
+	}
 	var tierManager *tier.Manager
 	if cfg.Broker.TierRouting.Enabled {
 		tierManager = tier.NewManager()

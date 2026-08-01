@@ -62,6 +62,13 @@ func Default() model.BrokerConfig {
 				FailureMode:      "pass-through",
 				RefreshOnStartup: true,
 			},
+			Webhooks: model.WebhooksConfig{
+				Enabled:        false,
+				Timeout:        5 * time.Second,
+				MaxAttempts:    3,
+				InitialBackoff: 500 * time.Millisecond,
+				MaxBackoff:     10 * time.Second,
+			},
 		},
 		Pools: []model.PoolConfig{
 			{
