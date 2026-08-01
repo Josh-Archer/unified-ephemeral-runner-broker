@@ -255,6 +255,9 @@ func TestDefaultIncludesDockerAndVMBackends(t *testing.T) {
 	if !contains(codebuildCfg.Capabilities, "docker") {
 		t.Fatalf("expected codebuild to advertise docker capability, got %v", codebuildCfg.Capabilities)
 	}
+	if !contains(codebuildCfg.Capabilities, "os:linux") || !contains(codebuildCfg.Capabilities, "arch:amd64") {
+		t.Fatalf("expected codebuild to advertise default linux/amd64 platform tags, got %v", codebuildCfg.Capabilities)
+	}
 
 	azureVMCfg, ok := pool.Backends["azure-vm"]
 	if !ok {
@@ -274,6 +277,9 @@ func TestDefaultIncludesDockerAndVMBackends(t *testing.T) {
 		}
 		if !contains(cfg.Capabilities, "docker") || !contains(cfg.Capabilities, "vm") {
 			t.Fatalf("expected %s backend to advertise docker and vm capabilities, got %v", name, cfg.Capabilities)
+		}
+		if !contains(cfg.Capabilities, "os:linux") || !contains(cfg.Capabilities, "arch:amd64") {
+			t.Fatalf("expected %s backend to advertise default linux/amd64 platform tags, got %v", name, cfg.Capabilities)
 		}
 	}
 }

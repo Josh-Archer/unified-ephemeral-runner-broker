@@ -38,7 +38,7 @@ data:
             healthy: true
             maxRunners: 4
             weight: 1
-            capabilities: [cluster-local, docker, region:local]
+            capabilities: [os:linux, arch:amd64, cluster-local, docker, region:local]
             template: arc-full
       - name: lite
         labels: [self-hosted, linux, x64, uecb, uecb-lite]
@@ -55,7 +55,7 @@ data:
             healthy: true
             maxRunners: 4
             weight: 3
-            capabilities: [cluster-local, docker, region:local]
+            capabilities: [os:linux, arch:amd64, cluster-local, docker, region:local]
             template: arc-lite
           codebuild:
             enabled: true
@@ -66,5 +66,5 @@ data:
             warmTTL: 10m
             weight: 1
             maxJobDuration: 14m
-            capabilities: [docker, region:aws-us-east-1]
+            capabilities: [os:linux, arch:amd64, docker, region:aws-us-east-1]
             secretRef: uecb-codebuild

@@ -80,7 +80,7 @@ func Default() model.BrokerConfig {
 						Healthy:      true,
 						MaxRunners:   4,
 						Weight:       1,
-						Capabilities: []string{"cluster-local", "docker", "region:local"},
+						Capabilities: []string{"os:linux", "arch:amd64", "cluster-local", "docker", "region:local"},
 						Template:     "arc-full",
 					},
 				},
@@ -103,7 +103,7 @@ func Default() model.BrokerConfig {
 						Healthy:      true,
 						MaxRunners:   2,
 						Weight:       1,
-						Capabilities: []string{"cluster-local", "docker", "region:local"},
+						Capabilities: []string{"os:linux", "arch:amd64", "cluster-local", "docker", "region:local"},
 						Template:     "arc-lite",
 					},
 					model.BackendCodeBuild: {
@@ -112,7 +112,7 @@ func Default() model.BrokerConfig {
 						MaxRunners:     3,
 						Weight:         1,
 						MaxJobDuration: 14 * time.Minute,
-						Capabilities:   []string{"docker", "region:aws-us-east-1"},
+						Capabilities:   []string{"os:linux", "arch:amd64", "docker", "region:aws-us-east-1"},
 						SecretRef:      "uecb-codebuild",
 					},
 					model.BackendLambda: {
@@ -121,7 +121,7 @@ func Default() model.BrokerConfig {
 						MaxRunners:     3,
 						Weight:         1,
 						MaxJobDuration: 14 * time.Minute,
-						Capabilities:   []string{"region:aws-us-east-1"},
+						Capabilities:   []string{"os:linux", "arch:amd64", "region:aws-us-east-1"},
 						SecretRef:      "uecb-lambda",
 					},
 					model.BackendCloudRun: {
@@ -130,7 +130,7 @@ func Default() model.BrokerConfig {
 						MaxRunners:     2,
 						Weight:         1,
 						MaxJobDuration: 30 * time.Minute,
-						Capabilities:   []string{"region:gcp-us-central1"},
+						Capabilities:   []string{"os:linux", "arch:amd64", "region:gcp-us-central1"},
 						SecretRef:      "uecb-cloud-run",
 					},
 					model.BackendAzureFunctions: {
@@ -139,7 +139,7 @@ func Default() model.BrokerConfig {
 						MaxRunners:     2,
 						Weight:         1,
 						MaxJobDuration: 25 * time.Minute,
-						Capabilities:   []string{"region:azure-eastus"},
+						Capabilities:   []string{"os:linux", "arch:amd64", "region:azure-eastus"},
 						SecretRef:      "uecb-azure-functions",
 					},
 					model.BackendAzureVM: {
@@ -148,7 +148,7 @@ func Default() model.BrokerConfig {
 						MaxRunners:     1,
 						Weight:         1,
 						MaxJobDuration: 6 * time.Hour,
-						Capabilities:   []string{"docker", "privileged", "vm", "cloud:azure", "region:azure-eastus"},
+						Capabilities:   []string{"os:linux", "arch:amd64", "docker", "privileged", "vm", "cloud:azure", "region:azure-eastus"},
 						RunnerLabel:    "replace-with-private-azure-vm-runner-label",
 					},
 					model.BackendEC2: {
@@ -157,7 +157,7 @@ func Default() model.BrokerConfig {
 						MaxRunners:     1,
 						Weight:         1,
 						MaxJobDuration: 6 * time.Hour,
-						Capabilities:   []string{"docker", "privileged", "vm", "cloud:aws", "region:aws-us-east-1"},
+						Capabilities:   []string{"os:linux", "arch:amd64", "docker", "privileged", "vm", "cloud:aws", "region:aws-us-east-1"},
 						SecretRef:      "uecb-ec2",
 					},
 					model.BackendGCE: {
@@ -166,7 +166,7 @@ func Default() model.BrokerConfig {
 						MaxRunners:     1,
 						Weight:         1,
 						MaxJobDuration: 6 * time.Hour,
-						Capabilities:   []string{"docker", "privileged", "vm", "cloud:gcp", "region:gcp-us-central1"},
+						Capabilities:   []string{"os:linux", "arch:amd64", "docker", "privileged", "vm", "cloud:gcp", "region:gcp-us-central1"},
 						SecretRef:      "uecb-gce",
 					},
 				},

@@ -38,7 +38,7 @@ data:
             healthy: true
             maxRunners: 4
             weight: 1
-            capabilities: [cluster-local, docker, region:local]
+            capabilities: [os:linux, arch:amd64, cluster-local, docker, region:local]
             template: arc-full
       - name: lite
         labels: [self-hosted, linux, x64, uecb, uecb-lite]
@@ -55,5 +55,5 @@ data:
             healthy: true
             maxRunners: 2
             weight: 1
-            capabilities: [cluster-local, docker, region:local]
+            capabilities: [os:linux, arch:amd64, cluster-local, docker, region:local]
             template: arc-lite

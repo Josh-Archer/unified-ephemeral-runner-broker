@@ -186,6 +186,10 @@ Capability-aware routing is evaluated before scheduler selection.
 - Pinned backend requests still honor capability filters. If the pinned backend is configured for the pool but excluded by the request, the broker returns a clear rejection instead of falling through to another backend.
 - Missing backend capability metadata means that backend advertises no extra capabilities.
 - Docker workflows should request `required_capabilities: docker`; serverless-only backends should omit that tag so Docker work is routed to ARC, CodeBuild, or VM-style backends.
+- Platform dimensions use canonical tags `os:linux` / `os:windows` / `os:macos` and `arch:amd64` / `arch:arm64`. Bare aliases such as `windows`, `arm64`, and `x64` expand to those forms before matching. Default backends advertise `os:linux` and `arch:amd64`; Windows or arm64 fleets must advertise the matching tags explicitly.
+- The `allocate-runner` action exposes first-class `os` and `arch` inputs that merge into `required_capabilities`.
+
+Full schema, aliases, and examples live in [capabilities.md](capabilities.md).
 
 This keeps scheduling policy isolated in the scheduler registry while making capability eligibility deterministic at the API layer.
 

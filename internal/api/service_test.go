@@ -2392,6 +2392,80 @@ func TestAllocateRoutesDockerCapabilityToDockerBackend(t *testing.T) {
 	}
 }
 
+func TestAllocateRoutesWindowsArm64AliasesToMatchingBackend(t *testing.T) {
+	service := newServiceWithConfig(func(pool *model.PoolConfig) {
+		if pool.Name != model.PoolLite {
+			return
+		}
+		for name, cfg := range pool.Backends {
+			cfg.Enabled = false
+			pool.Backends[name] = cfg
+		}
+		// Default Linux/amd64 fleet remains available but must not match.
+		arcCfg := pool.Backends[model.BackendARC]
+		arcCfg.Enabled = true
+		arcCfg.Capabilities = []string{"os:linux", "arch:amd64", "cluster-local", "docker"}
+		pool.Backends[model.BackendARC] = arcCfg
+
+		windowsCfg := pool.Backends[model.BackendAzureVM]
+		windowsCfg.Enabled = true
+		windowsCfg.MaxRunners = 2
+		windowsCfg.Capabilities = []string{"windows", "arm64", "vm", "cloud:azure"}
+		windowsCfg.RunnerLabel = "windows-arm64-runners"
+		pool.Backends[model.BackendAzureVM] = windowsCfg
+	})
+
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:                 model.PoolLite,
+		RequiredCapabilities: []string{"Windows", "ARM64"},
+	})
+	if err != nil {
+		t.Fatalf("allocate failed: %v", err)
+	}
+	if allocation.SelectedBackend != model.BackendAzureVM {
+		t.Fatalf("expected azure-vm windows/arm64 backend, got %s", allocation.SelectedBackend)
+	}
+
+	// Canonical tags should also match the same backend.
+	allocation, err = service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:                 model.PoolLite,
+		RequiredCapabilities: []string{"os:windows", "arch:arm64"},
+	})
+	if err != nil {
+		t.Fatalf("allocate with canonical tags failed: %v", err)
+	}
+	if allocation.SelectedBackend != model.BackendAzureVM {
+		t.Fatalf("expected azure-vm for canonical os/arch tags, got %s", allocation.SelectedBackend)
+	}
+}
+
+func TestAllocateRejectsWindowsRequestWhenOnlyLinuxBackendsExist(t *testing.T) {
+	service := newService()
+
+	_, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:                 model.PoolLite,
+		RequiredCapabilities: []string{"os:windows"},
+	})
+	if !errors.Is(err, ErrNoMatchingBackendCapabilities) {
+		t.Fatalf("expected capability mismatch error, got %v", err)
+	}
+}
+
+func TestAllocateMatchesDefaultLinuxAmd64PlatformTags(t *testing.T) {
+	service := newService()
+
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:                 model.PoolLite,
+		RequiredCapabilities: []string{"linux", "x64"},
+	})
+	if err != nil {
+		t.Fatalf("allocate failed: %v", err)
+	}
+	if allocation.SelectedBackend != model.BackendARC && allocation.SelectedBackend != model.BackendCodeBuild {
+		t.Fatalf("expected a default linux/amd64 backend, got %s", allocation.SelectedBackend)
+	}
+}
+
 func TestAllocateAzureVMReturnsConfiguredRunnerLabel(t *testing.T) {
 	cfg := config.Default()
 	for index := range cfg.Pools {

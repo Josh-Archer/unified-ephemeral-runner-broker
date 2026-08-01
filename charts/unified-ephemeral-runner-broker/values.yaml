@@ -138,6 +138,8 @@ config:
           maxRunners: 4
           weight: 1
           capabilities:
+            - os:linux
+            - arch:amd64
             - cluster-local
             - docker
             - region:local
@@ -170,6 +172,8 @@ config:
           maxRunners: 2
           weight: 1
           capabilities:
+            - os:linux
+            - arch:amd64
             - cluster-local
             - docker
             - region:local
@@ -212,6 +216,8 @@ config:
           weight: 1
           maxJobDuration: 14m
           capabilities:
+            - os:linux
+            - arch:amd64
             - docker
             - region:aws-us-east-1
           secretRef: uecb-codebuild
@@ -225,6 +231,8 @@ config:
           weight: 1
           maxJobDuration: 14m
           capabilities:
+            - os:linux
+            - arch:amd64
             - region:aws-us-east-1
           secretRef: uecb-lambda
         cloud-run:
@@ -234,6 +242,8 @@ config:
           weight: 1
           maxJobDuration: 30m
           capabilities:
+            - os:linux
+            - arch:amd64
             - region:gcp-us-central1
           secretRef: uecb-cloud-run
         azure-functions:
@@ -243,6 +253,8 @@ config:
           weight: 1
           maxJobDuration: 25m
           capabilities:
+            - os:linux
+            - arch:amd64
             - region:azure-eastus
           secretRef: uecb-azure-functions
         azure-vm:
@@ -262,6 +274,8 @@ config:
           weight: 1
           maxJobDuration: 6h
           capabilities:
+            - os:linux
+            - arch:amd64
             - docker
             - privileged
             - vm
@@ -275,6 +289,8 @@ config:
           weight: 1
           maxJobDuration: 6h
           capabilities:
+            - os:linux
+            - arch:amd64
             - docker
             - privileged
             - vm
@@ -288,6 +304,8 @@ config:
           weight: 1
           maxJobDuration: 6h
           capabilities:
+            - os:linux
+            - arch:amd64
             - docker
             - privileged
             - vm

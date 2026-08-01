@@ -183,6 +183,20 @@ Pinned requests still honor the `enabled` and `healthy` flags, and capability fi
 
 This routes to ARC or CodeBuild only. Lambda and Cloud Run do not advertise `docker` in this pack.
 
+### Route Windows or arm64 jobs
+
+Windows or arm64 fleets must advertise platform tags (`os:windows`, `arch:arm64`,
+or aliases such as `windows` / `arm64`). Request them with action inputs:
+
+```yaml
+- uses: ./actions/allocate-runner
+  with:
+    broker_url: https://broker.example.com
+    pool: lite
+    os: windows
+    arch: arm64
+```
+
 ### Route jobs to a specific cloud region
 
 ```yaml

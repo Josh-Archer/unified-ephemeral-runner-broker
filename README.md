@@ -778,9 +778,13 @@ Jobs can further narrow backend selection with optional capability filters on th
 - `required_capabilities`: every listed tag must be advertised by the backend
 - `excluded_capabilities`: none of the listed tags may be advertised by the backend
 - Capability matching is case-insensitive and uses normalized string tags
+- Platform dimensions: `os:linux` / `os:windows` / `os:macos` and `arch:amd64` / `arch:arm64` (aliases such as `windows`, `arm64`, and `x64` expand automatically)
+- The `allocate-runner` action also accepts first-class `os` and `arch` inputs that merge into `required_capabilities`
 - If neither field is set, broker behavior is unchanged
 
 Capability filtering happens before the pool scheduler runs. The scheduler registry stays unchanged and only sees the eligible backends that remain after filtering.
+
+Full schema and alias table: [docs/capabilities.md](docs/capabilities.md). Example workflow: [examples/workflows/platform-routing.yml](examples/workflows/platform-routing.yml).
 
 Backend capability tags are configured per pool:
 
@@ -793,6 +797,8 @@ pools:
         enabled: true
         maxRunners: 2
         capabilities:
+          - os:linux
+          - arch:amd64
           - cluster-local
           - docker
           - region:local
@@ -800,6 +806,8 @@ pools:
         enabled: true
         maxRunners: 3
         capabilities:
+          - os:linux
+          - arch:amd64
           - docker
           - region:aws-us-east-1
       azure-vm:
@@ -807,6 +815,8 @@ pools:
         maxRunners: 1
         runnerLabel: replace-with-private-azure-vm-runner-label
         capabilities:
+          - os:linux
+          - arch:amd64
           - docker
           - privileged
           - vm
@@ -815,6 +825,8 @@ pools:
         enabled: true
         maxRunners: 2
         capabilities:
+          - os:linux
+          - arch:amd64
           - region:gcp-us-central1
 ```
 
@@ -841,6 +853,19 @@ Examples:
 ```
 
 This excludes serverless-only backends such as `lambda`, `cloud-run`, and `azure-functions` unless an environment explicitly advertises Docker support for those backends.
+
+- Windows + arm64 routing:
+
+```yaml
+- uses: ./actions/allocate-runner
+  with:
+    broker_url: https://broker.example.com
+    pool: lite
+    os: windows
+    arch: arm64
+```
+
+Equivalent capability tags: `required_capabilities: os:windows,arch:arm64` (or aliases `windows,arm64`). Default backends advertise Linux/amd64 only; enable and tag a Windows/arm64 backend (for example a dedicated VM label) before using this filter.
 
 - GPU routing:
 
