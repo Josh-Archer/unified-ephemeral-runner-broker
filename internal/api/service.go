@@ -59,6 +59,7 @@ type Service struct {
 	tierMgr     *tier.Manager
 	capacityMgr *capacity.Manager
 	budgets     *budget.Tracker
+	quality     *quality.Tracker
 	warmMu      sync.Mutex
 	initErr     error
 	health      func(context.Context) error
@@ -98,6 +99,7 @@ func newServiceWithStore(cfg model.BrokerConfig, registry *backend.Registry, hea
 		return nil
 	}
 	admissionStore := store.AsAdmissionStateStore(stateStore)
+	qualityCfg := cfg.Broker.QualityAware
 	service := &Service{
 		cfg:      cfg,
 		registry: registry,
@@ -111,6 +113,7 @@ func newServiceWithStore(cfg model.BrokerConfig, registry *backend.Registry, hea
 		tierMgr:     tier.NewManager(),
 		capacityMgr: capacity.NewManager(),
 		budgets:     budget.NewTracker(admissionStore),
+		quality:     quality.NewTracker(qualityCfg.Window, qualityCfg.MinSamples),
 		health:      health,
 		now:         time.Now,
 	}
@@ -202,6 +205,17 @@ func firstErr(errs ...error) error {
 		}
 	}
 	return nil
+}
+
+func (s *Service) reaperGrace() time.Duration {
+	if s == nil {
+		return 0
+	}
+	grace := s.cfg.Broker.OrphanCleanup.GracePeriod
+	if grace < 0 {
+		return 0
+	}
+	return grace
 }
 
 func (s *Service) rehydrateSchedulerState() error {
@@ -815,9 +829,23 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 		s.observer.ObserveRegistrationLatency(pool.Name, selected, launchLatency)
 		if err != nil {
 			endSpan(provisionSpan, err)
-			s.release(context.Background(), pool, selected, allocation)
 			s.recordBackendFailure(pool, selected, err, s.now())
 			s.recordQualityFailure(pool.Name, selected, backend.IsCapacityExhausted(err))
+			// Cancel may have already released capacity and marked the allocation
+			// terminal while provision was in flight. Only release/fail when the
+			// reservation is still ours.
+			if current, canceled := s.allocationCanceledDuringProvision(allocation.ID); canceled {
+				return current, ErrAllocationCanceled
+			}
+			abandoned, abandonedOK := s.abandonReservedAllocation(context.Background(), pool, allocation, model.StateFailed, err.Error())
+			if !abandonedOK {
+				if abandoned.State == model.StateCanceled {
+					return abandoned, ErrAllocationCanceled
+				}
+				if isTerminalAllocationState(abandoned.State) {
+					return abandoned, err
+				}
+			}
 			if backend.IsCapacityExhausted(err) {
 				capacityFallback = selected
 				s.observer.ObserveLiveCapacityDecision(pool.Name, selected, "provider-reject", 0)
@@ -831,8 +859,6 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 					// Pinned requests are not silently rerouted on live-capacity rejection.
 					if existing.ID == "" {
 						_ = s.store.Delete(allocation.ID)
-					} else {
-						s.markState(allocation.ID, model.StateFailed, s.now(), err.Error())
 					}
 					return model.AllocationStatus{}, fmt.Errorf("pinned backend %q live capacity exhausted: %w", selected, ErrBackendLiveCapacity)
 				}
@@ -849,16 +875,16 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 				if len(reservePool.Backends) > 0 {
 					continue
 				}
-				if existing.ID != "" {
-					s.markState(existing.ID, model.StateFailed, s.now(), err.Error())
-				}
 				return model.AllocationStatus{}, fmt.Errorf("selected backend %q capacity exhausted and no fallback backend is available: %w", selected, ErrBackendLiveCapacity)
 			}
 			if queued, ok := s.queueAllocation(ctx, request, pool.Name, selected, err, allocation); ok {
 				result = "queued"
 				return queued, nil
 			}
-			s.markState(allocation.ID, model.StateFailed, s.now(), err.Error())
+			if !abandonedOK && abandoned.ID != "" {
+				// Reservation was taken by cancel/expire; surface that outcome.
+				return abandoned, err
+			}
 			logAllocationEvent(ctx, "allocation_failed", map[string]string{
 				"allocation_id": allocation.ID,
 				"pool":          string(pool.Name),
@@ -876,10 +902,21 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 			launchMode,
 		)
 		allocation.State = model.StateReady
-		s.store.Save(allocation)
+		// Commit ready only while still reserved so a concurrent cancel cannot be
+		// overwritten with a live runner label.
+		saved, saveErr := s.store.SaveIfState(allocation, model.StateReserved)
+		if saveErr != nil {
+			s.release(context.Background(), pool, selected, allocation)
+			s.cleanupAllocation(context.Background(), allocation)
+			return model.AllocationStatus{}, saveErr
+		}
+		if !saved {
+			return s.finalizeCanceledDuringProvision(ctx, allocation)
+		}
 		s.notifyReady(allocation)
 		s.recordBackendSuccess(pool, selected, s.now())
 		s.recordBudgetUsage(pool, selected)
+		s.recordQualitySuccess(pool.Name, selected, launchLatency)
 		result = "success"
 		allocationID = allocation.ID
 		logAllocationEvent(ctx, "allocation_ready", map[string]string{
@@ -1084,39 +1121,44 @@ func (s *Service) Cancel(ctx context.Context, id string) (model.AllocationStatus
 		s.observer.ObserveCancellation(poolName, backendName, result, s.now().Sub(started))
 	}()
 
-	status, ok := s.store.Get(id)
-	if !ok {
-		return model.AllocationStatus{}, false
+	// Cancel is idempotent: concurrent cancels and races with provision completion
+	// converge on a single terminal canceled record and one capacity release.
+	for {
+		status, ok := s.store.Get(id)
+		if !ok {
+			return model.AllocationStatus{}, false
+		}
+		poolName = status.Pool
+		backendName = status.SelectedBackend
+		span.SetAttributes(
+			spanAttrPool(string(status.Pool)),
+			spanAttrBackend(string(status.SelectedBackend)),
+			spanAttrState(string(status.State)),
+			spanAttrCorrelationID(firstNonEmpty(status.CorrelationID, correlationIDFromContext(ctx))),
+		)
+		if isTerminalAllocationState(status.State) {
+			result = "already_terminal"
+			return status, true
+		}
+		updated, ok := s.store.CompareAndMarkState(id, status.State, model.StateCanceled, s.now(), "")
+		if !ok {
+			// Lost a race with provision ready/complete/expire; retry for idempotency.
+			continue
+		}
+		s.notifyLifecycleTerminal(updated)
+		if pool, err := s.resolvePool(updated.Pool); err == nil {
+			s.release(ctx, pool, updated.SelectedBackend, updated)
+		}
+		result = "success"
+		logAllocationEvent(ctx, "allocation_canceled", map[string]string{
+			"allocation_id": allocationIDLabel(updated.ID),
+			"pool":          string(updated.Pool),
+			"backend":       string(updated.SelectedBackend),
+			"state":         string(updated.State),
+		})
+		s.observeState()
+		return updated, true
 	}
-	poolName = status.Pool
-	backendName = status.SelectedBackend
-	span.SetAttributes(
-		spanAttrPool(string(status.Pool)),
-		spanAttrBackend(string(status.SelectedBackend)),
-		spanAttrState(string(status.State)),
-		spanAttrCorrelationID(firstNonEmpty(status.CorrelationID, correlationIDFromContext(ctx))),
-	)
-	if isTerminalAllocationState(status.State) {
-		result = "already_terminal"
-		return status, true
-	}
-	updated, ok := s.markState(id, model.StateCanceled, s.now(), "")
-	if !ok {
-		result = "conflict"
-		return model.AllocationStatus{}, false
-	}
-	if pool, err := s.resolvePool(updated.Pool); err == nil {
-		s.release(ctx, pool, updated.SelectedBackend, updated)
-	}
-	result = "success"
-	logAllocationEvent(ctx, "allocation_canceled", map[string]string{
-		"allocation_id": allocationIDLabel(updated.ID),
-		"pool":          string(updated.Pool),
-		"backend":       string(updated.SelectedBackend),
-		"state":         string(updated.State),
-	})
-	s.observeState()
-	return updated, true
 }
 
 type completionRequest struct {
@@ -1253,6 +1295,7 @@ func (s *Service) SweepExpired(now time.Time) int {
 					// Still attempt provider cleanup when the pool config vanished.
 					s.reclaimStaleRunnerLabel(context.Background(), status)
 				}
+				s.observer.ObserveOrphanCleanup(status.Pool, status.SelectedBackend, orphanAction)
 				s.observer.ObserveAllocationReaped(status.Pool, status.SelectedBackend, string(nextState))
 				logAllocationEvent(context.Background(), "allocation_reaped", map[string]string{
 					"allocation_id": allocationIDLabel(status.ID),
@@ -1279,7 +1322,11 @@ func (s *Service) SweepExpired(now time.Time) int {
 		if status.ExpiresAt.After(now) {
 			continue
 		}
-		if _, ok := s.markState(status.ID, model.StateExpired, now, "allocation quarantine expired"); ok {
+		if _, ok := s.markState(status.ID, model.StateExpired, now, "stale runner label quarantine expired"); ok {
+			// Retry provider cleanup in case the quarantine transition failed to
+			// tear down the runner registration.
+			s.reclaimStaleRunnerLabel(context.Background(), status)
+			s.observer.ObserveOrphanCleanup(status.Pool, status.SelectedBackend, orphanActionQuarantineExpired)
 			logAllocationEvent(context.Background(), "allocation_expired", map[string]string{
 				"allocation_id": allocationIDLabel(status.ID),
 				"pool":          string(status.Pool),
