@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend"
+	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/capacity/fakecapacity"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/config"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 )
@@ -625,6 +626,50 @@ func TestCapacityMissingURL(t *testing.T) {
 	})
 	if _, err := dispatchBackend.Capacity(context.Background()); err == nil {
 		t.Fatal("expected error when capacity_url is missing")
+	}
+}
+
+// TestCapacityUsesFakeServer exercises capacity_url against the first-class
+// fakecapacity HTTP fixture (no cloud credentials / outbound provider network).
+func TestCapacityUsesFakeServer(t *testing.T) {
+	srv := fakecapacity.NewServer(t,
+		fakecapacity.WithStatus(fakecapacity.Detailed(6, 3, 1, 0)),
+		fakecapacity.WithBearerAuth("broker-secret"),
+	)
+
+	cfg := newRepoScopedConfig()
+	dispatchBackend := New(model.BackendCodeBuild, cfg, staticSecrets{
+		"uecb-codebuild": {
+			secretKeyCapacityURL:   srv.URL,
+			secretKeyDispatchToken: "broker-secret",
+		},
+	})
+
+	status, err := dispatchBackend.Capacity(context.Background())
+	if err != nil {
+		t.Fatalf("capacity: %v", err)
+	}
+	if status.MaxRunners != 6 || status.ActiveRunners != 3 || status.PendingRunners != 1 {
+		t.Fatalf("unexpected capacity %+v", status)
+	}
+	if backend.FreeSlots(status) != 2 {
+		t.Fatalf("expected 2 free slots, got %d", backend.FreeSlots(status))
+	}
+
+	// Simulate provider becoming full without restarting the dispatch backend.
+	srv.SetStatus(fakecapacity.Full(6))
+	status, err = dispatchBackend.Capacity(context.Background())
+	if err != nil {
+		t.Fatalf("capacity after full: %v", err)
+	}
+	if backend.FreeSlots(status) != 0 {
+		t.Fatalf("expected full provider, free=%d status=%+v", backend.FreeSlots(status), status)
+	}
+
+	// Probe failure path via HTTP status.
+	srv.SetStatusCode(http.StatusServiceUnavailable)
+	if _, err := dispatchBackend.Capacity(context.Background()); err == nil {
+		t.Fatal("expected capacity error on 503")
 	}
 }
 
