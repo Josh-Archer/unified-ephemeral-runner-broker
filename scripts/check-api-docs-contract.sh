@@ -17,11 +17,14 @@ DOC_PATHS=(
 )
 
 # Action-only inputs that never appear on the allocation request body.
+# os/arch are convenience inputs merged into required_capabilities by the action.
 ACTION_ONLY_INPUTS=(
   broker_url
   oidc_audience
   allow_unauthenticated
   queue_wait_timeout
+  os
+  arch
 )
 
 # finalize-allocation inputs that are not CompletionRequest body fields.
