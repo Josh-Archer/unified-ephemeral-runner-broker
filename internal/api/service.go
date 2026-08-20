@@ -544,7 +544,15 @@ func (s *Service) createRestartOrphanHolds(pool model.PoolConfig, backendName mo
 }
 
 func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest) (model.AllocationStatus, error) {
-	return s.allocateNow(ctx, request, model.AllocationStatus{})
+	status, err := s.allocateNow(ctx, request, model.AllocationStatus{})
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || (s.initErr != nil && errors.Is(err, s.initErr)) {
+			return status, err
+		}
+		pool, _ := s.resolvePool(request.Pool)
+		return status, s.wrapAllocationError(pool, request, err)
+	}
+	return status, nil
 }
 
 func (s *Service) allocateNow(ctx context.Context, request model.AllocationRequest, existing model.AllocationStatus) (model.AllocationStatus, error) {

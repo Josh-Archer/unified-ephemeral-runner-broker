@@ -97,7 +97,7 @@ func (s *Server) handleAllocations(w http.ResponseWriter, r *http.Request) {
 		ctx := withPrincipal(r.Context(), claims)
 		allocation, err := s.service.Allocate(ctx, request)
 		if err != nil {
-			s.writeError(w, http.StatusBadRequest, err)
+			s.writeAllocationError(w, err)
 			return
 		}
 		if allocation.State == model.StatePending {
@@ -264,6 +264,15 @@ func (s *Server) writeOwnershipError(w http.ResponseWriter, err error) {
 		return
 	}
 	s.writeError(w, http.StatusForbidden, err)
+}
+
+func (s *Server) writeAllocationError(w http.ResponseWriter, err error) {
+	var allocErr *AllocationError
+	if errors.As(err, &allocErr) {
+		s.writeJSON(w, http.StatusBadRequest, allocErr)
+		return
+	}
+	s.writeError(w, http.StatusBadRequest, err)
 }
 
 func (s *Server) writeError(w http.ResponseWriter, code int, err error) {
