@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/azure-functions/python:4-python3.11
+FROM --platform=linux/amd64 mcr.microsoft.com/azure-functions/python:4-python3.11
 
 ENV DEBIAN_FRONTEND=noninteractive \
     AzureFunctionsJobHost__Logging__Console__IsEnabled=true \
