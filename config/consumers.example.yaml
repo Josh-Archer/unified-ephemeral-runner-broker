@@ -1,0 +1,13 @@
+# GitOps consumers configuration for automated release pin PRs.
+# Copy this file to config/consumers.yaml and configure your consumer repositories.
+
+consumers:
+  - name: example-gitops
+    repository: example-org/example-gitops
+    base_branch: main
+    pins:
+      - path: gitops/apps/unified-ephemeral-runner-broker/kustomization.yaml
+        kind: kustomize
+      - path: terraform/modules/uecb/variables.tf
+        kind: terraform_default
+        variable: uecb_broker_release_version

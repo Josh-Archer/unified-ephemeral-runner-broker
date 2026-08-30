@@ -1,0 +1,331 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag to publish (e.g. v0.1.25). Defaults to the pushed ref.'
+        required: false
+        type: string
+        default: ''
+      push_artifacts:
+        description: 'Push container images and Helm chart to GHCR'
+        required: true
+        type: boolean
+        default: true
+      create_pin_pr:
+        description: 'Open GitOps pin PR(s) in downstream consumer repositories'
+        required: true
+        type: boolean
+        default: true
+      consumer_repos:
+        description: 'Optional comma-separated consumer filter (default: all in config/consumers.yaml)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: release-uecb-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_OWNER: josh-archer
+  SYFT_VERSION: v1.48.0
+
+jobs:
+  validate:
+    name: Validate release inputs
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      version_no_v: ${{ steps.meta.outputs.version_no_v }}
+      short_sha: ${{ steps.meta.outputs.short_sha }}
+      full_sha: ${{ steps.meta.outputs.full_sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve release version metadata
+        id: meta
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="${INPUT_VERSION}"
+          if [[ -z "${version}" ]]; then
+            if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+              version="${GITHUB_REF#refs/tags/}"
+            else
+              echo "::error::Version must be provided via workflow inputs or triggered by a v* tag."
+              exit 1
+            fi
+          fi
+
+          if [[ "${version}" == "latest" || "${version}" == "main" ]]; then
+            echo "::error::Version must be an immutable release tag (e.g. v0.1.25), not '${version}'."
+            exit 1
+          fi
+
+          version_no_v="${version#v}"
+          full_sha="$(git rev-parse HEAD)"
+          short_sha="$(git rev-parse --short=7 HEAD)"
+
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "version_no_v=${version_no_v}" >> "$GITHUB_OUTPUT"
+          echo "full_sha=${full_sha}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${short_sha}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Release Pipeline Metadata"
+            echo ""
+            echo "| Parameter | Value |"
+            echo "| :--- | :--- |"
+            echo "| Version | \`${version}\` |"
+            echo "| Version (plain) | \`${version_no_v}\` |"
+            echo "| Commit SHA | \`${full_sha}\` (\`${short_sha}\`) |"
+            echo "| Push Artifacts | \`${{ inputs.push_artifacts != false }}\` |"
+            echo "| Create Pin PR | \`${{ inputs.create_pin_pr != false }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish-images:
+    name: Build & publish container images
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: release
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - name: broker
+            package: unified-ephemeral-runner-broker/broker
+            dockerfile: Dockerfile.broker
+            platform: linux/amd64,linux/arm64
+          - name: launcher
+            package: unified-ephemeral-runner-broker/launcher
+            dockerfile: Dockerfile.launcher
+            platform: linux/amd64,linux/arm64
+          - name: cloud-run
+            package: unified-ephemeral-runner-broker/cloud-run
+            dockerfile: Dockerfile.cloud-run
+            platform: linux/amd64
+          - name: lambda
+            package: unified-ephemeral-runner-broker/lambda
+            dockerfile: Dockerfile.lambda
+            platform: linux/amd64
+          - name: azure-functions
+            package: unified-ephemeral-runner-broker/azure-functions
+            dockerfile: Dockerfile.azure-functions
+            platform: linux/amd64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        if: ${{ inputs.push_artifacts != false }}
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.image.dockerfile }}
+          platforms: ${{ matrix.image.platform }}
+          push: ${{ inputs.push_artifacts != false }}
+          provenance: false
+          sbom: false
+          outputs: type=image,push=${{ inputs.push_artifacts != false }},oci-mediatypes=false
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ matrix.image.package }}:${{ needs.validate.outputs.version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ matrix.image.package }}:${{ needs.validate.outputs.version_no_v }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ matrix.image.package }}:sha-${{ needs.validate.outputs.short_sha }}
+
+      - name: Capture image identity
+        id: image
+        if: ${{ inputs.push_artifacts != false }}
+        env:
+          PACKAGE_NAME: ${{ matrix.image.package }}
+          VERSION_TAG: ${{ needs.validate.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="${REGISTRY}/${IMAGE_OWNER}/${PACKAGE_NAME}"
+          digest="${{ steps.build.outputs.digest }}"
+          if [[ -z "${digest}" || "${digest}" != sha256:* ]]; then
+            echo "Missing or invalid build digest: '${digest}'" >&2
+            exit 1
+          fi
+          echo "name=${name}" >> "${GITHUB_OUTPUT}"
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+          echo "ref=${name}@${digest}" >> "${GITHUB_OUTPUT}"
+          echo "tag_ref=${name}:${VERSION_TAG}" >> "${GITHUB_OUTPUT}"
+      - name: Verify Lambda-compatible image manifest
+        if: ${{ inputs.push_artifacts != false && matrix.image.name == 'lambda' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="${{ steps.image.outputs.tag_ref }}"
+          raw="$(docker buildx imagetools inspect --raw "${image}")"
+          media_type="$(printf '%s' "${raw}" | jq -r '.mediaType')"
+
+          if [ "${media_type}" != "application/vnd.docker.distribution.manifest.v2+json" ]; then
+            echo "Invalid Lambda manifest media type: ${media_type}" >&2
+            printf '%s\n' "${raw}" >&2
+            exit 1
+          fi
+
+      - name: Generate SPDX SBOM
+        id: sbom
+        if: ${{ inputs.push_artifacts != false }}
+        uses: anchore/sbom-action@v0.24.0
+        with:
+          image: ${{ steps.image.outputs.ref }}
+          format: spdx-json
+          artifact-name: ${{ matrix.image.name }}-${{ needs.validate.outputs.version }}.spdx.json
+          output-file: ${{ runner.temp }}/${{ matrix.image.name }}.spdx.json
+          upload-release-assets: false
+          syft-version: ${{ env.SYFT_VERSION }}
+
+      - name: Compact SBOM for attestation size limit
+        if: ${{ inputs.push_artifacts != false }}
+        shell: bash
+        env:
+          SBOM_PATH: ${{ runner.temp }}/${{ matrix.image.name }}.spdx.json
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+
+          path = pathlib.Path(os.environ["SBOM_PATH"])
+          data = json.loads(path.read_text(encoding="utf-8"))
+          before = path.stat().st_size
+          data.pop("files", None)
+          relationships = data.get("relationships")
+          if isinstance(relationships, list):
+              data["relationships"] = [
+                  rel
+                  for rel in relationships
+                  if not str(rel.get("spdxElementId", "")).startswith("SPDXRef-File")
+                  and not str(rel.get("relatedSpdxElement", "")).startswith("SPDXRef-File")
+              ]
+          path.write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
+          after = path.stat().st_size
+          limit = 16 * 1024 * 1024
+          print(f"SBOM size before compact={before} after={after} limit={limit}")
+          if after > limit:
+              raise SystemExit(f"SBOM still exceeds attestation limit after compact: {after}")
+          PY
+
+      - name: Attest build provenance
+        if: ${{ inputs.push_artifacts != false }}
+        uses: actions/attest@v4
+        with:
+          subject-name: ${{ steps.image.outputs.name }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Attest SBOM
+        if: ${{ inputs.push_artifacts != false }}
+        uses: actions/attest@v4
+        with:
+          subject-name: ${{ steps.image.outputs.name }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          sbom-path: ${{ runner.temp }}/${{ matrix.image.name }}.spdx.json
+          push-to-registry: true
+          create-storage-record: false
+
+  publish-chart:
+    name: Package & publish Helm chart
+    needs: [validate, publish-images]
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.14.0
+
+      - name: Package Helm chart
+        env:
+          VERSION_NO_V: ${{ needs.validate.outputs.version_no_v }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          helm package charts/unified-ephemeral-runner-broker \
+            --version "${VERSION_NO_V}" \
+            --app-version "${VERSION_NO_V}" \
+            --destination dist/
+      - name: Log in to GHCR for Helm
+        if: ${{ inputs.push_artifacts != false }}
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io --username "${{ github.actor }}" --password-stdin
+
+      - name: Push Helm chart OCI artifact
+        if: ${{ inputs.push_artifacts != false }}
+        env:
+          VERSION_NO_V: ${{ needs.validate.outputs.version_no_v }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          pkg="dist/unified-ephemeral-runner-broker-${VERSION_NO_V}.tgz"
+          helm push "${pkg}" "oci://${REGISTRY}/${IMAGE_OWNER}/charts"
+  promote-consumers:
+    name: Open GitOps consumer pin PRs
+    needs: [validate, publish-chart]
+    if: ${{ inputs.create_pin_pr != false && inputs.push_artifacts != false }}
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dispatch GitOps pin PRs
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          SOURCE_REF: ${{ needs.validate.outputs.version }}
+          SOURCE_SHA: ${{ needs.validate.outputs.full_sha }}
+          CONSUMERS_FILE: config/consumers.yaml
+          CONSUMER_REPOS: ${{ inputs.consumer_repos }}
+          RELEASE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          GH_TOKEN: ${{ secrets.GITOPS_PAT != '' && secrets.GITOPS_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          bash scripts/create-gitops-pin-pr.sh
+
+  verify-drift:
+    name: Verify release drift
+    needs: [validate, publish-chart]
+    if: ${{ inputs.push_artifacts != false }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run drift verification
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION_NO_V: ${{ needs.validate.outputs.version_no_v }}
+          SOURCE_REF: ${{ needs.validate.outputs.version }}
+        run: |
+          bash scripts/check-release-drift.sh \
+            --version "${VERSION_NO_V}" \
+            --source-ref "${SOURCE_REF}"
