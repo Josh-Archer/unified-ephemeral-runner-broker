@@ -24,6 +24,7 @@ import (
 	lambdabackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/lambda"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/capacity"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/config"
+	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/runtime"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/store"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/telemetry"
@@ -58,23 +59,14 @@ func main() {
 		log.Fatalf("configure kubernetes secret reader: %v", err)
 	}
 
-	registry := backend.NewRegistry(
-		arcbackend.New(cfg, secretReader),
-		codebuildbackend.New(cfg, secretReader),
-		lambdabackend.New(cfg, secretReader),
-		cloudbackend.New(cfg, secretReader),
-		azurebackend.New(cfg, secretReader),
-		azurevmbackend.New(cfg),
-		desktopbackend.New(cfg),
-		ec2backend.New(cfg, secretReader),
-		gcebackend.New(cfg, secretReader),
-	)
+	registry, desktopBackend := buildRegistry(cfg, secretReader)
 	healthChecker, err := runtime.NewSecretRefCheckerFromEnv(cfg)
 	if err != nil {
 		log.Fatalf("configure runtime dependencies: %v", err)
 	}
 
 	service := api.NewService(cfg, registry, healthChecker.Check)
+	wireDesktopActiveCounter(desktopBackend, service.Store())
 	if cfg.Broker.Webhooks.Enabled {
 		service.SetLifecycleNotifier(webhook.New(cfg.Broker.Webhooks, secretReader, nil))
 		log.Printf("allocation lifecycle webhooks enabled endpoints=%d", len(cfg.Broker.Webhooks.Endpoints))
@@ -230,4 +222,26 @@ func leaderIdentity(configured string) string {
 		return id
 	}
 	return "broker"
+}
+
+func buildRegistry(cfg model.BrokerConfig, secretReader runtime.SecretReader) (*backend.Registry, *desktopbackend.Backend) {
+	desktopBackend := desktopbackend.New(cfg)
+	registry := backend.NewRegistry(
+		arcbackend.New(cfg, secretReader),
+		codebuildbackend.New(cfg, secretReader),
+		lambdabackend.New(cfg, secretReader),
+		cloudbackend.New(cfg, secretReader),
+		azurebackend.New(cfg, secretReader),
+		azurevmbackend.New(cfg),
+		desktopBackend,
+		ec2backend.New(cfg, secretReader),
+		gcebackend.New(cfg, secretReader),
+	)
+	return registry, desktopBackend
+}
+
+func wireDesktopActiveCounter(desktop *desktopbackend.Backend, s store.Store) {
+	if desktop != nil && s != nil {
+		desktop.WithActiveCounter(s)
+	}
 }

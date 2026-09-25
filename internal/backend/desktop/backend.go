@@ -15,11 +15,16 @@ import (
 // DialFunc opens a TCP connection for optional desktop host probes.
 type DialFunc func(network, address string, timeout time.Duration) (net.Conn, error)
 
+// ActiveCounter reports the number of scheduler-accounted active allocations
+// for a pool and backend. This interface is satisfied directly by store.Store.
+type ActiveCounter = backend.ActiveCounter
+
 type Backend struct {
 	cfg             model.BrokerConfig
 	dial            DialFunc
 	mu              sync.Mutex
 	active          map[string]struct{}
+	activeCounter   backend.ActiveCounter
 	activeCountFunc func() int
 }
 
@@ -36,12 +41,42 @@ func (b *Backend) WithDialer(dial DialFunc) *Backend {
 	return b
 }
 
+// SetActiveCounter configures a durable active allocation counter.
+func (b *Backend) SetActiveCounter(counter backend.ActiveCounter) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.activeCounter = counter
+}
+
+// WithActiveCounter configures a durable active allocation counter and returns the backend.
+func (b *Backend) WithActiveCounter(counter backend.ActiveCounter) *Backend {
+	b.SetActiveCounter(counter)
+	return b
+}
+
 // WithActiveCountFunc overrides the active runner count source (tests).
 func (b *Backend) WithActiveCountFunc(fn func() int) *Backend {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.activeCountFunc = fn
 	return b
+}
+
+// ActiveCountFunc returns a count function summing counter.CountActive(pool, BackendDesktop)
+// across all pools in cfg where the desktop backend is configured.
+func ActiveCountFunc(cfg model.BrokerConfig, counter backend.ActiveCounter) func() int {
+	if counter == nil {
+		return nil
+	}
+	return func() int {
+		var total int
+		for _, pool := range cfg.Pools {
+			if _, ok := pool.Backends[model.BackendDesktop]; ok {
+				total += counter.CountActive(pool.Name, model.BackendDesktop)
+			}
+		}
+		return total
+	}
 }
 
 func (b *Backend) Name() model.BackendName {
@@ -124,11 +159,23 @@ func (b *Backend) Capacity(_ context.Context) (backend.CapacityStatus, error) {
 	}
 
 	b.mu.Lock()
-	activeRunners := len(b.active)
-	if b.activeCountFunc != nil {
-		activeRunners = b.activeCountFunc()
-	}
+	fn := b.activeCountFunc
+	counter := b.activeCounter
+	inMemoryCount := len(b.active)
 	b.mu.Unlock()
+
+	var activeRunners int
+	if fn != nil {
+		activeRunners = fn()
+	} else if counter != nil {
+		for _, pool := range b.cfg.Pools {
+			if _, ok := pool.Backends[model.BackendDesktop]; ok {
+				activeRunners += counter.CountActive(pool.Name, model.BackendDesktop)
+			}
+		}
+	} else {
+		activeRunners = inMemoryCount
+	}
 	if activeRunners < 0 {
 		activeRunners = 0
 	}
