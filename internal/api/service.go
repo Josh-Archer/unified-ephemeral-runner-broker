@@ -117,6 +117,13 @@ func newServiceWithStore(cfg model.BrokerConfig, registry *backend.Registry, hea
 		health:      health,
 		now:         time.Now,
 	}
+	if registry != nil && stateStore != nil {
+		for _, b := range registry.All() {
+			if receiver, ok := b.(backend.ActiveCountReceiver); ok {
+				receiver.SetActiveCounter(stateStore)
+			}
+		}
+	}
 	service.initErr = firstErr(
 		storeErr,
 		validateSchedulers(cfg.Pools, schedulerRegistry),

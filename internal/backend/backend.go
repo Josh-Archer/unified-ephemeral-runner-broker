@@ -140,6 +140,18 @@ type CapacityBackend interface {
 	Capacity(ctx context.Context) (CapacityStatus, error)
 }
 
+// ActiveCounter reports the number of scheduler-accounted active allocations
+// for a pool and backend. This interface is satisfied directly by store.Store.
+type ActiveCounter interface {
+	CountActive(pool model.PoolName, backend model.BackendName) int
+}
+
+// ActiveCountReceiver is an optional interface implemented by backends that can
+// receive an authoritative active allocation counter from the broker service.
+type ActiveCountReceiver interface {
+	SetActiveCounter(counter ActiveCounter)
+}
+
 type Registry struct {
 	backends map[model.BackendName]Backend
 }
@@ -155,6 +167,21 @@ func NewRegistry(entries ...Backend) *Registry {
 func (r *Registry) Get(name model.BackendName) (Backend, bool) {
 	backend, ok := r.backends[name]
 	return backend, ok
+}
+
+// All returns all registered backends sorted deterministically by name.
+func (r *Registry) All() []Backend {
+	if r == nil {
+		return nil
+	}
+	result := make([]Backend, 0, len(r.backends))
+	for _, b := range r.backends {
+		result = append(result, b)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Name() < result[j].Name()
+	})
+	return result
 }
 
 func DefaultRunnerLabel(name model.BackendName, allocationID string) string {

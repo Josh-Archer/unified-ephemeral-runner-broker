@@ -15,6 +15,7 @@ import (
 	azurevmbackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/azurevm"
 	cloudbackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/cloudrun"
 	codebuildbackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/codebuild"
+	desktopbackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/desktop"
 	ec2backend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/ec2"
 	gcebackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/gce"
 	lambdabackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/lambda"
@@ -4045,5 +4046,167 @@ func TestBudgetExceededErrorsAreNotQueued(t *testing.T) {
 	err := fmt.Errorf("all eligible backends for pool %q are over budget: %w", model.PoolLite, ErrBackendBudgetExceeded)
 	if queueableError(err) {
 		t.Fatal("budget exceeded errors must fail fast and not enter the admission queue")
+	}
+}
+
+func TestServiceDesktopLiveCapacityTracksActiveRunners(t *testing.T) {
+	cfg := config.Default()
+	enableLiveCapacity(&cfg)
+	for i := range cfg.Pools {
+		if cfg.Pools[i].Name != model.PoolLite {
+			continue
+		}
+		for name, backendCfg := range cfg.Pools[i].Backends {
+			backendCfg.Enabled = false
+			cfg.Pools[i].Backends[name] = backendCfg
+		}
+		cfg.Pools[i].Backends[model.BackendDesktop] = model.BackendConfig{
+			Enabled:    true,
+			Healthy:    true,
+			MaxRunners: 1,
+		}
+	}
+
+	desktop := desktopbackend.New(cfg)
+	service := NewService(cfg, backend.NewRegistry(desktop), nil)
+	manager := capacity.NewManager()
+	service.SetCapacityManager(manager)
+
+	// Step 1: Desktop is online and has 0 active runners -> Capacity reports 0 active, 1 free.
+	capStatus, err := desktop.Capacity(context.Background())
+	if err != nil {
+		t.Fatalf("desktop capacity: %v", err)
+	}
+	if capStatus.ActiveRunners != 0 || backend.FreeSlots(capStatus) != 1 {
+		t.Fatalf("expected 0 active 1 free initially, got %+v", capStatus)
+	}
+
+	// Step 2: Allocate a runner via Service on desktop.
+	pinned := model.BackendDesktop
+	alloc, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolLite,
+		Backend:    &pinned,
+		JobTimeout: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("allocate desktop: %v", err)
+	}
+
+	// Step 3: Desktop capacity now reports 1 active runner, 0 free slots.
+	capStatus, err = desktop.Capacity(context.Background())
+	if err != nil {
+		t.Fatalf("desktop capacity: %v", err)
+	}
+	if capStatus.ActiveRunners != 1 || backend.FreeSlots(capStatus) != 0 {
+		t.Fatalf("expected 1 active 0 free while busy, got %+v", capStatus)
+	}
+
+	// Step 4: Refresh manager with desktop capacity and verify live capacity treats it as exhausted.
+	manager.Set(capacity.Snapshot{
+		Backend:   model.BackendDesktop,
+		Status:    capStatus,
+		UpdatedAt: time.Now().UTC(),
+		Source:    "live",
+	})
+
+	_, err = service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolLite,
+		Backend:    &pinned,
+		JobTimeout: 5 * time.Minute,
+	})
+	if !errors.Is(err, ErrBackendLiveCapacity) {
+		t.Fatalf("expected ErrBackendLiveCapacity when desktop is busy, got %v", err)
+	}
+
+	// Step 5: Complete allocation -> Desktop cleanup frees the runner.
+	_, _, err = service.Complete(context.Background(), alloc.ID, completionRequest{State: "completed"})
+	if err != nil {
+		t.Fatalf("complete allocation: %v", err)
+	}
+
+	capStatus, err = desktop.Capacity(context.Background())
+	if err != nil {
+		t.Fatalf("desktop capacity after complete: %v", err)
+	}
+	if capStatus.ActiveRunners != 0 || backend.FreeSlots(capStatus) != 1 {
+		t.Fatalf("expected 0 active 1 free after complete, got %+v", capStatus)
+	}
+}
+
+func TestServiceWiresDesktopActiveCounter_RestartScenario(t *testing.T) {
+	cfg := config.Default()
+	for i := range cfg.Pools {
+		for name, backendCfg := range cfg.Pools[i].Backends {
+			backendCfg.Enabled = false
+			cfg.Pools[i].Backends[name] = backendCfg
+		}
+		cfg.Pools[i].Backends[model.BackendDesktop] = model.BackendConfig{
+			Enabled:    true,
+			Healthy:    true,
+			MaxRunners: 2,
+		}
+	}
+
+	// 1. Initial service instance with its desktop backend
+	desktop1 := desktopbackend.New(cfg)
+	service1 := NewService(cfg, backend.NewRegistry(desktop1), nil)
+
+	// Step 1: Desktop is online and has 0 active runners
+	capStatus, err := desktop1.Capacity(context.Background())
+	if err != nil {
+		t.Fatalf("desktop1 capacity: %v", err)
+	}
+	if capStatus.ActiveRunners != 0 || backend.FreeSlots(capStatus) != 2 {
+		t.Fatalf("expected 0 active 2 free initially, got %+v", capStatus)
+	}
+
+	// Step 2: Allocate runner on desktop via service1
+	pinned := model.BackendDesktop
+	alloc, err := service1.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolLite,
+		Backend:    &pinned,
+		JobTimeout: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("allocate desktop: %v", err)
+	}
+
+	// Step 3: Verify desktop1 reflects 1 active runner
+	capStatus, err = desktop1.Capacity(context.Background())
+	if err != nil {
+		t.Fatalf("desktop1 capacity after alloc: %v", err)
+	}
+	if capStatus.ActiveRunners != 1 || backend.FreeSlots(capStatus) != 1 {
+		t.Fatalf("expected 1 active 1 free, got %+v", capStatus)
+	}
+
+	// Step 4: Simulate broker restart!
+	// A new service instance starts with a fresh desktop backend instance (empty in-memory map)
+	// attached to the existing shared durable store.
+	desktop2 := desktopbackend.New(cfg)
+	service2 := NewServiceWithStore(cfg, backend.NewRegistry(desktop2), nil, service1.Store())
+
+	// Step 5: desktop2 must report ActiveRunners=1 from the authoritative store count,
+	// NOT 0 (which would happen if it relied on empty in-memory state).
+	capStatus, err = desktop2.Capacity(context.Background())
+	if err != nil {
+		t.Fatalf("desktop2 capacity after restart: %v", err)
+	}
+	if capStatus.ActiveRunners != 1 || backend.FreeSlots(capStatus) != 1 {
+		t.Fatalf("expected 1 active 1 free on restarted broker, got %+v", capStatus)
+	}
+
+	// Step 6: Complete allocation via restarted service -> frees capacity in store
+	_, _, err = service2.Complete(context.Background(), alloc.ID, completionRequest{State: "completed"})
+	if err != nil {
+		t.Fatalf("complete allocation: %v", err)
+	}
+
+	capStatus, err = desktop2.Capacity(context.Background())
+	if err != nil {
+		t.Fatalf("desktop2 capacity after complete: %v", err)
+	}
+	if capStatus.ActiveRunners != 0 || backend.FreeSlots(capStatus) != 2 {
+		t.Fatalf("expected 0 active 2 free after complete, got %+v", capStatus)
 	}
 }
