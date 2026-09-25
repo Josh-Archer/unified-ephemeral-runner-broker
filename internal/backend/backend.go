@@ -75,17 +75,19 @@ func FreeSlots(status CapacityStatus) int {
 // CapacityJSON is the HTTP capacity feed body used by capacity_url endpoints
 // and by native Capacity() implementations that speak the same contract.
 // Controllers may also expose free_slots; when set without max_runners the
-// broker reconstructs a ceiling.
+// broker reconstructs a ceiling. When set alongside max_runners, the broker
+// honors the published free slot count by adjusting effective max_runners.
 type CapacityJSON struct {
-	MaxRunners     int `json:"max_runners"`
-	ActiveRunners  int `json:"active_runners"`
-	PendingRunners int `json:"pending_runners"`
-	WarmRunners    int `json:"warm_runners"`
-	FreeSlots      int `json:"free_slots"`
+	MaxRunners     int  `json:"max_runners"`
+	ActiveRunners  int  `json:"active_runners"`
+	PendingRunners int  `json:"pending_runners"`
+	WarmRunners    int  `json:"warm_runners"`
+	FreeSlots      *int `json:"free_slots"`
 }
 
 // CapacityStatusFromJSON maps a capacity feed payload into CapacityStatus,
-// reconstructing MaxRunners from free_slots when needed.
+// reconstructing MaxRunners from free_slots when needed or clamping it to
+// honor published free_slots when max_runners is also present.
 func CapacityStatusFromJSON(payload CapacityJSON) CapacityStatus {
 	status := CapacityStatus{
 		MaxRunners:     payload.MaxRunners,
@@ -93,14 +95,17 @@ func CapacityStatusFromJSON(payload CapacityJSON) CapacityStatus {
 		PendingRunners: payload.PendingRunners,
 		WarmRunners:    payload.WarmRunners,
 	}
-	// Prefer explicit free_slots when controllers publish it without a max.
-	if payload.FreeSlots > 0 && status.MaxRunners <= 0 {
-		status.MaxRunners = payload.FreeSlots + status.ActiveRunners + status.PendingRunners + status.WarmRunners
-	}
-	if status.MaxRunners <= 0 && payload.FreeSlots == 0 {
-		// free_slots:0 with no max is a valid "full" signal when work is in flight.
-		if payload.ActiveRunners > 0 || payload.PendingRunners > 0 || payload.WarmRunners > 0 {
-			status.MaxRunners = payload.ActiveRunners + payload.PendingRunners + payload.WarmRunners
+	if payload.FreeSlots != nil {
+		free := *payload.FreeSlots
+		if free < 0 {
+			free = 0
+		}
+		used := status.ActiveRunners + status.PendingRunners + status.WarmRunners
+		reconstructed := free + used
+		if status.MaxRunners <= 0 {
+			status.MaxRunners = reconstructed
+		} else if reconstructed < status.MaxRunners {
+			status.MaxRunners = reconstructed
 		}
 	}
 	return status
