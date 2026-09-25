@@ -150,6 +150,108 @@ func TestProvisionOnlineReturnsLabel(t *testing.T) {
 	}
 }
 
+func TestCapacityOnlineReportsActiveRunners(t *testing.T) {
+	cfg := desktopConfig(2, "desktop.local", 22)
+	b := New(cfg).WithDialer(func(network, address string, timeout time.Duration) (net.Conn, error) {
+		return stubConn{}, nil
+	})
+
+	// Initially 0 active runners, 2 free slots.
+	status, err := b.Capacity(context.Background())
+	if err != nil {
+		t.Fatalf("capacity: %v", err)
+	}
+	if status.ActiveRunners != 0 || backend.FreeSlots(status) != 2 {
+		t.Fatalf("expected 0 active 2 free, got %+v", status)
+	}
+
+	// Provision first runner: active becomes 1, free becomes 1.
+	_, err = b.Provision(context.Background(), model.AllocationRequest{Pool: model.PoolLite}, model.AllocationStatus{
+		ID:   "desk-1",
+		Pool: model.PoolLite,
+	})
+	if err != nil {
+		t.Fatalf("provision 1: %v", err)
+	}
+
+	status, err = b.Capacity(context.Background())
+	if err != nil {
+		t.Fatalf("capacity: %v", err)
+	}
+	if status.ActiveRunners != 1 || backend.FreeSlots(status) != 1 {
+		t.Fatalf("expected 1 active 1 free, got %+v free=%d", status, backend.FreeSlots(status))
+	}
+
+	// Provision second runner: busy / exhausted shape (active=2, free=0).
+	_, err = b.Provision(context.Background(), model.AllocationRequest{Pool: model.PoolLite}, model.AllocationStatus{
+		ID:   "desk-2",
+		Pool: model.PoolLite,
+	})
+	if err != nil {
+		t.Fatalf("provision 2: %v", err)
+	}
+
+	status, err = b.Capacity(context.Background())
+	if err != nil {
+		t.Fatalf("capacity: %v", err)
+	}
+	if status.ActiveRunners != 2 || backend.FreeSlots(status) != 0 {
+		t.Fatalf("expected 2 active 0 free, got %+v free=%d", status, backend.FreeSlots(status))
+	}
+
+	// Cleanup first runner: active returns to 1, free returns to 1.
+	if err := b.Cleanup(context.Background(), model.AllocationStatus{ID: "desk-1"}); err != nil {
+		t.Fatalf("cleanup 1: %v", err)
+	}
+
+	status, err = b.Capacity(context.Background())
+	if err != nil {
+		t.Fatalf("capacity: %v", err)
+	}
+	if status.ActiveRunners != 1 || backend.FreeSlots(status) != 1 {
+		t.Fatalf("expected 1 active 1 free, got %+v free=%d", status, backend.FreeSlots(status))
+	}
+
+	// Cleanup second runner: active returns to 0, free returns to 2.
+	if err := b.Cleanup(context.Background(), model.AllocationStatus{ID: "desk-2"}); err != nil {
+		t.Fatalf("cleanup 2: %v", err)
+	}
+
+	status, err = b.Capacity(context.Background())
+	if err != nil {
+		t.Fatalf("capacity: %v", err)
+	}
+	if status.ActiveRunners != 0 || backend.FreeSlots(status) != 2 {
+		t.Fatalf("expected 0 active 2 free, got %+v free=%d", status, backend.FreeSlots(status))
+	}
+}
+
+func TestCapacityOnlineWithActiveCountFunc(t *testing.T) {
+	cfg := desktopConfig(3, "desktop.local", 22)
+	b := New(cfg).
+		WithDialer(func(network, address string, timeout time.Duration) (net.Conn, error) {
+			return stubConn{}, nil
+		}).
+		WithActiveCountFunc(func() int {
+			return 2
+		})
+
+	status, err := b.Capacity(context.Background())
+	if err != nil {
+		t.Fatalf("capacity: %v", err)
+	}
+	if status.MaxRunners != 3 || status.ActiveRunners != 2 {
+		t.Fatalf("expected max=3 active=2, got %+v", status)
+	}
+	if free := backend.FreeSlots(status); free != 1 {
+		t.Fatalf("expected 1 free slot, got %d", free)
+	}
+}
+
 func TestCapacityImplementsCapacityBackend(t *testing.T) {
 	var _ backend.CapacityBackend = New(desktopConfig(1, "", 0))
+}
+
+func TestCleanupImplementsCleanupBackend(t *testing.T) {
+	var _ backend.CleanupBackend = New(desktopConfig(1, "", 0))
 }
