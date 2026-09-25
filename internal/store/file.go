@@ -54,15 +54,32 @@ func NewFile(path string) (*File, error) {
 func (f *File) Save(status model.AllocationStatus) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	prev, ok := f.allocations[status.ID]
 	f.allocations[status.ID] = status
-	return f.persistLocked()
+	if err := f.persistLocked(); err != nil {
+		if ok {
+			f.allocations[status.ID] = prev
+		} else {
+			delete(f.allocations, status.ID)
+		}
+		return err
+	}
+	return nil
 }
 
 func (f *File) Delete(id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	prev, ok := f.allocations[id]
+	if !ok {
+		return nil
+	}
 	delete(f.allocations, id)
-	return f.persistLocked()
+	if err := f.persistLocked(); err != nil {
+		f.allocations[id] = prev
+		return err
+	}
+	return nil
 }
 
 func (f *File) Get(id string) (model.AllocationStatus, bool) {
@@ -92,11 +109,12 @@ func (f *File) MarkState(id string, state model.AllocationState, now time.Time, 
 		return model.AllocationStatus{}, false
 	}
 
-	status = applyMarkState(status, state, now, message)
+	previous := status
+	status = applyMarkState(previous, state, now, message)
 	f.allocations[id] = status
 	if err := f.persistLocked(); err != nil {
-		status.Error = err.Error()
-		f.allocations[id] = status
+		f.allocations[id] = previous
+		return model.AllocationStatus{}, false
 	}
 	return status, true
 }
@@ -109,11 +127,12 @@ func (f *File) CompareAndMarkState(id string, expectedFrom model.AllocationState
 	if !ok || status.State != expectedFrom {
 		return model.AllocationStatus{}, false
 	}
-	status = applyMarkState(status, to, now, message)
+	previous := status
+	status = applyMarkState(previous, to, now, message)
 	f.allocations[id] = status
 	if err := f.persistLocked(); err != nil {
-		status.Error = err.Error()
-		f.allocations[id] = status
+		f.allocations[id] = previous
+		return model.AllocationStatus{}, false
 	}
 	return status, true
 }
@@ -128,6 +147,7 @@ func (f *File) SaveIfState(status model.AllocationStatus, expectedFrom model.All
 	}
 	f.allocations[status.ID] = status
 	if err := f.persistLocked(); err != nil {
+		f.allocations[status.ID] = current
 		return false, err
 	}
 	return true, nil
@@ -139,8 +159,17 @@ func (f *File) SaveIfCapacity(status model.AllocationStatus, maxRunners int, ten
 	if err := capacityAllowed(f.allocations, status, maxRunners, tenantQuota); err != nil {
 		return err
 	}
+	prev, ok := f.allocations[status.ID]
 	f.allocations[status.ID] = status
-	return f.persistLocked()
+	if err := f.persistLocked(); err != nil {
+		if ok {
+			f.allocations[status.ID] = prev
+		} else {
+			delete(f.allocations, status.ID)
+		}
+		return err
+	}
+	return nil
 }
 
 func (f *File) CountActive(pool model.PoolName, backend model.BackendName) int {

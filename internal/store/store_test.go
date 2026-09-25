@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -196,4 +198,179 @@ func itoa(i int) string {
 		i /= 10
 	}
 	return string(b[pos:])
+}
+
+func TestFileStoreMarkStatePersistFailure(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "state.json")
+	s, err := NewFile(filePath)
+	if err != nil {
+		t.Fatalf("NewFile: %v", err)
+	}
+
+	initial := model.AllocationStatus{
+		ID:              "alloc-1",
+		State:           model.StateReserved,
+		Pool:            model.PoolLite,
+		SelectedBackend: model.BackendARC,
+	}
+	if err := s.Save(initial); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	// Block file writes by making the .tmp path a directory
+	tmpPath := filePath + ".tmp"
+	if err := os.Mkdir(tmpPath, 0o755); err != nil {
+		t.Fatalf("mkdir tmp: %v", err)
+	}
+
+	// MarkState should fail and return false when persistLocked fails
+	status, ok := s.MarkState("alloc-1", model.StateReady, time.Now(), "failed update")
+	if ok {
+		t.Fatalf("expected MarkState to fail on persist error, got ok=true, status=%+v", status)
+	}
+
+	// In-memory record should retain the previous state
+	got, found := s.Get("alloc-1")
+	if !found {
+		t.Fatal("expected alloc-1 to still exist")
+	}
+	if got.State != model.StateReserved {
+		t.Fatalf("expected in-memory state to remain reserved, got %s", got.State)
+	}
+
+	// On-disk record reloaded in a fresh store should also retain previous state
+	reloaded, err := NewFile(filePath)
+	if err != nil {
+		t.Fatalf("reload NewFile: %v", err)
+	}
+	reloadedStatus, found := reloaded.Get("alloc-1")
+	if !found || reloadedStatus.State != model.StateReserved {
+		t.Fatalf("expected on-disk state reserved, got found=%v status=%+v", found, reloadedStatus)
+	}
+
+	// Remove write blocker; subsequent MarkState should succeed
+	if err := os.Remove(tmpPath); err != nil {
+		t.Fatalf("remove tmp dir: %v", err)
+	}
+	status, ok = s.MarkState("alloc-1", model.StateReady, time.Now(), "success")
+	if !ok || status.State != model.StateReady {
+		t.Fatalf("expected MarkState to succeed after unblocking, got ok=%v status=%+v", ok, status)
+	}
+	reloaded2, err := NewFile(filePath)
+	if err != nil {
+		t.Fatalf("reload2 NewFile: %v", err)
+	}
+	if reloadedStatus2, found := reloaded2.Get("alloc-1"); !found || reloadedStatus2.State != model.StateReady {
+		t.Fatalf("expected on-disk state ready after unblocking, got found=%v status=%+v", found, reloadedStatus2)
+	}
+}
+
+func TestFileStoreCompareAndMarkStatePersistFailure(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "state.json")
+	s, err := NewFile(filePath)
+	if err != nil {
+		t.Fatalf("NewFile: %v", err)
+	}
+
+	initial := model.AllocationStatus{
+		ID:              "alloc-cas-1",
+		State:           model.StateReserved,
+		Pool:            model.PoolLite,
+		SelectedBackend: model.BackendARC,
+	}
+	if err := s.Save(initial); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	// Block file writes
+	tmpPath := filePath + ".tmp"
+	if err := os.Mkdir(tmpPath, 0o755); err != nil {
+		t.Fatalf("mkdir tmp: %v", err)
+	}
+
+	// CompareAndMarkState should fail and return false when persistLocked fails
+	status, ok := s.CompareAndMarkState("alloc-cas-1", model.StateReserved, model.StateReady, time.Now(), "failed write")
+	if ok {
+		t.Fatalf("expected CompareAndMarkState to fail on persist error, got ok=true status=%+v", status)
+	}
+
+	// In-memory record should retain the previous state
+	got, found := s.Get("alloc-cas-1")
+	if !found {
+		t.Fatal("expected alloc-cas-1 to still exist")
+	}
+	if got.State != model.StateReserved {
+		t.Fatalf("expected in-memory state to remain reserved, got %s", got.State)
+	}
+
+	// On-disk record should also retain previous state
+	reloaded, err := NewFile(filePath)
+	if err != nil {
+		t.Fatalf("reload NewFile: %v", err)
+	}
+	reloadedStatus, found := reloaded.Get("alloc-cas-1")
+	if !found || reloadedStatus.State != model.StateReserved {
+		t.Fatalf("expected on-disk state reserved, got found=%v status=%+v", found, reloadedStatus)
+	}
+
+	// Remove blocker and verify successful CAS
+	if err := os.Remove(tmpPath); err != nil {
+		t.Fatalf("remove tmp: %v", err)
+	}
+	status, ok = s.CompareAndMarkState("alloc-cas-1", model.StateReserved, model.StateReady, time.Now(), "success")
+	if !ok || status.State != model.StateReady {
+		t.Fatalf("expected CompareAndMarkState success after unblocking, got ok=%v status=%+v", ok, status)
+	}
+	reloaded2, err := NewFile(filePath)
+	if err != nil {
+		t.Fatalf("reload2 NewFile: %v", err)
+	}
+	if reloadedStatus2, found := reloaded2.Get("alloc-cas-1"); !found || reloadedStatus2.State != model.StateReady {
+		t.Fatalf("expected on-disk state ready after unblocking, got found=%v status=%+v", found, reloadedStatus2)
+	}
+}
+
+func TestFileStoreSaveIfStatePersistFailure(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "state.json")
+	s, err := NewFile(filePath)
+	if err != nil {
+		t.Fatalf("NewFile: %v", err)
+	}
+
+	initial := model.AllocationStatus{
+		ID:              "alloc-saveif-1",
+		State:           model.StateReserved,
+		Pool:            model.PoolLite,
+		SelectedBackend: model.BackendARC,
+	}
+	if err := s.Save(initial); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	// Block file writes
+	tmpPath := filePath + ".tmp"
+	if err := os.Mkdir(tmpPath, 0o755); err != nil {
+		t.Fatalf("mkdir tmp: %v", err)
+	}
+
+	ready := initial
+	ready.State = model.StateReady
+	ready.RunnerLabel = "lbl-123"
+
+	ok, err := s.SaveIfState(ready, model.StateReserved)
+	if ok || err == nil {
+		t.Fatalf("expected SaveIfState to fail on persist error, got ok=%v err=%v", ok, err)
+	}
+
+	// In-memory record should retain the previous state
+	got, found := s.Get("alloc-saveif-1")
+	if !found {
+		t.Fatal("expected alloc-saveif-1 to still exist")
+	}
+	if got.State != model.StateReserved || got.RunnerLabel != "" {
+		t.Fatalf("expected in-memory state to remain reserved without label, got %+v", got)
+	}
 }
