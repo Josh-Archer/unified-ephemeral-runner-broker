@@ -209,6 +209,33 @@ func TestCapacityURLExhaustion(t *testing.T) {
 	}
 }
 
+func TestCapacityURLFreeSlotsHonoredAlongsideMaxRunners(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"max_runners":10,"active_runners":2,"pending_runners":0,"warm_runners":0,"free_slots":3}`))
+	}))
+	defer server.Close()
+
+	cfg := configureArcBackend(config.Default(), model.PoolFull, func(backendCfg *model.BackendConfig) {
+		backendCfg.Enabled = true
+		backendCfg.MaxRunners = 10
+		backendCfg.SecretRef = "uecb-arc"
+	})
+
+	status, err := New(cfg, staticSecrets{
+		"uecb-arc": {secretKeyCapacityURL: server.URL},
+	}).Capacity(context.Background())
+	if err != nil {
+		t.Fatalf("capacity: %v", err)
+	}
+	if status.MaxRunners != 5 {
+		t.Fatalf("expected clamped max_runners=5, got %+v", status)
+	}
+	if free := backend.FreeSlots(status); free != 3 {
+		t.Fatalf("expected 3 free slots, got %d from %+v", free, status)
+	}
+}
+
 func TestCapacityURLFreeSlotsOnlyExhaustion(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// free_slots:0 with active work and no max reconstructs a full ceiling.

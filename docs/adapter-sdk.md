@@ -102,6 +102,8 @@ Successful responses (`2xx`) should return JSON:
   `free_slots` so the broker can reconstruct a ceiling).
 - `free_slots` is optional; when `max_runners` is omitted and `free_slots > 0`,
   the broker derives `max_runners = free_slots + active + pending + warm`.
+  When specified alongside `max_runners`, the broker honors `free_slots`
+  (capping effective capacity so the published free count is respected).
 - Missing `capacity_url` on HTTP-dispatch backends means that backend does not
   publish live capacity; the broker uses local `maxRunners` accounting only for
   that backend. Built-in `arc` falls back to configured scale instead of
