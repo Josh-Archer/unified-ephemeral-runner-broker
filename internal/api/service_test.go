@@ -810,6 +810,31 @@ func TestAllocatePassesThroughUnknownTierStateByDefault(t *testing.T) {
 	}
 }
 
+func TestAllocateBlocksWhenAllBackendsExceededUnderPassThrough(t *testing.T) {
+	service := newServiceWithBrokerConfig(func(cfg *model.BrokerConfig) {
+		cfg.Broker.TierRouting.Enabled = true
+		cfg.Broker.TierRouting.FailureMode = tier.FailureModePassThrough
+		cfg.Broker.Queue.Enabled = false
+	})
+	manager := tier.NewManager()
+	manager.SetDecision(tier.Decision{
+		Pool:      model.PoolLite,
+		Backend:   model.BackendARC,
+		State:     tier.StateExceeded,
+		Action:    tier.ActionDisable,
+		UpdatedAt: time.Now(),
+	})
+	service.SetTierManager(manager)
+
+	_, err := service.Allocate(context.Background(), model.AllocationRequest{Pool: model.PoolLite})
+	if err == nil {
+		t.Fatal("expected allocation to be blocked when backend is explicitly exceeded with ActionDisable")
+	}
+	if !errors.Is(err, ErrBackendTierBlocked) {
+		t.Fatalf("expected ErrBackendTierBlocked, got: %v", err)
+	}
+}
+
 func TestAllocateUsesTierFallbackBackends(t *testing.T) {
 	service := newServiceWithBrokerConfig(func(cfg *model.BrokerConfig) {
 		cfg.Broker.TierRouting.Enabled = true
