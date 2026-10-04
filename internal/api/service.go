@@ -1860,6 +1860,18 @@ func (s *Service) filterBackendsByTierState(pool model.PoolConfig, request model
 		s.observer.ObserveTierFallback(pool.Name, mode, "fallback-empty")
 		return model.PoolConfig{}, fmt.Errorf("%w for pool %q: no fallback backends available", ErrBackendTierBlocked, pool.Name)
 	default:
+		allExceeded := true
+		for _, dec := range blocked {
+			if dec.Stale || dec.State == tier.StateUnknown || dec.Action != tier.ActionDisable || dec.State != tier.StateExceeded {
+				allExceeded = false
+				break
+			}
+		}
+		if allExceeded {
+			s.observer.ObserveTierFallback(pool.Name, "blocked", "all-backends-exceeded")
+			return model.PoolConfig{}, fmt.Errorf("%w for pool %q: all backends disabled by tier policy", ErrBackendTierBlocked, pool.Name)
+		}
+
 		s.observer.ObserveTierFallback(pool.Name, tier.FailureModePassThrough, "pass-through")
 		return pool, nil
 	}
