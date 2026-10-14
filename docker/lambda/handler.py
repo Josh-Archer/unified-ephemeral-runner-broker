@@ -5,8 +5,11 @@ import subprocess
 import time
 import traceback
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import boto3
+import jwt
 
 
 dynamodb = boto3.resource("dynamodb")
@@ -30,6 +33,88 @@ def _secret_value(secret_id):
     if "SecretString" in payload:
         return payload["SecretString"]
     return payload["SecretBinary"].decode("utf-8")
+
+
+TOKEN_REQUEST_ATTEMPTS = 3
+TOKEN_RETRY_BASE_DELAY = 1.0
+_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+
+def _installation_token_scope(github):
+    """Least-privilege access token request body for how the runner is registered.
+
+    Mirrors registration_endpoint() in docker/launcher/entrypoint.sh: repository
+    runners use /repos/{owner}/{repo}/actions/runners/* (Administration: write),
+    organization runners use /orgs/{org}/actions/runners/* (Self-hosted runners: write).
+    """
+    github = github or {}
+    scope_type = str(github.get("scope_type") or "").strip()
+    if scope_type == "repository":
+        repository = str(github.get("repository") or "").strip()
+        if not repository:
+            raise RuntimeError("repository scope requires github.repository")
+        return {"repositories": [repository], "permissions": {"administration": "write"}}
+    if scope_type == "organization":
+        # Org runner endpoints are org-level; the only permission granted is org-scoped,
+        # so the token carries no repository permissions at all.
+        return {"permissions": {"organization_self_hosted_runners": "write"}}
+    raise RuntimeError(f"unsupported github scope_type: {scope_type!r}")
+
+
+def _request_installation_token(request):
+    last_error = None
+    for attempt in range(TOKEN_REQUEST_ATTEMPTS):
+        try:
+            with urlopen(request, timeout=10) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            last_error = RuntimeError(f"GitHub App installation token request failed with HTTP {exc.code}")
+            if exc.code not in _RETRYABLE_STATUS:
+                raise last_error from exc
+        except (URLError, TimeoutError) as exc:
+            last_error = RuntimeError(f"GitHub App installation token request failed: {exc}")
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("GitHub App installation token response was not valid JSON") from exc
+        if attempt + 1 < TOKEN_REQUEST_ATTEMPTS:
+            time.sleep(TOKEN_RETRY_BASE_DELAY * (2 ** attempt))
+    raise last_error
+
+
+def _github_installation_token(github=None):
+    """Exchange Lambda's GitHub App credentials for a short-lived, scoped token."""
+    scope = _installation_token_scope(github)
+    try:
+        app = json.loads(_secret_value(os.environ["RUNNER_GITHUB_APP_SECRET_ARN"]))
+        app_id = str(app["app_id"]).strip()
+        installation_id = str(app["installation_id"]).strip()
+        private_key = app["private_key"]
+    except (KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("GitHub App secret must contain app_id, installation_id, and private_key") from exc
+    if not app_id or not installation_id or not isinstance(private_key, str) or not private_key.strip():
+        raise RuntimeError("GitHub App secret must contain app_id, installation_id, and private_key")
+
+    now = int(time.time())
+    app_jwt = jwt.encode(
+        {"iat": now - 60, "exp": now + 540, "iss": app_id},
+        private_key,
+        algorithm="RS256",
+    )
+    request = Request(
+        f"https://api.github.com/app/installations/{installation_id}/access_tokens",
+        data=json.dumps(scope).encode("utf-8"),
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {app_jwt}",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    payload = _request_installation_token(request)
+    token = str((payload or {}).get("token") or "").strip() if isinstance(payload, dict) else ""
+    if not token:
+        raise RuntimeError("GitHub App installation token response did not contain a token")
+    return token
 
 
 def _tail(path, limit=120):
@@ -75,7 +160,6 @@ def lambda_handler(event, _context):
     env = os.environ.copy()
     env.update(
         {
-            "GITHUB_PAT": _secret_value(os.environ["RUNNER_PAT_SECRET_ARN"]),
             "GITHUB_SCOPE_TYPE": scope_type,
             "GITHUB_ORGANIZATION": str(github.get("organization") or "").strip(),
             "GITHUB_OWNER": str(github.get("owner") or "").strip(),
@@ -93,6 +177,7 @@ def lambda_handler(event, _context):
     )
 
     try:
+        env["GITHUB_TOKEN"] = _github_installation_token(github)
         with log_path.open("w", encoding="utf-8") as log_file:
             completed = subprocess.run(
                 ["bash", "/opt/uecb/runner-entrypoint.sh"],

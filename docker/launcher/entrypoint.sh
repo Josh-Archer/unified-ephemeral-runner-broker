@@ -13,11 +13,12 @@ github_api_request() {
   local method="$1"
   local endpoint="$2"
   local payload="${3:-}"
+  local github_token="${GITHUB_TOKEN:-${GITHUB_PAT:-}}"
   local curl_args=(
     -fsSL
     -X "${method}"
     -H "Accept: application/vnd.github+json"
-    -H "Authorization: Bearer ${GITHUB_PAT}"
+    -H "Authorization: Bearer ${github_token}"
     -H "X-GitHub-Api-Version: 2022-11-28"
   )
   if [[ -n "${payload}" ]]; then
@@ -87,7 +88,10 @@ cleanup() {
 
 trap cleanup EXIT
 
-require_env GITHUB_PAT
+if [[ -z "${GITHUB_TOKEN:-${GITHUB_PAT:-}}" ]]; then
+  echo "missing required environment variable: GITHUB_TOKEN" >&2
+  exit 1
+fi
 require_env GITHUB_SCOPE_TYPE
 require_env GITHUB_TARGET_URL
 require_env RUNNER_NAME
