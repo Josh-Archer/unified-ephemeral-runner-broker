@@ -38,7 +38,7 @@ def _secret_value(secret_id):
 
 TOKEN_REQUEST_ATTEMPTS = 3
 TOKEN_RETRY_BASE_DELAY = 1.0
-_RETRYABLE_STATUS = {429, 500, 501, 502, 503, 504}
+_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 
 def _installation_token_scope(github):

@@ -126,11 +126,11 @@ class GithubInstallationTokenTests(unittest.TestCase):
         self.assertEqual(urlopen.call_count, 3)
         self.assertEqual([c.args[0] for c in sleep.call_args_list], [1.0, 2.0])
 
-    def test_http_501_retries_with_backoff_then_succeeds(self):
-        token, urlopen, sleep = self._call([_http_error(501), Response({"token": "ok"})])
-        self.assertEqual(token, "ok")
-        self.assertEqual(urlopen.call_count, 2)
-        self.assertEqual([c.args[0] for c in sleep.call_args_list], [1.0])
+    def test_http_501_fails_fast_without_retry(self):
+        with self.assertRaisesRegex(RuntimeError, "HTTP 501") as ctx:
+            self._call([_http_error(501), Response({"token": "ok"})])
+        self.assertEqual(ctx.exception.urlopen.call_count, 1)
+        ctx.exception.sleep.assert_not_called()
 
     def test_read_connection_failures_retry_with_backoff_then_succeed(self):
         read_errors = (
