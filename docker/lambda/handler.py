@@ -1,4 +1,5 @@
 import json
+from http.client import IncompleteRead, RemoteDisconnected
 import os
 import shutil
 import subprocess
@@ -72,6 +73,8 @@ def _request_installation_token(request):
             if exc.code not in _RETRYABLE_STATUS:
                 raise last_error from exc
         except (URLError, TimeoutError) as exc:
+            last_error = RuntimeError(f"GitHub App installation token request failed: {exc}")
+        except (ConnectionResetError, IncompleteRead, RemoteDisconnected) as exc:
             last_error = RuntimeError(f"GitHub App installation token request failed: {exc}")
         except json.JSONDecodeError as exc:
             raise RuntimeError("GitHub App installation token response was not valid JSON") from exc
