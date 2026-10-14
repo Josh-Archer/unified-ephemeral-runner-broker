@@ -25,7 +25,7 @@ RUN apt-get update \
   && curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash - \
   && apt-get install -y --no-install-recommends nodejs \
   && node --version \
-  && python3 -m pip install --break-system-packages --no-cache-dir awslambdaric boto3 \
+  && python3 -m pip install --break-system-packages --no-cache-dir 'PyJWT[crypto]' awslambdaric boto3 \
   && mkdir -p /bootstrap /opt/uecb /var/task \
   && rm -rf /var/lib/apt/lists/*
 

@@ -33,6 +33,9 @@ jobs:
       - name: finalize-allocation action unit tests
         run: python -m unittest discover -s actions/finalize-allocation -p '*_test.py' -v
 
+      - name: Lambda handler unit tests
+        run: python -m unittest discover -s docker/lambda -p 'test_*.py' -v
+
       - name: Manifest render sanity
         run: |
           helm template uecb charts/unified-ephemeral-runner-broker >/tmp/uecb-helm.yaml

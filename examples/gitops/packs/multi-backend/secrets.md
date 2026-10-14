@@ -30,6 +30,20 @@ kubectl create secret generic uecb-lambda \
 
 The Lambda launcher is a private controller that wraps the `lambda` OCI image published from this repository. The Lambda function image must be mirrored into ECR because AWS Lambda requires the function image to reside in a registry in the same account. The broker only calls the dispatcher endpoint; it does not interact with ECR or Lambda directly.
 
+### Lambda runner GitHub App credentials
+
+Configure the Lambda function with `RUNNER_GITHUB_APP_SECRET_ARN` pointing to an AWS Secrets Manager secret whose JSON value has this shape:
+
+```json
+{
+  "app_id": "REPLACE_ME",
+  "installation_id": "REPLACE_ME",
+  "private_key": "REPLACE_ME"
+}
+```
+
+Store the GitHub App private key in Secrets Manager and grant the Lambda execution role `secretsmanager:GetSecretValue` for this secret. Install the app on the organization or repository that owns the runner scope. Grant it **Self-hosted runners: write** for organization runners, or **Administration: write** for repository runners. The handler signs a short-lived App JWT, exchanges it for an installation access token for each invocation, and the runner entrypoint uses that token to request the one-hour runner registration token. Neither token is logged. See [GitHub's self-hosted runner token API](https://docs.github.com/en/rest/actions/self-hosted-runners#create-a-registration-token-for-an-organization) for the required installation permissions and token lifetime.
+
 ## Required Secret: `uecb-cloud-run`
 
 The broker uses this secret to dispatch allocation requests to your GCP Cloud Run launcher controller.
