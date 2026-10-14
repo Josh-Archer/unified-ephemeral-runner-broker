@@ -122,6 +122,9 @@ With `broker.stateStore.type: postgres` the broker:
   replicas cannot exceed `maxRunners` (or fair-share tenant quotas when set).
 - Claims warm runners with compare-and-swap state transitions.
 - Shares circuit-breaker and rate-limit runtime state across replicas.
+- Does not share fair-share usage-window history or starvation timers. Those
+  stay in each broker process (see [Pools](#pools)). Postgres replicates
+  allocation records, hard `maxRunners` accounting, and tenant quotas only.
 - Runs the stuck-allocation reaper (expiry sweeps), warm-pool, queue, and
   backend-health reconciliation only on the elected leader (lease in PostgreSQL,
   renewed each background tick). The reaper marks active allocations past
@@ -224,7 +227,9 @@ Pools can also enable `fairShare`. Fair-share **composes** with the pool backend
 3. Fair-share ranks eligible backends by active load and per-tenant usage; higher `priority_class` weights reduce the tenant penalty when capacity exists.
 4. Among backends with equal fair-share scores and free capacity, the pool scheduler chooses the backend. With `weighted-round-robin`, backend `weight` values still influence the pick; with `round-robin`, each backend has one slot.
 
-Allocation requests may include `tenant` and `priority_class`. Soft reserves and priority weights shape *new* admissions only; the broker does not preempt active runners. Restart rehydration accounts existing work under hard `maxRunners` (soft reserves are not applied) so already-admitted low-priority runners are not expired. `usageWindow` limits the fair-share tenant penalty to reservations made within the window (all-time active counts still gate hard capacity); `starvationAfter` bypasses soft reserves for a priority class that has been continuously denied for longer than the configured duration.
+Allocation requests may include `tenant` and `priority_class`. Soft reserves and priority weights shape *new* admissions only; the broker does not preempt active runners. Restart rehydration accounts existing work under hard `maxRunners` (soft reserves are not applied) so already-admitted low-priority runners are not expired. `usageWindow` limits the fair-share tenant penalty to reservations made within the window (all-time active counts still gate hard capacity). `starvationAfter` bypasses soft reserves once a priority class has been denied by those reserves for at least that long. Only soft-reserve denials arm the timer: if every eligible backend is already at `maxRunners`, the denial does not start or refresh it. The streak resets when the class is admitted. It also resets when the class goes idle, which is a gap since the last soft-reserve denial longer than twice `starvationAfter`. When `starvationAfter` is zero, the broker records no starvation state. Unknown `priority_class` values are normalized to a known class (a configured `priorityClasses` entry, or the built-in `high` / `normal` lanes; any other name shares `normal`) so the tracker stays bounded by configuration.
+
+Fair-share usage-window history and starvation state are per-process. They are not written to the allocation state store and are not shared across replicas. That includes `stateStore.type: postgres`, which replicates allocation records, hard capacity, and tenant quotas, but not these two trackers. Each replica scores recent tenant usage and starvation only from admissions it handled. A process restart clears both.
 
 Recommended path: `fairShare.enabled: true` with `scheduler: weighted-round-robin` or `round-robin`, named `priorityClasses`, and `softReserves` for high-risk lanes. `scheduler: priority-fair-share` is a standalone fair-share mode without weight expansion and shares the same fair-share state instance as `fairShare.enabled`.
 
