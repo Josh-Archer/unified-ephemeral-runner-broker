@@ -48,6 +48,9 @@ func Validate(cfg model.BrokerConfig) error {
 	if err := validateWarmPools(cfg); err != nil {
 		return err
 	}
+	if err := validateFairShare(cfg); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -512,4 +515,21 @@ func normalizeStringDefault(value, fallback string) string {
 		return fallback
 	}
 	return normalized
+}
+
+func validateFairShare(cfg model.BrokerConfig) error {
+	for _, pool := range cfg.Pools {
+		fs := pool.FairShare
+		if !fs.Enabled {
+			continue
+		}
+		prefix := fmt.Sprintf("pools[%s].fairShare", pool.Name)
+		if fs.UsageWindow < 0 {
+			return fmt.Errorf("%s.usageWindow must not be negative", prefix)
+		}
+		if fs.StarvationAfter < 0 {
+			return fmt.Errorf("%s.starvationAfter must not be negative", prefix)
+		}
+	}
+	return nil
 }

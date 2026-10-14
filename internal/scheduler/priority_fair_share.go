@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 )
@@ -17,6 +18,9 @@ const (
 	priorityShareClassBoost     = 500
 	priorityShareClassMinWeight = 1
 )
+
+// nowFunc is the time source for the scheduler. Tests may replace it.
+var nowFunc = time.Now
 
 type PriorityFairShare struct {
 	state *priorityFairShareState
@@ -40,18 +44,41 @@ func (p *PriorityFairShare) Active(pool model.PoolName, backend model.BackendNam
 	return p.state.Active(pool, backend)
 }
 
+// tenantReservation records when a tenant reservation was made so windowed
+// fair-share scoring can age out old entries.
+type tenantReservation struct {
+	tenant    string
+	backend   model.BackendName
+	reserveAt time.Time
+}
+
 type priorityFairShareState struct {
 	mu           sync.Mutex
 	cursors      map[model.PoolName]int
 	active       map[model.PoolName]map[model.BackendName]int
 	tenantActive map[model.PoolName]map[model.BackendName]map[string]int
+
+	// tenantLog records per-pool reservation timestamps for UsageWindow scoring.
+	// Only populated when UsageWindow > 0 on the pool's FairShareConfig.
+	tenantLog map[model.PoolName][]tenantReservation
+
+	// starvationStart tracks when a (pool, priorityClass) first failed to
+	// reserve due to capacity. Cleared on successful reservation.
+	starvationStart map[starvationKey]time.Time
+}
+
+type starvationKey struct {
+	pool          model.PoolName
+	priorityClass string
 }
 
 func newPriorityFairShareState() *priorityFairShareState {
 	return &priorityFairShareState{
-		cursors:      map[model.PoolName]int{},
-		active:       map[model.PoolName]map[model.BackendName]int{},
-		tenantActive: map[model.PoolName]map[model.BackendName]map[string]int{},
+		cursors:         map[model.PoolName]int{},
+		active:          map[model.PoolName]map[model.BackendName]int{},
+		tenantActive:    map[model.PoolName]map[model.BackendName]map[string]int{},
+		tenantLog:       map[model.PoolName][]tenantReservation{},
+		starvationStart: map[starvationKey]time.Time{},
 	}
 }
 
@@ -77,13 +104,18 @@ func (s *priorityFairShareState) Reserve(pool model.PoolConfig, request model.Al
 		}
 	}
 
+	now := nowFunc()
+	starving := s.isStarving(pool, request.PriorityClass, now)
+	sk := starvationKey{pool: pool.Name, priorityClass: normalizePriorityClassString(request.PriorityClass)}
+
 	pinned := request.Backend
 	if pinned != nil {
 		cfg, ok := pool.Backends[*pinned]
 		if !ok {
 			return "", ErrUnknownBackend
 		}
-		if !backendAvailableForPriority(cfg, s.active[pool.Name][*pinned], pool, request.PriorityClass) {
+		if !backendAvailableForPriorityWithStarvation(cfg, s.active[pool.Name][*pinned], pool, request.PriorityClass, starving) {
+			s.recordStarvation(sk, now)
 			return "", ErrNoCapacity
 		}
 		s.active[pool.Name][*pinned]++
@@ -93,6 +125,8 @@ func (s *priorityFairShareState) Reserve(pool model.PoolConfig, request model.Al
 			s.tenantActive[pool.Name][*pinned] = tenantMap
 		}
 		tenantMap[normalizeTenant(request.Tenant)]++
+		s.recordReservation(pool, *pinned, tenant, now)
+		delete(s.starvationStart, sk)
 		return *pinned, nil
 	}
 
@@ -118,12 +152,12 @@ func (s *priorityFairShareState) Reserve(pool model.PoolConfig, request model.Al
 		candidate := backends[(start+offset)%len(backends)]
 		cfg := pool.Backends[candidate]
 		active := s.active[pool.Name][candidate]
-		if !backendAvailableForPriority(cfg, active, pool, request.PriorityClass) {
+		if !backendAvailableForPriorityWithStarvation(cfg, active, pool, request.PriorityClass, starving) {
 			continue
 		}
 
-		normalizedTenant := s.tenantActive[pool.Name][candidate][tenant]
-		score := priorityFairShareScore(active, normalizedTenant, priorityWeight)
+		tenantUsage := s.tenantUsage(pool, candidate, tenant, now)
+		score := priorityFairShareScore(active, tenantUsage, priorityWeight)
 		if bestIndex == -1 || score < bestScore || (score == bestScore && offset < bestOffset) {
 			bestIndex = (start + offset) % len(backends)
 			bestScore = score
@@ -132,6 +166,7 @@ func (s *priorityFairShareState) Reserve(pool model.PoolConfig, request model.Al
 	}
 
 	if bestIndex < 0 {
+		s.recordStarvation(sk, now)
 		return "", ErrNoCapacity
 	}
 
@@ -144,7 +179,75 @@ func (s *priorityFairShareState) Reserve(pool model.PoolConfig, request model.Al
 	}
 	s.tenantActive[pool.Name][selected][tenant]++
 	s.cursors[pool.Name] = (bestIndex + 1) % len(backends)
+	s.recordReservation(pool, selected, tenant, now)
+	delete(s.starvationStart, sk)
 	return selected, nil
+}
+
+// tenantUsage returns the tenant's active count on a backend for fair-share
+// scoring. When UsageWindow is configured, only reservations within the window
+// are counted instead of the all-time active count.
+func (s *priorityFairShareState) tenantUsage(pool model.PoolConfig, backend model.BackendName, tenant string, now time.Time) int {
+	if pool.FairShare.UsageWindow <= 0 {
+		return s.tenantActive[pool.Name][backend][tenant]
+	}
+	cutoff := now.Add(-pool.FairShare.UsageWindow)
+	count := 0
+	for _, entry := range s.tenantLog[pool.Name] {
+		if entry.backend == backend && entry.tenant == tenant && !entry.reserveAt.Before(cutoff) {
+			count++
+		}
+	}
+	return count
+}
+
+// recordReservation appends a timestamped entry to the tenant log when
+// UsageWindow is configured and prunes entries older than the window.
+func (s *priorityFairShareState) recordReservation(pool model.PoolConfig, backend model.BackendName, tenant string, now time.Time) {
+	if pool.FairShare.UsageWindow <= 0 {
+		return
+	}
+	s.tenantLog[pool.Name] = append(s.tenantLog[pool.Name], tenantReservation{
+		tenant:    tenant,
+		backend:   backend,
+		reserveAt: now,
+	})
+	s.pruneLog(pool.Name, now.Add(-pool.FairShare.UsageWindow))
+}
+
+// pruneLog removes entries older than cutoff from the tenant log.
+func (s *priorityFairShareState) pruneLog(pool model.PoolName, cutoff time.Time) {
+	log := s.tenantLog[pool]
+	kept := 0
+	for _, entry := range log {
+		if !entry.reserveAt.Before(cutoff) {
+			log[kept] = entry
+			kept++
+		}
+	}
+	s.tenantLog[pool] = log[:kept]
+}
+
+// isStarving reports whether the given priority class has been continuously
+// denied for longer than StarvationAfter. Caller must hold s.mu.
+func (s *priorityFairShareState) isStarving(pool model.PoolConfig, priorityClass string, now time.Time) bool {
+	if pool.FairShare.StarvationAfter <= 0 {
+		return false
+	}
+	sk := starvationKey{pool: pool.Name, priorityClass: normalizePriorityClassString(priorityClass)}
+	start, ok := s.starvationStart[sk]
+	if !ok {
+		return false
+	}
+	return now.Sub(start) >= pool.FairShare.StarvationAfter
+}
+
+// recordStarvation marks the start of a starvation period for a priority class
+// if one hasn't started already. Caller must hold s.mu.
+func (s *priorityFairShareState) recordStarvation(sk starvationKey, now time.Time) {
+	if _, ok := s.starvationStart[sk]; !ok {
+		s.starvationStart[sk] = now
+	}
 }
 
 // fairShareCandidateBackends returns the ordered candidate ring used when
@@ -205,8 +308,18 @@ func priorityFairShareScore(activeTotal, tenantActive, weight int) int {
 // backendAvailableForPriority reports whether a backend has free capacity for
 // the given priority class after soft reserves for higher lanes are held back.
 func backendAvailableForPriority(cfg model.BackendConfig, active int, pool model.PoolConfig, priorityClass string) bool {
+	return backendAvailableForPriorityWithStarvation(cfg, active, pool, priorityClass, false)
+}
+
+// backendAvailableForPriorityWithStarvation is like backendAvailableForPriority
+// but when starving is true, soft reserves are bypassed so the class can use
+// the full maxRunners budget.
+func backendAvailableForPriorityWithStarvation(cfg model.BackendConfig, active int, pool model.PoolConfig, priorityClass string, starving bool) bool {
 	if !cfg.Enabled || !cfg.Healthy {
 		return false
+	}
+	if starving {
+		return active < cfg.MaxRunners
 	}
 	return active < EffectiveMaxRunners(cfg.MaxRunners, pool.FairShare, priorityClass)
 }
@@ -273,6 +386,14 @@ func priorityClassWeight(fairShare model.FairShareConfig, requestPriorityClass s
 		return defaultNormalPriorityClass
 	}
 	return defaultNormalPriorityClass
+}
+
+func normalizePriorityClassString(value string) string {
+	value = strings.TrimSpace(strings.ToLower(value))
+	if value == "" {
+		return string(model.PriorityClassNormal)
+	}
+	return value
 }
 
 func normalizeTenant(value string) string {
