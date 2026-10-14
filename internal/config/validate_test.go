@@ -2,6 +2,7 @@ package config
 
 import (
 	"testing"
+	"time"
 
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 )
@@ -85,5 +86,54 @@ func TestValidateBackendBudgets(t *testing.T) {
 	}
 	if err := Validate(cfg); err != nil {
 		t.Fatalf("valid budget config should pass: %v", err)
+	}
+}
+
+func TestValidateFairShareNegativeUsageWindow(t *testing.T) {
+	cfg := Default()
+	for i := range cfg.Pools {
+		if cfg.Pools[i].Name != model.PoolLite {
+			continue
+		}
+		cfg.Pools[i].FairShare = model.FairShareConfig{
+			Enabled:     true,
+			UsageWindow: -1 * time.Minute,
+		}
+	}
+	if err := Validate(cfg); err == nil {
+		t.Fatal("negative usageWindow should fail validation")
+	}
+}
+
+func TestValidateFairShareNegativeStarvationAfter(t *testing.T) {
+	cfg := Default()
+	for i := range cfg.Pools {
+		if cfg.Pools[i].Name != model.PoolLite {
+			continue
+		}
+		cfg.Pools[i].FairShare = model.FairShareConfig{
+			Enabled:         true,
+			StarvationAfter: -30 * time.Second,
+		}
+	}
+	if err := Validate(cfg); err == nil {
+		t.Fatal("negative starvationAfter should fail validation")
+	}
+}
+
+func TestValidateFairSharePositiveValues(t *testing.T) {
+	cfg := Default()
+	for i := range cfg.Pools {
+		if cfg.Pools[i].Name != model.PoolLite {
+			continue
+		}
+		cfg.Pools[i].FairShare = model.FairShareConfig{
+			Enabled:         true,
+			UsageWindow:     10 * time.Minute,
+			StarvationAfter: 30 * time.Second,
+		}
+	}
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("valid fair share config should pass: %v", err)
 	}
 }
