@@ -4,6 +4,7 @@ import json
 import sys
 import types
 import unittest
+from http.client import IncompleteRead, RemoteDisconnected
 from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError, URLError
@@ -22,8 +23,9 @@ with patch.dict(sys.modules, {"boto3": boto3_stub, "jwt": jwt_stub}):
 
 
 class Response:
-    def __init__(self, payload):
+    def __init__(self, payload, read_error=None):
         self.payload = payload
+        self.read_error = read_error
 
     def __enter__(self):
         return self
@@ -32,6 +34,8 @@ class Response:
         return False
 
     def read(self):
+        if self.read_error:
+            raise self.read_error
         return json.dumps(self.payload).encode("utf-8")
 
 
@@ -121,6 +125,27 @@ class GithubInstallationTokenTests(unittest.TestCase):
         self.assertEqual(token, "ok")
         self.assertEqual(urlopen.call_count, 3)
         self.assertEqual([c.args[0] for c in sleep.call_args_list], [1.0, 2.0])
+
+    def test_http_501_retries_with_backoff_then_succeeds(self):
+        token, urlopen, sleep = self._call([_http_error(501), Response({"token": "ok"})])
+        self.assertEqual(token, "ok")
+        self.assertEqual(urlopen.call_count, 2)
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], [1.0])
+
+    def test_read_connection_failures_retry_with_backoff_then_succeed(self):
+        read_errors = (
+            ConnectionResetError("connection reset"),
+            IncompleteRead(b"partial response"),
+            RemoteDisconnected("server disconnected"),
+        )
+        for read_error in read_errors:
+            with self.subTest(error=type(read_error).__name__):
+                token, urlopen, sleep = self._call(
+                    [Response(None, read_error=read_error), Response({"token": "ok"})]
+                )
+                self.assertEqual(token, "ok")
+                self.assertEqual(urlopen.call_count, 2)
+                self.assertEqual([c.args[0] for c in sleep.call_args_list], [1.0])
 
     def test_retries_are_bounded(self):
         with self.assertRaisesRegex(RuntimeError, "HTTP 503") as ctx:
