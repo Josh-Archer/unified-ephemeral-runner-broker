@@ -150,8 +150,8 @@ and are retried by the queue reconciler when their `retryAfter` time is reached.
 ## Allocation Lifecycle Webhooks
 
 Optional outbound webhooks notify external systems when an allocation becomes
-`ready` or reaches a terminal state (`failed`, `expired`, `completed`,
-`canceled`). Configure under `broker.webhooks`:
+`ready`, reaches a terminal state (`failed`, `expired`, `completed`,
+`canceled`), or enters `quarantined`. Configure under `broker.webhooks`:
 
 ```yaml
 broker:
@@ -171,6 +171,7 @@ broker:
           - expired
           - completed
           - canceled
+          - quarantined
 ```
 
 Each delivery is an HTTP POST of a signed JSON envelope:

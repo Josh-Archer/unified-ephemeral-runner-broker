@@ -88,6 +88,41 @@ func TestDispatcherDeliversSignedReadyEvent(t *testing.T) {
 	}
 }
 
+func TestDispatcherDeliversQuarantinedEvent(t *testing.T) {
+	var gotEvent string
+	var gotEnvelope Envelope
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotEvent = r.Header.Get(headerEvent)
+		if err := json.NewDecoder(r.Body).Decode(&gotEnvelope); err != nil {
+			t.Errorf("decode webhook body: %v", err)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	d := New(model.WebhooksConfig{
+		Enabled:     true,
+		MaxAttempts: 1,
+		Endpoints: []model.WebhookEndpointConfig{{
+			URL:           server.URL,
+			SigningSecret: "test-signing-secret",
+			Events:        []string{"quarantined"},
+		}},
+	}, nil, server.Client())
+	d.Notify(model.AllocationStatus{ID: "alloc-quarantined", State: model.StateQuarantined})
+	d.Wait()
+
+	if gotEvent != "allocation.quarantined" {
+		t.Fatalf("event header = %q", gotEvent)
+	}
+	if gotEnvelope.Event != "allocation.quarantined" {
+		t.Fatalf("envelope event = %q", gotEnvelope.Event)
+	}
+	if gotEnvelope.Allocation.ID != "alloc-quarantined" {
+		t.Fatalf("allocation id = %q", gotEnvelope.Allocation.ID)
+	}
+}
+
 func TestDispatcherFiltersEvents(t *testing.T) {
 	var hits atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -214,7 +249,7 @@ func TestEventName(t *testing.T) {
 	if EventName(model.StatePending) != "" {
 		t.Fatal("pending should not be webhooked")
 	}
-	if EventName(model.StateQuarantined) != "" {
-		t.Fatal("quarantined should not be webhooked")
+	if EventName(model.StateQuarantined) != EventQuarantined {
+		t.Fatalf("quarantined event = %q", EventName(model.StateQuarantined))
 	}
 }

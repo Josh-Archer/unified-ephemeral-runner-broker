@@ -55,12 +55,13 @@ func Validate(cfg model.BrokerConfig) error {
 }
 
 var supportedWebhookEvents = map[string]struct{}{
-	"ready":     {},
-	"failed":    {},
-	"expired":   {},
-	"completed": {},
-	"canceled":  {},
-	"cancelled": {}, // alias for canceled
+	"ready":       {},
+	"failed":      {},
+	"expired":     {},
+	"completed":   {},
+	"canceled":    {},
+	"cancelled":   {}, // alias for canceled
+	"quarantined": {},
 }
 
 func validateWebhooks(cfg model.WebhooksConfig) error {

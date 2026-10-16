@@ -13,8 +13,8 @@ info:
     ## Outbound lifecycle webhooks
 
     When `broker.webhooks.enabled` is true the broker POSTs signed JSON
-    envelopes to each configured endpoint on `ready` and terminal transitions
-    (`failed`, `expired`, `completed`, `canceled`). See the
+    envelopes to each configured endpoint on `ready`, `quarantined`, and
+    terminal transitions (`failed`, `expired`, `completed`, `canceled`). See the
     `AllocationLifecycleWebhook` schema. Deliveries include:
 
     - `X-UECB-Event`: `allocation.<event>`
@@ -437,6 +437,7 @@ components:
             - allocation.expired
             - allocation.completed
             - allocation.canceled
+            - allocation.quarantined
           example: allocation.ready
         occurred_at:
           type: string

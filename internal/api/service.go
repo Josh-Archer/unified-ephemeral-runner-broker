@@ -40,7 +40,7 @@ const (
 	launchModeWarm = "warm"
 )
 
-// LifecycleNotifier delivers allocation lifecycle events (ready and terminals).
+// LifecycleNotifier delivers allocation lifecycle events (ready, terminal, and quarantine).
 // Implementations must be safe for concurrent use and must not block callers
 // on remote I/O (async delivery is expected).
 type LifecycleNotifier interface {
@@ -174,8 +174,9 @@ func (s *Service) SetLifecycleNotifier(notifier LifecycleNotifier) {
 }
 
 // markState updates allocation state and emits lifecycle webhooks for terminal
-// transitions. Ready is intentionally excluded because warm claim updates the
-// record further before the final Save; callers must notifyReady after that.
+// and quarantine transitions. Ready is intentionally excluded because warm
+// claim updates the record further before the final Save; callers must
+// notifyReady after that.
 func (s *Service) markState(id string, state model.AllocationState, now time.Time, message string) (model.AllocationStatus, bool) {
 	updated, ok := s.store.MarkState(id, state, now, message)
 	if ok {
@@ -193,7 +194,7 @@ func (s *Service) notifyReady(status model.AllocationStatus) {
 
 func (s *Service) notifyLifecycleTerminal(status model.AllocationStatus) {
 	switch status.State {
-	case model.StateFailed, model.StateExpired, model.StateCompleted, model.StateCanceled:
+	case model.StateFailed, model.StateExpired, model.StateCompleted, model.StateCanceled, model.StateQuarantined:
 		s.notifyLifecycle(status)
 	}
 }
