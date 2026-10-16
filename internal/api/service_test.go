@@ -43,8 +43,28 @@ type probeBackend struct {
 
 type missingSecretReader struct{}
 
+type recordingLifecycleNotifier struct {
+	statuses []model.AllocationStatus
+}
+
+func (n *recordingLifecycleNotifier) Notify(status model.AllocationStatus) {
+	n.statuses = append(n.statuses, status)
+}
+
 func (missingSecretReader) ReadSecret(context.Context, string) (map[string]string, error) {
 	return nil, errors.New("secret not found")
+}
+
+func TestNotifyLifecycleTransitionIncludesQuarantined(t *testing.T) {
+	notifier := &recordingLifecycleNotifier{}
+	service := &Service{lifecycle: notifier}
+	status := model.AllocationStatus{ID: "alloc-quarantined", State: model.StateQuarantined}
+
+	service.notifyLifecycleTerminal(status)
+
+	if len(notifier.statuses) != 1 || notifier.statuses[0].ID != status.ID || notifier.statuses[0].State != status.State {
+		t.Fatalf("notified statuses = %+v, want quarantined status", notifier.statuses)
+	}
 }
 
 func (b testBackend) Name() model.BackendName {
