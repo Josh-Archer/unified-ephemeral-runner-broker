@@ -44,6 +44,12 @@ export GH_PROMPT_DISABLED=1
 export GLAMOUR_STYLE=notty
 
 if [[ ! -f "${CONSUMERS_FILE}" ]]; then
+  # No consumers configured yet: without an explicit consumer filter there is
+  # nothing to pin, so succeed as a no-op instead of failing the release.
+  if [[ -z "${CONSUMER_REPOS}" ]]; then
+    echo "No consumers file at ${CONSUMERS_FILE} and no consumer filter requested; nothing to pin."
+    exit 0
+  fi
   echo "::error::Consumers file not found: ${CONSUMERS_FILE}"
   exit 1
 fi
