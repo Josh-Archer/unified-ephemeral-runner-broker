@@ -332,8 +332,8 @@ Use `file` or `postgres` whenever cloud backends are enabled in production. See
 ### Allocation Lifecycle Webhooks
 
 Subscribe external systems to allocation lifecycle events (`ready`, `failed`,
-`expired`, `completed`, `canceled`). Each endpoint receives a signed JSON POST
-with exponential backoff retries. See
+`expired`, `completed`, `canceled`, `quarantined`). Each endpoint receives a
+signed JSON POST with exponential backoff retries. See
 [docs/architecture.md](docs/architecture.md#allocation-lifecycle-webhooks) and
 [docs/openapi.yaml](docs/openapi.yaml) for the envelope and signature contract.
 

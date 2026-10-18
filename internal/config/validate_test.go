@@ -32,6 +32,21 @@ func TestValidateReplicaSafety(t *testing.T) {
 	}
 }
 
+func TestValidateWebhooksAcceptsQuarantinedEvent(t *testing.T) {
+	cfg := Default()
+	cfg.Broker.Webhooks = model.WebhooksConfig{
+		Enabled: true,
+		Endpoints: []model.WebhookEndpointConfig{{
+			URL:           "https://hooks.example.com/uecb",
+			SigningSecret: "test-secret",
+			Events:        []string{"quarantined"},
+		}},
+	}
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("quarantined webhook event should be valid: %v", err)
+	}
+}
+
 func TestHAEnabled(t *testing.T) {
 	cfg := model.BrokerRuntimeConfig{StateStore: model.StateStoreConfig{Type: "memory"}}
 	if HAEnabled(cfg) {

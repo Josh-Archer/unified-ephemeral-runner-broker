@@ -22,18 +22,19 @@ import (
 )
 
 const (
-	headerEvent     = "X-UECB-Event"
-	headerDelivery  = "X-UECB-Delivery"
-	headerSignature = "X-UECB-Signature"
-	headerTimestamp = "X-UECB-Timestamp"
-	userAgent       = "uecb-broker-webhooks/1.0"
+	headerEvent      = "X-UECB-Event"
+	headerDelivery   = "X-UECB-Delivery"
+	headerSignature  = "X-UECB-Signature"
+	headerTimestamp  = "X-UECB-Timestamp"
+	userAgent        = "uecb-broker-webhooks/1.0"
 	defaultSecretKey = "signing_secret"
 
-	EventReady     = "ready"
-	EventFailed    = "failed"
-	EventExpired   = "expired"
-	EventCompleted = "completed"
-	EventCanceled  = "canceled"
+	EventReady       = "ready"
+	EventFailed      = "failed"
+	EventExpired     = "expired"
+	EventCompleted   = "completed"
+	EventCanceled    = "canceled"
+	EventQuarantined = "quarantined"
 )
 
 // EventName returns the short lifecycle event name for a state, or empty when
@@ -50,6 +51,8 @@ func EventName(state model.AllocationState) string {
 		return EventCompleted
 	case model.StateCanceled:
 		return EventCanceled
+	case model.StateQuarantined:
+		return EventQuarantined
 	default:
 		return ""
 	}
@@ -57,10 +60,10 @@ func EventName(state model.AllocationState) string {
 
 // Envelope is the JSON body POSTed to each endpoint.
 type Envelope struct {
-	ID          string                 `json:"id"`
-	Event       string                 `json:"event"`
-	OccurredAt  time.Time              `json:"occurred_at"`
-	Allocation  model.AllocationStatus `json:"allocation"`
+	ID         string                 `json:"id"`
+	Event      string                 `json:"event"`
+	OccurredAt time.Time              `json:"occurred_at"`
+	Allocation model.AllocationStatus `json:"allocation"`
 }
 
 // HTTPClient is the subset of *http.Client used by the dispatcher.
@@ -316,7 +319,7 @@ func normalizeEvent(event string) string {
 	event = strings.ToLower(strings.TrimSpace(event))
 	event = strings.TrimPrefix(event, "allocation.")
 	switch event {
-	case EventReady, EventFailed, EventExpired, EventCompleted, EventCanceled:
+	case EventReady, EventFailed, EventExpired, EventCompleted, EventCanceled, EventQuarantined:
 		return event
 	case "cancelled":
 		return EventCanceled
