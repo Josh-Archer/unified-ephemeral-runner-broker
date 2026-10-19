@@ -26,6 +26,7 @@ type Server struct {
 	oidcPolicy     model.OIDCPolicyConfig
 	oidcVerifier   *OIDCVerifier
 	requests       *prometheus.CounterVec
+	githubWebhook  *githubWebhookHandler
 }
 
 func NewServer(service *Service, allowedIssuers []string, expectedAud string, allowAnon bool) *Server {
@@ -60,6 +61,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1/allocations/", s.handleAllocationByID)
 	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/healthz", s.handleHealth)
+	mux.HandleFunc("/webhooks/github", s.handleGitHubWebhook)
+	if s.githubWebhook != nil {
+		s.githubWebhook.metrics.register()
+	}
 	if err := prometheus.Register(s.requests); err != nil {
 		if _, ok := err.(prometheus.AlreadyRegisteredError); !ok {
 			panic(err)
@@ -344,6 +349,8 @@ func routeName(path string) string {
 		return "/metrics"
 	case path == "/healthz":
 		return "/healthz"
+	case path == "/webhooks/github":
+		return "/webhooks/github"
 	default:
 		return "unknown"
 	}

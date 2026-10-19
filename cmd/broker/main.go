@@ -121,6 +121,19 @@ func main() {
 	elector := store.AsLeaderElector(service.Store())
 	useLeaderElection := config.HAEnabled(cfg.Broker)
 
+	if webhookPoolsConfigured(cfg) {
+		server.SetGitHubWebhook(api.GitHubWebhookOptions{
+			Secret: api.GitHubWebhookSecretFunc(cfg.Broker.GitHubWebhook, secretReader.ReadSecret),
+			IsLeader: func(ctx context.Context) (bool, error) {
+				if !useLeaderElection {
+					return true, nil
+				}
+				return elector.TryAcquireLeadership(ctx, store.LeaderLeaseName, identity, leaseTTL)
+			},
+		})
+		log.Printf("github workflow_job webhook enabled at /webhooks/github")
+	}
+
 	startBackground := func(name string, interval time.Duration, fn func(time.Time)) {
 		go func() {
 			ticker := time.NewTicker(interval)
@@ -197,6 +210,15 @@ func main() {
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		log.Printf("http shutdown: %v", err)
 	}
+}
+
+func webhookPoolsConfigured(cfg model.BrokerConfig) bool {
+	for _, pool := range cfg.Pools {
+		if len(pool.WebhookLabels) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func expectedReplicasFromEnv() int {

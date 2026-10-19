@@ -152,3 +152,38 @@ func TestValidateFairSharePositiveValues(t *testing.T) {
 		t.Fatalf("valid fair share config should pass: %v", err)
 	}
 }
+
+func TestValidateWebhookLabels(t *testing.T) {
+	valid := func() model.BrokerConfig {
+		cfg := Default()
+		cfg.Pools[0].WebhookLabels = []string{"self-hosted", "uecb-full"}
+		cfg.Broker.GitHubWebhook.Secret = "s"
+		return cfg
+	}
+	if err := Validate(valid()); err != nil {
+		t.Fatalf("valid webhook config rejected: %v", err)
+	}
+
+	noSecret := valid()
+	noSecret.Broker.GitHubWebhook = model.GitHubWebhookConfig{}
+	if err := Validate(noSecret); err == nil {
+		t.Fatal("webhookLabels without githubWebhook secret should be rejected")
+	}
+
+	empty := valid()
+	empty.Pools[0].WebhookLabels = []string{"self-hosted", " "}
+	if err := Validate(empty); err == nil {
+		t.Fatal("blank webhook label should be rejected")
+	}
+
+	dup := valid()
+	dup.Pools[1].WebhookLabels = []string{"UECB-full", "self-hosted"}
+	if err := Validate(dup); err == nil {
+		t.Fatal("identical label sets across pools should be rejected")
+	}
+
+	off := Default()
+	if err := Validate(off); err != nil {
+		t.Fatalf("pools without webhookLabels need no secret: %v", err)
+	}
+}

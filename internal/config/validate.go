@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -40,6 +41,9 @@ func Validate(cfg model.BrokerConfig) error {
 		return err
 	}
 	if err := validateWebhooks(cfg.Broker.Webhooks); err != nil {
+		return err
+	}
+	if err := validateWebhookLabels(cfg); err != nil {
 		return err
 	}
 	if err := validateBackendBudgets(cfg); err != nil {
@@ -531,6 +535,42 @@ func validateFairShare(cfg model.BrokerConfig) error {
 		if fs.StarvationAfter < 0 {
 			return fmt.Errorf("%s.starvationAfter must not be negative", prefix)
 		}
+	}
+	return nil
+}
+
+// validateWebhookLabels checks pools[].webhookLabels: labels must be non-empty,
+// distinct pools must not share an identical label set, and the inbound
+// GitHub webhook secret must be configured when any pool opts in.
+func validateWebhookLabels(cfg model.BrokerConfig) error {
+	seen := map[string]model.PoolName{}
+	enabled := false
+	for _, pool := range cfg.Pools {
+		if len(pool.WebhookLabels) == 0 {
+			continue
+		}
+		enabled = true
+		normalized := make([]string, 0, len(pool.WebhookLabels))
+		for i, label := range pool.WebhookLabels {
+			label = strings.ToLower(strings.TrimSpace(label))
+			if label == "" {
+				return fmt.Errorf("pools[%s].webhookLabels[%d] must not be empty", pool.Name, i)
+			}
+			normalized = append(normalized, label)
+		}
+		sort.Strings(normalized)
+		key := strings.Join(normalized, ",")
+		if other, ok := seen[key]; ok {
+			return fmt.Errorf("pools[%s].webhookLabels duplicates pools[%s].webhookLabels", pool.Name, other)
+		}
+		seen[key] = pool.Name
+	}
+	if !enabled {
+		return nil
+	}
+	gh := cfg.Broker.GitHubWebhook
+	if strings.TrimSpace(gh.Secret) == "" && strings.TrimSpace(gh.SecretRef) == "" {
+		return fmt.Errorf("broker.githubWebhook requires secret or secretRef when pools[].webhookLabels is set")
 	}
 	return nil
 }

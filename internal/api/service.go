@@ -61,6 +61,9 @@ type Service struct {
 	budgets     *budget.Tracker
 	quality     *quality.Tracker
 	warmMu      sync.Mutex
+	// workflowJobMu serializes webhook-driven allocation so one job id never
+	// yields two allocations.
+	workflowJobMu sync.Mutex
 	initErr     error
 	health      func(context.Context) error
 	now         func() time.Time

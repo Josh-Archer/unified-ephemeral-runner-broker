@@ -150,6 +150,18 @@ type BrokerRuntimeConfig struct {
 	LiveCapacity LiveCapacityConfig   `yaml:"liveCapacity,omitempty" json:"liveCapacity,omitempty"`
 	QualityAware QualityAwareConfig   `yaml:"qualityAware,omitempty" json:"qualityAware,omitempty"`
 	Webhooks     WebhooksConfig       `yaml:"webhooks,omitempty" json:"webhooks,omitempty"`
+	// GitHubWebhook configures the inbound POST /webhooks/github endpoint used
+	// by pools that set webhookLabels.
+	GitHubWebhook GitHubWebhookConfig `yaml:"githubWebhook,omitempty" json:"githubWebhook,omitempty"`
+}
+
+// GitHubWebhookConfig holds the shared secret used to verify X-Hub-Signature-256
+// on inbound GitHub workflow_job deliveries. Prefer secretRef for production.
+type GitHubWebhookConfig struct {
+	Secret    string `yaml:"secret,omitempty" json:"secret,omitempty"`
+	SecretRef string `yaml:"secretRef,omitempty" json:"secretRef,omitempty"`
+	// SecretKey is the key inside SecretRef (default: webhook_secret).
+	SecretKey string `yaml:"secretKey,omitempty" json:"secretKey,omitempty"`
 }
 
 // WebhooksConfig controls outbound allocation lifecycle event delivery.
@@ -387,6 +399,11 @@ type PoolConfig struct {
 	Labels            []string                      `yaml:"labels" json:"labels"`
 	Scheduler         string                        `yaml:"scheduler" json:"scheduler"`
 	FairShare         FairShareConfig               `yaml:"fairShare,omitempty" json:"fairShare,omitempty"`
+	// WebhookLabels opts the pool into workflow_job webhook-driven allocation.
+	// A queued job whose runs-on labels are all contained in this set (and that
+	// names at least one label besides self-hosted) is allocated from this pool;
+	// runners register with these static labels instead of a per-allocation one.
+	WebhookLabels     []string                      `yaml:"webhookLabels,omitempty" json:"webhookLabels,omitempty"`
 	CapabilityProfile CapabilityProfile             `yaml:"capabilityProfile" json:"capabilityProfile"`
 	Backends          map[BackendName]BackendConfig `yaml:"backends" json:"backends"`
 }
@@ -406,6 +423,9 @@ type AllocationRequest struct {
 	Labels               []string      `json:"labels,omitempty"`
 	RequiredCapabilities []string      `json:"required_capabilities,omitempty"`
 	ExcludedCapabilities []string      `json:"excluded_capabilities,omitempty"`
+	// WorkflowJobID is set only by the GitHub workflow_job webhook path; it is
+	// not accepted from the public allocation API.
+	WorkflowJobID int64 `json:"workflow_job_id,omitempty"`
 }
 
 type AllocationStatus struct {
