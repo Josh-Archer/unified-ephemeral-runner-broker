@@ -286,12 +286,6 @@ func validateHA(cfg model.BrokerRuntimeConfig) error {
 	if cfg.HA.LeaseTTL < 0 {
 		return fmt.Errorf("broker.ha.leaseTTL must not be negative")
 	}
-	enabled := HAEnabled(cfg)
-	if enabled && normalizeStringDefault(cfg.StateStore.Type, "memory") != "postgres" {
-		// Allow explicit HA with any store that implements leader election
-		// (memory/file implement local leases for tests). Only warn via docs;
-		// production multi-replica still requires ValidateReplicaSafety.
-	}
 	return nil
 }
 

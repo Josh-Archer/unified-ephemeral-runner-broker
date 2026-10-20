@@ -75,15 +75,15 @@ type dispatchResponse struct {
 // cleanupRequest is the JSON body POSTed to cleanup_url (or derived cleanup endpoint).
 // Launchers should treat cleanup as idempotent: 200/204 and 404 are success.
 type cleanupRequest struct {
-	Action         string            `json:"action"`
-	Backend        string            `json:"backend"`
-	AllocationID   string            `json:"allocation_id"`
-	CorrelationID  string            `json:"correlation_id,omitempty"`
-	Pool           string            `json:"pool"`
-	RunnerLabel    string            `json:"runner_label"`
-	State          string            `json:"state"`
-	Error          string            `json:"error,omitempty"`
-	Metadata       map[string]string `json:"metadata,omitempty"`
+	Action        string            `json:"action"`
+	Backend       string            `json:"backend"`
+	AllocationID  string            `json:"allocation_id"`
+	CorrelationID string            `json:"correlation_id,omitempty"`
+	Pool          string            `json:"pool"`
+	RunnerLabel   string            `json:"runner_label"`
+	State         string            `json:"state"`
+	Error         string            `json:"error,omitempty"`
+	Metadata      map[string]string `json:"metadata,omitempty"`
 }
 
 func New(name model.BackendName, cfg model.BrokerConfig, secrets runtime.SecretReader) *Backend {
@@ -183,7 +183,7 @@ func (b *Backend) Provision(ctx context.Context, request model.AllocationRequest
 	if err != nil {
 		return backend.ProvisionedRunner{}, classifyDispatchError(b.name, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		message, readErr := readErrorMessage(resp.Body)
@@ -297,7 +297,7 @@ func (b *Backend) Capacity(ctx context.Context) (backend.CapacityStatus, error) 
 	if err != nil {
 		return backend.CapacityStatus{}, classifyDispatchError(b.name, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		message, readErr := readErrorMessage(resp.Body)
@@ -362,7 +362,7 @@ func (b *Backend) Probe(ctx context.Context, pool model.PoolConfig, cfg model.Ba
 	if err != nil {
 		return classifyDispatchError(b.name, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		return nil
 	}
@@ -449,7 +449,7 @@ func (b *Backend) Cleanup(ctx context.Context, status model.AllocationStatus) er
 	if err != nil {
 		return classifyDispatchError(b.name, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// Idempotent cleanup: success and not-found are both OK.
 	if (resp.StatusCode >= 200 && resp.StatusCode < 300) || resp.StatusCode == http.StatusNotFound {

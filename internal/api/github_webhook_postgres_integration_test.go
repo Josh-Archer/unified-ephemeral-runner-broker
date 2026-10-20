@@ -80,13 +80,35 @@ func TestPostgresWebhookInboxLeaseExpiryDuringAllocationIsIdempotent(t *testing.
 	if !ok {
 		t.Fatal("webhook pool did not match")
 	}
-	firstAllocation, created, err := h.service.AllocateForWorkflowJob(ctx, pool, 81001)
-	if err != nil || !created {
-		t.Fatalf("first allocation = %+v, created=%v, err=%v", firstAllocation, created, err)
+	type allocationResult struct {
+		service *Service
+		status  model.AllocationStatus
+		created bool
+		err     error
 	}
-	secondAllocation, created, err := secondService.AllocateForWorkflowJob(ctx, pool, 81001)
-	if err != nil || created || firstAllocation.ID != secondAllocation.ID || len(h.service.Store().List()) != 1 {
-		t.Fatalf("retry allocation = %+v, created=%v, err=%v; first=%+v", secondAllocation, created, err, firstAllocation)
+	results := make(chan allocationResult, 2)
+	for _, service := range []*Service{h.service, secondService} {
+		go func(service *Service) {
+			status, created, err := service.AllocateForWorkflowJob(ctx, pool, 81001)
+			results <- allocationResult{service: service, status: status, created: created, err: err}
+		}(service)
+	}
+	firstResult, secondResult := <-results, <-results
+	for _, result := range []*allocationResult{&firstResult, &secondResult} {
+		if result.err == nil {
+			continue
+		}
+		result.status, result.created, result.err = result.service.AllocateForWorkflowJob(ctx, pool, 81001)
+	}
+	if firstResult.err != nil || secondResult.err != nil || firstResult.created == secondResult.created || firstResult.status.ID == "" || firstResult.status.ID != secondResult.status.ID {
+		t.Fatalf("overlapping allocations = %+v, %+v", firstResult, secondResult)
+	}
+	var jobAllocationCount int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM uecb_allocations WHERE workflow_job_id = $1`, 81001).Scan(&jobAllocationCount); err != nil {
+		t.Fatal(err)
+	}
+	if jobAllocationCount != 1 {
+		t.Fatalf("allocations for workflow job = %d, want 1", jobAllocationCount)
 	}
 
 	var lockedUntil, dbNow time.Time

@@ -77,7 +77,7 @@ func TestServerJSONProtocol(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status %d", resp.StatusCode)
 	}
@@ -95,7 +95,7 @@ func TestServerJSONProtocol(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp2.Body.Close()
+	defer func() { _ = resp2.Body.Close() }()
 	if resp2.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d", resp2.StatusCode)
 	}
@@ -109,7 +109,7 @@ func TestServerProbeFailureAndMutation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503, got %d", resp.StatusCode)
 	}
@@ -120,7 +120,7 @@ func TestServerProbeFailureAndMutation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp2.Body.Close()
+	defer func() { _ = resp2.Body.Close() }()
 	var payload map[string]int
 	if err := json.NewDecoder(resp2.Body).Decode(&payload); err != nil {
 		t.Fatal(err)
@@ -136,7 +136,7 @@ func TestServerFreeSlotsOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	var payload map[string]int
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
 		t.Fatal(err)

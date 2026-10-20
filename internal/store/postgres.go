@@ -164,7 +164,7 @@ func (p *Postgres) List() []model.AllocationStatus {
 	if err != nil {
 		return nil
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	result := make([]model.AllocationStatus, 0)
 	for rows.Next() {

@@ -164,7 +164,7 @@ func (b *Backend) getCapacityURL(ctx context.Context, capacityURL, dispatchToken
 	if err != nil {
 		return backend.CapacityStatus{}, fmt.Errorf("capacity backend %s: %w", model.BackendARC, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return backend.CapacityStatus{}, fmt.Errorf("capacity backend %s: unexpected status %d", model.BackendARC, resp.StatusCode)
@@ -200,5 +200,3 @@ func (b *Backend) backendConfig(poolName model.PoolName) (model.BackendConfig, b
 	}
 	return model.BackendConfig{}, false
 }
-
-

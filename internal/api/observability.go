@@ -92,8 +92,8 @@ func (noopObserver) ObserveAllocationReaped(model.PoolName, model.BackendName, s
 func (noopObserver) ObserveOrphanCleanup(model.PoolName, model.BackendName, string)    {}
 func (noopObserver) ObserveLabelGarbage(model.PoolName, model.BackendName, string)     {}
 func (noopObserver) ObserveStaleRunnerLabels([]staleRunnerLabelSnapshot)               {}
-func (noopObserver) ObserveProcessLocalStateLoss(string)                              {}
-func (noopObserver) ObserveRestartOrphans(model.BackendName, string, int)             {}
+func (noopObserver) ObserveProcessLocalStateLoss(string)                               {}
+func (noopObserver) ObserveRestartOrphans(model.BackendName, string, int)              {}
 
 type liveCapacitySnapshot struct {
 	Backend model.BackendName
@@ -163,11 +163,7 @@ type PrometheusObserver struct {
 	orphanedRunners       *prometheus.GaugeVec
 }
 
-func NewPrometheusObserver(registerer prometheus.Registerer) *PrometheusObserver {
-	if registerer == nil {
-		registerer = prometheus.DefaultRegisterer
-	}
-
+func NewPrometheusObserver(_ prometheus.Registerer) *PrometheusObserver {
 	latencyBuckets := []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 90}
 	return &PrometheusObserver{
 		allocationLatency: prometheus.NewHistogramVec(prometheus.HistogramOpts{

@@ -816,7 +816,7 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 				backend.WithCapabilitiesMetadata(pool.Backends[selected], warmAllocation.Metadata),
 				launchMode,
 			)
-			s.store.Save(warmAllocation)
+			_ = s.store.Save(warmAllocation)
 			s.recordBudgetUsage(pool, selected)
 			launchLatency := time.Duration(0)
 			s.observer.ObserveLaunchLatency(pool.Name, selected, launchMode, launchLatency)
@@ -1753,7 +1753,7 @@ func (s *Service) createWarmAllocation(pool model.PoolConfig, backendName model.
 		launchModeWarm,
 	)
 	allocation.ExpiresAt = now.Add(ttl)
-	s.store.Save(allocation)
+	_ = s.store.Save(allocation)
 	return nil
 }
 

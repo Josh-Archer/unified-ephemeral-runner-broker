@@ -400,12 +400,6 @@ func priorityFairShareScore(activeTotal, tenantActive, weight int) int {
 	return activeTotal*priorityShareScale + tenantPenalty - (weight-1)*priorityShareClassBoost
 }
 
-// backendAvailableForPriority reports whether a backend has free capacity for
-// the given priority class after soft reserves for higher lanes are held back.
-func backendAvailableForPriority(cfg model.BackendConfig, active int, pool model.PoolConfig, priorityClass string) bool {
-	return backendAvailableForPriorityWithStarvation(cfg, active, pool, priorityClass, false)
-}
-
 // backendAvailableForPriorityWithStarvation is like backendAvailableForPriority
 // but when starving is true, soft reserves are bypassed so the class can use
 // the full maxRunners budget.

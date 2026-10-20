@@ -26,8 +26,6 @@ const (
 	caFileName         = "ca.crt"
 )
 
-var errMissingNamespace = errors.New("UECB_POD_NAMESPACE is not set")
-
 type HealthChecker interface {
 	Check(ctx context.Context) error
 }
@@ -152,7 +150,7 @@ func (c *kubernetesSecretClient) ReadSecret(ctx context.Context, name string) (m
 	if err != nil {
 		return nil, fmt.Errorf("query kubernetes secret %s: %w", name, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	switch resp.StatusCode {
 	case http.StatusOK:
@@ -180,7 +178,7 @@ func (c *kubernetesSecretClient) secretExists(ctx context.Context, name string) 
 	if err != nil {
 		return false, fmt.Errorf("query kubernetes secret %s: %w", name, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	_, _ = io.Copy(io.Discard, resp.Body)
 
 	switch resp.StatusCode {

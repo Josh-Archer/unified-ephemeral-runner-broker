@@ -225,8 +225,8 @@ func newOIDCTestIssuer(t *testing.T, key *rsa.PrivateKey, kid string) *httptest.
 				Use: "sig",
 				Kid: kid,
 				Alg: "RS256",
-				N:   base64.RawURLEncoding.EncodeToString(key.PublicKey.N.Bytes()),
-				E:   base64.RawURLEncoding.EncodeToString(bigEndianInt(key.PublicKey.E)),
+				N:   base64.RawURLEncoding.EncodeToString(key.N.Bytes()),
+				E:   base64.RawURLEncoding.EncodeToString(bigEndianInt(key.E)),
 			}},
 		})
 	})
