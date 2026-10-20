@@ -11,6 +11,34 @@ permissions:
   contents: read
 
 jobs:
+  postgres-webhook-inbox-integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: uecb_test
+          POSTGRES_USER: uecb
+          POSTGRES_PASSWORD: uecb
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U uecb -d uecb_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      UECB_TEST_POSTGRES_DSN: postgres://uecb:uecb@localhost:5432/uecb_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Postgres webhook inbox integration tests
+        run: go test ./internal/api -run '^TestPostgresWebhookInbox' -count=1 -v
+
   test:
     runs-on: ubuntu-latest
     steps:

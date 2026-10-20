@@ -10,6 +10,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -52,6 +53,7 @@ type githubWebhookMetrics struct {
 	matched  *prometheus.CounterVec
 	ignored  *prometheus.CounterVec
 	enqueued *prometheus.CounterVec
+	expired  prometheus.Counter
 }
 
 func newGitHubWebhookMetrics() *githubWebhookMetrics {
@@ -72,11 +74,15 @@ func newGitHubWebhookMetrics() *githubWebhookMetrics {
 			Name: "uecb_github_webhook_events_enqueued_total",
 			Help: "workflow_job deliveries persisted to the shared inbox by a non-leader replica.",
 		}, []string{"action"}),
+		expired: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "uecb_github_webhook_inbox_expired_total",
+			Help: "Webhook inbox deliveries discarded after exceeding the maximum processing age.",
+		}),
 	}
 }
 
 func (m *githubWebhookMetrics) register() {
-	for _, c := range []prometheus.Collector{m.received, m.matched, m.ignored, m.enqueued} {
+	for _, c := range []prometheus.Collector{m.received, m.matched, m.ignored, m.enqueued, m.expired} {
 		if err := prometheus.Register(c); err != nil {
 			if _, ok := err.(prometheus.AlreadyRegisteredError); !ok {
 				panic(err)
@@ -307,12 +313,21 @@ func (h *githubWebhookHandler) drainInbox(ctx context.Context) (int, error) {
 		for _, d := range batch {
 			var payload workflowJobPayload
 			if err := json.Unmarshal(d.Payload, &payload); err != nil {
-				log.Printf("github webhook inbox: dropping undecodable delivery %s: %v", d.DeliveryID, err)
+				slog.Error("dropping undecodable GitHub webhook inbox delivery", "delivery_id", d.DeliveryID, "error", err)
 			} else if time.Since(d.ReceivedAt) > inboxMaxAge {
-				log.Printf("github webhook inbox: dropping stale delivery %s job=%d", d.DeliveryID, payload.WorkflowJob.ID)
-			} else if _, _, err := h.process(ctx, payload); err != nil {
-				log.Printf("github webhook inbox: delivery %s job=%d attempt=%d failed: %v", d.DeliveryID, payload.WorkflowJob.ID, d.Attempts, err)
-				continue
+				slog.Error("dropping expired GitHub webhook inbox delivery", "delivery_id", d.DeliveryID, "job_id", payload.WorkflowJob.ID, "attempts", d.Attempts, "age", time.Since(d.ReceivedAt))
+				h.metrics.expired.Inc()
+			} else {
+				result, _, err := h.process(ctx, payload)
+				if err != nil {
+					log.Printf("github webhook inbox: delivery %s job=%d attempt=%d failed: %v", d.DeliveryID, payload.WorkflowJob.ID, d.Attempts, err)
+					continue
+				}
+				// A completion can race ahead of its queued event. Keep it leased
+				// for retry so a later drain can finalize the allocation.
+				if payload.Action == "completed" && result["reason"] == "unknown_job" {
+					continue
+				}
 			}
 			if err := h.opts.Inbox.AckWebhook(ctx, d.ID); err != nil {
 				return processed, err

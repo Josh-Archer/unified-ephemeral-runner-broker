@@ -67,6 +67,7 @@ func (p *Postgres) migrate(ctx context.Context) error {
 	const schema = `
 CREATE TABLE IF NOT EXISTS uecb_allocations (
   id TEXT PRIMARY KEY,
+  workflow_job_id BIGINT,
   pool TEXT NOT NULL,
   backend TEXT NOT NULL DEFAULT '',
   state TEXT NOT NULL,
@@ -74,6 +75,9 @@ CREATE TABLE IF NOT EXISTS uecb_allocations (
   payload JSONB NOT NULL,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+ALTER TABLE uecb_allocations ADD COLUMN IF NOT EXISTS workflow_job_id BIGINT;
+CREATE UNIQUE INDEX IF NOT EXISTS uecb_allocations_workflow_job_id_idx
+  ON uecb_allocations (workflow_job_id) WHERE workflow_job_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS uecb_allocations_active_idx
   ON uecb_allocations (pool, backend, state);
 CREATE INDEX IF NOT EXISTS uecb_allocations_tenant_idx
@@ -112,17 +116,19 @@ func (p *Postgres) Save(status model.AllocationStatus) error {
 		return fmt.Errorf("encode allocation: %w", err)
 	}
 	tenant := normalizeTenant(status.Tenant)
+	workflowJobID := allocationWorkflowJobID(status)
 	_, err = p.db.Exec(`
-INSERT INTO uecb_allocations (id, pool, backend, state, tenant, payload, updated_at)
-VALUES ($1, $2, $3, $4, $5, $6, NOW())
+INSERT INTO uecb_allocations (id, workflow_job_id, pool, backend, state, tenant, payload, updated_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
 ON CONFLICT (id) DO UPDATE SET
+  workflow_job_id = EXCLUDED.workflow_job_id,
   pool = EXCLUDED.pool,
   backend = EXCLUDED.backend,
   state = EXCLUDED.state,
   tenant = EXCLUDED.tenant,
   payload = EXCLUDED.payload,
   updated_at = NOW()
-`, status.ID, string(status.Pool), string(status.SelectedBackend), string(status.State), tenant, payload)
+`, status.ID, workflowJobID, string(status.Pool), string(status.SelectedBackend), string(status.State), tenant, payload)
 	if err != nil {
 		return fmt.Errorf("save allocation: %w", err)
 	}
@@ -433,18 +439,27 @@ func (p *Postgres) saveTx(tx *sql.Tx, status model.AllocationStatus) error {
 		return err
 	}
 	tenant := normalizeTenant(status.Tenant)
+	workflowJobID := allocationWorkflowJobID(status)
 	_, err = tx.Exec(`
-INSERT INTO uecb_allocations (id, pool, backend, state, tenant, payload, updated_at)
-VALUES ($1, $2, $3, $4, $5, $6, NOW())
+INSERT INTO uecb_allocations (id, workflow_job_id, pool, backend, state, tenant, payload, updated_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
 ON CONFLICT (id) DO UPDATE SET
+  workflow_job_id = EXCLUDED.workflow_job_id,
   pool = EXCLUDED.pool,
   backend = EXCLUDED.backend,
   state = EXCLUDED.state,
   tenant = EXCLUDED.tenant,
   payload = EXCLUDED.payload,
   updated_at = NOW()
-`, status.ID, string(status.Pool), string(status.SelectedBackend), string(status.State), tenant, payload)
+`, status.ID, workflowJobID, string(status.Pool), string(status.SelectedBackend), string(status.State), tenant, payload)
 	return err
+}
+
+func allocationWorkflowJobID(status model.AllocationStatus) any {
+	if status.Request == nil || status.Request.WorkflowJobID == 0 {
+		return nil
+	}
+	return status.Request.WorkflowJobID
 }
 
 func (p *Postgres) EnqueueWebhook(ctx context.Context, deliveryID string, payload []byte) error {
@@ -462,15 +477,14 @@ func (p *Postgres) ClaimWebhooks(ctx context.Context, limit int, lease time.Dura
 	if limit <= 0 {
 		limit = 50
 	}
-	now := time.Now()
 	rows, err := p.db.QueryContext(ctx, `
-UPDATE uecb_webhook_inbox SET locked_until = $1, attempts = attempts + 1
+UPDATE uecb_webhook_inbox SET locked_until = NOW() + ($1 * INTERVAL '1 microsecond'), attempts = attempts + 1
 WHERE id IN (
-  SELECT id FROM uecb_webhook_inbox WHERE locked_until <= $2
-  ORDER BY id LIMIT $3 FOR UPDATE SKIP LOCKED
+  SELECT id FROM uecb_webhook_inbox WHERE locked_until <= NOW()
+  ORDER BY id LIMIT $2 FOR UPDATE SKIP LOCKED
 )
 RETURNING id, delivery_id, payload, attempts, received_at
-`, now.Add(lease), now, limit)
+`, lease.Microseconds(), limit)
 	if err != nil {
 		return nil, fmt.Errorf("claim webhooks: %w", err)
 	}
