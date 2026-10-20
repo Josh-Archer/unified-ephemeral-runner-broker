@@ -474,7 +474,7 @@ RETURNING id, delivery_id, payload, attempts, received_at
 	if err != nil {
 		return nil, fmt.Errorf("claim webhooks: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []WebhookDelivery
 	for rows.Next() {
 		var d WebhookDelivery
