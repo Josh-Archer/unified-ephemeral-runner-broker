@@ -11,8 +11,10 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
+	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/store"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 )
@@ -42,6 +44,8 @@ type webhookHarness struct {
 	service *Service
 	handler http.Handler
 	leader  bool
+	inbox   store.WebhookInbox
+	server  *Server
 }
 
 func newWebhookHarness(t *testing.T, enable bool) *webhookHarness {
@@ -52,10 +56,11 @@ func newWebhookHarness(t *testing.T, enable bool) *webhookHarness {
 		}
 	})
 	server := newTestServer(t, service)
-	h := &webhookHarness{t: t, service: service, leader: true}
+	h := &webhookHarness{t: t, service: service, leader: true, server: server, inbox: store.AsWebhookInbox(service.Store())}
 	server.SetGitHubWebhook(GitHubWebhookOptions{
 		Secret:   func(context.Context) (string, error) { return testWebhookSecret, nil },
 		IsLeader: func(context.Context) (bool, error) { return h.leader, nil },
+		Inbox:    h.inbox,
 	})
 	h.handler = server.Handler()
 	return h
@@ -273,21 +278,78 @@ func TestGitHubWebhookDuplicateDeliveryIdempotent(t *testing.T) {
 	}
 }
 
-func TestGitHubWebhookNonLeaderNoOp(t *testing.T) {
+func TestGitHubWebhookNonLeaderNoInboxRejects(t *testing.T) {
 	h := newWebhookHarness(t, true)
 	h.leader = false
-	body := jobBody("queued", 21, "", "self-hosted", "uecb-full")
-	rec := h.send("workflow_job", "nl1", body)
+	h.server.githubWebhook.opts.Inbox = nil
+	rec := h.send("workflow_job", "nl0", jobBody("queued", 20, "", "self-hosted", "uecb-full"))
 	if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), "not_leader") {
 		t.Fatalf("got %d %s", rec.Code, rec.Body)
 	}
+}
+
+func TestGitHubWebhookNonLeaderQueuesForLeader(t *testing.T) {
+	h := newWebhookHarness(t, true)
+	h.leader = false
+	queued := jobBody("queued", 21, "", "self-hosted", "uecb-full")
+	rec := h.send("workflow_job", "nl1", queued)
+	if rec.Code != http.StatusAccepted || !strings.Contains(rec.Body.String(), `"queued"`) {
+		t.Fatalf("got %d %s", rec.Code, rec.Body)
+	}
+	// Redelivery of the same GUID must not duplicate the queued entry.
+	h.send("workflow_job", "nl1", queued)
 	if h.activeCount() != 0 {
 		t.Fatal("non-leader must not allocate")
 	}
-	// The same delivery must still be processable once leadership is held.
+
+	// The leader's drain loop picks the delivery up and allocates exactly once.
 	h.leader = true
-	if rec := h.send("workflow_job", "nl1", body); rec.Code != http.StatusAccepted {
-		t.Fatalf("after leadership: %d %s", rec.Code, rec.Body)
+	n, err := h.server.DrainGitHubWebhookInbox(context.Background())
+	if err != nil || n != 1 {
+		t.Fatalf("drain = %d, %v; want 1, nil", n, err)
+	}
+	if got := h.activeCount(); got != 1 {
+		t.Fatalf("active allocations = %d, want 1", got)
+	}
+	if n, _ := h.server.DrainGitHubWebhookInbox(context.Background()); n != 0 {
+		t.Fatalf("inbox not emptied, drained %d more", n)
+	}
+}
+
+func TestGitHubWebhookLeaderDrainsInboxBeforeProcessing(t *testing.T) {
+	h := newWebhookHarness(t, true)
+	h.leader = false
+	h.send("workflow_job", "o1", jobBody("queued", 22, "", "self-hosted", "uecb-full"))
+	h.send("workflow_job", "o2", jobBody("completed", 22, "success", "self-hosted", "uecb-full"))
+	// Leadership returns and an unrelated delivery arrives: the backlog is
+	// applied in order (allocate then finalize) before it.
+	h.leader = true
+	if rec := h.send("workflow_job", "o3", jobBody("queued", 23, "", "self-hosted", "uecb-full")); rec.Code != http.StatusAccepted {
+		t.Fatalf("got %d %s", rec.Code, rec.Body)
+	}
+	if got := h.activeCount(); got != 1 {
+		t.Fatalf("active allocations = %d, want 1 (job 22 finalized, job 23 live)", got)
+	}
+}
+
+func TestGitHubWebhookInboxFailureRetried(t *testing.T) {
+	defer func(old time.Duration) { inboxLease = old }(inboxLease)
+	inboxLease = 0
+	h := newWebhookHarness(t, true)
+	h.leader = false
+	h.send("workflow_job", "r1", jobBody("queued", 24, "", "self-hosted", "uecb-full"))
+	h.leader = true
+	h.service.initErr = errors.New("boom")
+	if n, _ := h.server.DrainGitHubWebhookInbox(context.Background()); n != 0 {
+		t.Fatalf("failed delivery must not be acked, drained %d", n)
+	}
+	// Still queued: once the lease lapses and the fault clears it is applied.
+	h.service.initErr = nil
+	if n, err := h.server.DrainGitHubWebhookInbox(context.Background()); err != nil || n != 1 {
+		t.Fatalf("retry drain = %d, %v", n, err)
+	}
+	if h.activeCount() != 1 {
+		t.Fatal("retried delivery did not allocate")
 	}
 }
 

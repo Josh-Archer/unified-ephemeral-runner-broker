@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -88,6 +89,15 @@ CREATE TABLE IF NOT EXISTS uecb_admission_state (
   id SMALLINT PRIMARY KEY CHECK (id = 1),
   payload JSONB NOT NULL,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS uecb_webhook_inbox (
+  id BIGSERIAL PRIMARY KEY,
+  delivery_id TEXT NOT NULL UNIQUE,
+  payload JSONB NOT NULL,
+  attempts INT NOT NULL DEFAULT 0,
+  locked_until TIMESTAMPTZ NOT NULL DEFAULT 'epoch',
+  received_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 `
 	if _, err := p.db.ExecContext(ctx, schema); err != nil {
@@ -435,4 +445,54 @@ ON CONFLICT (id) DO UPDATE SET
   updated_at = NOW()
 `, status.ID, string(status.Pool), string(status.SelectedBackend), string(status.State), tenant, payload)
 	return err
+}
+
+func (p *Postgres) EnqueueWebhook(ctx context.Context, deliveryID string, payload []byte) error {
+	_, err := p.db.ExecContext(ctx, `
+INSERT INTO uecb_webhook_inbox (delivery_id, payload) VALUES ($1, $2)
+ON CONFLICT (delivery_id) DO NOTHING
+`, deliveryID, payload)
+	if err != nil {
+		return fmt.Errorf("enqueue webhook: %w", err)
+	}
+	return nil
+}
+
+func (p *Postgres) ClaimWebhooks(ctx context.Context, limit int, lease time.Duration) ([]WebhookDelivery, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	now := time.Now()
+	rows, err := p.db.QueryContext(ctx, `
+UPDATE uecb_webhook_inbox SET locked_until = $1, attempts = attempts + 1
+WHERE id IN (
+  SELECT id FROM uecb_webhook_inbox WHERE locked_until <= $2
+  ORDER BY id LIMIT $3 FOR UPDATE SKIP LOCKED
+)
+RETURNING id, delivery_id, payload, attempts, received_at
+`, now.Add(lease), now, limit)
+	if err != nil {
+		return nil, fmt.Errorf("claim webhooks: %w", err)
+	}
+	defer rows.Close()
+	var out []WebhookDelivery
+	for rows.Next() {
+		var d WebhookDelivery
+		if err := rows.Scan(&d.ID, &d.DeliveryID, &d.Payload, &d.Attempts, &d.ReceivedAt); err != nil {
+			return nil, fmt.Errorf("scan webhook: %w", err)
+		}
+		out = append(out, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+func (p *Postgres) AckWebhook(ctx context.Context, id int64) error {
+	if _, err := p.db.ExecContext(ctx, `DELETE FROM uecb_webhook_inbox WHERE id = $1`, id); err != nil {
+		return fmt.Errorf("ack webhook: %w", err)
+	}
+	return nil
 }

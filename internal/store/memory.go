@@ -13,6 +13,7 @@ type Memory struct {
 	allocations map[string]model.AllocationStatus
 	admission   AdmissionStateDocument
 	leader      map[string]leaderLease
+	inbox       memoryInbox
 }
 
 type leaderLease struct {

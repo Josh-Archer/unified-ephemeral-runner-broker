@@ -374,3 +374,29 @@ func TestFileStoreSaveIfStatePersistFailure(t *testing.T) {
 		t.Fatalf("expected in-memory state to remain reserved without label, got %+v", got)
 	}
 }
+
+func TestMemoryWebhookInbox(t *testing.T) {
+	s := NewMemory()
+	ctx := context.Background()
+	for _, id := range []string{"a", "b", "a"} {
+		if err := s.EnqueueWebhook(ctx, id, []byte(`{"id":"`+id+`"}`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.ClaimWebhooks(ctx, 10, time.Minute)
+	if err != nil || len(got) != 2 || got[0].DeliveryID != "a" || got[1].DeliveryID != "b" {
+		t.Fatalf("claim = %+v, %v; want a,b deduped and ordered", got, err)
+	}
+	if again, _ := s.ClaimWebhooks(ctx, 10, time.Minute); len(again) != 0 {
+		t.Fatalf("leased deliveries reclaimed: %+v", again)
+	}
+	if err := s.AckWebhook(ctx, got[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	// An unacked delivery becomes claimable again once its lease lapses.
+	s.inbox.items[got[1].ID].lockedUntil = time.Now().Add(-time.Second)
+	again, _ := s.ClaimWebhooks(ctx, 10, time.Minute)
+	if len(again) != 1 || again[0].DeliveryID != "b" || again[0].Attempts != 2 {
+		t.Fatalf("retry claim = %+v", again)
+	}
+}

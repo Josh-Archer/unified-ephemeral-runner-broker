@@ -124,6 +124,7 @@ func main() {
 	if webhookPoolsConfigured(cfg) {
 		server.SetGitHubWebhook(api.GitHubWebhookOptions{
 			Secret: api.GitHubWebhookSecretFunc(cfg.Broker.GitHubWebhook, secretReader.ReadSecret),
+			Inbox:  store.AsWebhookInbox(service.Store()),
 			IsLeader: func(ctx context.Context) (bool, error) {
 				if !useLeaderElection {
 					return true, nil
@@ -167,6 +168,14 @@ func main() {
 	startBackground("reconcile-queue", 10*time.Second, func(now time.Time) {
 		service.ReconcileQueue(context.Background(), now)
 	})
+
+	if webhookPoolsConfigured(cfg) {
+		startBackground("github-webhook-inbox", 5*time.Second, func(time.Time) {
+			if _, err := server.DrainGitHubWebhookInbox(context.Background()); err != nil {
+				log.Printf("github webhook inbox drain: %v", err)
+			}
+		})
+	}
 
 	if tierManager != nil {
 		go func() {

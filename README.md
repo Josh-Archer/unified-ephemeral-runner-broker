@@ -286,7 +286,7 @@ Behavior:
 - On `queued` the allocation is requested with the pool's static labels, so the runner registers with them (JIT config) instead of a per-allocation label, and `workflow_job.id` is recorded on the allocation. A duplicate `queued` for the same job id never creates a second allocation.
 - On `completed` the allocation is finalized by `workflow_job.id`: `cancelled` conclusions cancel it (also removing it from the admission queue), anything else completes it. Lost events are covered by the [stuck-allocation reaper](#stuck-allocation-reaper-orphan-cleanup): the allocation expires after `job_timeout`.
 - Idempotency: deliveries are deduplicated on `X-GitHub-Delivery`. A delivery whose processing failed (`500`) is not remembered, so GitHub redelivery retries it.
-- Only the reconciliation leader acts. With `broker.ha` enabled, a replica that does not hold the lease returns `503` and does nothing, so route the webhook to the leader or redeliver from GitHub's "Recent Deliveries" page. The delivery cache is in-memory (per process); job-id lookup in the shared store keeps allocation creation idempotent across restarts.
+- Only the reconciliation leader acts, but no delivery is lost. With `broker.ha` enabled, a replica that does not hold the lease persists the delivery to a durable shared inbox (`uecb_webhook_inbox` in the postgres state store, deduplicated on `X-GitHub-Delivery`) and answers `202`. The leader drains the inbox every 5s (and before handling any direct delivery, to keep `queued`/`completed` ordering); a failed delivery stays queued and is retried every 30s, and entries older than 24h are dropped. If the inbox write itself fails the replica returns `503`. The in-memory delivery cache is per process; job-id lookup in the shared store keeps allocation creation idempotent across restarts.
 
 GitHub setup: in the repository or organization settings add a webhook with
 payload URL `https://<broker-host>/webhooks/github`, content type
@@ -296,9 +296,9 @@ so expose just `/webhooks/github` to GitHub's hook IP ranges.
 
 Metrics: `uecb_github_webhook_events_received_total{event}` (valid-signature
 deliveries), `uecb_github_webhook_events_matched_total{pool,action}` and
-`uecb_github_webhook_events_ignored_total{reason}` (`unsupported_event`,
+`uecb_github_webhook_events_enqueued_total{action}` (queued by a non-leader for the leader), and `uecb_github_webhook_events_ignored_total{reason}` (`unsupported_event`,
 `unsupported_action`, `no_matching_pool`, `duplicate_delivery`,
-`duplicate_job`, `unknown_job`, `not_leader`, `invalid_signature`,
+`duplicate_job`, `unknown_job`, `not_leader` (no shared inbox), `enqueue_failed`, `invalid_signature`,
 `missing_signature`, and others).
 
 ### Stuck-allocation reaper (orphan cleanup)

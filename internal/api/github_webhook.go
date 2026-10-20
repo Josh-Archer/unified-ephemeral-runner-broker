@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
+	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/store"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -22,7 +24,13 @@ const (
 	maxGitHubWebhookBody = 26 << 20 // GitHub caps payloads at 25 MB.
 	deliveryTTL          = 24 * time.Hour
 	maxTrackedDeliveries = 50000
+
+	inboxBatch  = 50
+	inboxMaxAge = 24 * time.Hour // older queued jobs are useless; drop them
 )
+
+// inboxLease is the retry delay for a failed inbox delivery (var for tests).
+var inboxLease = 30 * time.Second
 
 // GitHubWebhookOptions wires the inbound GitHub webhook endpoint.
 type GitHubWebhookOptions struct {
@@ -32,12 +40,18 @@ type GitHubWebhookOptions struct {
 	// IsLeader reports whether this replica currently holds reconciliation
 	// leadership. Nil means a single replica that always acts.
 	IsLeader func(ctx context.Context) (bool, error)
+	// Inbox is a durable queue shared by all replicas. A replica that is not
+	// the leader persists the delivery here and acknowledges it; the leader
+	// drains it (DrainGitHubWebhookInbox). Nil means non-leader deliveries are
+	// rejected with 503, which is only safe for a single replica.
+	Inbox store.WebhookInbox
 }
 
 type githubWebhookMetrics struct {
 	received *prometheus.CounterVec
 	matched  *prometheus.CounterVec
 	ignored  *prometheus.CounterVec
+	enqueued *prometheus.CounterVec
 }
 
 func newGitHubWebhookMetrics() *githubWebhookMetrics {
@@ -54,11 +68,15 @@ func newGitHubWebhookMetrics() *githubWebhookMetrics {
 			Name: "uecb_github_webhook_events_ignored_total",
 			Help: "GitHub webhook deliveries that were not acted on, by reason.",
 		}, []string{"reason"}),
+		enqueued: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "uecb_github_webhook_events_enqueued_total",
+			Help: "workflow_job deliveries persisted to the shared inbox by a non-leader replica.",
+		}, []string{"action"}),
 	}
 }
 
 func (m *githubWebhookMetrics) register() {
-	for _, c := range []prometheus.Collector{m.received, m.matched, m.ignored} {
+	for _, c := range []prometheus.Collector{m.received, m.matched, m.ignored, m.enqueued} {
 		if err := prometheus.Register(c); err != nil {
 			if _, ok := err.(prometheus.AlreadyRegisteredError); !ok {
 				panic(err)
@@ -207,14 +225,19 @@ func (h *githubWebhookHandler) serve(s *Server, w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Only the reconciliation leader acts. 503 (rather than 200) keeps the
-	// delivery visible as failed in GitHub so it can be redelivered.
+	// Only the reconciliation leader acts. A non-leader persists the delivery
+	// to the shared inbox so the leader processes it; GitHub does not retry
+	// failed deliveries, so it must never be dropped.
 	if h.opts.IsLeader != nil {
 		leader, err := h.opts.IsLeader(ctx)
 		if err != nil || !leader {
-			h.metrics.ignored.WithLabelValues("not_leader").Inc()
-			s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "ignored", "reason": "not_leader"})
+			h.enqueueForLeader(ctx, s, w, r, payload)
 			return
+		}
+		// Process anything queued earlier first so a completed event cannot
+		// overtake the queued event it belongs to.
+		if _, err := h.drainInbox(ctx); err != nil {
+			log.Printf("github webhook inbox drain failed: %v", err)
 		}
 	}
 
@@ -238,6 +261,77 @@ func (h *githubWebhookHandler) serve(s *Server, w http.ResponseWriter, r *http.R
 		h.deliveries.done(guid)
 	}
 	s.writeJSON(w, code, status)
+}
+
+func (h *githubWebhookHandler) enqueueForLeader(ctx context.Context, s *Server, w http.ResponseWriter, r *http.Request, payload workflowJobPayload) {
+	if h.opts.Inbox == nil {
+		h.metrics.ignored.WithLabelValues("not_leader").Inc()
+		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "ignored", "reason": "not_leader"})
+		return
+	}
+	id := strings.TrimSpace(r.Header.Get("X-GitHub-Delivery"))
+	if id == "" {
+		buf := make([]byte, 16)
+		_, _ = rand.Read(buf)
+		id = "generated-" + hex.EncodeToString(buf)
+	}
+	raw, err := json.Marshal(payload)
+	if err == nil {
+		err = h.opts.Inbox.EnqueueWebhook(ctx, id, raw)
+	}
+	if err != nil {
+		log.Printf("github webhook enqueue failed job=%d: %v", payload.WorkflowJob.ID, err)
+		h.metrics.ignored.WithLabelValues("enqueue_failed").Inc()
+		s.writeError(w, http.StatusServiceUnavailable, errors.New("unable to queue webhook delivery"))
+		return
+	}
+	h.metrics.enqueued.WithLabelValues(payload.Action).Inc()
+	s.writeJSON(w, http.StatusAccepted, map[string]string{"status": "queued", "reason": "not_leader"})
+}
+
+// drainInbox processes deliveries queued by non-leader replicas. A delivery
+// that fails stays in the inbox and is retried after the lease expires.
+func (h *githubWebhookHandler) drainInbox(ctx context.Context) (int, error) {
+	if h.opts.Inbox == nil {
+		return 0, nil
+	}
+	processed := 0
+	for {
+		batch, err := h.opts.Inbox.ClaimWebhooks(ctx, inboxBatch, inboxLease)
+		if err != nil {
+			return processed, err
+		}
+		if len(batch) == 0 {
+			return processed, nil
+		}
+		for _, d := range batch {
+			var payload workflowJobPayload
+			if err := json.Unmarshal(d.Payload, &payload); err != nil {
+				log.Printf("github webhook inbox: dropping undecodable delivery %s: %v", d.DeliveryID, err)
+			} else if time.Since(d.ReceivedAt) > inboxMaxAge {
+				log.Printf("github webhook inbox: dropping stale delivery %s job=%d", d.DeliveryID, payload.WorkflowJob.ID)
+			} else if _, _, err := h.process(ctx, payload); err != nil {
+				log.Printf("github webhook inbox: delivery %s job=%d attempt=%d failed: %v", d.DeliveryID, payload.WorkflowJob.ID, d.Attempts, err)
+				continue
+			}
+			if err := h.opts.Inbox.AckWebhook(ctx, d.ID); err != nil {
+				return processed, err
+			}
+			processed++
+		}
+		if len(batch) < inboxBatch {
+			return processed, nil
+		}
+	}
+}
+
+// DrainGitHubWebhookInbox processes queued webhook deliveries. Call it only on
+// the leader; it is a no-op when the webhook or its inbox is not configured.
+func (s *Server) DrainGitHubWebhookInbox(ctx context.Context) (int, error) {
+	if s.githubWebhook == nil {
+		return 0, nil
+	}
+	return s.githubWebhook.drainInbox(ctx)
 }
 
 // process handles an authenticated, leader-owned queued/completed delivery.
