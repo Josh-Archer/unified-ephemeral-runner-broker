@@ -256,6 +256,51 @@ Notes:
   orphan cleanup still reclaims capacity and runner labels after the job-timeout
   TTL—see below.
 
+### Webhook-driven allocation (no explicit allocate/finalize jobs)
+
+Instead of adding an `allocate` job and a finalize job to every workflow, a
+pool can opt in to GitHub `workflow_job` webhooks. A `queued` event reserves
+capacity through the normal scheduler, budget and admission path; a
+`completed` event (including cancelled runs) releases it. Explicit
+`POST /v1/allocations` usage is unchanged and pools without `webhookLabels`
+are never touched by webhooks.
+
+```yaml
+broker:
+  githubWebhook:
+    secretRef: uecb-github-webhook   # Kubernetes secret; key defaults to webhook_secret
+    # secretKey: webhook_secret
+    # secret: "..."                  # inline alternative for local testing only
+pools:
+  - name: full
+    webhookLabels: [self-hosted, uecb-full]
+    # ...backends as usual
+```
+
+Workflows then simply use `runs-on: [self-hosted, uecb-full]`.
+
+Behavior:
+
+- `POST /webhooks/github` verifies `X-Hub-Signature-256` (HMAC-SHA256 over the raw body) and answers `401` for a missing or wrong signature. Only `workflow_job` events with action `queued` or `completed` are acted on; everything else (including `ping`) is acknowledged with `200` and counted as ignored.
+- A job matches a pool when every `runs-on` label is in the pool's `webhookLabels` (case-insensitive) and at least one label is not `self-hosted`. The first matching pool in config order wins; two pools may not share an identical label set.
+- On `queued` the allocation is requested with the pool's static labels, so the runner registers with them (JIT config) instead of a per-allocation label, and `workflow_job.id` is recorded on the allocation. A duplicate `queued` for the same job id never creates a second allocation.
+- On `completed` the allocation is finalized by `workflow_job.id`: `cancelled` conclusions cancel it (also removing it from the admission queue), anything else completes it. Lost events are covered by the [stuck-allocation reaper](#stuck-allocation-reaper-orphan-cleanup): the allocation expires after `job_timeout`.
+- Idempotency: deliveries are deduplicated on `X-GitHub-Delivery`. A delivery whose processing failed (`500`) is not remembered, so GitHub redelivery retries it.
+- Only the reconciliation leader acts, but no delivery is lost. With `broker.ha` enabled, a replica that does not hold the lease persists the delivery to a durable shared inbox (`uecb_webhook_inbox` in the postgres state store, deduplicated on `X-GitHub-Delivery`) and answers `202`. The leader drains the inbox every 5s (and before handling any direct delivery, to keep `queued`/`completed` ordering); a failed delivery stays queued and is retried every 30s, and entries older than 24h are dropped. If the inbox write itself fails the replica returns `503`. The in-memory delivery cache is per process; job-id lookup in the shared store keeps allocation creation idempotent across restarts.
+
+GitHub setup: in the repository or organization settings add a webhook with
+payload URL `https://<broker-host>/webhooks/github`, content type
+`application/json`, the same secret as `githubWebhook`, and select only the
+**Workflow jobs** event. This route is authenticated by signature, not OIDC,
+so expose just `/webhooks/github` to GitHub's hook IP ranges.
+
+Metrics: `uecb_github_webhook_events_received_total{event}` (valid-signature
+deliveries), `uecb_github_webhook_events_matched_total{pool,action}` and
+`uecb_github_webhook_events_enqueued_total{action}` (queued by a non-leader for the leader), and `uecb_github_webhook_events_ignored_total{reason}` (`unsupported_event`,
+`unsupported_action`, `no_matching_pool`, `duplicate_delivery`,
+`duplicate_job`, `unknown_job`, `not_leader` (no shared inbox), `enqueue_failed`, `invalid_signature`,
+`missing_signature`, and others).
+
 ### Stuck-allocation reaper (orphan cleanup)
 
 When finalize never runs (cancelled workflows, lost cleanup jobs), the broker-side

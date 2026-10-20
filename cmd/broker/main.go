@@ -121,6 +121,20 @@ func main() {
 	elector := store.AsLeaderElector(service.Store())
 	useLeaderElection := config.HAEnabled(cfg.Broker)
 
+	if webhookPoolsConfigured(cfg) {
+		server.SetGitHubWebhook(api.GitHubWebhookOptions{
+			Secret: api.GitHubWebhookSecretFunc(cfg.Broker.GitHubWebhook, secretReader.ReadSecret),
+			Inbox:  store.AsWebhookInbox(service.Store()),
+			IsLeader: func(ctx context.Context) (bool, error) {
+				if !useLeaderElection {
+					return true, nil
+				}
+				return elector.TryAcquireLeadership(ctx, store.LeaderLeaseName, identity, leaseTTL)
+			},
+		})
+		log.Printf("github workflow_job webhook enabled at /webhooks/github")
+	}
+
 	startBackground := func(name string, interval time.Duration, fn func(time.Time)) {
 		go func() {
 			ticker := time.NewTicker(interval)
@@ -154,6 +168,14 @@ func main() {
 	startBackground("reconcile-queue", 10*time.Second, func(now time.Time) {
 		service.ReconcileQueue(context.Background(), now)
 	})
+
+	if webhookPoolsConfigured(cfg) {
+		startBackground("github-webhook-inbox", 5*time.Second, func(time.Time) {
+			if _, err := server.DrainGitHubWebhookInbox(context.Background()); err != nil {
+				log.Printf("github webhook inbox drain: %v", err)
+			}
+		})
+	}
 
 	if tierManager != nil {
 		go func() {
@@ -197,6 +219,15 @@ func main() {
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		log.Printf("http shutdown: %v", err)
 	}
+}
+
+func webhookPoolsConfigured(cfg model.BrokerConfig) bool {
+	for _, pool := range cfg.Pools {
+		if len(pool.WebhookLabels) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func expectedReplicasFromEnv() int {

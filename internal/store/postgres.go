@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -66,6 +67,7 @@ func (p *Postgres) migrate(ctx context.Context) error {
 	const schema = `
 CREATE TABLE IF NOT EXISTS uecb_allocations (
   id TEXT PRIMARY KEY,
+  workflow_job_id BIGINT,
   pool TEXT NOT NULL,
   backend TEXT NOT NULL DEFAULT '',
   state TEXT NOT NULL,
@@ -73,6 +75,9 @@ CREATE TABLE IF NOT EXISTS uecb_allocations (
   payload JSONB NOT NULL,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+ALTER TABLE uecb_allocations ADD COLUMN IF NOT EXISTS workflow_job_id BIGINT;
+CREATE UNIQUE INDEX IF NOT EXISTS uecb_allocations_workflow_job_id_idx
+  ON uecb_allocations (workflow_job_id) WHERE workflow_job_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS uecb_allocations_active_idx
   ON uecb_allocations (pool, backend, state);
 CREATE INDEX IF NOT EXISTS uecb_allocations_tenant_idx
@@ -89,6 +94,15 @@ CREATE TABLE IF NOT EXISTS uecb_admission_state (
   payload JSONB NOT NULL,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS uecb_webhook_inbox (
+  id BIGSERIAL PRIMARY KEY,
+  delivery_id TEXT NOT NULL UNIQUE,
+  payload JSONB NOT NULL,
+  attempts INT NOT NULL DEFAULT 0,
+  locked_until TIMESTAMPTZ NOT NULL DEFAULT 'epoch',
+  received_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 `
 	if _, err := p.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("migrate postgres state store: %w", err)
@@ -102,17 +116,19 @@ func (p *Postgres) Save(status model.AllocationStatus) error {
 		return fmt.Errorf("encode allocation: %w", err)
 	}
 	tenant := normalizeTenant(status.Tenant)
+	workflowJobID := allocationWorkflowJobID(status)
 	_, err = p.db.Exec(`
-INSERT INTO uecb_allocations (id, pool, backend, state, tenant, payload, updated_at)
-VALUES ($1, $2, $3, $4, $5, $6, NOW())
+INSERT INTO uecb_allocations (id, workflow_job_id, pool, backend, state, tenant, payload, updated_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
 ON CONFLICT (id) DO UPDATE SET
+  workflow_job_id = EXCLUDED.workflow_job_id,
   pool = EXCLUDED.pool,
   backend = EXCLUDED.backend,
   state = EXCLUDED.state,
   tenant = EXCLUDED.tenant,
   payload = EXCLUDED.payload,
   updated_at = NOW()
-`, status.ID, string(status.Pool), string(status.SelectedBackend), string(status.State), tenant, payload)
+`, status.ID, workflowJobID, string(status.Pool), string(status.SelectedBackend), string(status.State), tenant, payload)
 	if err != nil {
 		return fmt.Errorf("save allocation: %w", err)
 	}
@@ -148,7 +164,7 @@ func (p *Postgres) List() []model.AllocationStatus {
 	if err != nil {
 		return nil
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	result := make([]model.AllocationStatus, 0)
 	for rows.Next() {
@@ -423,16 +439,74 @@ func (p *Postgres) saveTx(tx *sql.Tx, status model.AllocationStatus) error {
 		return err
 	}
 	tenant := normalizeTenant(status.Tenant)
+	workflowJobID := allocationWorkflowJobID(status)
 	_, err = tx.Exec(`
-INSERT INTO uecb_allocations (id, pool, backend, state, tenant, payload, updated_at)
-VALUES ($1, $2, $3, $4, $5, $6, NOW())
+INSERT INTO uecb_allocations (id, workflow_job_id, pool, backend, state, tenant, payload, updated_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
 ON CONFLICT (id) DO UPDATE SET
+  workflow_job_id = EXCLUDED.workflow_job_id,
   pool = EXCLUDED.pool,
   backend = EXCLUDED.backend,
   state = EXCLUDED.state,
   tenant = EXCLUDED.tenant,
   payload = EXCLUDED.payload,
   updated_at = NOW()
-`, status.ID, string(status.Pool), string(status.SelectedBackend), string(status.State), tenant, payload)
+`, status.ID, workflowJobID, string(status.Pool), string(status.SelectedBackend), string(status.State), tenant, payload)
 	return err
+}
+
+func allocationWorkflowJobID(status model.AllocationStatus) any {
+	if status.Request == nil || status.Request.WorkflowJobID == 0 {
+		return nil
+	}
+	return status.Request.WorkflowJobID
+}
+
+func (p *Postgres) EnqueueWebhook(ctx context.Context, deliveryID string, payload []byte) error {
+	_, err := p.db.ExecContext(ctx, `
+INSERT INTO uecb_webhook_inbox (delivery_id, payload) VALUES ($1, $2)
+ON CONFLICT (delivery_id) DO NOTHING
+`, deliveryID, payload)
+	if err != nil {
+		return fmt.Errorf("enqueue webhook: %w", err)
+	}
+	return nil
+}
+
+func (p *Postgres) ClaimWebhooks(ctx context.Context, limit int, lease time.Duration) ([]WebhookDelivery, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := p.db.QueryContext(ctx, `
+UPDATE uecb_webhook_inbox SET locked_until = NOW() + ($1 * INTERVAL '1 microsecond'), attempts = attempts + 1
+WHERE id IN (
+  SELECT id FROM uecb_webhook_inbox WHERE locked_until <= NOW()
+  ORDER BY id LIMIT $2 FOR UPDATE SKIP LOCKED
+)
+RETURNING id, delivery_id, payload, attempts, received_at
+`, lease.Microseconds(), limit)
+	if err != nil {
+		return nil, fmt.Errorf("claim webhooks: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []WebhookDelivery
+	for rows.Next() {
+		var d WebhookDelivery
+		if err := rows.Scan(&d.ID, &d.DeliveryID, &d.Payload, &d.Attempts, &d.ReceivedAt); err != nil {
+			return nil, fmt.Errorf("scan webhook: %w", err)
+		}
+		out = append(out, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+func (p *Postgres) AckWebhook(ctx context.Context, id int64) error {
+	if _, err := p.db.ExecContext(ctx, `DELETE FROM uecb_webhook_inbox WHERE id = $1`, id); err != nil {
+		return fmt.Errorf("ack webhook: %w", err)
+	}
+	return nil
 }

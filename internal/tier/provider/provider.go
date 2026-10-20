@@ -71,7 +71,7 @@ func (c *HTTPClient) Snapshot(ctx context.Context, request Request) (Snapshot, e
 	if err != nil {
 		return Snapshot{}, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8*1024))
 		return Snapshot{}, fmt.Errorf("provider query failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))

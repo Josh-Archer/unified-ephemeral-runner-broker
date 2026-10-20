@@ -350,7 +350,7 @@ func (v *OIDCVerifier) jwksURI(ctx context.Context, issuer string) (string, erro
 	if err != nil {
 		return "", err
 	}
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
 	if res.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("oidc discovery status %d", res.StatusCode)
 	}
@@ -408,7 +408,7 @@ func (v *OIDCVerifier) jwks(ctx context.Context, jwksURI string, forceRefresh bo
 	if err != nil {
 		return nil, err
 	}
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
 	if res.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("jwks status %d", res.StatusCode)
 	}

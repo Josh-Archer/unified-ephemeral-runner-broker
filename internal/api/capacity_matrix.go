@@ -84,11 +84,12 @@ func (s *Service) BuildCapacitySnapshot(pool model.PoolConfig, request model.All
 		} else if s.admission != nil {
 			decision := s.admission.allow(pool.Name, name, backendCfg, now, false, false)
 			if !decision.Allowed {
-				if decision.Reason == "rate-limited" {
+				switch decision.Reason {
+				case "rate-limited":
 					status = "rate-limited"
-				} else if decision.Reason == "circuit-open" {
+				case "circuit-open":
 					status = "circuit-open"
-				} else {
+				default:
 					status = decision.Reason
 				}
 				avail = 0
