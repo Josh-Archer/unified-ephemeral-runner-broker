@@ -40,6 +40,9 @@ func Validate(cfg model.BrokerConfig) error {
 	if err := validateQualityAware(cfg.Broker.QualityAware); err != nil {
 		return err
 	}
+	if err := validateARCFirst(cfg.Broker.ARCFirst); err != nil {
+		return err
+	}
 	if err := validateWebhooks(cfg.Broker.Webhooks); err != nil {
 		return err
 	}
@@ -54,6 +57,16 @@ func Validate(cfg model.BrokerConfig) error {
 	}
 	if err := validateFairShare(cfg); err != nil {
 		return err
+	}
+	return nil
+}
+
+func validateARCFirst(cfg model.ARCFirstConfig) error {
+	if cfg.SaturationWait < 0 {
+		return fmt.Errorf("broker.arcFirst.saturationWait must not be negative")
+	}
+	if cfg.PollInterval < 0 {
+		return fmt.Errorf("broker.arcFirst.pollInterval must not be negative")
 	}
 	return nil
 }
