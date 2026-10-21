@@ -92,6 +92,25 @@ func TestHandleAllocationsAcceptsStringJobTimeout(t *testing.T) {
 	}
 }
 
+func TestHandleAllocationsBackendAutoUsesNormalSelection(t *testing.T) {
+	service := newServiceWithConfig(nil)
+	server := newTestServer(t, service)
+	request := httptest.NewRequest(http.MethodPost, "/v1/allocations", bytes.NewBufferString(`{"pool":"lite","backend":"auto"}`))
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("expected 201 for backend=auto, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	var allocation model.AllocationStatus
+	if err := json.NewDecoder(recorder.Body).Decode(&allocation); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if allocation.SelectedBackend != model.BackendARC {
+		t.Fatalf("backend=auto selected %s, want ARC-first selection", allocation.SelectedBackend)
+	}
+}
+
 func TestHandleAllocationsReturnsAcceptedForQueuedTransientFailure(t *testing.T) {
 	cfg := config.Default()
 	cfg.Broker.Queue.Enabled = true

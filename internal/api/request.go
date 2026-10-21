@@ -59,8 +59,11 @@ func decodeAllocationRequest(reader io.Reader) (model.AllocationRequest, error) 
 
 	var backend *model.BackendName
 	if request.Backend != nil {
-		backendCopy := *request.Backend
-		backend = &backendCopy
+		backendValue := strings.TrimSpace(string(*request.Backend))
+		if !strings.EqualFold(backendValue, "auto") {
+			backendCopy := model.BackendName(backendValue)
+			backend = &backendCopy
+		}
 	}
 
 	return model.AllocationRequest{

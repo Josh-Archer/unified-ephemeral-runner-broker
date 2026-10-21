@@ -725,15 +725,37 @@ func TestAllocateARCFirstFallbackOnSaturation(t *testing.T) {
 	log.SetOutput(&output)
 	t.Cleanup(func() { log.SetOutput(previousOutput) })
 
+	started := time.Now()
 	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{Pool: model.PoolLite})
+	elapsed := time.Since(started)
 	if err != nil {
 		t.Fatalf("allocate with saturated ARC: %v", err)
 	}
 	if allocation.SelectedBackend != model.BackendCodeBuild {
 		t.Fatalf("selected %s, want codebuild fallback", allocation.SelectedBackend)
 	}
+	if elapsed >= 500*time.Millisecond {
+		t.Fatalf("fallback took %s with saturationWait=0, want immediate fallback", elapsed)
+	}
 	if !strings.Contains(output.String(), "event=arc_fallback") || !strings.Contains(output.String(), "fallback_reason=saturated") {
 		t.Fatalf("missing saturation fallback reason in logs: %s", output.String())
+	}
+}
+
+func TestFallbackBackendsIncludesConfiguredNonCloudBackends(t *testing.T) {
+	pool := model.PoolConfig{Backends: map[model.BackendName]model.BackendConfig{
+		model.BackendARC:            {Enabled: true},
+		model.BackendCodeBuild:      {Enabled: true},
+		model.BackendName("custom"): {Enabled: true},
+	}}
+	got := fallbackBackends(pool).Backends
+	if _, ok := got[model.BackendARC]; ok {
+		t.Fatal("fallback set should exclude ARC")
+	}
+	for _, name := range []model.BackendName{model.BackendCodeBuild, model.BackendName("custom")} {
+		if _, ok := got[name]; !ok {
+			t.Errorf("fallback set omitted configured backend %q", name)
+		}
 	}
 }
 

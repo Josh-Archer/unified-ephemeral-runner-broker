@@ -55,6 +55,18 @@ func TestDecodeAllocationRequestParsesLambdaBackendAsString(t *testing.T) {
 	}
 }
 
+func TestDecodeAllocationRequestTreatsAutoBackendAsUnpinned(t *testing.T) {
+	for _, raw := range []string{`"auto"`, `" AUTO "`, `"\taUtO\n"`} {
+		request, err := decodeAllocationRequest(bytes.NewReader([]byte(`{"pool":"lite","backend":` + raw + `}`)))
+		if err != nil {
+			t.Fatalf("decode %s: %v", raw, err)
+		}
+		if request.Backend != nil {
+			t.Errorf("backend %s should be unpinned, got %q", raw, *request.Backend)
+		}
+	}
+}
+
 func TestDecodeAllocationRequestParsesTenant(t *testing.T) {
 	request, err := decodeAllocationRequest(bytes.NewReader([]byte(`{"pool":"lite","tenant":"tenant-a","job_timeout":"1m"}`)))
 	if err != nil {
