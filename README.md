@@ -451,10 +451,10 @@ and [docs/observability.md](docs/observability.md).
 
 ### ARC-First Routing
 
-Unpinned allocation requests prefer the homelab ARC backend whenever it is
-available. If ARC is unhealthy or unavailable, or has no free capacity, the
-broker can use the configured cloud backends (`azure-vm`, `azure-functions`,
-`ec2`, `gce`, `cloud-run`, `lambda`, and `codebuild`). When ARC is saturated,
+Unpinned allocation requests prefer the ARC backend on the local cluster
+whenever it is available. If ARC is unhealthy or unavailable, or has no free
+capacity, the broker can use the configured cloud backends (`azure-vm`,
+`azure-functions`, `ec2`, `gce`, `cloud-run`, `lambda`, and `codebuild`). When ARC is saturated,
 the broker waits briefly for capacity before falling back. The wait defaults to
 2 seconds with a 100 millisecond polling interval; fallback events are logged
 with an `arc_fallback` reason.
