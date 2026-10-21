@@ -149,10 +149,18 @@ type BrokerRuntimeConfig struct {
 	TierRouting  TierRoutingConfig    `yaml:"tierRouting,omitempty" json:"tierRouting,omitempty"`
 	LiveCapacity LiveCapacityConfig   `yaml:"liveCapacity,omitempty" json:"liveCapacity,omitempty"`
 	QualityAware QualityAwareConfig   `yaml:"qualityAware,omitempty" json:"qualityAware,omitempty"`
+	ARCFirst     ARCFirstConfig       `yaml:"arcFirst,omitempty" json:"arcFirst,omitempty"`
 	Webhooks     WebhooksConfig       `yaml:"webhooks,omitempty" json:"webhooks,omitempty"`
 	// GitHubWebhook configures the inbound POST /webhooks/github endpoint used
 	// by pools that set webhookLabels.
 	GitHubWebhook GitHubWebhookConfig `yaml:"githubWebhook,omitempty" json:"githubWebhook,omitempty"`
+}
+
+// ARCFirstConfig controls how long automatic allocations wait for local ARC
+// capacity before falling back to a cloud backend.
+type ARCFirstConfig struct {
+	SaturationWait time.Duration `yaml:"saturationWait,omitempty" json:"saturationWait,omitempty"`
+	PollInterval   time.Duration `yaml:"pollInterval,omitempty" json:"pollInterval,omitempty"`
 }
 
 // GitHubWebhookConfig holds the shared secret used to verify X-Hub-Signature-256
@@ -180,9 +188,9 @@ type WebhooksConfig struct {
 // Prefer signingSecretRef for production; signingSecret is useful for local tests.
 // Events filters which lifecycle names are sent; empty means all supported events.
 type WebhookEndpointConfig struct {
-	URL              string   `yaml:"url" json:"url"`
-	SigningSecret    string   `yaml:"signingSecret,omitempty" json:"signingSecret,omitempty"`
-	SigningSecretRef string   `yaml:"signingSecretRef,omitempty" json:"signingSecretRef,omitempty"`
+	URL              string `yaml:"url" json:"url"`
+	SigningSecret    string `yaml:"signingSecret,omitempty" json:"signingSecret,omitempty"`
+	SigningSecretRef string `yaml:"signingSecretRef,omitempty" json:"signingSecretRef,omitempty"`
 	// SigningSecretKey is the key inside SigningSecretRef (default: signing_secret).
 	SigningSecretKey string   `yaml:"signingSecretKey,omitempty" json:"signingSecretKey,omitempty"`
 	Events           []string `yaml:"events,omitempty" json:"events,omitempty"`
@@ -209,10 +217,10 @@ type LiveCapacityConfig struct {
 // Pins, capability filters, tier, live capacity, and admission still apply
 // first; provision failure still falls back to remaining eligible backends.
 type QualityAwareConfig struct {
-	Enabled    bool                  `yaml:"enabled,omitempty" json:"enabled,omitempty"`
-	Window     time.Duration         `yaml:"window,omitempty" json:"window,omitempty"`
-	MinSamples int                   `yaml:"minSamples,omitempty" json:"minSamples,omitempty"`
-	Weights    QualityAwareWeights   `yaml:"weights,omitempty" json:"weights,omitempty"`
+	Enabled    bool                `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	Window     time.Duration       `yaml:"window,omitempty" json:"window,omitempty"`
+	MinSamples int                 `yaml:"minSamples,omitempty" json:"minSamples,omitempty"`
+	Weights    QualityAwareWeights `yaml:"weights,omitempty" json:"weights,omitempty"`
 }
 
 // QualityAwareWeights scales score components. Zero values use defaults when
@@ -296,17 +304,17 @@ type DesktopConfig struct {
 }
 
 type BackendConfig struct {
-	Enabled        bool                 `yaml:"enabled" json:"enabled"`
-	Healthy        bool                 `yaml:"healthy" json:"healthy"`
-	MaxRunners     int                  `yaml:"maxRunners" json:"maxRunners"`
-	WarmMin        int                  `yaml:"warmMin" json:"warmMin"`
-	WarmMax        int                  `yaml:"warmMax" json:"warmMax"`
-	WarmTTL        time.Duration        `yaml:"warmTTL,omitempty" json:"warmTTL,omitempty"`
+	Enabled    bool          `yaml:"enabled" json:"enabled"`
+	Healthy    bool          `yaml:"healthy" json:"healthy"`
+	MaxRunners int           `yaml:"maxRunners" json:"maxRunners"`
+	WarmMin    int           `yaml:"warmMin" json:"warmMin"`
+	WarmMax    int           `yaml:"warmMax" json:"warmMax"`
+	WarmTTL    time.Duration `yaml:"warmTTL,omitempty" json:"warmTTL,omitempty"`
 	// WarmSchedule optionally gates warmMin/warmMax to calendar windows so cold
 	// cloud backends (Lambda, Cloud Run, Azure Functions, …) can pre-warm only
 	// during known CI periods and stay at zero otherwise for cost control.
-	WarmSchedule   *WarmScheduleConfig  `yaml:"warmSchedule,omitempty" json:"warmSchedule,omitempty"`
-	Weight         int                  `yaml:"weight,omitempty" json:"weight,omitempty"`
+	WarmSchedule *WarmScheduleConfig `yaml:"warmSchedule,omitempty" json:"warmSchedule,omitempty"`
+	Weight       int                 `yaml:"weight,omitempty" json:"weight,omitempty"`
 	// CostClass ranks relative expense for scheduler tie-breaking when free
 	// capacity is equal. Lower is cheaper. Zero means use the built-in default
 	// for the backend name (cluster-local first, then free-tier cloud, then VMs).
@@ -339,9 +347,9 @@ type WarmScheduleConfig struct {
 // Start, the window crosses midnight (e.g. 22:00–06:00).
 type WarmWindowConfig struct {
 	// Days lists weekday names (mon..sun). Empty means every day.
-	Days []string `yaml:"days,omitempty" json:"days,omitempty"`
-	Start string  `yaml:"start" json:"start"`
-	End   string  `yaml:"end" json:"end"`
+	Days  []string `yaml:"days,omitempty" json:"days,omitempty"`
+	Start string   `yaml:"start" json:"start"`
+	End   string   `yaml:"end" json:"end"`
 	// Optional per-window overrides of backend warmMin/warmMax.
 	WarmMin *int `yaml:"warmMin,omitempty" json:"warmMin,omitempty"`
 	WarmMax *int `yaml:"warmMax,omitempty" json:"warmMax,omitempty"`
@@ -376,9 +384,9 @@ type ProviderTierRuleConfig struct {
 }
 
 type FairShareConfig struct {
-	Enabled         bool           `yaml:"enabled" json:"enabled"`
-	UsageWindow     time.Duration  `yaml:"usageWindow,omitempty" json:"usageWindow,omitempty"`
-	StarvationAfter time.Duration  `yaml:"starvationAfter,omitempty" json:"starvationAfter,omitempty"`
+	Enabled         bool          `yaml:"enabled" json:"enabled"`
+	UsageWindow     time.Duration `yaml:"usageWindow,omitempty" json:"usageWindow,omitempty"`
+	StarvationAfter time.Duration `yaml:"starvationAfter,omitempty" json:"starvationAfter,omitempty"`
 	// PriorityClasses maps priority_class / lane names to positive weights.
 	// Higher weight ranks better under fair-share scoring and is treated as a
 	// higher lane for soft-reserve protection (for example deploy:3, pr:2, smoke:1).
@@ -395,10 +403,10 @@ type FairShareConfig struct {
 }
 
 type PoolConfig struct {
-	Name              PoolName                      `yaml:"name" json:"name"`
-	Labels            []string                      `yaml:"labels" json:"labels"`
-	Scheduler         string                        `yaml:"scheduler" json:"scheduler"`
-	FairShare         FairShareConfig               `yaml:"fairShare,omitempty" json:"fairShare,omitempty"`
+	Name      PoolName        `yaml:"name" json:"name"`
+	Labels    []string        `yaml:"labels" json:"labels"`
+	Scheduler string          `yaml:"scheduler" json:"scheduler"`
+	FairShare FairShareConfig `yaml:"fairShare,omitempty" json:"fairShare,omitempty"`
 	// WebhookLabels opts the pool into workflow_job webhook-driven allocation.
 	// A queued job whose runs-on labels are all contained in this set (and that
 	// names at least one label besides self-hosted) is allocated from this pool;

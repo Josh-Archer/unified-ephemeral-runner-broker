@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 	"sync"
@@ -667,7 +668,7 @@ func TestQueueRetriesTransientBackendFailure(t *testing.T) {
 	}
 }
 
-func TestAllocateUsesWeightedSchedulerForPool(t *testing.T) {
+func TestAllocatePrefersARCOverWeightedCloudBackends(t *testing.T) {
 	service := newServiceWithConfig(func(pool *model.PoolConfig) {
 		if pool.Name != model.PoolLite {
 			return
@@ -686,24 +687,85 @@ func TestAllocateUsesWeightedSchedulerForPool(t *testing.T) {
 		pool.Backends[model.BackendARC] = arcCfg
 	})
 
-	want := []model.BackendName{
-		model.BackendARC,
-		model.BackendCodeBuild,
-		model.BackendCodeBuild,
-		model.BackendCodeBuild,
-	}
-
-	for index, expected := range want {
+	for index := range 4 {
 		allocation, err := service.Allocate(context.Background(), model.AllocationRequest{Pool: model.PoolLite})
 		if err != nil {
 			t.Fatalf("allocate #%d failed: %v", index+1, err)
 		}
-		if allocation.SelectedBackend != expected {
-			t.Fatalf("allocate #%d selected %s, want %s", index+1, allocation.SelectedBackend, expected)
+		if allocation.SelectedBackend != model.BackendARC {
+			t.Fatalf("allocate #%d selected %s, want ARC", index+1, allocation.SelectedBackend)
 		}
 		if _, ok := service.Cancel(context.Background(), allocation.ID); !ok {
 			t.Fatalf("cancel #%d failed", index+1)
 		}
+	}
+}
+
+func TestAllocateARCFirstFallbackOnSaturation(t *testing.T) {
+	cfg := config.Default()
+	cfg.Broker.ARCFirst.SaturationWait = 0
+	cfg.Broker.ARCFirst.PollInterval = 0
+	for index := range cfg.Pools {
+		if cfg.Pools[index].Name != model.PoolLite {
+			continue
+		}
+		arcCfg := cfg.Pools[index].Backends[model.BackendARC]
+		arcCfg.MaxRunners = 1
+		cfg.Pools[index].Backends[model.BackendARC] = arcCfg
+		cloudCfg := cfg.Pools[index].Backends[model.BackendCodeBuild]
+		cloudCfg.Enabled = true
+		cfg.Pools[index].Backends[model.BackendCodeBuild] = cloudCfg
+	}
+	service := NewService(cfg, backend.NewRegistry(testBackend{name: model.BackendARC}, testBackend{name: model.BackendCodeBuild}), nil)
+	if _, err := service.reserveForBackend(cfg.Pools[1], model.BackendARC); err != nil {
+		t.Fatalf("occupy ARC capacity: %v", err)
+	}
+	var output strings.Builder
+	previousOutput := log.Writer()
+	log.SetOutput(&output)
+	t.Cleanup(func() { log.SetOutput(previousOutput) })
+
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{Pool: model.PoolLite})
+	if err != nil {
+		t.Fatalf("allocate with saturated ARC: %v", err)
+	}
+	if allocation.SelectedBackend != model.BackendCodeBuild {
+		t.Fatalf("selected %s, want codebuild fallback", allocation.SelectedBackend)
+	}
+	if !strings.Contains(output.String(), "event=arc_fallback") || !strings.Contains(output.String(), "fallback_reason=saturated") {
+		t.Fatalf("missing saturation fallback reason in logs: %s", output.String())
+	}
+}
+
+func TestAllocateARCFirstFallbackWhenARCDown(t *testing.T) {
+	cfg := config.Default()
+	cfg.Broker.ARCFirst.SaturationWait = 0
+	for index := range cfg.Pools {
+		if cfg.Pools[index].Name != model.PoolLite {
+			continue
+		}
+		arcCfg := cfg.Pools[index].Backends[model.BackendARC]
+		arcCfg.Healthy = false
+		cfg.Pools[index].Backends[model.BackendARC] = arcCfg
+		cloudCfg := cfg.Pools[index].Backends[model.BackendCodeBuild]
+		cloudCfg.Enabled = true
+		cfg.Pools[index].Backends[model.BackendCodeBuild] = cloudCfg
+	}
+	service := NewService(cfg, backend.NewRegistry(testBackend{name: model.BackendARC}, testBackend{name: model.BackendCodeBuild}), nil)
+	var output strings.Builder
+	previousOutput := log.Writer()
+	log.SetOutput(&output)
+	t.Cleanup(func() { log.SetOutput(previousOutput) })
+
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{Pool: model.PoolLite})
+	if err != nil {
+		t.Fatalf("allocate with unhealthy ARC: %v", err)
+	}
+	if allocation.SelectedBackend != model.BackendCodeBuild {
+		t.Fatalf("selected %s, want codebuild fallback", allocation.SelectedBackend)
+	}
+	if !strings.Contains(output.String(), "event=arc_fallback") || !strings.Contains(output.String(), "fallback_reason=unhealthy") {
+		t.Fatalf("missing unhealthy fallback reason in logs: %s", output.String())
 	}
 }
 
@@ -926,8 +988,8 @@ func TestAllocateUsesPriorityFairShareScheduler(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tenant-b normal allocation failed: %v", err)
 	}
-	if allocation.SelectedBackend != model.BackendCodeBuild {
-		t.Fatalf("expected tenant-b to use fair-share low-load backend, got %s", allocation.SelectedBackend)
+	if allocation.SelectedBackend != model.BackendARC {
+		t.Fatalf("expected ARC to remain first under fair-share, got %s", allocation.SelectedBackend)
 	}
 	if allocation.Tenant != "tenant-b" {
 		t.Fatalf("expected tenant metadata on allocation, got %q", allocation.Tenant)
@@ -941,7 +1003,7 @@ func TestAllocateUsesPriorityFairShareScheduler(t *testing.T) {
 	}
 }
 
-func TestAllocateFairShareComposesWithWeightedRoundRobin(t *testing.T) {
+func TestARCFirstOverridesFairShareWeightedRoundRobin(t *testing.T) {
 	service := newServiceWithConfig(func(pool *model.PoolConfig) {
 		if pool.Name != model.PoolLite {
 			return
@@ -961,13 +1023,7 @@ func TestAllocateFairShareComposesWithWeightedRoundRobin(t *testing.T) {
 		}
 	})
 
-	want := []model.BackendName{
-		model.BackendARC,
-		model.BackendCodeBuild,
-		model.BackendCodeBuild,
-		model.BackendCodeBuild,
-	}
-	for index, expected := range want {
+	for index := range 4 {
 		allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
 			Pool:       model.PoolLite,
 			Tenant:     "tenant-a",
@@ -976,8 +1032,8 @@ func TestAllocateFairShareComposesWithWeightedRoundRobin(t *testing.T) {
 		if err != nil {
 			t.Fatalf("allocate #%d failed: %v", index+1, err)
 		}
-		if allocation.SelectedBackend != expected {
-			t.Fatalf("allocate #%d selected %s, want %s (weights under fairShare)", index+1, allocation.SelectedBackend, expected)
+		if allocation.SelectedBackend != model.BackendARC {
+			t.Fatalf("allocate #%d selected %s, want ARC (ARC-first overrides scheduler rotation)", index+1, allocation.SelectedBackend)
 		}
 		if _, ok := service.Cancel(context.Background(), allocation.ID); !ok {
 			t.Fatalf("cancel #%d failed", index+1)
@@ -2024,8 +2080,7 @@ func TestWarmPoolRespectsLiveCapacityFreeSlots(t *testing.T) {
 }
 
 func TestAutoAllocatePrefersWarmColdCloudBackend(t *testing.T) {
-	// ARC is faster to schedule by weight but has no warm pool; Lambda holds warm.
-	// Auto selection should pin to the warm Lambda so launch_mode=warm.
+	// With ARC disabled, auto selection should still prefer the warm Lambda.
 	lambda := &countingBackend{testBackend: testBackend{name: model.BackendLambda}}
 	service := newServiceWithCountingBackend(func(pool *model.PoolConfig) {
 		if pool.Name != model.PoolLite {
@@ -2036,7 +2091,7 @@ func TestAutoAllocatePrefersWarmColdCloudBackend(t *testing.T) {
 			pool.Backends[name] = backendCfg
 		}
 		arc := pool.Backends[model.BackendARC]
-		arc.Enabled = true
+		arc.Enabled = false
 		arc.Healthy = true
 		arc.MaxRunners = 4
 		arc.Weight = 100
@@ -3775,7 +3830,7 @@ func TestLiveCapacityRespectsLowerCeiling(t *testing.T) {
 	}
 }
 
-func TestLiveCapacityFairShareStillRanks(t *testing.T) {
+func TestLiveCapacityDoesNotOverrideARCFirstWithFairShare(t *testing.T) {
 	cfg := config.Default()
 	enableLiveCapacity(&cfg)
 	for i := range cfg.Pools {
@@ -3820,15 +3875,15 @@ func TestLiveCapacityFairShareStillRanks(t *testing.T) {
 			t.Fatalf("seed allocate: %v", err)
 		}
 	}
-	// tenant-b should prefer the less loaded backend (codebuild) under fair-share.
+	// ARC stays first even when fair-share sees more tenant usage there.
 	status, err := service.Allocate(context.Background(), model.AllocationRequest{
 		Pool: model.PoolLite, Tenant: "tenant-b", JobTimeout: time.Minute,
 	})
 	if err != nil {
 		t.Fatalf("fair-share allocate: %v", err)
 	}
-	if status.SelectedBackend != model.BackendCodeBuild {
-		t.Fatalf("expected codebuild under fair-share with live capacity, got %s", status.SelectedBackend)
+	if status.SelectedBackend != model.BackendARC {
+		t.Fatalf("expected ARC under ARC-first routing, got %s", status.SelectedBackend)
 	}
 }
 

@@ -32,6 +32,22 @@ func TestValidateReplicaSafety(t *testing.T) {
 	}
 }
 
+func TestARCFirstWaitDefaultsAndValidation(t *testing.T) {
+	cfg := Default()
+	if cfg.Broker.ARCFirst.SaturationWait != 2*time.Second || cfg.Broker.ARCFirst.PollInterval != 100*time.Millisecond {
+		t.Fatalf("unexpected ARC-first defaults: %+v", cfg.Broker.ARCFirst)
+	}
+	cfg.Broker.ARCFirst.SaturationWait = 0
+	cfg.Broker.ARCFirst.PollInterval = 0
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("zero wait should allow immediate fallback: %v", err)
+	}
+	cfg.Broker.ARCFirst.SaturationWait = -time.Second
+	if err := Validate(cfg); err == nil {
+		t.Fatal("negative ARC-first saturation wait should be rejected")
+	}
+}
+
 func TestValidateWebhooksAcceptsQuarantinedEvent(t *testing.T) {
 	cfg := Default()
 	cfg.Broker.Webhooks = model.WebhooksConfig{

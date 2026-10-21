@@ -129,6 +129,11 @@ config:
         successRate: 1
         latency: 1
         capacityErrors: 1
+    # Automatic allocations prefer ARC. A full ARC pool gets a short grace
+    # period before the configured cloud backends are considered.
+    arcFirst:
+      saturationWait: 2s
+      pollInterval: 100ms
   pools:
     - name: full
       labels:

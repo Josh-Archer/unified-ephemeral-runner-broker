@@ -449,6 +449,27 @@ Selection reasons are exported as `uecb_quality_selection_total` and logged as
 [docs/architecture.md](docs/architecture.md#quality-aware-auto-backend-selection)
 and [docs/observability.md](docs/observability.md).
 
+### ARC-First Routing
+
+Unpinned allocation requests prefer the ARC backend on the local cluster
+whenever it is available. If ARC is unhealthy or unavailable, or has no free
+capacity, the broker can use the configured cloud backends (`azure-vm`,
+`azure-functions`, `ec2`, `gce`, `cloud-run`, `lambda`, and `codebuild`). When ARC is saturated,
+the broker waits briefly for capacity before falling back. The wait defaults to
+2 seconds with a 100 millisecond polling interval; fallback events are logged
+with an `arc_fallback` reason.
+
+```yaml
+broker:
+  arcFirst:
+    saturationWait: 2s
+    pollInterval: 100ms
+```
+
+Set `saturationWait: 0s` in a full broker config to skip the wait and fall back
+immediately. Explicitly pinned backend requests continue to use the requested
+backend.
+
 ### Queued Admission
 
 Queued admission is disabled by default. When enabled, retryable allocation

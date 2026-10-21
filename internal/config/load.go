@@ -73,6 +73,10 @@ func Default() model.BrokerConfig {
 					CapacityErrors: 1,
 				},
 			},
+			ARCFirst: model.ARCFirstConfig{
+				SaturationWait: 2 * time.Second,
+				PollInterval:   100 * time.Millisecond,
+			},
 		},
 		Pools: []model.PoolConfig{
 			{

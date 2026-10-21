@@ -35,9 +35,11 @@ var ErrBackendLiveCapacity = errors.New("backend live capacity exhausted")
 var ErrBackendBudgetExceeded = errors.New("backend allocation budget exceeded")
 
 const (
-	defaultWarmTTL = 15 * time.Minute
-	launchModeCold = "cold"
-	launchModeWarm = "warm"
+	defaultWarmTTL           = 15 * time.Minute
+	launchModeCold           = "cold"
+	launchModeWarm           = "warm"
+	defaultARCSaturationWait = 2 * time.Second
+	defaultARCPollInterval   = 100 * time.Millisecond
 )
 
 // LifecycleNotifier delivers allocation lifecycle events (ready, terminal, and quarantine).
@@ -64,9 +66,9 @@ type Service struct {
 	// workflowJobMu serializes webhook-driven allocation so one job id never
 	// yields two allocations.
 	workflowJobMu sync.Mutex
-	initErr     error
-	health      func(context.Context) error
-	now         func() time.Time
+	initErr       error
+	health        func(context.Context) error
+	now           func() time.Time
 }
 
 func NewService(cfg model.BrokerConfig, registry *backend.Registry, health func(context.Context) error) *Service {
@@ -607,6 +609,7 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 		return model.AllocationStatus{}, err
 	}
 	resultPool = pool.Name
+	configuredARCCfg, arcWasConfigured := pool.Backends[model.BackendARC]
 
 	explicitTimeout := request.JobTimeout > 0
 	timeout := request.JobTimeout
@@ -668,25 +671,84 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 		return model.AllocationStatus{}, err
 	}
 
-	// Auto (unpinned) selection prefers a backend that already holds idle warm
-	// capacity so cold cloud backends can serve allocate→ready without a cold start.
+	// Auto allocation requests prefer ARC. If it is full, briefly wait for
+	// capacity to open before allowing the configured cloud backends to run.
+	var selected model.BackendName
+	reservePool := pool
+	reserveRequest := request
+	fallbackPool := pool
+	var preReserved bool
+	if request.Backend == nil && hasCloudFallback(pool) {
+		arcCfg, arcConfigured := pool.Backends[model.BackendARC]
+		if !arcConfigured || !arcCfg.Enabled || !arcCfg.Healthy || arcCfg.MaxRunners <= 0 {
+			if !arcConfigured && arcWasConfigured {
+				arcCfg, arcConfigured = configuredARCCfg, true
+				if configuredARCCfg.Enabled && configuredARCCfg.Healthy && configuredARCCfg.MaxRunners > 0 {
+					arcCfg.Healthy = false // filtered by an availability/admission policy
+				}
+			}
+			reason := arcUnavailableReason(arcCfg, arcConfigured)
+			reservePool = cloudFallbacks(pool)
+			logARCFallback(ctx, pool.Name, reason)
+		} else {
+			arcPool := pool
+			arcPool.Backends = map[model.BackendName]model.BackendConfig{model.BackendARC: arcCfg}
+			arcRequest := request
+			arcRequest.Backend = backendNamePtr(model.BackendARC)
+			wait, poll := arcFirstWaits(s.cfg.Broker.ARCFirst)
+			deadline := time.Now().Add(wait)
+			for {
+				candidate, reserveErr := s.reserve(arcPool, arcRequest)
+				if reserveErr == nil {
+					selected = candidate
+					reservePool, reserveRequest, preReserved = arcPool, arcRequest, true
+					break
+				}
+				if !errors.Is(reserveErr, scheduler.ErrNoCapacity) {
+					return model.AllocationStatus{}, reserveErr
+				}
+				if wait <= 0 || !time.Now().Before(deadline) {
+					reservePool = cloudFallbacks(fallbackPool)
+					logARCFallback(ctx, pool.Name, "saturated")
+					break
+				}
+				delay := poll
+				if remaining := time.Until(deadline); remaining < delay {
+					delay = remaining
+				}
+				timer := time.NewTimer(delay)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return model.AllocationStatus{}, ctx.Err()
+				case <-timer.C:
+				}
+			}
+		}
+	}
+
+	// Preserve warm starts among the selected lane. ARC remains preferred even
+	// when a cloud backend currently has a warm allocation.
 	if request.Backend == nil {
-		if preferred, ok := s.preferredWarmBackend(pool); ok {
+		if preferred, ok := s.preferredWarmBackend(reservePool); ok && !preReserved {
 			request.Backend = &preferred
+			reserveRequest = request
 		}
 	}
 
 	// Outer loop retries selection when a provider rejects reservation due to
 	// live capacity exhaustion. Local scheduler reservations remain the broker
 	// concurrency authority; provider rejection is the final capacity check.
-	reservePool := pool
-	reserveRequest := request
-	var selected model.BackendName
 	var rateLimitedFallback model.BackendName
 	var capacityFallback model.BackendName
 	for {
 		for {
-			selected, err = s.reserve(reservePool, reserveRequest)
+			if preReserved {
+				preReserved = false
+				err = nil
+			} else {
+				selected, err = s.reserve(reservePool, reserveRequest)
+			}
 			if err != nil {
 				if errors.Is(err, scheduler.ErrNoCapacity) {
 					if capacityFallback != "" {
@@ -716,6 +778,12 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 				s.observer.ObserveBackendAdmissionRejected(reservePool.Name, selected, decision.Reason)
 				switch decision.Reason {
 				case "circuit-open":
+					if selected == model.BackendARC && pinnedBackend == nil && hasCloudFallback(withoutBackend(fallbackPool, selected)) {
+						logARCFallback(ctx, pool.Name, "circuit-open")
+						reservePool = cloudFallbacks(withoutBackend(fallbackPool, selected))
+						reserveRequest.Backend = nil
+						continue
+					}
 					err := fmt.Errorf("selected backend %q is not admissible: %w", selected, ErrBackendCircuitOpen)
 					if queued, ok := s.queueAllocation(ctx, reserveRequest, reservePool.Name, selected, err, existing); ok {
 						result = "queued"
@@ -724,7 +792,12 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 					return model.AllocationStatus{}, err
 				case "rate-limited":
 					rateLimitedFallback = selected
-					reservePool = withoutBackend(reservePool, selected)
+					if selected == model.BackendARC && pinnedBackend == nil && hasCloudFallback(withoutBackend(fallbackPool, selected)) {
+						logARCFallback(ctx, pool.Name, "rate-limited")
+						reservePool = cloudFallbacks(withoutBackend(fallbackPool, selected))
+					} else {
+						reservePool = withoutBackend(reservePool, selected)
+					}
 					reserveRequest.Backend = nil
 					if len(reservePool.Backends) > 0 {
 						continue
@@ -874,6 +947,9 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 					"backend":       string(selected),
 					"error":         err.Error(),
 				})
+				if selected == model.BackendARC && pinnedBackend == nil && hasCloudFallback(withoutBackend(fallbackPool, selected)) {
+					logARCFallback(ctx, pool.Name, "provider-capacity-rejected")
+				}
 				if pinnedBackend != nil && *pinnedBackend == selected && !fallbackFromRateLimit {
 					// Pinned requests are not silently rerouted on live-capacity rejection.
 					if existing.ID == "" {
@@ -881,7 +957,11 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 					}
 					return model.AllocationStatus{}, fmt.Errorf("pinned backend %q live capacity exhausted: %w", selected, ErrBackendLiveCapacity)
 				}
-				reservePool = withoutBackend(reservePool, selected)
+				if selected == model.BackendARC && pinnedBackend == nil {
+					reservePool = cloudFallbacks(withoutBackend(fallbackPool, selected))
+				} else {
+					reservePool = withoutBackend(reservePool, selected)
+				}
 				reserveRequest.Backend = nil
 				if existing.ID == "" {
 					_ = s.store.Delete(allocation.ID)
@@ -895,6 +975,22 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 					continue
 				}
 				return model.AllocationStatus{}, fmt.Errorf("selected backend %q capacity exhausted and no fallback backend is available: %w", selected, ErrBackendLiveCapacity)
+			}
+			if selected == model.BackendARC && pinnedBackend == nil && isARCUnavailableFailure(err) && hasCloudFallback(withoutBackend(fallbackPool, selected)) {
+				logARCFallback(ctx, pool.Name, arcFailureReason(err))
+				reservePool = cloudFallbacks(withoutBackend(fallbackPool, selected))
+				reserveRequest.Backend = nil
+				if existing.ID == "" {
+					_ = s.store.Delete(allocation.ID)
+					existing = model.AllocationStatus{}
+				} else {
+					existing = allocation
+					existing.State = model.StatePending
+					existing.Error = err.Error()
+				}
+				if len(reservePool.Backends) > 0 {
+					continue
+				}
 			}
 			if queued, ok := s.queueAllocation(ctx, request, pool.Name, selected, err, allocation); ok {
 				result = "queued"
@@ -2353,6 +2449,97 @@ func (s *Service) reserve(pool model.PoolConfig, request model.AllocationRequest
 		return s.reserveQualityAware(pool, request)
 	}
 	return s.reserveScheduled(pool, request)
+}
+
+func backendNamePtr(name model.BackendName) *model.BackendName { return &name }
+
+func arcFirstWaits(cfg model.ARCFirstConfig) (time.Duration, time.Duration) {
+	wait, poll := cfg.SaturationWait, cfg.PollInterval
+	if wait == 0 && poll == 0 {
+		return defaultARCSaturationWait, defaultARCPollInterval
+	}
+	if poll <= 0 {
+		poll = defaultARCPollInterval
+	}
+	return wait, poll
+}
+
+func hasCloudFallback(pool model.PoolConfig) bool {
+	for name, cfg := range pool.Backends {
+		if isCloudFallback(name) && cfg.Enabled && cfg.Healthy && cfg.MaxRunners > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func cloudFallbacks(pool model.PoolConfig) model.PoolConfig {
+	filtered := pool
+	filtered.Backends = make(map[model.BackendName]model.BackendConfig)
+	for name, cfg := range pool.Backends {
+		if isCloudFallback(name) {
+			filtered.Backends[name] = cfg
+		}
+	}
+	return filtered
+}
+
+func isCloudFallback(name model.BackendName) bool {
+	switch name {
+	case model.BackendAzureVM, model.BackendAzureFunctions, model.BackendEC2,
+		model.BackendGCE, model.BackendCloudRun, model.BackendLambda, model.BackendCodeBuild:
+		return true
+	default:
+		return false
+	}
+}
+
+func arcUnavailableReason(cfg model.BackendConfig, configured bool) string {
+	if !configured {
+		return "not-configured"
+	}
+	if !cfg.Enabled {
+		return "disabled"
+	}
+	if !cfg.Healthy {
+		return "unhealthy"
+	}
+	if cfg.MaxRunners <= 0 {
+		return "no-capacity-configured"
+	}
+	return "unavailable"
+}
+
+func logARCFallback(ctx context.Context, pool model.PoolName, reason string) {
+	logAllocationEvent(ctx, "arc_fallback", map[string]string{
+		"pool":            string(pool),
+		"backend":         string(model.BackendARC),
+		"fallback_to":     "cloud",
+		"fallback_reason": reason,
+	})
+}
+
+func isARCUnavailableFailure(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	reason, ok := backend.FailureReason(err)
+	if !ok {
+		return false
+	}
+	switch reason {
+	case backend.FailureReasonTimeout, backend.FailureReasonTransport, backend.FailureReasonServerError, backend.FailureReasonProbeFailed:
+		return true
+	default:
+		return false
+	}
+}
+
+func arcFailureReason(err error) string {
+	if reason, ok := backend.FailureReason(err); ok {
+		return reason
+	}
+	return "unavailable"
 }
 
 func (s *Service) reserveScheduled(pool model.PoolConfig, request model.AllocationRequest) (model.BackendName, error) {
