@@ -157,7 +157,8 @@ type BrokerRuntimeConfig struct {
 }
 
 // ARCFirstConfig controls how long automatic allocations wait for local ARC
-// capacity before falling back to a cloud backend.
+// capacity before falling back. A zero SaturationWait skips the wait; config
+// defaults supply two seconds when the field is omitted.
 type ARCFirstConfig struct {
 	SaturationWait time.Duration `yaml:"saturationWait,omitempty" json:"saturationWait,omitempty"`
 	PollInterval   time.Duration `yaml:"pollInterval,omitempty" json:"pollInterval,omitempty"`

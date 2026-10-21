@@ -457,7 +457,8 @@ capacity, the broker can use the configured cloud backends (`azure-vm`,
 `azure-functions`, `ec2`, `gce`, `cloud-run`, `lambda`, and `codebuild`). When ARC is saturated,
 the broker waits briefly for capacity before falling back. The wait defaults to
 2 seconds with a 100 millisecond polling interval; fallback events are logged
-with an `arc_fallback` reason.
+with an `arc_fallback` reason. Other configured non-ARC backends are also eligible
+after the listed cloud backends.
 
 ```yaml
 broker:
@@ -466,9 +467,9 @@ broker:
     pollInterval: 100ms
 ```
 
-Set `saturationWait: 0s` in a full broker config to skip the wait and fall back
-immediately. Explicitly pinned backend requests continue to use the requested
-backend.
+Omitting `saturationWait` uses the 2 second default. Set `saturationWait: 0s` to
+skip the wait and fall back immediately. Explicitly pinned backend requests
+continue to use the requested backend.
 
 ### Queued Admission
 

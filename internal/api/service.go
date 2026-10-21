@@ -38,7 +38,6 @@ const (
 	defaultWarmTTL           = 15 * time.Minute
 	launchModeCold           = "cold"
 	launchModeWarm           = "warm"
-	defaultARCSaturationWait = 2 * time.Second
 	defaultARCPollInterval   = 100 * time.Millisecond
 )
 
@@ -678,7 +677,7 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 	reserveRequest := request
 	fallbackPool := pool
 	var preReserved bool
-	if request.Backend == nil && hasCloudFallback(pool) {
+	if request.Backend == nil && hasFallbackBackend(pool) {
 		arcCfg, arcConfigured := pool.Backends[model.BackendARC]
 		if !arcConfigured || !arcCfg.Enabled || !arcCfg.Healthy || arcCfg.MaxRunners <= 0 {
 			if !arcConfigured && arcWasConfigured {
@@ -688,7 +687,7 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 				}
 			}
 			reason := arcUnavailableReason(arcCfg, arcConfigured)
-			reservePool = cloudFallbacks(pool)
+			reservePool = fallbackBackends(pool)
 			logARCFallback(ctx, pool.Name, reason)
 		} else {
 			arcPool := pool
@@ -708,7 +707,7 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 					return model.AllocationStatus{}, reserveErr
 				}
 				if wait <= 0 || !time.Now().Before(deadline) {
-					reservePool = cloudFallbacks(fallbackPool)
+					reservePool = fallbackBackends(fallbackPool)
 					logARCFallback(ctx, pool.Name, "saturated")
 					break
 				}
@@ -778,9 +777,9 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 				s.observer.ObserveBackendAdmissionRejected(reservePool.Name, selected, decision.Reason)
 				switch decision.Reason {
 				case "circuit-open":
-					if selected == model.BackendARC && pinnedBackend == nil && hasCloudFallback(withoutBackend(fallbackPool, selected)) {
+					if selected == model.BackendARC && pinnedBackend == nil && hasFallbackBackend(withoutBackend(fallbackPool, selected)) {
 						logARCFallback(ctx, pool.Name, "circuit-open")
-						reservePool = cloudFallbacks(withoutBackend(fallbackPool, selected))
+						reservePool = fallbackBackends(withoutBackend(fallbackPool, selected))
 						reserveRequest.Backend = nil
 						continue
 					}
@@ -792,9 +791,9 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 					return model.AllocationStatus{}, err
 				case "rate-limited":
 					rateLimitedFallback = selected
-					if selected == model.BackendARC && pinnedBackend == nil && hasCloudFallback(withoutBackend(fallbackPool, selected)) {
+					if selected == model.BackendARC && pinnedBackend == nil && hasFallbackBackend(withoutBackend(fallbackPool, selected)) {
 						logARCFallback(ctx, pool.Name, "rate-limited")
-						reservePool = cloudFallbacks(withoutBackend(fallbackPool, selected))
+						reservePool = fallbackBackends(withoutBackend(fallbackPool, selected))
 					} else {
 						reservePool = withoutBackend(reservePool, selected)
 					}
@@ -947,7 +946,7 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 					"backend":       string(selected),
 					"error":         err.Error(),
 				})
-				if selected == model.BackendARC && pinnedBackend == nil && hasCloudFallback(withoutBackend(fallbackPool, selected)) {
+				if selected == model.BackendARC && pinnedBackend == nil && hasFallbackBackend(withoutBackend(fallbackPool, selected)) {
 					logARCFallback(ctx, pool.Name, "provider-capacity-rejected")
 				}
 				if pinnedBackend != nil && *pinnedBackend == selected && !fallbackFromRateLimit {
@@ -958,7 +957,7 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 					return model.AllocationStatus{}, fmt.Errorf("pinned backend %q live capacity exhausted: %w", selected, ErrBackendLiveCapacity)
 				}
 				if selected == model.BackendARC && pinnedBackend == nil {
-					reservePool = cloudFallbacks(withoutBackend(fallbackPool, selected))
+					reservePool = fallbackBackends(withoutBackend(fallbackPool, selected))
 				} else {
 					reservePool = withoutBackend(reservePool, selected)
 				}
@@ -976,9 +975,9 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 				}
 				return model.AllocationStatus{}, fmt.Errorf("selected backend %q capacity exhausted and no fallback backend is available: %w", selected, ErrBackendLiveCapacity)
 			}
-			if selected == model.BackendARC && pinnedBackend == nil && isARCUnavailableFailure(err) && hasCloudFallback(withoutBackend(fallbackPool, selected)) {
+			if selected == model.BackendARC && pinnedBackend == nil && isARCUnavailableFailure(err) && hasFallbackBackend(withoutBackend(fallbackPool, selected)) {
 				logARCFallback(ctx, pool.Name, arcFailureReason(err))
-				reservePool = cloudFallbacks(withoutBackend(fallbackPool, selected))
+				reservePool = fallbackBackends(withoutBackend(fallbackPool, selected))
 				reserveRequest.Backend = nil
 				if existing.ID == "" {
 					_ = s.store.Delete(allocation.ID)
@@ -2455,29 +2454,33 @@ func backendNamePtr(name model.BackendName) *model.BackendName { return &name }
 
 func arcFirstWaits(cfg model.ARCFirstConfig) (time.Duration, time.Duration) {
 	wait, poll := cfg.SaturationWait, cfg.PollInterval
-	if wait == 0 && poll == 0 {
-		return defaultARCSaturationWait, defaultARCPollInterval
-	}
 	if poll <= 0 {
 		poll = defaultARCPollInterval
 	}
 	return wait, poll
 }
 
-func hasCloudFallback(pool model.PoolConfig) bool {
+func hasFallbackBackend(pool model.PoolConfig) bool {
 	for name, cfg := range pool.Backends {
-		if isCloudFallback(name) && cfg.Enabled && cfg.Healthy && cfg.MaxRunners > 0 {
+		if name != model.BackendARC && cfg.Enabled && cfg.Healthy && cfg.MaxRunners > 0 {
 			return true
 		}
 	}
 	return false
 }
 
-func cloudFallbacks(pool model.PoolConfig) model.PoolConfig {
+// fallbackBackends preserves the cloud fallback lane and includes any other
+// configured non-ARC backend after it, so custom backends are not lost.
+func fallbackBackends(pool model.PoolConfig) model.PoolConfig {
 	filtered := pool
 	filtered.Backends = make(map[model.BackendName]model.BackendConfig)
 	for name, cfg := range pool.Backends {
 		if isCloudFallback(name) {
+			filtered.Backends[name] = cfg
+		}
+	}
+	for name, cfg := range pool.Backends {
+		if name != model.BackendARC && !isCloudFallback(name) {
 			filtered.Backends[name] = cfg
 		}
 	}

@@ -130,7 +130,8 @@ config:
         latency: 1
         capacityErrors: 1
     # Automatic allocations prefer ARC. A full ARC pool gets a short grace
-    # period before the configured cloud backends are considered.
+    # period before configured non-ARC backends are considered (cloud backends
+    # first, followed by any other configured backend).
     arcFirst:
       saturationWait: 2s
       pollInterval: 100ms
