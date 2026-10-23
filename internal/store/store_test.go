@@ -24,13 +24,13 @@ func TestMemorySaveIfCapacityEnforcesMaxRunners(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		status := base
 		status.ID = "a" + string(rune('1'+i))
-		if err := s.SaveIfCapacity(status, 2, 0); err != nil {
+		if err := s.SaveIfCapacity(status, 2, 0, 0); err != nil {
 			t.Fatalf("unexpected error on save %d: %v", i, err)
 		}
 	}
 	overflow := base
 	overflow.ID = "overflow"
-	if err := s.SaveIfCapacity(overflow, 2, 0); err != ErrNoCapacity {
+	if err := s.SaveIfCapacity(overflow, 2, 0, 0); err != ErrNoCapacity {
 		t.Fatalf("expected ErrNoCapacity, got %v", err)
 	}
 	if got := s.CountActive(model.PoolLite, model.BackendARC); got != 2 {
@@ -55,7 +55,7 @@ func TestMemorySaveIfCapacityConcurrent(t *testing.T) {
 				SelectedBackend: model.BackendCodeBuild,
 				State:           model.StateReserved,
 			}
-			if err := s.SaveIfCapacity(status, maxRunners, 0); err == nil {
+			if err := s.SaveIfCapacity(status, maxRunners, 0, 0); err == nil {
 				success.Add(1)
 			}
 		}(i)
@@ -158,7 +158,7 @@ func TestMemoryTenantQuota(t *testing.T) {
 			State:           model.StateReady,
 			Tenant:          "acme",
 		}
-		if err := s.SaveIfCapacity(status, 10, 2); err != nil {
+		if err := s.SaveIfCapacity(status, 10, 2, 0); err != nil {
 			t.Fatalf("save %d: %v", i, err)
 		}
 	}
@@ -169,8 +169,49 @@ func TestMemoryTenantQuota(t *testing.T) {
 		State:           model.StateReserved,
 		Tenant:          "acme",
 	}
-	if err := s.SaveIfCapacity(overflow, 10, 2); err != ErrNoCapacity {
+	if err := s.SaveIfCapacity(overflow, 10, 2, 0); err != ErrNoCapacity {
 		t.Fatalf("expected tenant quota ErrNoCapacity, got %v", err)
+	}
+}
+
+func TestMemorySaveIfCapacityCrossPoolBackendLimit(t *testing.T) {
+	s := NewMemory()
+
+	// Allocation 1 in pool full for azure-vm
+	a1 := model.AllocationStatus{
+		ID:              "alloc-1",
+		Pool:            model.PoolFull,
+		SelectedBackend: model.BackendAzureVM,
+		State:           model.StateReady,
+	}
+	if err := s.SaveIfCapacity(a1, 5, 0, 2); err != nil {
+		t.Fatalf("save a1: %v", err)
+	}
+
+	// Allocation 2 in pool lite for azure-vm
+	a2 := model.AllocationStatus{
+		ID:              "alloc-2",
+		Pool:            model.PoolLite,
+		SelectedBackend: model.BackendAzureVM,
+		State:           model.StateReady,
+	}
+	if err := s.SaveIfCapacity(a2, 5, 0, 2); err != nil {
+		t.Fatalf("save a2: %v", err)
+	}
+
+	if got := s.CountBackendActive(model.BackendAzureVM); got != 2 {
+		t.Fatalf("expected CountBackendActive=2, got %d", got)
+	}
+
+	// Allocation 3 in pool full for azure-vm exceeds cross-pool limit of 2 even though pool limit is 5
+	a3 := model.AllocationStatus{
+		ID:              "alloc-3",
+		Pool:            model.PoolFull,
+		SelectedBackend: model.BackendAzureVM,
+		State:           model.StateReserved,
+	}
+	if err := s.SaveIfCapacity(a3, 5, 0, 2); err != ErrNoCapacity {
+		t.Fatalf("expected ErrNoCapacity from cross-pool backend limit, got %v", err)
 	}
 }
 

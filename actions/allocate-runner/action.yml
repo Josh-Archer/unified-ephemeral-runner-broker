@@ -15,6 +15,10 @@ inputs:
     description: Requested job timeout duration, for example 15m
     required: false
     default: 15m
+  registration_timeout:
+    description: Optional registration/claim timeout duration before an unused runner slot expires, for example 10m
+    required: false
+    default: ""
   labels:
     description: Optional comma-separated labels to attach to the allocation request
     required: false
@@ -80,6 +84,7 @@ runs:
         INPUT_POOL: ${{ inputs.pool }}
         INPUT_BACKEND: ${{ inputs.backend }}
         INPUT_JOB_TIMEOUT: ${{ inputs.job_timeout }}
+        INPUT_REGISTRATION_TIMEOUT: ${{ inputs.registration_timeout }}
         INPUT_LABELS: ${{ inputs.labels }}
         INPUT_TENANT: ${{ inputs.tenant }}
         INPUT_PRIORITY_CLASS: ${{ inputs.priority_class }}
@@ -113,6 +118,10 @@ runs:
             "pool": os.environ["INPUT_POOL"],
             "job_timeout": os.environ["INPUT_JOB_TIMEOUT"],
         }
+
+        registration_timeout = os.environ.get("INPUT_REGISTRATION_TIMEOUT", "").strip()
+        if registration_timeout:
+            payload["registration_timeout"] = registration_timeout
 
         backend = os.environ.get("INPUT_BACKEND", "").strip()
         if backend:

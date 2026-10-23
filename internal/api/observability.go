@@ -47,6 +47,7 @@ type Observer interface {
 	ObserveQualitySelection(model.PoolName, model.BackendName, string, float64)
 	ObserveQualityScore(model.PoolName, model.BackendName, float64, float64, time.Duration, int, int)
 	ObserveAllocationReaped(model.PoolName, model.BackendName, string)
+	ObserveAllocationExpired(model.PoolName, model.BackendName, string)
 	ObserveOrphanCleanup(model.PoolName, model.BackendName, string)
 	ObserveLabelGarbage(model.PoolName, model.BackendName, string)
 	ObserveStaleRunnerLabels([]staleRunnerLabelSnapshot)
@@ -88,8 +89,9 @@ func (noopObserver) ObserveBudgetUsage(model.PoolName, model.BackendName, int, i
 func (noopObserver) ObserveQualitySelection(model.PoolName, model.BackendName, string, float64) {}
 func (noopObserver) ObserveQualityScore(model.PoolName, model.BackendName, float64, float64, time.Duration, int, int) {
 }
-func (noopObserver) ObserveAllocationReaped(model.PoolName, model.BackendName, string) {}
-func (noopObserver) ObserveOrphanCleanup(model.PoolName, model.BackendName, string)    {}
+func (noopObserver) ObserveAllocationReaped(model.PoolName, model.BackendName, string)  {}
+func (noopObserver) ObserveAllocationExpired(model.PoolName, model.BackendName, string) {}
+func (noopObserver) ObserveOrphanCleanup(model.PoolName, model.BackendName, string)     {}
 func (noopObserver) ObserveLabelGarbage(model.PoolName, model.BackendName, string)     {}
 func (noopObserver) ObserveStaleRunnerLabels([]staleRunnerLabelSnapshot)               {}
 func (noopObserver) ObserveProcessLocalStateLoss(string)                               {}
@@ -155,6 +157,7 @@ type PrometheusObserver struct {
 	qualityCapacityErrors *prometheus.GaugeVec
 	qualityFreeSlots      *prometheus.GaugeVec
 	allocationsReaped     *prometheus.CounterVec
+	allocationExpired     *prometheus.CounterVec
 	orphanCleanupActions  *prometheus.CounterVec
 	labelGarbage          *prometheus.CounterVec
 	staleRunnerLabels     *prometheus.GaugeVec
@@ -287,6 +290,10 @@ func NewPrometheusObserver(_ prometheus.Registerer) *PrometheusObserver {
 			Name: "uecb_allocations_reaped_total",
 			Help: "Stuck allocations reaped by the broker-side reaper after job_timeout (+ grace), by pool, backend, and terminal result.",
 		}, []string{"pool", "backend", "result"}),
+		allocationExpired: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "uecb_allocation_expired_total",
+			Help: "Total allocations that expired, by backend, pool, and reason (unregistered, unclaimed, job_timeout, quarantine_ttl_elapsed).",
+		}, []string{"backend", "pool", "reason"}),
 		orphanCleanupActions: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "uecb_orphan_cleanup_actions_total",
 			Help: "Orphan cleanup sweep actions for stale allocations (missing finalize / hard job kill).",
@@ -348,6 +355,7 @@ func (o *PrometheusObserver) Register(registerer prometheus.Registerer) error {
 		o.qualityCapacityErrors,
 		o.qualityFreeSlots,
 		o.allocationsReaped,
+		o.allocationExpired,
 		o.orphanCleanupActions,
 		o.labelGarbage,
 		o.staleRunnerLabels,
@@ -567,6 +575,13 @@ func (o *PrometheusObserver) ObserveCancellation(pool model.PoolName, backend mo
 	}
 	o.cancellations.WithLabelValues(string(pool), string(backend), result).Inc()
 	o.cancellationLatency.WithLabelValues(string(pool), string(backend), result).Observe(latency.Seconds())
+}
+
+func (o *PrometheusObserver) ObserveAllocationExpired(pool model.PoolName, backend model.BackendName, reason string) {
+	if reason == "" {
+		reason = "unknown"
+	}
+	o.allocationExpired.WithLabelValues(string(backend), string(pool), reason).Inc()
 }
 
 func (o *PrometheusObserver) ObserveActiveAllocations(statuses []model.AllocationStatus) {

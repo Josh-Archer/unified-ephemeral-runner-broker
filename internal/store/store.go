@@ -48,11 +48,16 @@ type Store interface {
 	// allocations for the same pool/backend (reserved|ready|warm), excluding this
 	// allocation id, is strictly below maxRunners. When tenantQuota > 0 the same
 	// rule is applied to the tenant's accounted allocations across all backends
-	// in the pool. Returns ErrNoCapacity when either limit would be exceeded.
-	SaveIfCapacity(status model.AllocationStatus, maxRunners int, tenantQuota int) error
+	// in the pool. When backendLimit > 0, accounted allocations for this backend
+	// across all pools must be strictly below backendLimit. Returns ErrNoCapacity
+	// when any limit would be exceeded.
+	SaveIfCapacity(status model.AllocationStatus, maxRunners int, tenantQuota int, backendLimit int) error
 
 	// CountActive returns the number of scheduler-accounted allocations for pool/backend.
 	CountActive(pool model.PoolName, backend model.BackendName) int
+
+	// CountBackendActive returns accounted allocations for a backend across all pools.
+	CountBackendActive(backend model.BackendName) int
 
 	// CountTenantActive returns accounted allocations for a tenant in a pool (all backends).
 	CountTenantActive(pool model.PoolName, tenant string) int
@@ -234,10 +239,32 @@ func applyMarkState(status model.AllocationStatus, state model.AllocationState, 
 	return status
 }
 
-func capacityAllowed(allocations map[string]model.AllocationStatus, status model.AllocationStatus, maxRunners int, tenantQuota int) error {
+func countBackendActiveLocked(allocations map[string]model.AllocationStatus, backend model.BackendName, excludeID string) int {
+	count := 0
+	for id, status := range allocations {
+		if excludeID != "" && id == excludeID {
+			continue
+		}
+		if status.SelectedBackend != backend {
+			continue
+		}
+		if isSchedulerAccountedState(status.State) {
+			count++
+		}
+	}
+	return count
+}
+
+func capacityAllowed(allocations map[string]model.AllocationStatus, status model.AllocationStatus, maxRunners int, tenantQuota int, backendLimit int) error {
 	if maxRunners > 0 {
 		active := countActiveLocked(allocations, status.Pool, status.SelectedBackend, status.ID)
 		if active >= maxRunners {
+			return ErrNoCapacity
+		}
+	}
+	if backendLimit > 0 {
+		backendActive := countBackendActiveLocked(allocations, status.SelectedBackend, status.ID)
+		if backendActive >= backendLimit {
 			return ErrNoCapacity
 		}
 	}

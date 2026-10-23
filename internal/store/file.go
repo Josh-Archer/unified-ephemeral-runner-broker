@@ -153,10 +153,10 @@ func (f *File) SaveIfState(status model.AllocationStatus, expectedFrom model.All
 	return true, nil
 }
 
-func (f *File) SaveIfCapacity(status model.AllocationStatus, maxRunners int, tenantQuota int) error {
+func (f *File) SaveIfCapacity(status model.AllocationStatus, maxRunners int, tenantQuota int, backendLimit int) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := capacityAllowed(f.allocations, status, maxRunners, tenantQuota); err != nil {
+	if err := capacityAllowed(f.allocations, status, maxRunners, tenantQuota, backendLimit); err != nil {
 		return err
 	}
 	prev, ok := f.allocations[status.ID]
@@ -176,6 +176,12 @@ func (f *File) CountActive(pool model.PoolName, backend model.BackendName) int {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	return countActiveLocked(f.allocations, pool, backend, "")
+}
+
+func (f *File) CountBackendActive(backend model.BackendName) int {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return countBackendActiveLocked(f.allocations, backend, "")
 }
 
 func (f *File) CountTenantActive(pool model.PoolName, tenant string) int {

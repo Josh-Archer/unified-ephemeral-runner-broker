@@ -515,3 +515,48 @@ func TestHandleAllocationCompleteRejectsUnknownState(t *testing.T) {
 		t.Fatalf("expected 400, got %d: %s", recorder.Code, recorder.Body.String())
 	}
 }
+
+func TestHandleAllocationRegisterAndClaim(t *testing.T) {
+	service := newServiceWithConfig(nil)
+	server := newTestServer(t, service)
+
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolFull,
+		JobTimeout: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("allocation failed: %v", err)
+	}
+
+	// Register
+	regReq := httptest.NewRequest(http.MethodPost, "/v1/allocations/"+allocation.ID+"/register", nil)
+	regRec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(regRec, regReq)
+
+	if regRec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", regRec.Code, regRec.Body.String())
+	}
+	var regStatus model.AllocationStatus
+	if err := json.Unmarshal(regRec.Body.Bytes(), &regStatus); err != nil {
+		t.Fatalf("decode register response: %v", err)
+	}
+	if regStatus.RegisteredAt == nil {
+		t.Fatal("expected registered_at to be set")
+	}
+
+	// Claim
+	claimReq := httptest.NewRequest(http.MethodPost, "/v1/allocations/"+allocation.ID+"/claim", nil)
+	claimRec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(claimRec, claimReq)
+
+	if claimRec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", claimRec.Code, claimRec.Body.String())
+	}
+	var claimStatus model.AllocationStatus
+	if err := json.Unmarshal(claimRec.Body.Bytes(), &claimStatus); err != nil {
+		t.Fatalf("decode claim response: %v", err)
+	}
+	if claimStatus.ClaimedAt == nil {
+		t.Fatal("expected claimed_at to be set")
+	}
+}

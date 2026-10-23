@@ -103,10 +103,10 @@ func (m *Memory) SaveIfState(status model.AllocationStatus, expectedFrom model.A
 	return true, nil
 }
 
-func (m *Memory) SaveIfCapacity(status model.AllocationStatus, maxRunners int, tenantQuota int) error {
+func (m *Memory) SaveIfCapacity(status model.AllocationStatus, maxRunners int, tenantQuota int, backendLimit int) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := capacityAllowed(m.allocations, status, maxRunners, tenantQuota); err != nil {
+	if err := capacityAllowed(m.allocations, status, maxRunners, tenantQuota, backendLimit); err != nil {
 		return err
 	}
 	m.allocations[status.ID] = status
@@ -117,6 +117,12 @@ func (m *Memory) CountActive(pool model.PoolName, backend model.BackendName) int
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return countActiveLocked(m.allocations, pool, backend, "")
+}
+
+func (m *Memory) CountBackendActive(backend model.BackendName) int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return countBackendActiveLocked(m.allocations, backend, "")
 }
 
 func (m *Memory) CountTenantActive(pool model.PoolName, tenant string) int {

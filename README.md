@@ -328,6 +328,12 @@ broker:
   (or immediately when `0`), then to `expired`. Capacity is released when the
   allocation first enters quarantine/expired.
 
+#### Registration and Claim Timeout
+
+When a runner slot is allocated but the runner never registers with GitHub or no workflow job claims the runner within `registrationTimeout` (default `10m`), the reaper moves the allocation to `expired` with reason `"unregistered"` or `"unclaimed"` and releases the capacity slot. For static-label backends (such as pre-registered Azure VMs), the runner is already registered, so the allocation expires if no job claims the label within the window.
+
+Allocations can be marked claimed via GitHub webhooks (`workflow_job: in_progress`), the API endpoint `POST /v1/allocations/{id}/claim`, or `POST /v1/allocations/{id}/register`. Expiries are exposed on metric `uecb_allocation_expired_total{pool,backend,reason}`.
+
 ### Durable State Store
 
 The broker keeps allocation state in memory by default. Supported modes:

@@ -22,8 +22,9 @@ func Default() model.BrokerConfig {
 			},
 		},
 		Broker: model.BrokerRuntimeConfig{
-			DefaultPool:       model.PoolFull,
-			DefaultJobTimeout: 15 * time.Minute,
+			DefaultPool:         model.PoolFull,
+			DefaultJobTimeout:   15 * time.Minute,
+			RegistrationTimeout: 10 * time.Minute,
 			OrphanCleanup: struct {
 				Enabled       bool          `yaml:"enabled" json:"enabled"`
 				QuarantineTTL time.Duration `yaml:"quarantineTTL" json:"quarantineTTL"`

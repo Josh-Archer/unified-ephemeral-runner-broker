@@ -80,6 +80,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS uecb_allocations_workflow_job_id_idx
   ON uecb_allocations (workflow_job_id) WHERE workflow_job_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS uecb_allocations_active_idx
   ON uecb_allocations (pool, backend, state);
+CREATE INDEX IF NOT EXISTS uecb_allocations_backend_active_idx
+  ON uecb_allocations (backend, state);
 CREATE INDEX IF NOT EXISTS uecb_allocations_tenant_idx
   ON uecb_allocations (pool, tenant, state);
 
@@ -246,7 +248,7 @@ func (p *Postgres) SaveIfState(status model.AllocationStatus, expectedFrom model
 	return true, nil
 }
 
-func (p *Postgres) SaveIfCapacity(status model.AllocationStatus, maxRunners int, tenantQuota int) error {
+func (p *Postgres) SaveIfCapacity(status model.AllocationStatus, maxRunners int, tenantQuota int, backendLimit int) error {
 	tx, err := p.db.Begin()
 	if err != nil {
 		return err
@@ -263,6 +265,19 @@ WHERE pool = $1 AND backend = $2 AND state IN ('reserved', 'ready', 'warm') AND 
 			return fmt.Errorf("count active allocations: %w", err)
 		}
 		if active >= maxRunners {
+			return ErrNoCapacity
+		}
+	}
+	if backendLimit > 0 {
+		var backendActive int
+		err = tx.QueryRow(`
+SELECT COUNT(*) FROM uecb_allocations
+WHERE backend = $1 AND state IN ('reserved', 'ready', 'warm') AND id <> $2
+`, string(status.SelectedBackend), status.ID).Scan(&backendActive)
+		if err != nil {
+			return fmt.Errorf("count backend allocations: %w", err)
+		}
+		if backendActive >= backendLimit {
 			return ErrNoCapacity
 		}
 	}
@@ -291,6 +306,18 @@ func (p *Postgres) CountActive(pool model.PoolName, backend model.BackendName) i
 SELECT COUNT(*) FROM uecb_allocations
 WHERE pool = $1 AND backend = $2 AND state IN ('reserved', 'ready', 'warm')
 `, string(pool), string(backend)).Scan(&active)
+	if err != nil {
+		return 0
+	}
+	return active
+}
+
+func (p *Postgres) CountBackendActive(backend model.BackendName) int {
+	var active int
+	err := p.db.QueryRow(`
+SELECT COUNT(*) FROM uecb_allocations
+WHERE backend = $1 AND state IN ('reserved', 'ready', 'warm')
+`, string(backend)).Scan(&active)
 	if err != nil {
 		return 0
 	}

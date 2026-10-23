@@ -131,6 +131,11 @@ type BrokerRuntimeConfig struct {
 	DefaultPool          PoolName      `yaml:"defaultPool" json:"defaultPool"`
 	DefaultJobTimeout    time.Duration `yaml:"defaultJobTimeout" json:"defaultJobTimeout"`
 	AllowUnauthenticated bool          `yaml:"allowUnauthenticated" json:"allowUnauthenticated"`
+	// RegistrationTimeout is the window within which a runner must register or
+	// claim the job before the allocation expires and frees the slot.
+	RegistrationTimeout time.Duration `yaml:"registrationTimeout,omitempty" json:"registrationTimeout,omitempty"`
+	// BackendLimits sets cross-pool capacity limits per backend name across all pools.
+	BackendLimits map[BackendName]int `yaml:"backendLimits,omitempty" json:"backendLimits,omitempty"`
 	// OrphanCleanup is the broker-side stuck-allocation reaper. Active
 	// reserved/ready allocations past expires_at (+ optional gracePeriod) are
 	// marked terminal so maxRunners capacity is released when finalize never runs.
@@ -308,7 +313,10 @@ type BackendConfig struct {
 	Enabled    bool          `yaml:"enabled" json:"enabled"`
 	Healthy    bool          `yaml:"healthy" json:"healthy"`
 	MaxRunners int           `yaml:"maxRunners" json:"maxRunners"`
-	WarmMin    int           `yaml:"warmMin" json:"warmMin"`
+	// CrossPoolMaxRunners limits concurrent active allocations for this backend across all pools.
+	CrossPoolMaxRunners int           `yaml:"crossPoolMaxRunners,omitempty" json:"crossPoolMaxRunners,omitempty"`
+	RegistrationTimeout time.Duration `yaml:"registrationTimeout,omitempty" json:"registrationTimeout,omitempty"`
+	WarmMin             int           `yaml:"warmMin" json:"warmMin"`
 	WarmMax    int           `yaml:"warmMax" json:"warmMax"`
 	WarmTTL    time.Duration `yaml:"warmTTL,omitempty" json:"warmTTL,omitempty"`
 	// WarmSchedule optionally gates warmMin/warmMax to calendar windows so cold
@@ -427,6 +435,7 @@ type AllocationRequest struct {
 	Pool                 PoolName      `json:"pool"`
 	Backend              *BackendName  `json:"backend,omitempty"`
 	JobTimeout           time.Duration `json:"job_timeout"`
+	RegistrationTimeout  time.Duration `json:"registration_timeout,omitempty"`
 	Tenant               string        `json:"tenant,omitempty"`
 	PriorityClass        string        `json:"priority_class,omitempty"`
 	Labels               []string      `json:"labels,omitempty"`
@@ -450,6 +459,9 @@ type AllocationStatus struct {
 	Subject    string             `json:"subject,omitempty"`
 	Repository string             `json:"repository,omitempty"`
 	Owner      string             `json:"owner,omitempty"`
+	CreatedAt  time.Time          `json:"created_at,omitempty"`
+	RegisteredAt *time.Time       `json:"registered_at,omitempty"`
+	ClaimedAt    *time.Time       `json:"claimed_at,omitempty"`
 	ExpiresAt  time.Time          `json:"expires_at"`
 	RetryAfter time.Time          `json:"retry_after,omitempty"`
 	Attempts   int                `json:"attempts,omitempty"`
@@ -457,4 +469,12 @@ type AllocationStatus struct {
 	Error      string             `json:"error,omitempty"`
 	Metadata   map[string]string  `json:"metadata,omitempty"`
 	Request    *AllocationRequest `json:"request,omitempty"`
+}
+
+func (s AllocationStatus) IsRegistered() bool {
+	return s.RegisteredAt != nil && !s.RegisteredAt.IsZero()
+}
+
+func (s AllocationStatus) IsClaimed() bool {
+	return s.ClaimedAt != nil && !s.ClaimedAt.IsZero()
 }

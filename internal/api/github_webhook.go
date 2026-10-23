@@ -158,6 +158,7 @@ type workflowJobPayload struct {
 	Action      string `json:"action"`
 	WorkflowJob struct {
 		ID         int64    `json:"id"`
+		RunnerName string   `json:"runner_name"`
 		Labels     []string `json:"labels"`
 		Conclusion string   `json:"conclusion"`
 	} `json:"workflow_job"`
@@ -221,7 +222,7 @@ func (h *githubWebhookHandler) serve(s *Server, w http.ResponseWriter, r *http.R
 		return
 	}
 	action := payload.Action
-	if action != "queued" && action != "completed" {
+	if action != "queued" && action != "in_progress" && action != "completed" {
 		h.ignore(s, w, "unsupported_action")
 		return
 	}
@@ -371,6 +372,16 @@ func (h *githubWebhookHandler) process(ctx context.Context, payload workflowJobP
 		}
 		h.metrics.matched.WithLabelValues(string(pool.Name), "queued").Inc()
 		return map[string]string{"status": "allocated", "allocation_id": allocation.ID, "pool": string(pool.Name)}, http.StatusAccepted, nil
+	case "in_progress":
+		allocation, found, err := h.service.ClaimWorkflowJob(ctx, jobID, payload.WorkflowJob.RunnerName, payload.WorkflowJob.Labels)
+		if err != nil {
+			return nil, 0, err
+		}
+		if !found {
+			return ignored("unknown_job")
+		}
+		h.metrics.matched.WithLabelValues(string(allocation.Pool), "in_progress").Inc()
+		return map[string]string{"status": "claimed", "allocation_id": allocation.ID, "pool": string(allocation.Pool)}, http.StatusOK, nil
 	default: // completed
 		allocation, found, err := h.service.FinalizeWorkflowJob(ctx, jobID, payload.WorkflowJob.Conclusion)
 		if err != nil {

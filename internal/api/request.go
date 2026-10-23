@@ -40,16 +40,47 @@ func (d *durationRequestValue) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+type registrationTimeoutDurationValue time.Duration
+
+func (d *registrationTimeoutDurationValue) UnmarshalJSON(data []byte) error {
+	raw := strings.TrimSpace(string(data))
+	if raw == "" || raw == "null" {
+		*d = 0
+		return nil
+	}
+
+	if strings.HasPrefix(raw, "\"") && strings.HasSuffix(raw, "\"") {
+		var encoded string
+		if err := json.Unmarshal([]byte(raw), &encoded); err != nil {
+			return fmt.Errorf("invalid registration_timeout: %w", err)
+		}
+		parsed, err := time.ParseDuration(encoded)
+		if err != nil {
+			return fmt.Errorf("invalid registration_timeout: %w", err)
+		}
+		*d = registrationTimeoutDurationValue(parsed)
+		return nil
+	}
+
+	var nanos int64
+	if err := json.Unmarshal([]byte(raw), &nanos); err != nil {
+		return fmt.Errorf("invalid registration_timeout: expected duration string (for example \"5m\") or nanosecond integer")
+	}
+	*d = registrationTimeoutDurationValue(time.Duration(nanos))
+	return nil
+}
+
 func decodeAllocationRequest(reader io.Reader) (model.AllocationRequest, error) {
 	var request struct {
-		Pool                 model.PoolName       `json:"pool"`
-		Backend              *model.BackendName   `json:"backend,omitempty"`
-		JobTimeout           durationRequestValue `json:"job_timeout"`
-		Tenant               string               `json:"tenant,omitempty"`
-		PriorityClass        string               `json:"priority_class,omitempty"`
-		Labels               []string             `json:"labels,omitempty"`
-		RequiredCapabilities []string             `json:"required_capabilities,omitempty"`
-		ExcludedCapabilities []string             `json:"excluded_capabilities,omitempty"`
+		Pool                 model.PoolName                   `json:"pool"`
+		Backend              *model.BackendName               `json:"backend,omitempty"`
+		JobTimeout           durationRequestValue             `json:"job_timeout"`
+		RegistrationTimeout  registrationTimeoutDurationValue `json:"registration_timeout,omitempty"`
+		Tenant               string                           `json:"tenant,omitempty"`
+		PriorityClass        string                           `json:"priority_class,omitempty"`
+		Labels               []string                         `json:"labels,omitempty"`
+		RequiredCapabilities []string                         `json:"required_capabilities,omitempty"`
+		ExcludedCapabilities []string                         `json:"excluded_capabilities,omitempty"`
 	}
 
 	decoder := json.NewDecoder(reader)
@@ -70,6 +101,7 @@ func decodeAllocationRequest(reader io.Reader) (model.AllocationRequest, error) 
 		Pool:                 request.Pool,
 		Backend:              backend,
 		JobTimeout:           time.Duration(request.JobTimeout),
+		RegistrationTimeout:  time.Duration(request.RegistrationTimeout),
 		Tenant:               request.Tenant,
 		PriorityClass:        request.PriorityClass,
 		Labels:               append([]string(nil), request.Labels...),
