@@ -203,3 +203,38 @@ func TestValidateWebhookLabels(t *testing.T) {
 		t.Fatalf("pools without webhookLabels need no secret: %v", err)
 	}
 }
+
+func TestValidateRegistrationTimeoutAndBackendLimits(t *testing.T) {
+	cfg := Default()
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("default config should be valid: %v", err)
+	}
+
+	negReg := cfg
+	negReg.Broker.RegistrationTimeout = -1
+	if err := Validate(negReg); err == nil {
+		t.Fatal("negative broker.registrationTimeout should be rejected")
+	}
+
+	negLimit := cfg
+	negLimit.Broker.BackendLimits = map[model.BackendName]int{model.BackendAzureVM: -1}
+	if err := Validate(negLimit); err == nil {
+		t.Fatal("negative broker.backendLimits should be rejected")
+	}
+
+	negCrossPool := cfg
+	b := negCrossPool.Pools[0].Backends[model.BackendARC]
+	b.CrossPoolMaxRunners = -1
+	negCrossPool.Pools[0].Backends[model.BackendARC] = b
+	if err := Validate(negCrossPool); err == nil {
+		t.Fatal("negative backend.crossPoolMaxRunners should be rejected")
+	}
+
+	negBackendReg := cfg
+	b2 := negBackendReg.Pools[0].Backends[model.BackendARC]
+	b2.RegistrationTimeout = -1
+	negBackendReg.Pools[0].Backends[model.BackendARC] = b2
+	if err := Validate(negBackendReg); err == nil {
+		t.Fatal("negative backend.registrationTimeout should be rejected")
+	}
+}

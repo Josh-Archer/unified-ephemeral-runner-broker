@@ -2685,6 +2685,11 @@ type recordingObserver struct {
 	orphanActions  []string
 	labelGarbage   []string
 	staleSnapshots [][]staleRunnerLabelSnapshot
+	expiredEvents  []string
+}
+
+func (o *recordingObserver) ObserveAllocationExpired(pool model.PoolName, backend model.BackendName, reason string) {
+	o.expiredEvents = append(o.expiredEvents, string(pool)+":"+string(backend)+":"+reason)
 }
 
 func (o *recordingObserver) ObserveOrphanCleanup(_ model.PoolName, _ model.BackendName, action string) {
@@ -4331,4 +4336,348 @@ func TestServiceWiresDesktopActiveCounter_RestartScenario(t *testing.T) {
 	if capStatus.ActiveRunners != 0 || backend.FreeSlots(capStatus) != 2 {
 		t.Fatalf("expected 0 active 2 free after complete, got %+v", capStatus)
 	}
+}
+
+func TestSweepExpiredDynamicRunnerUnregistered(t *testing.T) {
+	observer := &recordingObserver{}
+	cfg := config.Default()
+	cfg.Broker.RegistrationTimeout = 5 * time.Minute
+	service := NewService(
+		cfg,
+		backend.NewRegistry(
+			testBackend{name: model.BackendARC},
+		),
+		nil,
+	)
+	service.observer = observer
+	now := time.Unix(1000, 0)
+	service.now = func() time.Time { return now }
+
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolFull,
+		JobTimeout: 30 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("allocate failed: %v", err)
+	}
+
+	// At 4m, should not expire
+	if swept := service.SweepExpired(now.Add(4 * time.Minute)); swept != 0 {
+		t.Fatalf("expected 0 swept at 4m, got %d", swept)
+	}
+
+	// At 6m, registrationTimeout (5m) has elapsed without registration
+	swept := service.SweepExpired(now.Add(6 * time.Minute))
+	if swept != 1 {
+		t.Fatalf("expected 1 swept at 6m, got %d", swept)
+	}
+
+	updated, ok := service.Get(allocation.ID)
+	if !ok {
+		t.Fatal("allocation not found after sweep")
+	}
+	if updated.State != model.StateExpired {
+		t.Fatalf("expected expired state, got %s", updated.State)
+	}
+	if !strings.Contains(updated.Error, "runner never registered or claimed") {
+		t.Fatalf("expected unregistered timeout error, got %q", updated.Error)
+	}
+
+	foundEvent := false
+	for _, ev := range observer.expiredEvents {
+		if ev == "full:arc:unregistered" {
+			foundEvent = true
+			break
+		}
+	}
+	if !foundEvent {
+		t.Fatalf("expected full:arc:unregistered in %v", observer.expiredEvents)
+	}
+}
+
+func TestSweepExpiredDynamicRunnerRegisteredNotExpiredUntilJobTimeout(t *testing.T) {
+	observer := &recordingObserver{}
+	cfg := config.Default()
+	cfg.Broker.RegistrationTimeout = 5 * time.Minute
+	service := NewService(
+		cfg,
+		backend.NewRegistry(
+			testBackend{name: model.BackendARC},
+		),
+		nil,
+	)
+	service.observer = observer
+	now := time.Unix(1000, 0)
+	service.now = func() time.Time { return now }
+
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolFull,
+		JobTimeout: 20 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("allocate failed: %v", err)
+	}
+
+	// Register allocation at 2m
+	service.now = func() time.Time { return now.Add(2 * time.Minute) }
+	registered, ok, err := service.Register(context.Background(), allocation.ID)
+	if err != nil || !ok {
+		t.Fatalf("register failed: ok=%v err=%v", ok, err)
+	}
+	if registered.RegisteredAt == nil {
+		t.Fatal("expected RegisteredAt to be set")
+	}
+
+	// At 6m (past 5m registrationTimeout, but registered!), should not expire
+	if swept := service.SweepExpired(now.Add(6 * time.Minute)); swept != 0 {
+		t.Fatalf("expected 0 swept at 6m, got %d", swept)
+	}
+
+	// At 21m (past 20m jobTimeout), should expire with job_timeout
+	swept := service.SweepExpired(now.Add(21 * time.Minute))
+	if swept != 1 {
+		t.Fatalf("expected 1 swept at 21m, got %d", swept)
+	}
+
+	updated, ok := service.Get(allocation.ID)
+	if !ok || updated.State != model.StateExpired {
+		t.Fatalf("expected expired state, got ok=%v state=%s", ok, updated.State)
+	}
+	foundEvent := false
+	for _, ev := range observer.expiredEvents {
+		if ev == "full:arc:job_timeout" {
+			foundEvent = true
+			break
+		}
+	}
+	if !foundEvent {
+		t.Fatalf("expected full:arc:job_timeout in %v", observer.expiredEvents)
+	}
+}
+
+func TestSweepExpiredStaticRunnerUnclaimed(t *testing.T) {
+	observer := &recordingObserver{}
+	cfg := config.Default()
+	cfg.Broker.RegistrationTimeout = 10 * time.Minute
+	for i := range cfg.Pools {
+		if cfg.Pools[i].Name == model.PoolLite {
+			b := cfg.Pools[i].Backends[model.BackendAzureVM]
+			b.Enabled = true
+			b.RunnerLabel = "az-vm-static"
+			cfg.Pools[i].Backends[model.BackendAzureVM] = b
+		}
+	}
+	service := NewService(
+		cfg,
+		backend.NewRegistry(
+			testBackend{name: model.BackendAzureVM},
+		),
+		nil,
+	)
+	service.observer = observer
+	now := time.Unix(1000, 0)
+	service.now = func() time.Time { return now }
+
+	azurePin := model.BackendAzureVM
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolLite,
+		Backend:    &azurePin,
+		JobTimeout: 60 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("allocate failed: %v", err)
+	}
+	if allocation.RegisteredAt == nil {
+		t.Fatal("expected RegisteredAt to be automatically set for static runner")
+	}
+	if allocation.ClaimedAt != nil {
+		t.Fatal("expected ClaimedAt to be nil initially")
+	}
+
+	// At 5m, should not expire
+	if swept := service.SweepExpired(now.Add(5 * time.Minute)); swept != 0 {
+		t.Fatalf("expected 0 swept at 5m, got %d", swept)
+	}
+
+	// At 11m, registrationTimeout (10m) has elapsed without job claiming
+	swept := service.SweepExpired(now.Add(11 * time.Minute))
+	if swept != 1 {
+		t.Fatalf("expected 1 swept at 11m, got %d", swept)
+	}
+
+	updated, ok := service.Get(allocation.ID)
+	if !ok || updated.State != model.StateExpired {
+		t.Fatalf("expected expired state, got ok=%v state=%s", ok, updated.State)
+	}
+	if !strings.Contains(updated.Error, "static runner label never claimed") {
+		t.Fatalf("expected unclaimed timeout error, got %q", updated.Error)
+	}
+
+	foundEvent := false
+	for _, ev := range observer.expiredEvents {
+		if ev == "lite:azure-vm:unclaimed" {
+			foundEvent = true
+			break
+		}
+	}
+	if !foundEvent {
+		t.Fatalf("expected lite:azure-vm:unclaimed in %v", observer.expiredEvents)
+	}
+}
+
+func TestSweepExpiredStaticRunnerClaimedNotExpired(t *testing.T) {
+	observer := &recordingObserver{}
+	cfg := config.Default()
+	cfg.Broker.RegistrationTimeout = 10 * time.Minute
+	for i := range cfg.Pools {
+		if cfg.Pools[i].Name == model.PoolLite {
+			b := cfg.Pools[i].Backends[model.BackendAzureVM]
+			b.Enabled = true
+			b.RunnerLabel = "az-vm-static"
+			cfg.Pools[i].Backends[model.BackendAzureVM] = b
+		}
+	}
+	service := NewService(
+		cfg,
+		backend.NewRegistry(
+			testBackend{name: model.BackendAzureVM},
+		),
+		nil,
+	)
+	service.observer = observer
+	now := time.Unix(1000, 0)
+	service.now = func() time.Time { return now }
+
+	azurePin := model.BackendAzureVM
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolLite,
+		Backend:    &azurePin,
+		JobTimeout: 60 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("allocate failed: %v", err)
+	}
+
+	// Claim allocation at 3m
+	service.now = func() time.Time { return now.Add(3 * time.Minute) }
+	claimed, ok, err := service.Claim(context.Background(), allocation.ID)
+	if err != nil || !ok {
+		t.Fatalf("claim failed: ok=%v err=%v", ok, err)
+	}
+	if claimed.ClaimedAt == nil {
+		t.Fatal("expected ClaimedAt to be set")
+	}
+
+	// At 15m, registrationTimeout has elapsed but job was claimed -> must NOT expire!
+	if swept := service.SweepExpired(now.Add(15 * time.Minute)); swept != 0 {
+		t.Fatalf("expected 0 swept at 15m, got %d", swept)
+	}
+	updated, ok := service.Get(allocation.ID)
+	if !ok || updated.State != model.StateReady {
+		t.Fatalf("expected ready state, got ok=%v state=%s", ok, updated.State)
+	}
+}
+
+func TestServiceCrossPoolBackendCapacityLimits(t *testing.T) {
+	cfg := model.BrokerConfig{
+		Broker: model.BrokerRuntimeConfig{
+			DefaultPool: model.PoolName("pool-a"),
+			BackendLimits: map[model.BackendName]int{
+				model.BackendAzureVM: 2,
+			},
+		},
+		Pools: []model.PoolConfig{
+			{
+				Name: "pool-a",
+				Backends: map[model.BackendName]model.BackendConfig{
+					model.BackendAzureVM: {
+						Enabled:             true,
+						Healthy:             true,
+						Weight:              1,
+						MaxRunners:          2,
+						CrossPoolMaxRunners: 2,
+						RunnerLabel:         "az-vm-a",
+					},
+				},
+			},
+			{
+				Name: "pool-b",
+				Backends: map[model.BackendName]model.BackendConfig{
+					model.BackendAzureVM: {
+						Enabled:             true,
+						Healthy:             true,
+						Weight:              1,
+						MaxRunners:          2,
+						CrossPoolMaxRunners: 2,
+						RunnerLabel:         "az-vm-b",
+					},
+				},
+			},
+		},
+	}
+
+	service := NewService(
+		cfg,
+		backend.NewRegistry(
+			testBackend{name: model.BackendAzureVM},
+		),
+		nil,
+	)
+
+	// Allocate 1 in pool-a -> succeeds
+	allocA1, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       "pool-a",
+		JobTimeout: 10 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("allocate pool-a #1 failed: %v", err)
+	}
+
+	// Allocate 1 in pool-b -> succeeds
+	allocB1, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       "pool-b",
+		JobTimeout: 10 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("allocate pool-b #1 failed: %v", err)
+	}
+
+	// Total active for azure-vm across pools is now 2 (which equals crossPoolMaxRunners=2).
+	// Attempt to allocate another in pool-a -> must fail with scheduler.ErrNoCapacity!
+	_, err = service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       "pool-a",
+		JobTimeout: 10 * time.Minute,
+	})
+	if !errors.Is(err, scheduler.ErrNoCapacity) {
+		t.Fatalf("expected ErrNoCapacity, got %v", err)
+	}
+
+	// Also attempt in pool-b -> must fail with scheduler.ErrNoCapacity!
+	_, err = service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       "pool-b",
+		JobTimeout: 10 * time.Minute,
+	})
+	if !errors.Is(err, scheduler.ErrNoCapacity) {
+		t.Fatalf("expected ErrNoCapacity, got %v", err)
+	}
+
+	// Complete allocA1 in pool-a
+	_, _, err = service.Complete(context.Background(), allocA1.ID, completionRequest{State: "completed"})
+	if err != nil {
+		t.Fatalf("complete failed: %v", err)
+	}
+
+	// Now active count is 1. Allocating in pool-b should succeed!
+	allocB2, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       "pool-b",
+		JobTimeout: 10 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("allocate pool-b #2 failed: %v", err)
+	}
+	if allocB2.ID == "" {
+		t.Fatal("expected non-empty allocation id")
+	}
+
+	_ = allocB1
 }

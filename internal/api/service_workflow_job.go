@@ -125,3 +125,51 @@ func (s *Service) FinalizeWorkflowJob(ctx context.Context, jobID int64, conclusi
 	}
 	return updated, true, nil
 }
+
+// ClaimWorkflowJob claims the allocation recorded for jobID or matching runner labels.
+func (s *Service) ClaimWorkflowJob(ctx context.Context, jobID int64, runnerName string, labels []string) (status model.AllocationStatus, found bool, err error) {
+	s.workflowJobMu.Lock()
+	defer s.workflowJobMu.Unlock()
+
+	if jobID > 0 {
+		status, found = s.findByWorkflowJobID(jobID)
+		if found && !isTerminalAllocationState(status.State) {
+			claimed, ok, claimErr := s.Claim(ctx, status.ID)
+			return claimed, ok, claimErr
+		}
+	}
+
+	wanted := normalizeLabelSet(labels)
+	normalizedRunnerName := strings.ToLower(strings.TrimSpace(runnerName))
+	var oldestUnclaimed model.AllocationStatus
+	foundMatch := false
+	for _, alloc := range s.store.List() {
+		if !isActiveAllocationState(alloc.State) {
+			continue
+		}
+		if alloc.ClaimedAt != nil && !alloc.ClaimedAt.IsZero() {
+			continue
+		}
+		allocLabel := strings.ToLower(strings.TrimSpace(alloc.RunnerLabel))
+		if allocLabel == "" {
+			continue
+		}
+		matched := false
+		if _, ok := wanted[allocLabel]; ok {
+			matched = true
+		} else if normalizedRunnerName != "" && allocLabel == normalizedRunnerName {
+			matched = true
+		}
+		if matched {
+			if !foundMatch || alloc.CreatedAt.Before(oldestUnclaimed.CreatedAt) {
+				oldestUnclaimed = alloc
+				foundMatch = true
+			}
+		}
+	}
+	if foundMatch {
+		claimed, ok, claimErr := s.Claim(ctx, oldestUnclaimed.ID)
+		return claimed, ok, claimErr
+	}
+	return model.AllocationStatus{}, false, nil
+}

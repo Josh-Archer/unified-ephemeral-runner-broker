@@ -59,6 +59,13 @@ config:
   broker:
     defaultPool: full
     defaultJobTimeout: 15m
+    # Optional timeout before an unused runner slot expires if the runner never
+    # registers or claims the job (defaults to 10m).
+    registrationTimeout: 10m
+    # Optional broker-wide cross-pool backend capacity limits to avoid over-committing
+    # shared static or cloud runners across pools. Key is backend name, value is limit.
+    backendLimits: {}
+      # azure-vm: 2
     orphanCleanup:
       enabled: false
       quarantineTTL: 15m
@@ -165,6 +172,8 @@ config:
           enabled: true
           healthy: true
           maxRunners: 4
+          # Optional cross-pool backend limit across all pools sharing this backend.
+          # crossPoolMaxRunners: 4
           weight: 1
           capabilities:
             - os:linux

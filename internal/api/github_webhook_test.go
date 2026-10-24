@@ -159,9 +159,9 @@ func TestGitHubWebhookIgnoresNonWorkflowJobEvents(t *testing.T) {
 			t.Fatalf("event %q: got %d %s", event, rec.Code, rec.Body)
 		}
 	}
-	rec := h.send("workflow_job", "d-ip", jobBody("in_progress", 9, "", "self-hosted", "uecb-full"))
+	rec := h.send("workflow_job", "d-waiting", jobBody("waiting", 9, "", "self-hosted", "uecb-full"))
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "unsupported_action") {
-		t.Fatalf("in_progress: got %d %s", rec.Code, rec.Body)
+		t.Fatalf("waiting: got %d %s", rec.Code, rec.Body)
 	}
 	if h.activeCount() != 0 {
 		t.Fatalf("ignored events must not allocate")
@@ -230,6 +230,31 @@ func TestGitHubWebhookQueuedAllocatesAndCompletedFinalizes(t *testing.T) {
 	}
 	if h.activeCount() != 0 {
 		t.Fatal("capacity not released")
+	}
+}
+
+func TestGitHubWebhookInProgressClaimsAllocation(t *testing.T) {
+	h := newWebhookHarness(t, true)
+	rec := h.send("workflow_job", "q1", jobBody("queued", 42, "", "self-hosted", "uecb-full"))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("queued: got %d %s", rec.Code, rec.Body)
+	}
+	allocation, ok := h.service.findByWorkflowJobID(42)
+	if !ok {
+		t.Fatal("allocation not found")
+	}
+	if allocation.ClaimedAt != nil {
+		t.Fatal("expected ClaimedAt to be nil initially")
+	}
+
+	rec = h.send("workflow_job", "ip1", jobBody("in_progress", 42, "", "self-hosted", "uecb-full"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("in_progress: got %d %s", rec.Code, rec.Body)
+	}
+
+	updated, _ := h.service.Get(allocation.ID)
+	if updated.ClaimedAt == nil {
+		t.Fatal("expected ClaimedAt to be set after in_progress")
 	}
 }
 

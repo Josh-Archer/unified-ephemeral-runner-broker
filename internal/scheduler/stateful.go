@@ -35,7 +35,7 @@ func (s *orderedScheduler) Reserve(pool model.PoolConfig, request model.Allocati
 		if !ok {
 			return "", ErrUnknownBackend
 		}
-		if !backendAvailable(cfg, s.active[pool.Name][*pinned]) {
+		if !backendAvailable(cfg, s.active[pool.Name][*pinned], s.activeBackendLocked(*pinned)) {
 			return "", ErrNoCapacity
 		}
 		s.active[pool.Name][*pinned]++
@@ -51,7 +51,7 @@ func (s *orderedScheduler) Reserve(pool model.PoolConfig, request model.Allocati
 	for offset := range len(backends) {
 		candidate := backends[(start+offset)%len(backends)]
 		cfg := pool.Backends[candidate]
-		if !backendAvailable(cfg, s.active[pool.Name][candidate]) {
+		if !backendAvailable(cfg, s.active[pool.Name][candidate], s.activeBackendLocked(candidate)) {
 			continue
 		}
 		s.active[pool.Name][candidate]++
@@ -81,11 +81,25 @@ func (s *orderedScheduler) Active(pool model.PoolName, backend model.BackendName
 	return s.active[pool][backend]
 }
 
-func backendAvailable(cfg model.BackendConfig, active int) bool {
+func (s *orderedScheduler) activeBackendLocked(backend model.BackendName) int {
+	total := 0
+	for _, poolAct := range s.active {
+		total += poolAct[backend]
+	}
+	return total
+}
+
+func backendAvailable(cfg model.BackendConfig, active int, activeBackend int) bool {
 	if !cfg.Enabled || !cfg.Healthy {
 		return false
 	}
-	return active < cfg.MaxRunners
+	if active >= cfg.MaxRunners {
+		return false
+	}
+	if cfg.CrossPoolMaxRunners > 0 && activeBackend >= cfg.CrossPoolMaxRunners {
+		return false
+	}
+	return true
 }
 
 func backendWeight(cfg model.BackendConfig) int {

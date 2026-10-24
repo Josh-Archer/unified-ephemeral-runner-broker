@@ -253,6 +253,15 @@ func (s *Service) rehydrateSchedulerState() error {
 			s.expireUnrehydratableAllocation(status, now, "rehydrate skipped: allocation expired")
 			continue
 		}
+		regTimeout := s.effectiveRegistrationTimeout(status)
+		if regTimeout > 0 && !status.CreatedAt.IsZero() && !status.CreatedAt.Add(regTimeout).After(now) {
+			isStatic := s.isStaticLabelBackend(status.Pool, status.SelectedBackend)
+			if (isStatic && (status.ClaimedAt == nil || status.ClaimedAt.IsZero())) ||
+				(!isStatic && (status.RegisteredAt == nil || status.RegisteredAt.IsZero()) && (status.ClaimedAt == nil || status.ClaimedAt.IsZero())) {
+				s.expireUnrehydratableAllocation(status, now, "rehydrate skipped: registration timeout elapsed")
+				continue
+			}
+		}
 		request := model.AllocationRequest{
 			Pool:          status.Pool,
 			Backend:       &selected,
@@ -881,6 +890,10 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 			warmAllocation.PriorityClass = request.PriorityClass
 			warmAllocation.RequestedLabels = append([]string(nil), request.Labels...)
 			warmAllocation.ExpiresAt = allocation.ExpiresAt
+			warmAllocation.CreatedAt = s.now()
+			nowWarm := s.now()
+			warmAllocation.RegisteredAt = &nowWarm
+			warmAllocation.ClaimedAt = nil
 			warmAllocation.Subject = allocation.Subject
 			warmAllocation.Repository = allocation.Repository
 			warmAllocation.Owner = allocation.Owner
@@ -1016,6 +1029,10 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 			launchMode,
 		)
 		allocation.State = model.StateReady
+		if s.isStaticLabelBackend(pool.Name, selected) {
+			nowStatic := s.now()
+			allocation.RegisteredAt = &nowStatic
+		}
 		// Commit ready only while still reserved so a concurrent cancel cannot be
 		// overwritten with a live runner label.
 		saved, saveErr := s.store.SaveIfState(allocation, model.StateReserved)
@@ -1050,6 +1067,9 @@ func (s *Service) prepareAllocation(ctx context.Context, request model.Allocatio
 		allocation.ID = newID()
 		allocation.CorrelationID = correlationIDFromContext(ctx)
 		allocation.Attempts = 0
+		allocation.CreatedAt = s.now()
+	} else if allocation.CreatedAt.IsZero() {
+		allocation.CreatedAt = s.now()
 	}
 	allocation.Pool = pool
 	allocation.SelectedBackend = selected
@@ -1089,7 +1109,16 @@ func (s *Service) saveReservedAllocation(allocation model.AllocationStatus, pool
 			tenantQuota = quota
 		}
 	}
-	if err := s.store.SaveIfCapacity(allocation, maxRunners, tenantQuota); err != nil {
+	backendLimit := 0
+	if cfg, ok := pool.Backends[allocation.SelectedBackend]; ok {
+		backendLimit = cfg.CrossPoolMaxRunners
+	}
+	if limit, ok := s.cfg.Broker.BackendLimits[allocation.SelectedBackend]; ok && limit > 0 {
+		if backendLimit == 0 || limit < backendLimit {
+			backendLimit = limit
+		}
+	}
+	if err := s.store.SaveIfCapacity(allocation, maxRunners, tenantQuota, backendLimit); err != nil {
 		return err
 	}
 	return nil
@@ -1346,6 +1375,13 @@ func (s *Service) Complete(ctx context.Context, id string, request completionReq
 		result = "conflict"
 		return model.AllocationStatus{}, false, nil
 	}
+	if targetState == model.StateExpired {
+		reason := request.Reason
+		if reason == "" {
+			reason = "client_expired"
+		}
+		s.observer.ObserveAllocationExpired(status.Pool, status.SelectedBackend, reason)
+	}
 	if isActiveAllocationState(status.State) {
 		if pool, err := s.resolvePool(status.Pool); err == nil {
 			s.release(ctx, pool, status.SelectedBackend, status)
@@ -1381,6 +1417,60 @@ func (s *Service) SweepExpired(now time.Time) int {
 	grace := s.reaperGrace()
 	for _, status := range s.store.List() {
 		if isActiveAllocationState(status.State) {
+			// 1. Lease / registration TTL: if no runner registers or claims within registrationTimeout,
+			// move to expired and free the slot immediately.
+			createdAt := status.CreatedAt
+			if createdAt.IsZero() {
+				if !status.ExpiresAt.IsZero() && status.Request != nil && status.Request.JobTimeout > 0 {
+					createdAt = status.ExpiresAt.Add(-status.Request.JobTimeout)
+				} else {
+					createdAt = status.ExpiresAt
+				}
+			}
+			regTimeout := s.effectiveRegistrationTimeout(status)
+			if regTimeout > 0 && !createdAt.IsZero() && !createdAt.Add(regTimeout).After(now) {
+				isStatic := s.isStaticLabelBackend(status.Pool, status.SelectedBackend)
+				expired := false
+				reason := ""
+				message := ""
+				if isStatic {
+					if status.ClaimedAt == nil || status.ClaimedAt.IsZero() {
+						expired = true
+						reason = "unclaimed"
+						message = "allocation expired: static runner label never claimed within registration timeout"
+					}
+				} else {
+					isReg := status.RegisteredAt != nil && !status.RegisteredAt.IsZero()
+					isClaim := status.ClaimedAt != nil && !status.ClaimedAt.IsZero()
+					if !isReg && !isClaim {
+						expired = true
+						reason = "unregistered"
+						message = "allocation expired: runner never registered or claimed within registration timeout"
+					}
+				}
+				if expired {
+					if _, ok := s.markState(status.ID, model.StateExpired, now, message); ok {
+						if pool, err := s.resolvePool(status.Pool); err == nil {
+							s.releaseStaleLabel(context.Background(), pool, status.SelectedBackend, status)
+							s.recordBackendFailureClass(pool, status.SelectedBackend, backend.FailureReasonWaitTimeout, now)
+						} else {
+							s.reclaimStaleRunnerLabel(context.Background(), status)
+						}
+						s.observer.ObserveAllocationExpired(status.Pool, status.SelectedBackend, reason)
+						logAllocationEvent(context.Background(), "allocation_expired", map[string]string{
+							"allocation_id": allocationIDLabel(status.ID),
+							"pool":          string(status.Pool),
+							"backend":       string(status.SelectedBackend),
+							"runner_label":  strings.TrimSpace(status.RunnerLabel),
+							"reason":        reason,
+						})
+						updated++
+					}
+					continue
+				}
+			}
+
+			// 2. Past job-timeout TTL without finalize (+ optional grace):
 			// Reap only after job_timeout (expires_at) plus optional grace.
 			if status.ExpiresAt.IsZero() || status.ExpiresAt.Add(grace).After(now) {
 				continue
@@ -1411,6 +1501,9 @@ func (s *Service) SweepExpired(now time.Time) int {
 				}
 				s.observer.ObserveOrphanCleanup(status.Pool, status.SelectedBackend, orphanAction)
 				s.observer.ObserveAllocationReaped(status.Pool, status.SelectedBackend, string(nextState))
+				if nextState == model.StateExpired {
+					s.observer.ObserveAllocationExpired(status.Pool, status.SelectedBackend, "job_timeout")
+				}
 				logAllocationEvent(context.Background(), "allocation_reaped", map[string]string{
 					"allocation_id": allocationIDLabel(status.ID),
 					"pool":          string(status.Pool),
@@ -1441,6 +1534,7 @@ func (s *Service) SweepExpired(now time.Time) int {
 			// tear down the runner registration.
 			s.reclaimStaleRunnerLabel(context.Background(), status)
 			s.observer.ObserveOrphanCleanup(status.Pool, status.SelectedBackend, orphanActionQuarantineExpired)
+			s.observer.ObserveAllocationExpired(status.Pool, status.SelectedBackend, "quarantine_ttl_elapsed")
 			logAllocationEvent(context.Background(), "allocation_expired", map[string]string{
 				"allocation_id": allocationIDLabel(status.ID),
 				"pool":          string(status.Pool),
@@ -2430,6 +2524,18 @@ func (s *Service) resolvePool(name model.PoolName) (model.PoolConfig, error) {
 	}
 	for _, pool := range s.cfg.Pools {
 		if pool.Name == name {
+			if len(s.cfg.Broker.BackendLimits) > 0 {
+				backendsCopy := make(map[model.BackendName]model.BackendConfig, len(pool.Backends))
+				for bName, bCfg := range pool.Backends {
+					if limit, ok := s.cfg.Broker.BackendLimits[bName]; ok && limit > 0 {
+						if bCfg.CrossPoolMaxRunners == 0 || limit < bCfg.CrossPoolMaxRunners {
+							bCfg.CrossPoolMaxRunners = limit
+						}
+					}
+					backendsCopy[bName] = bCfg
+				}
+				pool.Backends = backendsCopy
+			}
 			return pool, nil
 		}
 	}
@@ -3044,4 +3150,90 @@ func newID() string {
 		return fmt.Sprintf("%d", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(buf)
+}
+
+const defaultRegistrationTimeout = 10 * time.Minute
+
+func (s *Service) effectiveRegistrationTimeout(status model.AllocationStatus) time.Duration {
+	if status.Request != nil && status.Request.RegistrationTimeout > 0 {
+		return status.Request.RegistrationTimeout
+	}
+	if pool, err := s.resolvePool(status.Pool); err == nil {
+		if backendCfg, ok := pool.Backends[status.SelectedBackend]; ok && backendCfg.RegistrationTimeout > 0 {
+			return backendCfg.RegistrationTimeout
+		}
+	}
+	if s != nil && s.cfg.Broker.RegistrationTimeout > 0 {
+		return s.cfg.Broker.RegistrationTimeout
+	}
+	return defaultRegistrationTimeout
+}
+
+func (s *Service) isStaticLabelBackend(poolName model.PoolName, backendName model.BackendName) bool {
+	pool, err := s.resolvePool(poolName)
+	if err != nil {
+		return false
+	}
+	cfg, ok := pool.Backends[backendName]
+	if !ok {
+		return false
+	}
+	return strings.TrimSpace(cfg.RunnerLabel) != ""
+}
+
+// Claim marks an allocation as claimed by a running job.
+// A claimed allocation satisfies registrationTimeout and will not expire
+// early; it remains active until job_timeout or explicit completion/cancel.
+func (s *Service) Claim(ctx context.Context, id string) (model.AllocationStatus, bool, error) {
+	status, ok := s.store.Get(id)
+	if !ok {
+		return model.AllocationStatus{}, false, ErrAllocationNotFound
+	}
+	if isTerminalAllocationState(status.State) {
+		return status, true, ErrAllocationAlreadyCompleted
+	}
+	now := s.now()
+	if status.ClaimedAt == nil || status.ClaimedAt.IsZero() {
+		status.ClaimedAt = &now
+	}
+	if status.RegisteredAt == nil || status.RegisteredAt.IsZero() {
+		status.RegisteredAt = &now
+	}
+	if err := s.store.Save(status); err != nil {
+		return model.AllocationStatus{}, false, err
+	}
+	logAllocationEvent(ctx, "allocation_claimed", map[string]string{
+		"allocation_id": allocationIDLabel(status.ID),
+		"pool":          string(status.Pool),
+		"backend":       string(status.SelectedBackend),
+		"runner_label":  strings.TrimSpace(status.RunnerLabel),
+	})
+	return status, true, nil
+}
+
+// Register marks an allocation as registered by a runner.
+// For dynamic backends, registering satisfies registrationTimeout so the
+// allocation will not expire for failure to register.
+func (s *Service) Register(ctx context.Context, id string) (model.AllocationStatus, bool, error) {
+	status, ok := s.store.Get(id)
+	if !ok {
+		return model.AllocationStatus{}, false, ErrAllocationNotFound
+	}
+	if isTerminalAllocationState(status.State) {
+		return status, true, ErrAllocationAlreadyCompleted
+	}
+	now := s.now()
+	if status.RegisteredAt == nil || status.RegisteredAt.IsZero() {
+		status.RegisteredAt = &now
+	}
+	if err := s.store.Save(status); err != nil {
+		return model.AllocationStatus{}, false, err
+	}
+	logAllocationEvent(ctx, "allocation_registered", map[string]string{
+		"allocation_id": allocationIDLabel(status.ID),
+		"pool":          string(status.Pool),
+		"backend":       string(status.SelectedBackend),
+		"runner_label":  strings.TrimSpace(status.RunnerLabel),
+	})
+	return status, true, nil
 }

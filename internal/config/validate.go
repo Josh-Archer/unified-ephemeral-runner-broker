@@ -58,6 +58,31 @@ func Validate(cfg model.BrokerConfig) error {
 	if err := validateFairShare(cfg); err != nil {
 		return err
 	}
+	if err := validateRegistrationTimeoutAndBackendLimits(cfg); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateRegistrationTimeoutAndBackendLimits(cfg model.BrokerConfig) error {
+	if cfg.Broker.RegistrationTimeout < 0 {
+		return fmt.Errorf("broker.registrationTimeout must not be negative")
+	}
+	for backendName, limit := range cfg.Broker.BackendLimits {
+		if limit < 0 {
+			return fmt.Errorf("broker.backendLimits[%s] must not be negative", backendName)
+		}
+	}
+	for _, pool := range cfg.Pools {
+		for backendName, bCfg := range pool.Backends {
+			if bCfg.RegistrationTimeout < 0 {
+				return fmt.Errorf("pools[%s].backends[%s].registrationTimeout must not be negative", pool.Name, backendName)
+			}
+			if bCfg.CrossPoolMaxRunners < 0 {
+				return fmt.Errorf("pools[%s].backends[%s].crossPoolMaxRunners must not be negative", pool.Name, backendName)
+			}
+		}
+	}
 	return nil
 }
 

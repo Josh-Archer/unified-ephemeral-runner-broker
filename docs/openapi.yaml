@@ -211,6 +211,70 @@ paths:
         '405':
           $ref: '#/components/responses/Error'
 
+  /v1/allocations/{id}/register:
+    post:
+      tags: [allocations]
+      operationId: registerAllocation
+      summary: Mark an allocation as registered
+      description: |
+        Marks an allocation as registered by a runner, satisfying registrationTimeout
+        for dynamic backends.
+      security:
+        - bearerOIDC: []
+      parameters:
+        - $ref: '#/components/parameters/AllocationID'
+        - $ref: '#/components/parameters/CorrelationID'
+      responses:
+        '200':
+          description: Updated allocation status
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/CorrelationID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AllocationStatus'
+        '400':
+          $ref: '#/components/responses/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/Error'
+        '405':
+          $ref: '#/components/responses/Error'
+
+  /v1/allocations/{id}/claim:
+    post:
+      tags: [allocations]
+      operationId: claimAllocation
+      summary: Mark an allocation as claimed
+      description: |
+        Marks an allocation as claimed by a runner or workflow job, satisfying
+        registrationTimeout for both static and dynamic backends.
+      security:
+        - bearerOIDC: []
+      parameters:
+        - $ref: '#/components/parameters/AllocationID'
+        - $ref: '#/components/parameters/CorrelationID'
+      responses:
+        '200':
+          description: Updated allocation status
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/CorrelationID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AllocationStatus'
+        '400':
+          $ref: '#/components/responses/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/Error'
+        '405':
+          $ref: '#/components/responses/Error'
+
 components:
   securitySchemes:
     bearerOIDC:
@@ -290,6 +354,18 @@ components:
             - type: integer
               format: int64
               description: Nanoseconds
+        registration_timeout:
+          description: |
+            Optional timeout duration for the runner to register or claim the
+            job before an unused slot is released (for example `10m`). Numeric
+            nanosecond integers are also accepted. When omitted, the backend or
+            broker default is used.
+          oneOf:
+            - type: string
+              example: 10m
+            - type: integer
+              format: int64
+              description: Nanoseconds
         tenant:
           type: string
           description: |
@@ -365,6 +441,18 @@ components:
           description: Present when state is pending (queue admission)
         attempts:
           type: integer
+        created_at:
+          type: string
+          format: date-time
+          description: Timestamp when the allocation was created
+        registered_at:
+          type: string
+          format: date-time
+          description: Timestamp when the runner registered (or provisioned for static runners)
+        claimed_at:
+          type: string
+          format: date-time
+          description: Timestamp when the runner or workflow job claimed the slot
         state:
           $ref: '#/components/schemas/AllocationState'
         error:

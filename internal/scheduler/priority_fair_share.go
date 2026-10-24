@@ -137,8 +137,9 @@ func (s *priorityFairShareState) Reserve(pool model.PoolConfig, request model.Al
 			return "", ErrUnknownBackend
 		}
 		active := s.active[pool.Name][*pinned]
-		if !backendAvailableForPriorityWithStarvation(cfg, active, pool, request.PriorityClass, starving) {
-			if backendDeniedBySoftReserve(cfg, active, pool, request.PriorityClass) {
+		activeBackend := s.activeBackendLocked(*pinned)
+		if !backendAvailableForPriorityWithStarvation(cfg, active, activeBackend, pool, request.PriorityClass, starving) {
+			if backendDeniedBySoftReserve(cfg, active, activeBackend, pool, request.PriorityClass) {
 				s.recordStarvation(pool, request.PriorityClass, now)
 			}
 			return "", ErrNoCapacity
@@ -177,7 +178,8 @@ func (s *priorityFairShareState) Reserve(pool model.PoolConfig, request model.Al
 		candidate := backends[(start+offset)%len(backends)]
 		cfg := pool.Backends[candidate]
 		active := s.active[pool.Name][candidate]
-		if !backendAvailableForPriorityWithStarvation(cfg, active, pool, request.PriorityClass, starving) {
+		activeBackend := s.activeBackendLocked(candidate)
+		if !backendAvailableForPriorityWithStarvation(cfg, active, activeBackend, pool, request.PriorityClass, starving) {
 			continue
 		}
 
@@ -400,11 +402,22 @@ func priorityFairShareScore(activeTotal, tenantActive, weight int) int {
 	return activeTotal*priorityShareScale + tenantPenalty - (weight-1)*priorityShareClassBoost
 }
 
+func (s *priorityFairShareState) activeBackendLocked(backend model.BackendName) int {
+	total := 0
+	for _, poolAct := range s.active {
+		total += poolAct[backend]
+	}
+	return total
+}
+
 // backendAvailableForPriorityWithStarvation is like backendAvailableForPriority
 // but when starving is true, soft reserves are bypassed so the class can use
 // the full maxRunners budget.
-func backendAvailableForPriorityWithStarvation(cfg model.BackendConfig, active int, pool model.PoolConfig, priorityClass string, starving bool) bool {
+func backendAvailableForPriorityWithStarvation(cfg model.BackendConfig, active int, activeBackend int, pool model.PoolConfig, priorityClass string, starving bool) bool {
 	if !cfg.Enabled || !cfg.Healthy {
+		return false
+	}
+	if cfg.CrossPoolMaxRunners > 0 && activeBackend >= cfg.CrossPoolMaxRunners {
 		return false
 	}
 	if starving {
@@ -416,8 +429,11 @@ func backendAvailableForPriorityWithStarvation(cfg model.BackendConfig, active i
 // backendDeniedBySoftReserve reports a denial caused by higher-lane soft
 // reserves while hard maxRunners still has room. A backend already at
 // maxRunners is a hard-capacity denial and must not arm starvation.
-func backendDeniedBySoftReserve(cfg model.BackendConfig, active int, pool model.PoolConfig, priorityClass string) bool {
+func backendDeniedBySoftReserve(cfg model.BackendConfig, active int, activeBackend int, pool model.PoolConfig, priorityClass string) bool {
 	if !cfg.Enabled || !cfg.Healthy || cfg.MaxRunners <= 0 || active >= cfg.MaxRunners {
+		return false
+	}
+	if cfg.CrossPoolMaxRunners > 0 && activeBackend >= cfg.CrossPoolMaxRunners {
 		return false
 	}
 	return active >= EffectiveMaxRunners(cfg.MaxRunners, pool.FairShare, priorityClass)
@@ -426,7 +442,7 @@ func backendDeniedBySoftReserve(cfg model.BackendConfig, active int, pool model.
 func (s *priorityFairShareState) anyBackendDeniedBySoftReserve(pool model.PoolConfig, priorityClass string) bool {
 	active := s.active[pool.Name]
 	for name, cfg := range pool.Backends {
-		if backendDeniedBySoftReserve(cfg, active[name], pool, priorityClass) {
+		if backendDeniedBySoftReserve(cfg, active[name], s.activeBackendLocked(name), pool, priorityClass) {
 			return true
 		}
 	}

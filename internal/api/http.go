@@ -200,6 +200,62 @@ func (s *Server) handleAllocationByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if strings.HasSuffix(path, "/register") {
+		id := strings.TrimSuffix(path, "/register")
+		id = strings.TrimSuffix(id, "/")
+		if r.Method != http.MethodPost {
+			s.writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+			return
+		}
+		if err := s.authorizeAllocationAccess(claims, id); err != nil {
+			s.writeOwnershipError(w, err)
+			return
+		}
+		status, ok, err := s.service.Register(r.Context(), id)
+		if err != nil {
+			if errors.Is(err, ErrAllocationNotFound) {
+				s.writeError(w, http.StatusNotFound, err)
+				return
+			}
+			s.writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if !ok {
+			s.writeError(w, http.StatusNotFound, errors.New("allocation not found"))
+			return
+		}
+		s.writeJSON(w, http.StatusOK, status)
+		return
+	}
+
+	if strings.HasSuffix(path, "/claim") {
+		id := strings.TrimSuffix(path, "/claim")
+		id = strings.TrimSuffix(id, "/")
+		if r.Method != http.MethodPost {
+			s.writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+			return
+		}
+		if err := s.authorizeAllocationAccess(claims, id); err != nil {
+			s.writeOwnershipError(w, err)
+			return
+		}
+		status, ok, err := s.service.Claim(r.Context(), id)
+		if err != nil {
+			if errors.Is(err, ErrAllocationNotFound) {
+				s.writeError(w, http.StatusNotFound, err)
+				return
+			}
+			s.writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if !ok {
+			s.writeError(w, http.StatusNotFound, errors.New("allocation not found"))
+			return
+		}
+		s.writeJSON(w, http.StatusOK, status)
+		return
+	}
+
 	if r.Method != http.MethodGet {
 		s.writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 		return

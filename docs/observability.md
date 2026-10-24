@@ -44,6 +44,7 @@ Core metrics:
 - `uecb_finalization_latency_seconds{pool,backend,result}`: finalize callback latency.
 - `uecb_cancellations_total{pool,backend,result}`: cancel requests (`success`, `already_terminal`, `not_found`, …).
 - `uecb_cancellation_latency_seconds{pool,backend,result}`: cancel request latency.
+- `uecb_allocation_expired_total{pool,backend,reason}`: expired allocations by pool, backend, and expiry reason (`unregistered`, `unclaimed`, `job_timeout`, `quarantine_ttl_elapsed`).
 - `uecb_queue_depth{pool,state}`: current allocations by state.
 - `uecb_capacity_utilization_ratio{pool,backend}`: active allocation count divided by configured backend capacity.
 - `uecb_backend_circuit_state{pool,backend,state}`: active runtime circuit state for opt-in backends.
