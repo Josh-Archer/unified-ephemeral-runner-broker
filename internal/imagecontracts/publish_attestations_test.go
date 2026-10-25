@@ -29,7 +29,7 @@ func TestPublishRuntimeImagesWorkflowAttestationContract(t *testing.T) {
 		"id: build",
 
 		// Pinned SBOM tooling
-		"anchore/sbom-action@v0.24.0",
+		"uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0",
 		"format: spdx-json",
 		"SYFT_VERSION:",
 		"syft-version:",
@@ -39,7 +39,6 @@ func TestPublishRuntimeImagesWorkflowAttestationContract(t *testing.T) {
 		"16 * 1024 * 1024",
 
 		// GitHub artifact attestation flow bound to digest
-		"actions/attest@v4",
 		"subject-name:",
 		"subject-digest:",
 		"sbom-path:",
@@ -76,8 +75,8 @@ func TestPublishRuntimeImagesWorkflowAttestationContract(t *testing.T) {
 	// Two attest steps: provenance (no sbom-path on first use of actions/attest
 	// is hard to assert precisely) + SBOM — require sbom-path appears once and
 	// actions/attest appears at least twice.
-	if strings.Count(content, "uses: actions/attest@v4") < 2 {
-		t.Fatalf("%s expected at least two actions/attest@v4 steps (provenance + SBOM)", path)
+	if strings.Count(content, "uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4") < 2 {
+		t.Fatalf("%s expected at least two SHA-pinned actions/attest (v4) steps (provenance + SBOM)", path)
 	}
 	if strings.Count(content, "sbom-path:") < 1 {
 		t.Fatalf("%s expected SBOM attestation sbom-path input", path)
