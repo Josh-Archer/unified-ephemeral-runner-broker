@@ -32,14 +32,14 @@ type Event struct {
 
 // Snapshot is a rolling window summary used for scoring.
 type Snapshot struct {
-	Pool            model.PoolName
-	Backend         model.BackendName
-	Samples         int
-	Successes       int
-	Failures        int
-	CapacityErrors  int
-	SuccessRate     float64
-	P95Ready        time.Duration
+	Pool             model.PoolName
+	Backend          model.BackendName
+	Samples          int
+	Successes        int
+	Failures         int
+	CapacityErrors   int
+	SuccessRate      float64
+	P95Ready         time.Duration
 	InsufficientData bool
 }
 

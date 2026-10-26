@@ -313,15 +313,15 @@ type DesktopConfig struct {
 }
 
 type BackendConfig struct {
-	Enabled    bool          `yaml:"enabled" json:"enabled"`
-	Healthy    bool          `yaml:"healthy" json:"healthy"`
-	MaxRunners int           `yaml:"maxRunners" json:"maxRunners"`
+	Enabled    bool `yaml:"enabled" json:"enabled"`
+	Healthy    bool `yaml:"healthy" json:"healthy"`
+	MaxRunners int  `yaml:"maxRunners" json:"maxRunners"`
 	// CrossPoolMaxRunners limits concurrent active allocations for this backend across all pools.
 	CrossPoolMaxRunners int           `yaml:"crossPoolMaxRunners,omitempty" json:"crossPoolMaxRunners,omitempty"`
 	RegistrationTimeout time.Duration `yaml:"registrationTimeout,omitempty" json:"registrationTimeout,omitempty"`
 	WarmMin             int           `yaml:"warmMin" json:"warmMin"`
-	WarmMax    int           `yaml:"warmMax" json:"warmMax"`
-	WarmTTL    time.Duration `yaml:"warmTTL,omitempty" json:"warmTTL,omitempty"`
+	WarmMax             int           `yaml:"warmMax" json:"warmMax"`
+	WarmTTL             time.Duration `yaml:"warmTTL,omitempty" json:"warmTTL,omitempty"`
 	// WarmSchedule optionally gates warmMin/warmMax to calendar windows so cold
 	// cloud backends (Lambda, Cloud Run, Azure Functions, …) can pre-warm only
 	// during known CI periods and stay at zero otherwise for cost control.
@@ -459,19 +459,19 @@ type AllocationStatus struct {
 	Tenant          string      `json:"tenant,omitempty"`
 	PriorityClass   string      `json:"priority_class,omitempty"`
 	// Subject/Repository/Owner bind the allocating OIDC principal for ownership checks.
-	Subject    string             `json:"subject,omitempty"`
-	Repository string             `json:"repository,omitempty"`
-	Owner      string             `json:"owner,omitempty"`
-	CreatedAt  time.Time          `json:"created_at,omitempty"`
-	RegisteredAt *time.Time       `json:"registered_at,omitempty"`
-	ClaimedAt    *time.Time       `json:"claimed_at,omitempty"`
-	ExpiresAt  time.Time          `json:"expires_at"`
-	RetryAfter time.Time          `json:"retry_after,omitempty"`
-	Attempts   int                `json:"attempts,omitempty"`
-	State      AllocationState    `json:"state"`
-	Error      string             `json:"error,omitempty"`
-	Metadata   map[string]string  `json:"metadata,omitempty"`
-	Request    *AllocationRequest `json:"request,omitempty"`
+	Subject      string             `json:"subject,omitempty"`
+	Repository   string             `json:"repository,omitempty"`
+	Owner        string             `json:"owner,omitempty"`
+	CreatedAt    time.Time          `json:"created_at,omitempty"`
+	RegisteredAt *time.Time         `json:"registered_at,omitempty"`
+	ClaimedAt    *time.Time         `json:"claimed_at,omitempty"`
+	ExpiresAt    time.Time          `json:"expires_at"`
+	RetryAfter   time.Time          `json:"retry_after,omitempty"`
+	Attempts     int                `json:"attempts,omitempty"`
+	State        AllocationState    `json:"state"`
+	Error        string             `json:"error,omitempty"`
+	Metadata     map[string]string  `json:"metadata,omitempty"`
+	Request      *AllocationRequest `json:"request,omitempty"`
 }
 
 func (s AllocationStatus) IsRegistered() bool {

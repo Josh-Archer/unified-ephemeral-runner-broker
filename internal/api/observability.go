@@ -368,9 +368,7 @@ func (o *PrometheusObserver) Register(registerer prometheus.Registerer) error {
 		o.orphanedRunners,
 	} {
 		if err := registerer.Register(collector); err != nil {
-			if _, ok := err.(prometheus.AlreadyRegisteredError); !ok {
-				return err
-			}
+			return err
 		}
 	}
 	return nil
