@@ -10,9 +10,9 @@ import (
 	"testing"
 
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
+	"go.opentelemetry.io/otel"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
-	"go.opentelemetry.io/otel"
 )
 
 func installTestTracer(t *testing.T) *tracetest.InMemoryExporter {

@@ -92,10 +92,10 @@ func (noopObserver) ObserveQualityScore(model.PoolName, model.BackendName, float
 func (noopObserver) ObserveAllocationReaped(model.PoolName, model.BackendName, string)  {}
 func (noopObserver) ObserveAllocationExpired(model.PoolName, model.BackendName, string) {}
 func (noopObserver) ObserveOrphanCleanup(model.PoolName, model.BackendName, string)     {}
-func (noopObserver) ObserveLabelGarbage(model.PoolName, model.BackendName, string)     {}
-func (noopObserver) ObserveStaleRunnerLabels([]staleRunnerLabelSnapshot)               {}
-func (noopObserver) ObserveProcessLocalStateLoss(string)                               {}
-func (noopObserver) ObserveRestartOrphans(model.BackendName, string, int)              {}
+func (noopObserver) ObserveLabelGarbage(model.PoolName, model.BackendName, string)      {}
+func (noopObserver) ObserveStaleRunnerLabels([]staleRunnerLabelSnapshot)                {}
+func (noopObserver) ObserveProcessLocalStateLoss(string)                                {}
+func (noopObserver) ObserveRestartOrphans(model.BackendName, string, int)               {}
 
 type liveCapacitySnapshot struct {
 	Backend model.BackendName
@@ -364,9 +364,7 @@ func (o *PrometheusObserver) Register(registerer prometheus.Registerer) error {
 		o.orphanedRunners,
 	} {
 		if err := registerer.Register(collector); err != nil {
-			if _, ok := err.(prometheus.AlreadyRegisteredError); !ok {
-				return err
-			}
+			return err
 		}
 	}
 	return nil

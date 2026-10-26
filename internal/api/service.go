@@ -35,10 +35,10 @@ var ErrBackendLiveCapacity = errors.New("backend live capacity exhausted")
 var ErrBackendBudgetExceeded = errors.New("backend allocation budget exceeded")
 
 const (
-	defaultWarmTTL           = 15 * time.Minute
-	launchModeCold           = "cold"
-	launchModeWarm           = "warm"
-	defaultARCPollInterval   = 100 * time.Millisecond
+	defaultWarmTTL         = 15 * time.Minute
+	launchModeCold         = "cold"
+	launchModeWarm         = "warm"
+	defaultARCPollInterval = 100 * time.Millisecond
 )
 
 // LifecycleNotifier delivers allocation lifecycle events (ready, terminal, and quarantine).

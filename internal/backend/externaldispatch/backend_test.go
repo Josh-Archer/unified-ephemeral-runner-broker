@@ -493,8 +493,8 @@ func TestCleanupTreatsNotFoundAsSuccess(t *testing.T) {
 	})
 
 	err := dispatchBackend.Cleanup(context.Background(), model.AllocationStatus{
-		ID:   "alloc-gone",
-		Pool: model.PoolLite,
+		ID:    "alloc-gone",
+		Pool:  model.PoolLite,
 		State: model.StateExpired,
 	})
 	if err != nil {
@@ -517,8 +517,8 @@ func TestCleanupSurfacesRemoteFailures(t *testing.T) {
 	})
 
 	err := dispatchBackend.Cleanup(context.Background(), model.AllocationStatus{
-		ID:   "alloc-fail",
-		Pool: model.PoolLite,
+		ID:    "alloc-fail",
+		Pool:  model.PoolLite,
 		State: model.StateCanceled,
 	})
 	if err == nil || !strings.Contains(err.Error(), "cleanup rejected") {
@@ -536,8 +536,8 @@ func TestCleanupMissingCleanupURLIsNoop(t *testing.T) {
 	})
 
 	err := dispatchBackend.Cleanup(context.Background(), model.AllocationStatus{
-		ID:   "alloc-skip",
-		Pool: model.PoolLite,
+		ID:    "alloc-skip",
+		Pool:  model.PoolLite,
 		State: model.StateCanceled,
 	})
 	if err != nil {
@@ -563,8 +563,8 @@ func TestCleanupDefaultsRunnerLabelWhenEmpty(t *testing.T) {
 	})
 
 	err := dispatchBackend.Cleanup(context.Background(), model.AllocationStatus{
-		ID:   "xyz",
-		Pool: model.PoolLite,
+		ID:    "xyz",
+		Pool:  model.PoolLite,
 		State: model.StateExpired,
 	})
 	if err != nil {

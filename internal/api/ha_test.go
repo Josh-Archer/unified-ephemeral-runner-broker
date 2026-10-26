@@ -29,10 +29,10 @@ func TestHASharedStoreConcurrentCapacity(t *testing.T) {
 	shared := store.NewMemory()
 	cfg := model.BrokerConfig{
 		Broker: model.BrokerRuntimeConfig{
-			DefaultPool:       model.PoolLite,
-			DefaultJobTimeout: time.Minute,
+			DefaultPool:          model.PoolLite,
+			DefaultJobTimeout:    time.Minute,
 			AllowUnauthenticated: true,
-			StateStore:        model.StateStoreConfig{Type: "memory"},
+			StateStore:           model.StateStoreConfig{Type: "memory"},
 		},
 		Pools: []model.PoolConfig{{
 			Name:      model.PoolLite,

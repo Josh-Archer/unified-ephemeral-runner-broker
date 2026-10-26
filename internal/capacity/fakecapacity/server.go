@@ -25,11 +25,11 @@ type Server struct {
 	URL    string
 	server *httptest.Server
 
-	mu         sync.Mutex
-	status     backend.CapacityStatus
-	freeSlots  int // when > 0 and max is 0, publish free_slots for reconstruction
-	statusCode int
-	body       []byte // raw override body; when set, counters are ignored
+	mu          sync.Mutex
+	status      backend.CapacityStatus
+	freeSlots   int // when > 0 and max is 0, publish free_slots for reconstruction
+	statusCode  int
+	body        []byte // raw override body; when set, counters are ignored
 	requireAuth string
 }
 

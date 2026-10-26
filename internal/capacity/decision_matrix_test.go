@@ -14,15 +14,15 @@ import (
 // These golden cases cover skip-exhausted, stale pass-through/block, error
 // block, and local-only paths without contacting cloud providers.
 type decisionCase struct {
-	name         string
-	cfgMax       int
-	localActive  int
-	hasSnapshot  bool
-	snap         capacity.Snapshot
-	failureMode  string
-	wantMax      int
-	wantAvail    bool
-	wantReason   string
+	name        string
+	cfgMax      int
+	localActive int
+	hasSnapshot bool
+	snap        capacity.Snapshot
+	failureMode string
+	wantMax     int
+	wantAvail   bool
+	wantReason  string
 }
 
 func TestLiveCapacityDecisionMatrix(t *testing.T) {
