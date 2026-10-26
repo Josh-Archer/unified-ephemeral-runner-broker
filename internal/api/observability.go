@@ -4,8 +4,11 @@ import (
 	"context"
 	"log"
 	"net/http"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/store"
@@ -13,8 +16,9 @@ import (
 )
 
 const (
-	correlationIDHeader = "X-Correlation-ID"
-	correlationIDKey    = "correlation_id"
+	correlationIDHeader    = "X-Correlation-ID"
+	correlationIDKey       = "correlation_id"
+	maxCorrelationIDLength = 128
 )
 
 type contextKey string
@@ -92,10 +96,10 @@ func (noopObserver) ObserveQualityScore(model.PoolName, model.BackendName, float
 func (noopObserver) ObserveAllocationReaped(model.PoolName, model.BackendName, string)  {}
 func (noopObserver) ObserveAllocationExpired(model.PoolName, model.BackendName, string) {}
 func (noopObserver) ObserveOrphanCleanup(model.PoolName, model.BackendName, string)     {}
-func (noopObserver) ObserveLabelGarbage(model.PoolName, model.BackendName, string)     {}
-func (noopObserver) ObserveStaleRunnerLabels([]staleRunnerLabelSnapshot)               {}
-func (noopObserver) ObserveProcessLocalStateLoss(string)                               {}
-func (noopObserver) ObserveRestartOrphans(model.BackendName, string, int)              {}
+func (noopObserver) ObserveLabelGarbage(model.PoolName, model.BackendName, string)      {}
+func (noopObserver) ObserveStaleRunnerLabels([]staleRunnerLabelSnapshot)                {}
+func (noopObserver) ObserveProcessLocalStateLoss(string)                                {}
+func (noopObserver) ObserveRestartOrphans(model.BackendName, string, int)               {}
 
 type liveCapacitySnapshot struct {
 	Backend model.BackendName
@@ -649,28 +653,88 @@ func applyPrincipal(status *model.AllocationStatus, claims OIDCClaims) {
 	status.Owner = claims.EffectiveOwner()
 }
 
+// correlationIDFromRequest returns a correlation ID that is safe to echo in
+// response headers and logs. Surrounding whitespace is stripped. Empty values
+// and values that contain CR, LF, other control characters, or runes outside
+// [A-Za-z0-9._:-], or that are longer than maxCorrelationIDLength, are
+// discarded and replaced with newID().
 func correlationIDFromRequest(r *http.Request) string {
 	id := strings.TrimSpace(r.Header.Get(correlationIDHeader))
-	if id == "" {
+	if !validCorrelationID(id) {
 		return newID()
 	}
 	return id
 }
 
-func logAllocationEvent(ctx context.Context, event string, fields map[string]string) {
-	log.Printf("event=%s %s=%s%s", event, correlationIDKey, correlationIDFromContext(ctx), formatLogFields(fields))
+func validCorrelationID(id string) bool {
+	if id == "" || len(id) > maxCorrelationIDLength {
+		return false
+	}
+	for _, r := range id {
+		if unicode.IsControl(r) || !isCorrelationIDRune(r) {
+			return false
+		}
+	}
+	return true
 }
 
+func isCorrelationIDRune(r rune) bool {
+	switch {
+	case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		return true
+	case r == '.', r == '_', r == ':', r == '-':
+		return true
+	default:
+		return false
+	}
+}
+
+func logAllocationEvent(ctx context.Context, event string, fields map[string]string) {
+	log.Printf("event=%s %s=%s%s",
+		formatLogToken(event),
+		correlationIDKey,
+		formatLogToken(correlationIDFromContext(ctx)),
+		formatLogFields(fields),
+	)
+}
+
+// formatLogFields renders fields as " key=value" pairs in sorted key order.
+// Tokens that contain spaces, '=', quotes, or control characters are quoted
+// so one event stays on one line and cannot forge extra fields.
 func formatLogFields(fields map[string]string) string {
 	if len(fields) == 0 {
 		return ""
 	}
+	keys := make([]string, 0, len(fields))
+	for key := range fields {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
 	var builder strings.Builder
-	for key, value := range fields {
+	for _, key := range keys {
 		builder.WriteByte(' ')
-		builder.WriteString(key)
+		builder.WriteString(formatLogToken(key))
 		builder.WriteByte('=')
-		builder.WriteString(value)
+		builder.WriteString(formatLogToken(fields[key]))
 	}
 	return builder.String()
+}
+
+// formatLogToken returns value unchanged when it is a single safe log token.
+// Otherwise it returns strconv.Quote(value), which escapes CR, LF, quotes,
+// and other control characters.
+func formatLogToken(value string) string {
+	if logTokenIsSafe(value) {
+		return value
+	}
+	return strconv.Quote(value)
+}
+
+func logTokenIsSafe(value string) bool {
+	for _, r := range value {
+		if unicode.IsControl(r) || unicode.IsSpace(r) || r == '=' || r == '"' || r == '\'' {
+			return false
+		}
+	}
+	return true
 }
