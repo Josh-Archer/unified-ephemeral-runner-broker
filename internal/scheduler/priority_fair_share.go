@@ -118,7 +118,7 @@ func (s *priorityFairShareState) Reserve(pool model.PoolConfig, request model.Al
 	}
 
 	tenant := normalizeTenant(request.Tenant)
-	if quota, ok := pool.FairShare.Quotas[tenant]; ok {
+	if quota, ok := pool.FairShare.Quota(tenant); ok {
 		tenantTotal := 0
 		for _, counts := range s.tenantActive[pool.Name] {
 			tenantTotal += counts[tenant]
@@ -498,10 +498,8 @@ func priorityClassWeight(fairShare model.FairShareConfig, requestPriorityClass s
 		return defaultNormalPriorityClass
 	}
 
-	if fairShare.PriorityClasses != nil {
-		if weight, ok := fairShare.PriorityClasses[normalized]; ok && weight > 0 {
-			return weight
-		}
+	if weight, ok := fairShare.PriorityClassWeight(normalized); ok && weight > 0 {
+		return weight
 	}
 
 	switch model.PriorityClass(normalized) {
@@ -526,7 +524,7 @@ func normalizePriorityClassString(value string) string {
 // Unknown names share normal, matching priorityClassWeight's fallback.
 func canonicalPriorityClass(fairShare model.FairShareConfig, priorityClass string) string {
 	normalized := normalizePriorityClassString(priorityClass)
-	if weight, ok := fairShare.PriorityClasses[normalized]; ok && weight > 0 {
+	if weight, ok := fairShare.PriorityClassWeight(normalized); ok && weight > 0 {
 		return normalized
 	}
 	switch model.PriorityClass(normalized) {

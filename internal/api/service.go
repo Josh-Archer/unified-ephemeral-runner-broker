@@ -1094,7 +1094,7 @@ func (s *Service) saveReservedAllocation(allocation model.AllocationStatus, pool
 		if tenant == "" {
 			tenant = "default"
 		}
-		if quota, ok := pool.FairShare.Quotas[tenant]; ok {
+		if quota, ok := pool.FairShare.Quota(tenant); ok {
 			tenantQuota = quota
 		}
 	}
