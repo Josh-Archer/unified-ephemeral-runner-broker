@@ -1,6 +1,9 @@
 package model
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 type BackendName string
 
@@ -477,4 +480,33 @@ func (s AllocationStatus) IsRegistered() bool {
 
 func (s AllocationStatus) IsClaimed() bool {
 	return s.ClaimedAt != nil && !s.ClaimedAt.IsZero()
+}
+
+// lookupFold returns the value for key in m, matching keys case-insensitively
+// and ignoring surrounding whitespace so operator-written config keys such as
+// "TeamA" or "Deploy" match normalized request identities.
+func lookupFold(m map[string]int, key string) (int, bool) {
+	if len(m) == 0 {
+		return 0, false
+	}
+	key = strings.TrimSpace(key)
+	if v, ok := m[key]; ok {
+		return v, true
+	}
+	for k, v := range m {
+		if strings.EqualFold(strings.TrimSpace(k), key) {
+			return v, true
+		}
+	}
+	return 0, false
+}
+
+// Quota returns the hard tenant quota for tenant, matching keys case-insensitively.
+func (f FairShareConfig) Quota(tenant string) (int, bool) {
+	return lookupFold(f.Quotas, tenant)
+}
+
+// PriorityClassWeight returns the configured weight for class, matching keys case-insensitively.
+func (f FairShareConfig) PriorityClassWeight(class string) (int, bool) {
+	return lookupFold(f.PriorityClasses, class)
 }
