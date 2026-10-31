@@ -176,7 +176,7 @@ func TestWorkflowCapacityClassificationPreservesBudgetAndRateLimits(t *testing.T
 }
 
 func TestWorkflowTierBlockedPrimaryAndFullFallbackKeepsDemand(t *testing.T) {
-	for _, state := range []string{tier.StateHealthy, tier.StateApproaching} {
+	for _, state := range []string{tier.StateHealthy, tier.StateApproaching, tier.StateUnknown} {
 		t.Run(string(state), func(t *testing.T) {
 			cfg := workflowQueueConfig()
 			cfg.Broker.TierRouting.Enabled = true
@@ -187,7 +187,9 @@ func TestWorkflowTierBlockedPrimaryAndFullFallbackKeepsDemand(t *testing.T) {
 			service.now = func() time.Time { return now }
 			manager := tier.NewManager()
 			manager.SetDecision(tier.Decision{Pool: model.PoolFull, Backend: model.BackendARC, State: tier.StateExceeded, Action: tier.ActionDisable, UpdatedAt: now})
-			manager.SetDecision(tier.Decision{Pool: model.PoolFull, Backend: model.BackendKubernetes, State: state, Action: tier.ActionDeprioritize, UpdatedAt: now})
+			if state != tier.StateUnknown {
+				manager.SetDecision(tier.Decision{Pool: model.PoolFull, Backend: model.BackendKubernetes, State: state, Action: tier.ActionDeprioritize, UpdatedAt: now})
+			}
 			service.SetTierManager(manager)
 			first := ownershipAllocate(t, service, 6001)
 			if first.SelectedBackend != model.BackendKubernetes {
