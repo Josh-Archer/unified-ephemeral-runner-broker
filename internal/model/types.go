@@ -447,6 +447,10 @@ type AllocationRequest struct {
 	// WorkflowJobID is set only by the GitHub workflow_job webhook path; it is
 	// not accepted from the public allocation API.
 	WorkflowJobID int64 `json:"workflow_job_id,omitempty"`
+	// TargetRepository ("owner/repo") is the repository that queued the job. It
+	// is set only by the workflow_job webhook path and selects where the runner
+	// registers when github.scope.type is owner.
+	TargetRepository string `json:"target_repository,omitempty"`
 }
 
 type AllocationStatus struct {

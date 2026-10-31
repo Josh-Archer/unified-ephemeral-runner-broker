@@ -455,3 +455,39 @@ func TestGitHubWebhookSecretFunc(t *testing.T) {
 		t.Fatal("unconfigured must error")
 	}
 }
+
+func repoJobBody(action string, id int64, repository string, labels ...string) string {
+	body := jobBody(action, id, "", labels...)
+	return strings.TrimSuffix(body, "}") + fmt.Sprintf(`,"repository":{"full_name":%q}}`, repository)
+}
+
+func TestGitHubWebhookOwnerScopeRecordsRepositoryAndRejectsOthers(t *testing.T) {
+	h := newWebhookHarness(t, true)
+	h.service.cfg.GitHub.Scope = model.GitHubScope{Type: model.GitHubScopeOwner, Owner: "example-owner"}
+
+	rec := h.send("workflow_job", "o1", repoJobBody("queued", 501, "Example-Owner/questkit", "self-hosted", "uecb-full"))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("queued: got %d %s", rec.Code, rec.Body)
+	}
+	allocation, ok := h.service.findByWorkflowJobID(501)
+	if !ok {
+		t.Fatal("expected an allocation for the owner's repository")
+	}
+	if got := allocation.TargetRepository(); got != "Example-Owner/questkit" {
+		t.Fatalf("target repository = %q", got)
+	}
+
+	before := counterValue(t, "uecb_github_webhook_events_ignored_total", map[string]string{"reason": "foreign_repository"})
+	for i, repo := range []string{"someone-else/repo", ""} {
+		rec = h.send("workflow_job", fmt.Sprintf("o-foreign-%d", i), repoJobBody("queued", int64(600+i), repo, "self-hosted", "uecb-full"))
+		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "foreign_repository") {
+			t.Fatalf("repository %q: got %d %s", repo, rec.Code, rec.Body)
+		}
+		if _, ok := h.service.findByWorkflowJobID(int64(600 + i)); ok {
+			t.Fatalf("repository %q must not allocate", repo)
+		}
+	}
+	if after := counterValue(t, "uecb_github_webhook_events_ignored_total", map[string]string{"reason": "foreign_repository"}); after-before != 2 {
+		t.Fatalf("foreign_repository ignored delta = %v", after-before)
+	}
+}

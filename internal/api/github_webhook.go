@@ -162,6 +162,9 @@ type workflowJobPayload struct {
 		Labels     []string `json:"labels"`
 		Conclusion string   `json:"conclusion"`
 	} `json:"workflow_job"`
+	Repository struct {
+		FullName string `json:"full_name"`
+	} `json:"repository"`
 }
 
 func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
@@ -363,7 +366,11 @@ func (h *githubWebhookHandler) process(ctx context.Context, payload workflowJobP
 		if !ok {
 			return ignored("no_matching_pool")
 		}
-		allocation, created, err := h.service.AllocateForWorkflowJob(ctx, pool, jobID)
+		repository := strings.TrimSpace(payload.Repository.FullName)
+		if !h.service.AcceptsWebhookRepository(repository) {
+			return ignored("foreign_repository")
+		}
+		allocation, created, err := h.service.AllocateForWorkflowJob(ctx, pool, jobID, repository)
 		if err != nil {
 			return nil, 0, err
 		}

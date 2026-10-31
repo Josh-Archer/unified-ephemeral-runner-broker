@@ -238,3 +238,40 @@ func TestValidateRegistrationTimeoutAndBackendLimits(t *testing.T) {
 		t.Fatal("negative backend.registrationTimeout should be rejected")
 	}
 }
+
+func TestValidatePerRepositoryScope(t *testing.T) {
+	cfg := Default()
+	cfg.GitHub.Scope = model.GitHubScope{Type: model.GitHubScopeOwner, Owner: "example-owner"}
+	for i := range cfg.Pools {
+		for name, backendCfg := range cfg.Pools[i].Backends {
+			backendCfg.WarmMin, backendCfg.WarmMax, backendCfg.WarmSchedule = 0, 0, nil
+			cfg.Pools[i].Backends[name] = backendCfg
+		}
+	}
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("owner scope without warm runners should validate: %v", err)
+	}
+
+	withRepo := cfg
+	withRepo.GitHub.Scope.Repository = "fixed"
+	if err := Validate(withRepo); err == nil {
+		t.Fatal("owner scope with a fixed repository should be rejected")
+	}
+
+	noOwner := cfg
+	noOwner.GitHub.Scope.Owner = ""
+	if err := Validate(noOwner); err == nil {
+		t.Fatal("owner scope without an owner should be rejected")
+	}
+
+	pool := cfg.Pools[0]
+	for name, backendCfg := range pool.Backends {
+		backendCfg.Enabled = true
+		backendCfg.WarmMax = 1
+		pool.Backends[name] = backendCfg
+		break
+	}
+	if err := Validate(cfg); err == nil {
+		t.Fatal("owner scope with warm runners should be rejected")
+	}
+}

@@ -89,7 +89,7 @@ func TestPostgresWebhookInboxLeaseExpiryDuringAllocationIsIdempotent(t *testing.
 	results := make(chan allocationResult, 2)
 	for _, service := range []*Service{h.service, secondService} {
 		go func(service *Service) {
-			status, created, err := service.AllocateForWorkflowJob(ctx, pool, 81001)
+			status, created, err := service.AllocateForWorkflowJob(ctx, pool, 81001, "example-org/example-repo")
 			results <- allocationResult{service: service, status: status, created: created, err: err}
 		}(service)
 	}
@@ -98,7 +98,7 @@ func TestPostgresWebhookInboxLeaseExpiryDuringAllocationIsIdempotent(t *testing.
 		if result.err == nil {
 			continue
 		}
-		result.status, result.created, result.err = result.service.AllocateForWorkflowJob(ctx, pool, 81001)
+		result.status, result.created, result.err = result.service.AllocateForWorkflowJob(ctx, pool, 81001, "example-org/example-repo")
 	}
 	if firstResult.err != nil || secondResult.err != nil || firstResult.created == secondResult.created || firstResult.status.ID == "" || firstResult.status.ID != secondResult.status.ID {
 		t.Fatalf("overlapping allocations = %+v, %+v", firstResult, secondResult)

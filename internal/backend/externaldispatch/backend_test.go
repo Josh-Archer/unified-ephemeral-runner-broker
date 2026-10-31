@@ -693,3 +693,54 @@ func TestProvisionCapacityExhaustedConflict(t *testing.T) {
 		t.Fatalf("expected capacity exhausted classification, got %v", err)
 	}
 }
+
+func TestProvisionOwnerScopeRegistersOnRequestingRepository(t *testing.T) {
+	var payload dispatchRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	cfg := newRepoScopedConfig()
+	cfg.GitHub.Scope = model.GitHubScope{Type: model.GitHubScopeOwner, Owner: "example-org"}
+	backend := New(model.BackendCodeBuild, cfg, staticSecrets{
+		"uecb-codebuild": {secretKeyDispatchURL: server.URL},
+	})
+
+	request := model.AllocationRequest{Pool: model.PoolLite, JobTimeout: time.Minute, TargetRepository: "example-org/questkit"}
+	if _, err := backend.Provision(context.Background(), request, model.AllocationStatus{
+		ID:      "job1",
+		Pool:    model.PoolLite,
+		Request: &request,
+	}); err != nil {
+		t.Fatalf("provision failed: %v", err)
+	}
+	if payload.GitHub.ScopeType != model.GitHubScopeRepository || payload.GitHub.Owner != "example-org" || payload.GitHub.Repository != "questkit" {
+		t.Fatalf("expected per-job repository scope, got %+v", payload.GitHub)
+	}
+	if payload.GitHub.TargetURL != "https://github.com/example-org/questkit" {
+		t.Fatalf("unexpected target url %q", payload.GitHub.TargetURL)
+	}
+
+	// The OIDC principal's repository is used when no webhook repository is set.
+	if _, err := backend.Provision(context.Background(), model.AllocationRequest{Pool: model.PoolLite, JobTimeout: time.Minute}, model.AllocationStatus{
+		ID:         "api1",
+		Pool:       model.PoolLite,
+		Repository: "example-org/deskquest",
+	}); err != nil {
+		t.Fatalf("provision failed: %v", err)
+	}
+	if payload.GitHub.Repository != "deskquest" {
+		t.Fatalf("expected OIDC repository, got %+v", payload.GitHub)
+	}
+
+	if _, err := backend.Provision(context.Background(), model.AllocationRequest{Pool: model.PoolLite, JobTimeout: time.Minute}, model.AllocationStatus{
+		ID:         "foreign",
+		Pool:       model.PoolLite,
+		Repository: "someone-else/repo",
+	}); err == nil {
+		t.Fatal("a repository outside the owner must not get a runner")
+	}
+}

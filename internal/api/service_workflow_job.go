@@ -74,21 +74,34 @@ func (s *Service) findByWorkflowJobID(jobID int64) (model.AllocationStatus, bool
 	return found, ok
 }
 
+// AcceptsWebhookRepository reports whether a workflow_job from repository
+// ("owner/repo") may allocate. With github.scope.type owner the repository must
+// belong to that owner, because the runner registers on it; other scopes
+// register on a fixed target and accept any delivery the signature verified.
+func (s *Service) AcceptsWebhookRepository(repository string) bool {
+	if !s.cfg.GitHub.Scope.IsPerRepository() {
+		return true
+	}
+	_, err := s.cfg.GitHub.Scope.ForRepository(repository)
+	return err == nil
+}
+
 // AllocateForWorkflowJob allocates capacity for a queued workflow job through
 // the normal scheduler/budget/admission path. The runner registers with the
-// pool's static webhook labels and the job id is recorded on the allocation.
-// It is idempotent per job id: a second call returns the existing allocation
-// with created=false.
-func (s *Service) AllocateForWorkflowJob(ctx context.Context, pool model.PoolConfig, jobID int64) (status model.AllocationStatus, created bool, err error) {
+// pool's static webhook labels and the job id is recorded on the allocation,
+// along with the repository that queued it. It is idempotent per job id: a
+// second call returns the existing allocation with created=false.
+func (s *Service) AllocateForWorkflowJob(ctx context.Context, pool model.PoolConfig, jobID int64, repository string) (status model.AllocationStatus, created bool, err error) {
 	s.workflowJobMu.Lock()
 	defer s.workflowJobMu.Unlock()
 	if existing, ok := s.findByWorkflowJobID(jobID); ok {
 		return existing, false, nil
 	}
 	status, err = s.Allocate(ctx, model.AllocationRequest{
-		Pool:          pool.Name,
-		Labels:        append([]string(nil), pool.WebhookLabels...),
-		WorkflowJobID: jobID,
+		Pool:             pool.Name,
+		Labels:           append([]string(nil), pool.WebhookLabels...),
+		WorkflowJobID:    jobID,
+		TargetRepository: strings.TrimSpace(repository),
 	})
 	if err != nil {
 		return model.AllocationStatus{}, false, err
