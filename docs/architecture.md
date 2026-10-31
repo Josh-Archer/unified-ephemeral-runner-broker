@@ -103,7 +103,13 @@ On service startup the broker:
    a deterministic default runner label when possible, moves the allocation to
    `quarantined` (when `orphanCleanup.enabled`) or `expired`, releases capacity,
    and best-effort `CleanupBackend.Cleanup`.
-3. For **process-local** stores, **probes `Capacity()`** on backends that publish
+3. For **process-local** stores, **rebuilds lost allocations from live
+   runners** on backends that list them (the `kubernetes` driver reads
+   `uecb-runner-*` pods and the allocation id, runner id and workflow job id
+   annotated on them at provision). Each rebuilt allocation is `ready`, holds
+   its slot, and still completes through the `workflow_job` webhook and
+   `Cleanup`. Pods without a verifiable id fall through to the next step.
+4. For **process-local** stores, **probes `Capacity()`** on backends that publish
    live capacity. When the provider reports more active/pending/warm runners
    than the local store accounts for, the broker creates synthetic reserved
    **capacity holds** (`restart-orphan-<backend>-N`) so it does not immediately

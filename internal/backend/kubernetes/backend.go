@@ -39,7 +39,10 @@ const (
 	labelAllocation   = "uecb.josh-archer.dev/allocation-id"
 	labelPool         = "uecb.josh-archer.dev/pool"
 
-	annotationRepository = "uecb.josh-archer.dev/repository"
+	annotationRepository   = "uecb.josh-archer.dev/repository"
+	annotationAllocationID = "uecb.josh-archer.dev/allocation-id"
+	annotationRunnerID     = "uecb.josh-archer.dev/github-runner-id"
+	annotationWorkflowJob  = "uecb.josh-archer.dev/workflow-job-id"
 )
 
 // API is the subset of runtime.KubernetesAPI the backend uses.
@@ -129,6 +132,18 @@ func (b *Backend) Provision(ctx context.Context, request model.AllocationRequest
 	pod, err := b.buildPod(pool, backendCfg, allocation, jit.Encoded, timeout)
 	if err != nil {
 		return backend.ProvisionedRunner{}, err
+	}
+
+	// Record the full allocation identity on the pod so a restarted broker can
+	// rebuild the allocation from live pods (labels truncate to 63 chars).
+	if meta, ok := pod["metadata"].(map[string]any); ok {
+		if annotations, ok := meta["annotations"].(map[string]any); ok {
+			annotations[annotationAllocationID] = allocation.ID
+			annotations[annotationRunnerID] = strconv.FormatInt(jit.RunnerID, 10)
+			if allocation.Request != nil && allocation.Request.WorkflowJobID > 0 {
+				annotations[annotationWorkflowJob] = strconv.FormatInt(allocation.Request.WorkflowJobID, 10)
+			}
+		}
 	}
 
 	namespace := b.namespace(backendCfg)
@@ -398,7 +413,12 @@ func (b *Backend) buildPod(pool model.PoolConfig, cfg model.BackendConfig, alloc
 type podList struct {
 	Items []struct {
 		Metadata struct {
-			DeletionTimestamp string `json:"deletionTimestamp"`
+			Name              string            `json:"name"`
+			Namespace         string            `json:"namespace"`
+			DeletionTimestamp string            `json:"deletionTimestamp"`
+			CreationTimestamp time.Time         `json:"creationTimestamp"`
+			Labels            map[string]string `json:"labels"`
+			Annotations       map[string]string `json:"annotations"`
 		} `json:"metadata"`
 		Status struct {
 			Phase string `json:"phase"`
@@ -480,4 +500,68 @@ func kubeMessage(body []byte) string {
 		text = text[:512]
 	}
 	return text
+}
+
+// LiveRunners lists this backend's runner pods that still hold a slot
+// (not terminal, not being deleted), with the identity recorded at Provision.
+// The broker uses it on startup to rebuild allocations a restart lost.
+func (b *Backend) LiveRunners(ctx context.Context) ([]backend.LiveRunner, error) {
+	if b.api == nil {
+		return nil, fmt.Errorf("backend %s needs the broker to run in Kubernetes", b.name)
+	}
+	namespaces := map[string]struct{}{}
+	for _, pool := range b.cfg.Pools {
+		if cfg, ok := pool.Backends[b.name]; ok && cfg.Enabled {
+			namespaces[b.namespace(cfg)] = struct{}{}
+		}
+	}
+	selector := url.QueryEscape(fmt.Sprintf("%s=%s,%s=%s", labelManagedBy, labelManagedByVal, labelBackend, b.name))
+	var result []backend.LiveRunner
+	for namespace := range namespaces {
+		code, body, err := b.api.Do(ctx, http.MethodGet, podsPath(namespace, "")+"?labelSelector="+selector, nil)
+		if err != nil {
+			return nil, err
+		}
+		if code < 200 || code >= 300 {
+			return nil, fmt.Errorf("list runner pods in %s: status %d: %s", namespace, code, kubeMessage(body))
+		}
+		var list podList
+		if err := json.Unmarshal(body, &list); err != nil {
+			return nil, fmt.Errorf("decode runner pods in %s: %w", namespace, err)
+		}
+		for _, item := range list.Items {
+			if item.Status.Phase == "Succeeded" || item.Status.Phase == "Failed" || item.Metadata.DeletionTimestamp != "" {
+				continue
+			}
+			id := strings.TrimSpace(item.Metadata.Annotations[annotationAllocationID])
+			if id == "" {
+				id = strings.TrimSpace(item.Metadata.Labels[labelAllocation])
+			}
+			if id == "" || podName(id) != item.Metadata.Name {
+				// Without a verifiable allocation id the pod is left to capacity-gap holds.
+				continue
+			}
+			runner := backend.LiveRunner{
+				AllocationID: id,
+				Pool:         model.PoolName(item.Metadata.Labels[labelPool]),
+				Repository:   item.Metadata.Annotations[annotationRepository],
+				CreatedAt:    item.Metadata.CreationTimestamp,
+				Metadata: map[string]string{
+					"provisioner":  "kubernetes-pod",
+					"lifecycle":    "ephemeral",
+					"namespace":    namespace,
+					"pod_name":     item.Metadata.Name,
+					"runner_label": backend.DefaultRunnerLabel(b.name, id),
+				},
+			}
+			if v := item.Metadata.Annotations[annotationRunnerID]; v != "" {
+				runner.Metadata[metadataRunnerID] = v
+			}
+			if v, err := strconv.ParseInt(item.Metadata.Annotations[annotationWorkflowJob], 10, 64); err == nil && v > 0 {
+				runner.WorkflowJobID = v
+			}
+			result = append(result, runner)
+		}
+	}
+	return result, nil
 }
