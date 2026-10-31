@@ -297,7 +297,7 @@ func TestCapacityCountsLiveRunnerPods(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Capacity: %v", err)
 	}
-	if status.MaxRunners != 6 || status.ActiveRunners != 1 || status.PendingRunners != 1 || backend.FreeSlots(status) != 4 {
+	if status.MaxRunners != 6 || status.ActiveRunners != 2 || status.PendingRunners != 1 || backend.FreeSlots(status) != 3 {
 		t.Fatalf("status = %+v", status)
 	}
 	if !strings.Contains(api.calls[0].path, "labelSelector=") {

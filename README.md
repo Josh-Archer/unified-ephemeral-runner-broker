@@ -512,12 +512,13 @@ the allocation until it becomes `ready` or `queue_wait_timeout` expires.
 - `observability/`: reusable Prometheus alert rules and Grafana dashboard artifacts
 - `pkg/adapter`: public backend adapter SDK and conformance test helpers
 
-## Public CI and Private Release Boundary
+## Public CI and Trusted Release Boundary
 
 This repository is designed for a split trust model:
 
 - Public CI runs on GitHub-hosted runners only
-- A separate private release repository owns the authoritative ARC-backed publish lane
+- The trusted `release.yml` workflow publishes immutable releases from GitHub-hosted runners through the `release` environment
+- The former private release repository is archived and must stay retired
 - Public forks and PRs must never reach self-hosted runners or publish credentials
 
 See [docs/architecture.md](docs/architecture.md) and [docs/security-boundary.md](docs/security-boundary.md) for the full model.
@@ -700,6 +701,40 @@ pools:
 - Pods are named `uecb-runner-<allocation-id>` and deleted when the allocation finishes or is reaped.
 - `Capacity()` counts live pods. Unschedulable pods count as pending, so a full cluster shows no free slots.
 - A ResourceQuota rejection is reported as capacity exhaustion, which lets the scheduler fall back to other backends.
+
+Independent Kubernetes targets can share a pool while keeping their capacity and pod ownership separate. Use a non-builtin backend name and `driver: kubernetes`:
+
+```yaml
+backends:
+  kubernetes-desktop:
+    driver: kubernetes
+    enabled: true
+    healthy: true
+    maxRunners: 5
+    crossPoolMaxRunners: 5
+    capabilities: [cluster-local, docker, privileged]
+    kubernetes:
+      namespace: runners
+      nodeGuard:
+        nodeName: desktop-node
+        requiredLabels: {example.com/runner-admitted: "true"}
+      podLabels: {example.com/evictable: "true"}
+      podAnnotations: {example.com/eviction-policy: lossy}
+      podSpec:
+        containers:
+          - name: runner
+            resources:
+              requests: {cpu: "1", memory: 2Gi}
+              limits: {cpu: "1", memory: 2Gi}
+```
+
+A named target requires positive `maxRunners` and `crossPoolMaxRunners`. When the same target appears in multiple pools, its `driver`, `kubernetes` settings and cross-pool limit must match. The shared limit bounds concurrent allocations across those pools; capacity counts pods with that target's backend label, including pending and terminating runners, and clamps its ceiling to the shared limit. Explicit `costClass` still wins; named Kubernetes targets otherwise have the same local cost as the built-in adapter.
+
+`nodeGuard` reads the named Node immediately before registration and during capacity collection. The Node must be Ready, uncordoned, match every required label, and have no `NoSchedule` or `NoExecute` taints. Unknown node or inventory state reports no free slots, and provisioning returns capacity exhaustion before requesting a JIT registration so another eligible backend can be selected. Grant the broker `get` on just that Node with a `resourceNames`-restricted ClusterRole. The broker adds required labels to the pod's node selector and pins the exact node through required affinity, preserving existing affinity constraints. A guarded template cannot set `nodeName`, which would bypass scheduler admission. Labels revoked before scheduling therefore keep the pod pending; eviction of already running pods remains the operator's responsibility.
+
+Optional `podLabels` and `podAnnotations` carry operator metadata such as eviction policy. Broker ownership labels and the repository annotation override conflicting template entries. When adding a guarded target for hardware already used by ARC, first drain or disable that ARC target so the two provisioners do not each consume the hardware's runner allowance.
+
+A pool can set `webhookJobTimeout` (for example `6h`) for jobs received through workflow-job webhooks, since those events do not include the workflow timeout. Zero preserves `broker.defaultJobTimeout`. This setting does not change timeouts on explicit allocation API requests.
 
 Workflows then use `runs-on: [self-hosted, uecb-full]` in every repository, with the webhook set on each repository (or a GitHub App) for **Workflow jobs**.
 

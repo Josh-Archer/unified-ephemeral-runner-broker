@@ -126,3 +126,14 @@ func TestFreeSlots(t *testing.T) {
 		t.Fatalf("full free = %d, want 0", got)
 	}
 }
+
+func TestNamedKubernetesTargetHasLocalCost(t *testing.T) {
+	cfg := model.BackendConfig{Driver: "kubernetes"}
+	if got := CostClass("kubernetes-desktop", cfg); got != CostClass(model.BackendKubernetes, model.BackendConfig{}) {
+		t.Fatalf("named target cost=%d", got)
+	}
+	cfg.CostClass = 99
+	if got := CostClass("kubernetes-desktop", cfg); got != 99 {
+		t.Fatalf("explicit target cost ignored: %d", got)
+	}
+}

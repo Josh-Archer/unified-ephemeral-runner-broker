@@ -11,13 +11,15 @@ This public repository must stay free of private environment details.
 ## Public CI Rules
 
 - GitHub-hosted runners only
-- no publish jobs
+- pull request and audit workflows have no publish jobs
 - no self-hosted runner access
 - no privileged environment secrets
 
 ## Release Rules
 
-- authoritative releases are built and published from a separate private release lane
+- authoritative releases use the repository's trusted `release.yml` workflow
+  and its `release` environment on GitHub-hosted runners
+- the former private release repository is archived and must stay retired
 - only immutable tags or SHAs are promoted
 - images and charts are signed and published with digests
 - public runtime image publishes attach digest-bound provenance and SPDX SBOM

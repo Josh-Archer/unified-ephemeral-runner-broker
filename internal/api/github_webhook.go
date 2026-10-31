@@ -166,6 +166,7 @@ type workflowJobPayload struct {
 		ID         int64    `json:"id"`
 		RunID      int64    `json:"run_id"`
 		RunnerName string   `json:"runner_name"`
+		RunnerID   int64    `json:"runner_id"`
 		Labels     []string `json:"labels"`
 		Conclusion string   `json:"conclusion"`
 	} `json:"workflow_job"`
@@ -367,15 +368,16 @@ func (h *githubWebhookHandler) process(ctx context.Context, payload workflowJobP
 		h.metrics.ignored.WithLabelValues(reason).Inc()
 		return map[string]string{"status": "ignored", "reason": reason}, http.StatusOK, nil
 	}
+	repository := strings.TrimSpace(payload.Repository.FullName)
+	if !h.service.AcceptsWebhookRepository(repository) {
+		return ignored("foreign_repository")
+	}
+	runner := WorkflowJobRunner{Repository: repository, Name: payload.WorkflowJob.RunnerName, ID: payload.WorkflowJob.RunnerID}
 	switch payload.Action {
 	case "queued":
 		pool, ok := h.service.MatchWebhookPool(payload.WorkflowJob.Labels)
 		if !ok {
 			return ignored("no_matching_pool")
-		}
-		repository := strings.TrimSpace(payload.Repository.FullName)
-		if !h.service.AcceptsWebhookRepository(repository) {
-			return ignored("foreign_repository")
 		}
 		if h.opts.HeadRepository != nil {
 			if _, exists := h.service.findByWorkflowJobID(jobID); !exists {
@@ -398,7 +400,7 @@ func (h *githubWebhookHandler) process(ctx context.Context, payload workflowJobP
 		h.metrics.matched.WithLabelValues(string(pool.Name), "queued").Inc()
 		return map[string]string{"status": "allocated", "allocation_id": allocation.ID, "pool": string(pool.Name)}, http.StatusAccepted, nil
 	case "in_progress":
-		allocation, found, err := h.service.ClaimWorkflowJob(ctx, jobID, payload.WorkflowJob.RunnerName, payload.WorkflowJob.Labels)
+		allocation, found, err := h.service.ClaimWorkflowJob(ctx, jobID, payload.WorkflowJob.RunnerName, payload.WorkflowJob.Labels, runner)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -408,7 +410,7 @@ func (h *githubWebhookHandler) process(ctx context.Context, payload workflowJobP
 		h.metrics.matched.WithLabelValues(string(allocation.Pool), "in_progress").Inc()
 		return map[string]string{"status": "claimed", "allocation_id": allocation.ID, "pool": string(allocation.Pool)}, http.StatusOK, nil
 	default: // completed
-		allocation, found, err := h.service.FinalizeWorkflowJob(ctx, jobID, payload.WorkflowJob.Conclusion)
+		allocation, found, err := h.service.FinalizeWorkflowJob(ctx, jobID, payload.WorkflowJob.Conclusion, runner)
 		if err != nil {
 			return nil, 0, err
 		}
