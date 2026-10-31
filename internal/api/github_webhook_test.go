@@ -455,3 +455,114 @@ func TestGitHubWebhookSecretFunc(t *testing.T) {
 		t.Fatal("unconfigured must error")
 	}
 }
+
+func repoJobBody(action string, id int64, repository string, labels ...string) string {
+	body := jobBody(action, id, "", labels...)
+	return strings.TrimSuffix(body, "}") + fmt.Sprintf(`,"repository":{"full_name":%q}}`, repository)
+}
+
+func TestGitHubWebhookOwnerScopeRecordsRepositoryAndRejectsOthers(t *testing.T) {
+	h := newWebhookHarness(t, true)
+	h.service.cfg.GitHub.Scope = model.GitHubScope{Type: model.GitHubScopeOwner, Owner: "example-owner"}
+
+	rec := h.send("workflow_job", "o1", repoJobBody("queued", 501, "Example-Owner/questkit", "self-hosted", "uecb-full"))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("queued: got %d %s", rec.Code, rec.Body)
+	}
+	allocation, ok := h.service.findByWorkflowJobID(501)
+	if !ok {
+		t.Fatal("expected an allocation for the owner's repository")
+	}
+	if got := allocation.TargetRepository(); got != "Example-Owner/questkit" {
+		t.Fatalf("target repository = %q", got)
+	}
+	if allocation.Tenant != "example-owner/questkit" {
+		t.Fatalf("tenant = %q, want the repository for per-repository fair share", allocation.Tenant)
+	}
+
+	before := counterValue(t, "uecb_github_webhook_events_ignored_total", map[string]string{"reason": "foreign_repository"})
+	for i, repo := range []string{"someone-else/repo", ""} {
+		rec = h.send("workflow_job", fmt.Sprintf("o-foreign-%d", i), repoJobBody("queued", int64(600+i), repo, "self-hosted", "uecb-full"))
+		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "foreign_repository") {
+			t.Fatalf("repository %q: got %d %s", repo, rec.Code, rec.Body)
+		}
+		if _, ok := h.service.findByWorkflowJobID(int64(600 + i)); ok {
+			t.Fatalf("repository %q must not allocate", repo)
+		}
+	}
+	if after := counterValue(t, "uecb_github_webhook_events_ignored_total", map[string]string{"reason": "foreign_repository"}); after-before != 2 {
+		t.Fatalf("foreign_repository ignored delta = %v", after-before)
+	}
+}
+
+func TestWarmRunnersOnlyServeTheDefaultRepositoryUnderOwnerScope(t *testing.T) {
+	service := newServiceWithConfig(func(*model.PoolConfig) {})
+	request := func(repo string) model.AllocationStatus { return model.AllocationStatus{Repository: repo} }
+
+	if !service.warmRunnerServes(request("anyone/anything")) {
+		t.Fatal("fixed scopes keep sharing warm runners")
+	}
+
+	service.cfg.GitHub.Scope = model.GitHubScope{Type: model.GitHubScopeOwner, Owner: "example-owner", Repository: "home"}
+	for repo, want := range map[string]bool{
+		"example-owner/home":     true,
+		"Example-Owner/HOME":     true,
+		"":                       true,
+		"example-owner/questkit": false,
+		"someone-else/home":      false,
+	} {
+		if got := service.warmRunnerServes(request(repo)); got != want {
+			t.Errorf("warmRunnerServes(%q) = %v, want %v", repo, got, want)
+		}
+	}
+
+	service.cfg.GitHub.Scope.Repository = ""
+	if service.warmRunnerServes(request("example-owner/home")) {
+		t.Fatal("without a default repository there are no warm runners to share")
+	}
+}
+
+func TestGitHubWebhookRejectsForkPullRequestJobs(t *testing.T) {
+	h := newWebhookHarness(t, true)
+	h.service.cfg.GitHub.Scope = model.GitHubScope{Type: model.GitHubScopeOwner, Owner: "example-owner"}
+	heads := map[int64]string{1: "example-owner/questkit", 2: "attacker/questkit"}
+	lookups := 0
+	h.server.githubWebhook.opts.HeadRepository = func(_ context.Context, repo string, runID int64) (string, error) {
+		lookups++
+		if repo != "example-owner/questkit" {
+			t.Errorf("looked up %q", repo)
+		}
+		if head, ok := heads[runID]; ok {
+			return head, nil
+		}
+		return "", fmt.Errorf("run %d not found", runID)
+	}
+	body := func(jobID, runID int64) string {
+		b := repoJobBody("queued", jobID, "example-owner/questkit", "self-hosted", "uecb-full")
+		return strings.Replace(b, fmt.Sprintf(`"id":%d,`, jobID), fmt.Sprintf(`"id":%d,"run_id":%d,`, jobID, runID), 1)
+	}
+
+	if rec := h.send("workflow_job", "f1", body(701, 1)); rec.Code != http.StatusAccepted {
+		t.Fatalf("same-repository job: got %d %s", rec.Code, rec.Body)
+	}
+	rec := h.send("workflow_job", "f2", body(702, 2))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "fork_pull_request") {
+		t.Fatalf("fork job: got %d %s", rec.Code, rec.Body)
+	}
+	if _, ok := h.service.findByWorkflowJobID(702); ok {
+		t.Fatal("a fork pull request job must not get a runner")
+	}
+	if rec := h.send("workflow_job", "f3", body(703, 3)); rec.Code < 500 {
+		t.Fatalf("a failed lookup must fail the delivery, got %d %s", rec.Code, rec.Body)
+	}
+	if _, ok := h.service.findByWorkflowJobID(703); ok {
+		t.Fatal("a failed lookup must not allocate")
+	}
+	before := lookups
+	if rec := h.send("workflow_job", "f1-dup", body(701, 1)); rec.Code != http.StatusOK {
+		t.Fatalf("duplicate: got %d", rec.Code)
+	}
+	if lookups != before {
+		t.Fatal("an already allocated job needs no second lookup")
+	}
+}

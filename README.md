@@ -638,8 +638,70 @@ are in [docs/image-attestations.md](docs/image-attestations.md).
 
 - `organization`
 - `repository`
+- `owner`
 
 Repository scope requires `github.scope.owner` and `github.scope.repository`. Organization scope requires `github.scope.organization`.
+
+Owner scope requires `github.scope.owner`. `github.scope.repository` is optional there: it is the default repository for allocations that name none, such as warm runners or unauthenticated callers. Each runner registers on the repository that asked for it: the `repository.full_name` of a `workflow_job` webhook, or the `repository` claim of the caller's OIDC token. Repositories of other owners are refused, and webhook deliveries from them are ignored with reason `foreign_repository`. Use it when the owner is a personal account. Personal accounts have no organization-level runners, so a repository or organization scope cannot serve all of their repositories from one pool. Under owner scope:
+
+- The GitHub token (`github.auth.secretRef`) must be able to register runners on every repository that will use the pool.
+- Warm runners register on the default repository and are handed only to allocations from that repository. Without a default repository, warm runners are rejected at config load.
+- Webhook allocations use the repository, lower-cased, as their fair-share tenant, so `fairShare.quotas` can cap a single repository.
+- Webhook jobs whose code comes from another repository get no runner (ignored with reason `fork_pull_request`). For a `pull_request` from a fork, the fork author writes the workflow, including its `runs-on` labels. The broker reads the job's workflow run (`head_repository`) with its own token. If that lookup fails, the delivery fails instead of allocating. Set `broker.githubWebhook.allowForkPullRequests: true` only if fork code may run on these runners.
+
+### Shared in-cluster pool (`kubernetes` backend)
+
+The `arc` backend only hands out the label of an existing ARC runner scale set, and a scale set registers on one repository or organization. The `kubernetes` backend instead registers one ephemeral runner per allocation on the allocation's resolved scope, then starts a pod for it, so together with owner scope one pool serves every repository. The broker registers the runner with its own token (`generate-jitconfig`). The pod receives only that runner's single-use just-in-time config, never the GitHub token, so a job cannot read credentials for other repositories:
+
+```yaml
+github:
+  auth: {mode: github-app, secretRef: uecb-github-app}
+  scope: {type: owner, owner: Josh-Archer}
+broker:
+  githubWebhook: {secretRef: uecb-github-webhook}
+pools:
+  - name: full
+    labels: [self-hosted, linux, x64, uecb, uecb-full]
+    webhookLabels: [self-hosted, uecb-full]
+    scheduler: priority-fair-share
+    capabilityProfile: full
+    fairShare:
+      enabled: true
+      quotas: {josh-archer/deskquest: 3}
+    backends:
+      kubernetes:
+        enabled: true
+        healthy: true
+        maxRunners: 6
+        capabilities: [cluster-local, docker, privileged]
+        kubernetes:
+          namespace: arc-runners
+          podSpec:
+            nodeSelector: {kubernetes.io/arch: amd64}
+            containers:
+              - name: runner
+                env: [{name: DOCKER_HOST, value: unix:///var/run/docker/docker.sock}]
+                resources: {requests: {cpu: "1", memory: 2Gi}}
+                volumeMounts: [{name: dind-sock, mountPath: /var/run/docker}]
+              - name: dind
+                image: docker:dind
+                args: [dockerd, --host=unix:///var/run/docker/docker.sock]
+                securityContext: {privileged: true}
+                volumeMounts: [{name: dind-sock, mountPath: /var/run/docker}]
+            volumes: [{name: dind-sock, emptyDir: {}}]
+```
+
+- `podSpec` is a plain Kubernetes PodSpec used as the template. The broker sets `restartPolicy: Never` and `activeDeadlineSeconds` (job timeout plus `deadlineGrace`, default 10m).
+- The broker sets `ACTIONS_RUNNER_INPUT_JITCONFIG` on the container named `runnerContainer` (default `runner`). That container runs `image` (default `ghcr.io/actions/actions-runner:latest`) with command `/home/runner/run.sh` unless the template sets them.
+- The JIT config is a pod environment value, so anyone who can read pods in the namespace can see it until the runner has used it. Keep `pods/get` there limited to the broker and admins.
+- The broker reads its token from `github.auth.secretRef` (key `github_token`). It deletes the runner registration if the pod cannot be created, and again on finalize or reap if the runner never ran a job.
+- Jobs from different repositories share the namespace and nodes. Give the pods a service account with no RBAC bindings and `automountServiceAccountToken: false`, and limit privileges to the dind sidecar.
+- The broker needs pod `create`, `delete`, `get` and `list` there (`runnerPods.enabled` in the Helm chart).
+- Pods are named `uecb-runner-<allocation-id>` and deleted when the allocation finishes or is reaped.
+- `Capacity()` counts live pods. Unschedulable pods count as pending, so a full cluster shows no free slots.
+- A ResourceQuota rejection is reported as capacity exhaustion, which lets the scheduler fall back to other backends.
+
+Workflows then use `runs-on: [self-hosted, uecb-full]` in every repository, with the webhook set on each repository (or a GitHub App) for **Workflow jobs**.
 
 ## Scheduler Configuration
 

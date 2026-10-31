@@ -1674,9 +1674,31 @@ func (s *Service) observeTierState() {
 	s.observer.ObserveTierState(snapshots)
 }
 
+// warmRunnerServes reports whether a warm runner can take request. Under owner
+// scope warm runners register on the default repository, so they only serve
+// allocations that resolve to that same repository.
+func (s *Service) warmRunnerServes(request model.AllocationStatus) bool {
+	scope := s.cfg.GitHub.Scope
+	if !scope.IsPerRepository() {
+		return true
+	}
+	warmScope, err := scope.ForRepository("")
+	if err != nil {
+		return false
+	}
+	wanted, err := scope.ForRepository(request.TargetRepository())
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(wanted.Repository, warmScope.Repository)
+}
+
 func (s *Service) consumeWarmAllocation(ctx context.Context, pool model.PoolConfig, backendName model.BackendName, request model.AllocationStatus) (model.AllocationStatus, bool) {
 	cfg, ok := pool.Backends[backendName]
 	if !ok || !cfg.Enabled || !cfg.Healthy || !isWarmProvisionableBackend(backendName) {
+		return model.AllocationStatus{}, false
+	}
+	if !s.warmRunnerServes(request) {
 		return model.AllocationStatus{}, false
 	}
 

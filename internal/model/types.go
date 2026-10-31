@@ -17,6 +17,10 @@ const (
 	BackendEC2            BackendName = "ec2"
 	BackendGCE            BackendName = "gce"
 	BackendDesktop        BackendName = "desktop"
+	// BackendKubernetes launches one runner pod per allocation in the broker's
+	// cluster. Unlike arc it does not depend on a pre-registered scale set, so
+	// it works with github.scope.type owner.
+	BackendKubernetes BackendName = "kubernetes"
 )
 
 type PoolName string
@@ -179,6 +183,11 @@ type GitHubWebhookConfig struct {
 	SecretRef string `yaml:"secretRef,omitempty" json:"secretRef,omitempty"`
 	// SecretKey is the key inside SecretRef (default: webhook_secret).
 	SecretKey string `yaml:"secretKey,omitempty" json:"secretKey,omitempty"`
+	// AllowForkPullRequests lets jobs whose code comes from another repository
+	// (pull requests from forks) get a runner under github.scope.type owner.
+	// Off by default: anyone can open such a pull request on a public
+	// repository and choose its runs-on labels.
+	AllowForkPullRequests bool `yaml:"allowForkPullRequests,omitempty" json:"allowForkPullRequests,omitempty"`
 }
 
 // WebhooksConfig controls outbound allocation lifecycle event delivery.
@@ -312,6 +321,26 @@ type DesktopConfig struct {
 	CheckPort int    `yaml:"checkPort" json:"checkPort"`
 }
 
+// KubernetesBackendConfig configures the kubernetes backend's runner pods.
+type KubernetesBackendConfig struct {
+	// Namespace holds the runner pods. Empty means the broker's namespace.
+	Namespace string `yaml:"namespace,omitempty" json:"namespace,omitempty"`
+	// Image is the actions runner image for the runner container when PodSpec
+	// does not set one. Defaults to ghcr.io/actions/actions-runner:latest; the
+	// container command defaults to /home/runner/run.sh.
+	Image string `yaml:"image,omitempty" json:"image,omitempty"`
+	// RunnerContainer names the container in PodSpec that runs the actions
+	// runner and receives its just-in-time config. Defaults to "runner".
+	RunnerContainer string `yaml:"runnerContainer,omitempty" json:"runnerContainer,omitempty"`
+	// PodSpec is a Kubernetes PodSpec (affinity, resources, a dind sidecar,
+	// volumes, ...) used as the template for every runner pod. When empty the
+	// pod has only the runner container.
+	PodSpec map[string]any `yaml:"podSpec,omitempty" json:"podSpec,omitempty"`
+	// DeadlineGrace is added to the job timeout to form the pod's
+	// activeDeadlineSeconds. Defaults to 10 minutes.
+	DeadlineGrace time.Duration `yaml:"deadlineGrace,omitempty" json:"deadlineGrace,omitempty"`
+}
+
 type BackendConfig struct {
 	Enabled    bool `yaml:"enabled" json:"enabled"`
 	Healthy    bool `yaml:"healthy" json:"healthy"`
@@ -330,17 +359,18 @@ type BackendConfig struct {
 	// CostClass ranks relative expense for scheduler tie-breaking when free
 	// capacity is equal. Lower is cheaper. Zero means use the built-in default
 	// for the backend name (cluster-local first, then free-tier cloud, then VMs).
-	CostClass      int                  `yaml:"costClass,omitempty" json:"costClass,omitempty"`
-	MaxJobDuration time.Duration        `yaml:"maxJobDuration,omitempty" json:"maxJobDuration,omitempty"`
-	Capabilities   []string             `yaml:"capabilities,omitempty" json:"capabilities,omitempty"`
-	RunnerLabel    string               `yaml:"runnerLabel,omitempty" json:"runnerLabel,omitempty"`
-	Template       string               `yaml:"template,omitempty" json:"template,omitempty"`
-	SecretRef      string               `yaml:"secretRef,omitempty" json:"secretRef,omitempty"`
-	CircuitBreaker CircuitBreakerConfig `yaml:"circuitBreaker,omitempty" json:"circuitBreaker,omitempty"`
-	RateLimit      RateLimitConfig      `yaml:"rateLimit,omitempty" json:"rateLimit,omitempty"`
-	Budget         BudgetConfig         `yaml:"budget,omitempty" json:"budget,omitempty"`
-	TierRules      []TierRuleConfig     `yaml:"tierRules,omitempty" json:"tierRules,omitempty"`
-	Desktop        *DesktopConfig       `yaml:"desktop,omitempty" json:"desktop,omitempty"`
+	CostClass      int                      `yaml:"costClass,omitempty" json:"costClass,omitempty"`
+	MaxJobDuration time.Duration            `yaml:"maxJobDuration,omitempty" json:"maxJobDuration,omitempty"`
+	Capabilities   []string                 `yaml:"capabilities,omitempty" json:"capabilities,omitempty"`
+	RunnerLabel    string                   `yaml:"runnerLabel,omitempty" json:"runnerLabel,omitempty"`
+	Template       string                   `yaml:"template,omitempty" json:"template,omitempty"`
+	SecretRef      string                   `yaml:"secretRef,omitempty" json:"secretRef,omitempty"`
+	CircuitBreaker CircuitBreakerConfig     `yaml:"circuitBreaker,omitempty" json:"circuitBreaker,omitempty"`
+	RateLimit      RateLimitConfig          `yaml:"rateLimit,omitempty" json:"rateLimit,omitempty"`
+	Budget         BudgetConfig             `yaml:"budget,omitempty" json:"budget,omitempty"`
+	TierRules      []TierRuleConfig         `yaml:"tierRules,omitempty" json:"tierRules,omitempty"`
+	Desktop        *DesktopConfig           `yaml:"desktop,omitempty" json:"desktop,omitempty"`
+	Kubernetes     *KubernetesBackendConfig `yaml:"kubernetes,omitempty" json:"kubernetes,omitempty"`
 }
 
 // WarmScheduleConfig controls when warm pool targets apply. With no windows,
@@ -447,6 +477,10 @@ type AllocationRequest struct {
 	// WorkflowJobID is set only by the GitHub workflow_job webhook path; it is
 	// not accepted from the public allocation API.
 	WorkflowJobID int64 `json:"workflow_job_id,omitempty"`
+	// TargetRepository ("owner/repo") is the repository that queued the job. It
+	// is set only by the workflow_job webhook path and selects where the runner
+	// registers when github.scope.type is owner.
+	TargetRepository string `json:"target_repository,omitempty"`
 }
 
 type AllocationStatus struct {

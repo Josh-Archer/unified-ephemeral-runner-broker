@@ -2,8 +2,6 @@ package runtime
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -11,11 +9,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 )
@@ -59,47 +54,18 @@ type SecretRefChecker struct {
 }
 
 func NewSecretReaderFromEnv() (SecretReader, error) {
-	namespace := strings.TrimSpace(os.Getenv("UECB_POD_NAMESPACE"))
-	if namespace == "" {
+	api, err := NewKubernetesAPIFromEnv()
+	if err != nil {
+		return nil, err
+	}
+	if api == nil {
 		return noopSecretReader{}, nil
 	}
-
-	host := strings.TrimSpace(os.Getenv("KUBERNETES_SERVICE_HOST"))
-	port := strings.TrimSpace(os.Getenv("KUBERNETES_SERVICE_PORT"))
-	if host == "" || port == "" {
-		return nil, fmt.Errorf("kubernetes service host/port are not set")
-	}
-
-	tokenBytes, err := os.ReadFile(filepath.Join(serviceAccountRoot, tokenFileName))
-	if err != nil {
-		return nil, fmt.Errorf("read service account token: %w", err)
-	}
-
-	caBytes, err := os.ReadFile(filepath.Join(serviceAccountRoot, caFileName))
-	if err != nil {
-		return nil, fmt.Errorf("read service account CA: %w", err)
-	}
-
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(caBytes) {
-		return nil, errors.New("append kubernetes service account CA cert")
-	}
-
-	client := &http.Client{
-		Timeout: 5 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				MinVersion: tls.VersionTLS12,
-				RootCAs:    pool,
-			},
-		},
-	}
-
 	return &kubernetesSecretClient{
-		namespace: namespace,
-		baseURL:   fmt.Sprintf("https://%s:%s", host, port),
-		client:    client,
-		token:     strings.TrimSpace(string(tokenBytes)),
+		namespace: api.namespace,
+		baseURL:   api.baseURL,
+		client:    api.client,
+		token:     api.token,
 	}, nil
 }
 

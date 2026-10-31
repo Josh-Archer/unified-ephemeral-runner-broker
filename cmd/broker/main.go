@@ -21,9 +21,11 @@ import (
 	desktopbackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/desktop"
 	ec2backend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/ec2"
 	gcebackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/gce"
+	kubernetesbackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/kubernetes"
 	lambdabackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/lambda"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/capacity"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/config"
+	githubapi "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/github"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/runtime"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/store"
@@ -59,7 +61,20 @@ func main() {
 		log.Fatalf("configure kubernetes secret reader: %v", err)
 	}
 
-	registry, desktopBackend := buildRegistry(cfg, secretReader)
+	kubeAPI, err := runtime.NewKubernetesAPIFromEnv()
+	if err != nil {
+		log.Fatalf("configure kubernetes api client: %v", err)
+	}
+	var runnerPods kubernetesbackend.API
+	if kubeAPI != nil {
+		runnerPods = kubeAPI
+	}
+
+	// The broker's own GitHub client: registers kubernetes-backend runners and
+	// checks webhook jobs. Its token never leaves the broker.
+	githubClient := githubapi.NewClient(githubapi.TokenFromSecret(secretReader, cfg.GitHub.Auth.SecretRef, ""), nil)
+
+	registry, desktopBackend := buildRegistry(cfg, secretReader, runnerPods, githubClient)
 	healthChecker, err := runtime.NewSecretRefCheckerFromEnv(cfg)
 	if err != nil {
 		log.Fatalf("configure runtime dependencies: %v", err)
@@ -122,9 +137,14 @@ func main() {
 	useLeaderElection := config.HAEnabled(cfg.Broker)
 
 	if webhookPoolsConfigured(cfg) {
+		var headRepository func(context.Context, string, int64) (string, error)
+		if cfg.GitHub.Scope.IsPerRepository() && !cfg.Broker.GitHubWebhook.AllowForkPullRequests {
+			headRepository = githubClient.WorkflowRunHeadRepository
+		}
 		server.SetGitHubWebhook(api.GitHubWebhookOptions{
-			Secret: api.GitHubWebhookSecretFunc(cfg.Broker.GitHubWebhook, secretReader.ReadSecret),
-			Inbox:  store.AsWebhookInbox(service.Store()),
+			HeadRepository: headRepository,
+			Secret:         api.GitHubWebhookSecretFunc(cfg.Broker.GitHubWebhook, secretReader.ReadSecret),
+			Inbox:          store.AsWebhookInbox(service.Store()),
 			IsLeader: func(ctx context.Context) (bool, error) {
 				if !useLeaderElection {
 					return true, nil
@@ -202,7 +222,8 @@ func main() {
 		addr = ":8080"
 	}
 
-	httpServer := &http.Server{Addr: addr, Handler: server.Handler()}
+	// /webhooks/github can be exposed publicly; bound slow header reads.
+	httpServer := &http.Server{Addr: addr, Handler: server.Handler(), ReadHeaderTimeout: 10 * time.Second}
 	go func() {
 		log.Printf("listening on %s stateStore=%s ha=%v", addr, strings.TrimSpace(cfg.Broker.StateStore.Type), useLeaderElection)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -255,7 +276,7 @@ func leaderIdentity(configured string) string {
 	return "broker"
 }
 
-func buildRegistry(cfg model.BrokerConfig, secretReader runtime.SecretReader) (*backend.Registry, *desktopbackend.Backend) {
+func buildRegistry(cfg model.BrokerConfig, secretReader runtime.SecretReader, runnerPods kubernetesbackend.API, registrar kubernetesbackend.Registrar) (*backend.Registry, *desktopbackend.Backend) {
 	desktopBackend := desktopbackend.New(cfg)
 	registry := backend.NewRegistry(
 		arcbackend.New(cfg, secretReader),
@@ -265,6 +286,7 @@ func buildRegistry(cfg model.BrokerConfig, secretReader runtime.SecretReader) (*
 		azurebackend.New(cfg, secretReader),
 		azurevmbackend.New(cfg),
 		desktopBackend,
+		kubernetesbackend.New(cfg, runnerPods, registrar),
 		ec2backend.New(cfg, secretReader),
 		gcebackend.New(cfg, secretReader),
 	)

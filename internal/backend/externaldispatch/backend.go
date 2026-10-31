@@ -136,7 +136,11 @@ func (b *Backend) Provision(ctx context.Context, request model.AllocationRequest
 	}
 	dispatchToken := strings.TrimSpace(secretData[secretKeyDispatchToken])
 
-	targetURL, err := b.cfg.GitHub.Scope.TargetURL()
+	scope, err := b.cfg.GitHub.Scope.ForRepository(allocation.TargetRepository())
+	if err != nil {
+		return backend.ProvisionedRunner{}, err
+	}
+	targetURL, err := scope.TargetURL()
 	if err != nil {
 		return backend.ProvisionedRunner{}, err
 	}
@@ -155,12 +159,12 @@ func (b *Backend) Provision(ctx context.Context, request model.AllocationRequest
 		JobTimeout:        request.JobTimeout.String(),
 		JobTimeoutSeconds: int64(request.JobTimeout / time.Second),
 		GitHub: dispatchGitHub{
-			ScopeType:    b.cfg.GitHub.Scope.Type,
-			Organization: b.cfg.GitHub.Scope.Organization,
-			Owner:        b.cfg.GitHub.Scope.Owner,
-			Repository:   b.cfg.GitHub.Scope.Repository,
+			ScopeType:    scope.Type,
+			Organization: scope.Organization,
+			Owner:        scope.Owner,
+			Repository:   scope.Repository,
 			TargetURL:    targetURL,
-			RunnerGroup:  b.cfg.GitHub.Scope.RunnerGroup(pool.Name),
+			RunnerGroup:  scope.RunnerGroup(pool.Name),
 		},
 	}
 

@@ -55,6 +55,12 @@ func Validate(cfg model.BrokerConfig) error {
 	if err := validateWarmPools(cfg); err != nil {
 		return err
 	}
+	if err := validatePerRepositoryScope(cfg); err != nil {
+		return err
+	}
+	if err := validateKubernetesBackends(cfg); err != nil {
+		return err
+	}
 	if err := validateFairShare(cfg); err != nil {
 		return err
 	}
@@ -189,6 +195,71 @@ func validateWarmPools(cfg model.BrokerConfig) error {
 		for name, backendCfg := range pool.Backends {
 			if err := validateWarmBackendConfig(string(pool.Name), string(name), backendCfg); err != nil {
 				return err
+			}
+		}
+	}
+	return nil
+}
+
+// validatePerRepositoryScope checks github.scope.type owner. Warm runners
+// register before any job names a repository, so they need the default
+// github.scope.repository to register on.
+func validatePerRepositoryScope(cfg model.BrokerConfig) error {
+	scope := cfg.GitHub.Scope
+	if !scope.IsPerRepository() {
+		return nil
+	}
+	if err := scope.Validate(); err != nil {
+		return err
+	}
+	if scope.HasDefaultRepository() {
+		return nil
+	}
+	for _, pool := range cfg.Pools {
+		for name, backendCfg := range pool.Backends {
+			if !backendCfg.Enabled {
+				continue
+			}
+			if backendCfg.WarmMin > 0 || backendCfg.WarmMax > 0 || backendCfg.WarmSchedule != nil {
+				return fmt.Errorf("pools[%s].backends[%s]: warm runners with github.scope.type=%q need github.scope.repository, the repository they register on before a job names one", pool.Name, name, model.GitHubScopeOwner)
+			}
+		}
+	}
+	return nil
+}
+
+// validateKubernetesBackends checks the runner pod settings of enabled
+// kubernetes backends. The broker registers their runners itself, so it needs
+// github.auth.secretRef.
+func validateKubernetesBackends(cfg model.BrokerConfig) error {
+	for _, pool := range cfg.Pools {
+		backendCfg, ok := pool.Backends[model.BackendKubernetes]
+		if !ok || !backendCfg.Enabled {
+			continue
+		}
+		prefix := fmt.Sprintf("pools[%s].backends[%s]", pool.Name, model.BackendKubernetes)
+		kcfg := backendCfg.Kubernetes
+		if kcfg == nil {
+			return fmt.Errorf("%s.kubernetes is required when the backend is enabled", prefix)
+		}
+		if kcfg.DeadlineGrace < 0 {
+			return fmt.Errorf("%s.kubernetes.deadlineGrace must not be negative", prefix)
+		}
+		if strings.TrimSpace(cfg.GitHub.Auth.SecretRef) == "" {
+			return fmt.Errorf("%s: github.auth.secretRef is required; the broker registers these runners", prefix)
+		}
+		if backendCfg.WarmMin > 0 || backendCfg.WarmMax > 0 {
+			return fmt.Errorf("%s: warm runners are not supported; runner pods start per allocation", prefix)
+		}
+		if raw, present := kcfg.PodSpec["containers"]; present {
+			containers, ok := raw.([]any)
+			if !ok {
+				return fmt.Errorf("%s.kubernetes.podSpec.containers must be a list", prefix)
+			}
+			for index, rawContainer := range containers {
+				if _, ok := rawContainer.(map[string]any); !ok {
+					return fmt.Errorf("%s.kubernetes.podSpec.containers[%d] must be a mapping", prefix, index)
+				}
 			}
 		}
 	}

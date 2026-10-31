@@ -40,6 +40,7 @@ func (r *RoundRobin) Active(pool model.PoolName, backend model.BackendName) int 
 // free capacity is otherwise equal (round-robin still rotates within the order).
 var preferredBackendOrder = []model.BackendName{
 	model.BackendARC,
+	model.BackendKubernetes,
 	model.BackendCodeBuild,
 	model.BackendLambda,
 	model.BackendCloudRun,

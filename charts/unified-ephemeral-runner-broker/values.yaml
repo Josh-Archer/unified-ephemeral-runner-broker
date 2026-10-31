@@ -40,6 +40,13 @@ resources:
     cpu: 500m
     memory: 512Mi
 
+# The kubernetes backend launches runner pods. Enable this to grant the broker
+# pod create/delete/get/list in runnerPods.namespace (default: the release
+# namespace). Pods get only a single-use JIT config; the token stays in the broker.
+runnerPods:
+  enabled: false
+  namespace: ""
+
 podAnnotations: {}
 podLabels: {}
 nodeSelector: {}

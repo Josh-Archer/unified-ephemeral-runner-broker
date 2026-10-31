@@ -1,0 +1,26 @@
+{{- if .Values.runnerPods.enabled }}
+# Lets the kubernetes backend create and delete one runner pod per allocation.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "uecb.fullname" . }}-runner-pods
+  namespace: {{ .Values.runnerPods.namespace | default .Release.Namespace }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "delete", "get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "uecb.fullname" . }}-runner-pods
+  namespace: {{ .Values.runnerPods.namespace | default .Release.Namespace }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "uecb.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "uecb.fullname" . }}-runner-pods
+{{- end }}
