@@ -1157,13 +1157,57 @@ func (s *Service) queueAllocation(ctx context.Context, request model.AllocationR
 		applyPrincipal(&status, claims)
 	}
 	_ = s.store.Save(status)
-	logAllocationEvent(ctx, "allocation_pending", map[string]string{
+	fields := map[string]string{
 		"allocation_id": allocationIDLabel(status.ID),
 		"pool":          string(status.Pool),
 		"backend":       string(status.SelectedBackend),
 		"reason":        status.Metadata["queue_reason"],
-	})
+	}
+	if status.Metadata["queue_reason"] == "no-capacity" {
+		fields["capacity_caps"] = s.noCapacityCaps(pool)
+	}
+	logAllocationEvent(ctx, "allocation_pending", fields)
 	return status, true
+}
+
+// noCapacityCaps names, per backend of the pool, the limit that stops a new
+// allocation: "maxRunners" (pool cap), "crossPoolMaxRunners" (cap shared by
+// every pool on the backend), "pressure-auto-off" (a tier rule disabled it),
+// "disabled", or "free" when it still has room. Counts are active/cap. The
+// result is sorted so log lines are stable, e.g.
+// "arc=crossPoolMaxRunners(10/10),kubernetes-desktop=pressure-auto-off".
+func (s *Service) noCapacityCaps(poolName model.PoolName) string {
+	pool, err := s.resolvePool(poolName)
+	if err != nil {
+		return "unknown-pool"
+	}
+	names := make([]string, 0, len(pool.Backends))
+	for name := range pool.Backends {
+		names = append(names, string(name))
+	}
+	sort.Strings(names)
+	parts := make([]string, 0, len(names))
+	for _, raw := range names {
+		name := model.BackendName(raw)
+		cfg := pool.Backends[name]
+		active := s.store.CountActive(pool.Name, name)
+		shared := s.store.CountBackendActive(name)
+		var limit string
+		switch {
+		case !cfg.Enabled || !cfg.Healthy:
+			limit = "disabled"
+		case cfg.CrossPoolMaxRunners > 0 && shared >= cfg.CrossPoolMaxRunners:
+			limit = fmt.Sprintf("crossPoolMaxRunners(%d/%d)", shared, cfg.CrossPoolMaxRunners)
+		case active >= cfg.MaxRunners:
+			limit = fmt.Sprintf("maxRunners(%d/%d)", active, cfg.MaxRunners)
+		case s.cfg.Broker.TierRouting.Enabled && s.tierMgr != nil && !s.pinnedBackendAllowedByTier(pool.Name, name):
+			limit = "pressure-auto-off"
+		default:
+			limit = fmt.Sprintf("free(%d/%d)", active, cfg.MaxRunners)
+		}
+		parts = append(parts, raw+"="+limit)
+	}
+	return strings.Join(parts, ",")
 }
 
 func (s *Service) ReconcileQueue(ctx context.Context, now time.Time) int {
