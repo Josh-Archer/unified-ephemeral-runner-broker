@@ -42,7 +42,7 @@ func TestDrainQueuesWebhookDemandWithoutProvisioning(t *testing.T) {
 		t.Fatal(err)
 	}
 	svc.BeginDrain()
-	status, _, err := svc.AllocateForWorkflowJob(context.Background(), pool, 901, "Josh-Archer/home")
+	status, _, err := svc.AllocateForWorkflowJob(context.Background(), pool, 901, "example/project")
 	if err != nil {
 		t.Fatalf("webhook demand should be queued, got %v", err)
 	}
