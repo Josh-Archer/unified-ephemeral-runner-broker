@@ -363,3 +363,7 @@ This keeps scheduling policy isolated in the scheduler registry while making cap
 
 - `github.scope.type=organization` targets an org runner registration surface and can derive per-pool runner groups from `runnerGroupPrefix`.
 - `github.scope.type=repository` targets a single repository registration surface and ignores runner groups.
+
+### Tier policy with occupied fallback capacity
+
+An automatic allocation with a policy-eligible but full backend is a capacity wait, even when another backend is disabled by a pressure tier. Webhook demand stays pending until that eligible backend has a free slot; it never bypasses the disabled backend. API callers still receive a capacity error. If every backend is actually tier-blocked, the tier rejection remains unchanged.
