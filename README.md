@@ -638,8 +638,67 @@ are in [docs/image-attestations.md](docs/image-attestations.md).
 
 - `organization`
 - `repository`
+- `owner`
 
 Repository scope requires `github.scope.owner` and `github.scope.repository`. Organization scope requires `github.scope.organization`.
+
+Owner scope requires `github.scope.owner` and no repository. Each runner registers on the repository that asked for it: the `repository.full_name` of a `workflow_job` webhook, or the `repository` claim of the caller's OIDC token. Repositories of other owners are refused, and webhook deliveries from them are ignored with reason `foreign_repository`. Use it when the owner is a personal account. Personal accounts have no organization-level runners, so a repository or organization scope cannot serve all of their repositories from one pool. Under owner scope:
+
+- The GitHub token (`github.auth.secretRef`) must be able to register runners on every repository that will use the pool.
+- Warm runners are rejected at config load, because they would register before a repository is known.
+- Webhook allocations use the repository, lower-cased, as their fair-share tenant, so `fairShare.quotas` can cap a single repository.
+
+### Shared in-cluster pool (`kubernetes` backend)
+
+The `arc` backend only hands out the label of an existing ARC runner scale set, and a scale set registers on one repository or organization. The `kubernetes` backend instead starts one runner pod per allocation from the launcher image. The pod registers on the allocation's resolved scope, so together with owner scope one pool serves every repository:
+
+```yaml
+github:
+  auth: {mode: github-app, secretRef: uecb-github-app}
+  scope: {type: owner, owner: Josh-Archer}
+broker:
+  githubWebhook: {secretRef: uecb-github-webhook}
+pools:
+  - name: full
+    labels: [self-hosted, linux, x64, uecb, uecb-full]
+    webhookLabels: [self-hosted, uecb-full]
+    scheduler: priority-fair-share
+    capabilityProfile: full
+    fairShare:
+      enabled: true
+      quotas: {josh-archer/deskquest: 3}
+    backends:
+      kubernetes:
+        enabled: true
+        healthy: true
+        maxRunners: 6
+        capabilities: [cluster-local, docker, privileged]
+        kubernetes:
+          namespace: arc-runners
+          image: ghcr.io/josh-archer/unified-ephemeral-runner-broker/launcher:v0.1.27
+          podSpec:
+            nodeSelector: {kubernetes.io/arch: amd64}
+            containers:
+              - name: runner
+                env: [{name: DOCKER_HOST, value: unix:///var/run/docker/docker.sock}]
+                resources: {requests: {cpu: "1", memory: 2Gi}}
+                volumeMounts: [{name: dind-sock, mountPath: /var/run/docker}]
+              - name: dind
+                image: docker:dind
+                args: [dockerd, --host=unix:///var/run/docker/docker.sock]
+                securityContext: {privileged: true}
+                volumeMounts: [{name: dind-sock, mountPath: /var/run/docker}]
+            volumes: [{name: dind-sock, emptyDir: {}}]
+```
+
+- `podSpec` is a plain Kubernetes PodSpec used as the template. The broker sets `restartPolicy: Never` and `activeDeadlineSeconds` (job timeout plus `deadlineGrace`, default 10m). It adds the launcher environment (`GITHUB_TOKEN` from `tokenSecret`, scope, target URL, runner name and labels) to the container named `runnerContainer` (default `runner`), which runs `image` unless the template sets one.
+- `tokenSecret` defaults to `{name: <github.auth.secretRef>, key: github_token}`. That secret must exist in the runner namespace.
+- The broker needs pod `create`, `delete`, `get` and `list` there (`runnerPods.enabled` in the Helm chart).
+- Pods are named `uecb-runner-<allocation-id>` and deleted when the allocation finishes or is reaped.
+- `Capacity()` counts live pods. Unschedulable pods count as pending, so a full cluster shows no free slots.
+- A ResourceQuota rejection is reported as capacity exhaustion, which lets the scheduler fall back to other backends.
+
+Workflows then use `runs-on: [self-hosted, uecb-full]` in every repository, with the webhook set on each repository (or a GitHub App) for **Workflow jobs**.
 
 ## Scheduler Configuration
 

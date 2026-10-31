@@ -476,6 +476,9 @@ func TestGitHubWebhookOwnerScopeRecordsRepositoryAndRejectsOthers(t *testing.T) 
 	if got := allocation.TargetRepository(); got != "Example-Owner/questkit" {
 		t.Fatalf("target repository = %q", got)
 	}
+	if allocation.Tenant != "example-owner/questkit" {
+		t.Fatalf("tenant = %q, want the repository for per-repository fair share", allocation.Tenant)
+	}
 
 	before := counterValue(t, "uecb_github_webhook_events_ignored_total", map[string]string{"reason": "foreign_repository"})
 	for i, repo := range []string{"someone-else/repo", ""} {

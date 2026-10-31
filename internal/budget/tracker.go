@@ -226,7 +226,7 @@ func CostClass(name model.BackendName, cfg model.BackendConfig) int {
 		return cfg.CostClass
 	}
 	switch name {
-	case model.BackendARC, model.BackendDesktop:
+	case model.BackendARC, model.BackendKubernetes, model.BackendDesktop:
 		return 10
 	case model.BackendAzureFunctions:
 		return 30

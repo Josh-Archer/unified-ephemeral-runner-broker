@@ -80,7 +80,7 @@ func TestBuildRegistryIncludesDesktopBackend(t *testing.T) {
 			},
 		},
 	}
-	reg, desktop := buildRegistry(cfg, nil)
+	reg, desktop := buildRegistry(cfg, nil, nil)
 	if reg == nil {
 		t.Fatal("expected non-nil registry")
 	}

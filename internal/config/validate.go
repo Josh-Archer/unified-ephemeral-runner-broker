@@ -58,6 +58,9 @@ func Validate(cfg model.BrokerConfig) error {
 	if err := validatePerRepositoryScope(cfg); err != nil {
 		return err
 	}
+	if err := validateKubernetesBackends(cfg); err != nil {
+		return err
+	}
 	if err := validateFairShare(cfg); err != nil {
 		return err
 	}
@@ -216,6 +219,57 @@ func validatePerRepositoryScope(cfg model.BrokerConfig) error {
 			if backendCfg.WarmMin > 0 || backendCfg.WarmMax > 0 || backendCfg.WarmSchedule != nil {
 				return fmt.Errorf("pools[%s].backends[%s]: warm runners are not supported with github.scope.type=%q because they register before a repository is known", pool.Name, name, model.GitHubScopeOwner)
 			}
+		}
+	}
+	return nil
+}
+
+// validateKubernetesBackends checks the runner pod settings of enabled
+// kubernetes backends: an image, a token secret and a sane podSpec.
+func validateKubernetesBackends(cfg model.BrokerConfig) error {
+	for _, pool := range cfg.Pools {
+		backendCfg, ok := pool.Backends[model.BackendKubernetes]
+		if !ok || !backendCfg.Enabled {
+			continue
+		}
+		prefix := fmt.Sprintf("pools[%s].backends[%s]", pool.Name, model.BackendKubernetes)
+		kcfg := backendCfg.Kubernetes
+		if kcfg == nil {
+			return fmt.Errorf("%s.kubernetes is required when the backend is enabled", prefix)
+		}
+		if kcfg.DeadlineGrace < 0 {
+			return fmt.Errorf("%s.kubernetes.deadlineGrace must not be negative", prefix)
+		}
+		if strings.TrimSpace(kcfg.TokenSecret.Name) == "" && strings.TrimSpace(cfg.GitHub.Auth.SecretRef) == "" {
+			return fmt.Errorf("%s.kubernetes.tokenSecret.name is required when github.auth.secretRef is empty", prefix)
+		}
+		if backendCfg.WarmMin > 0 || backendCfg.WarmMax > 0 {
+			return fmt.Errorf("%s: warm runners are not supported; runner pods start per allocation", prefix)
+		}
+		runnerName := strings.TrimSpace(kcfg.RunnerContainer)
+		if runnerName == "" {
+			runnerName = "runner"
+		}
+		runnerImage := strings.TrimSpace(kcfg.Image)
+		if raw, present := kcfg.PodSpec["containers"]; present {
+			containers, ok := raw.([]any)
+			if !ok {
+				return fmt.Errorf("%s.kubernetes.podSpec.containers must be a list", prefix)
+			}
+			for index, rawContainer := range containers {
+				container, ok := rawContainer.(map[string]any)
+				if !ok {
+					return fmt.Errorf("%s.kubernetes.podSpec.containers[%d] must be a mapping", prefix, index)
+				}
+				if container["name"] == runnerName {
+					if image, _ := container["image"].(string); strings.TrimSpace(image) != "" {
+						runnerImage = image
+					}
+				}
+			}
+		}
+		if runnerImage == "" {
+			return fmt.Errorf("%s: set kubernetes.image or an image on podSpec container %q", prefix, runnerName)
 		}
 	}
 	return nil

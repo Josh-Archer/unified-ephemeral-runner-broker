@@ -21,6 +21,7 @@ import (
 	desktopbackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/desktop"
 	ec2backend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/ec2"
 	gcebackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/gce"
+	kubernetesbackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/kubernetes"
 	lambdabackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/lambda"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/capacity"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/config"
@@ -59,7 +60,16 @@ func main() {
 		log.Fatalf("configure kubernetes secret reader: %v", err)
 	}
 
-	registry, desktopBackend := buildRegistry(cfg, secretReader)
+	kubeAPI, err := runtime.NewKubernetesAPIFromEnv()
+	if err != nil {
+		log.Fatalf("configure kubernetes api client: %v", err)
+	}
+	var runnerPods kubernetesbackend.API
+	if kubeAPI != nil {
+		runnerPods = kubeAPI
+	}
+
+	registry, desktopBackend := buildRegistry(cfg, secretReader, runnerPods)
 	healthChecker, err := runtime.NewSecretRefCheckerFromEnv(cfg)
 	if err != nil {
 		log.Fatalf("configure runtime dependencies: %v", err)
@@ -255,7 +265,7 @@ func leaderIdentity(configured string) string {
 	return "broker"
 }
 
-func buildRegistry(cfg model.BrokerConfig, secretReader runtime.SecretReader) (*backend.Registry, *desktopbackend.Backend) {
+func buildRegistry(cfg model.BrokerConfig, secretReader runtime.SecretReader, runnerPods kubernetesbackend.API) (*backend.Registry, *desktopbackend.Backend) {
 	desktopBackend := desktopbackend.New(cfg)
 	registry := backend.NewRegistry(
 		arcbackend.New(cfg, secretReader),
@@ -265,6 +275,7 @@ func buildRegistry(cfg model.BrokerConfig, secretReader runtime.SecretReader) (*
 		azurebackend.New(cfg, secretReader),
 		azurevmbackend.New(cfg),
 		desktopBackend,
+		kubernetesbackend.New(cfg, runnerPods),
 		ec2backend.New(cfg, secretReader),
 		gcebackend.New(cfg, secretReader),
 	)

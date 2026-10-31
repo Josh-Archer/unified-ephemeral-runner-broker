@@ -97,8 +97,14 @@ func (s *Service) AllocateForWorkflowJob(ctx context.Context, pool model.PoolCon
 	if existing, ok := s.findByWorkflowJobID(jobID); ok {
 		return existing, false, nil
 	}
+	tenant := ""
+	if s.cfg.GitHub.Scope.IsPerRepository() {
+		// One pool serves every repository, so fair-share quotas apply per repository.
+		tenant = strings.ToLower(strings.TrimSpace(repository))
+	}
 	status, err = s.Allocate(ctx, model.AllocationRequest{
 		Pool:             pool.Name,
+		Tenant:           tenant,
 		Labels:           append([]string(nil), pool.WebhookLabels...),
 		WorkflowJobID:    jobID,
 		TargetRepository: strings.TrimSpace(repository),
