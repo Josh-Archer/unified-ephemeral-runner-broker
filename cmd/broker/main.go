@@ -233,11 +233,29 @@ func main() {
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Drain: stop starting new runners, then let in-flight requests (including
+	// provisions) finish within UECB_SHUTDOWN_TIMEOUT. Keep the pod's
+	// terminationGracePeriodSeconds above it.
+	service.BeginDrain()
+	shutdownTimeout := shutdownTimeoutFromEnv()
+	log.Printf("draining: new allocations paused, waiting up to %s for in-flight requests", shutdownTimeout)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		log.Printf("http shutdown: %v", err)
 	}
+}
+
+func shutdownTimeoutFromEnv() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("UECB_SHUTDOWN_TIMEOUT"))
+	if raw == "" {
+		return 10 * time.Second
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return 10 * time.Second
+	}
+	return d
 }
 
 func webhookPoolsConfigured(cfg model.BrokerConfig) bool {
