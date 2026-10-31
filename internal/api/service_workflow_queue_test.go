@@ -12,6 +12,7 @@ import (
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/config"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/scheduler"
+	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/tier"
 )
 
 func workflowQueueConfig() model.BrokerConfig {
@@ -171,5 +172,48 @@ func TestWorkflowCapacityClassificationPreservesBudgetAndRateLimits(t *testing.T
 	}
 	if workflowCapacityError(model.AllocationRequest{}, scheduler.ErrNoCapacity) {
 		t.Fatal("API capacity policy changed")
+	}
+}
+
+func TestWorkflowTierBlockedPrimaryAndFullFallbackKeepsDemand(t *testing.T) {
+	for _, state := range []string{tier.StateHealthy, tier.StateApproaching} {
+		t.Run(string(state), func(t *testing.T) {
+			cfg := workflowQueueConfig()
+			cfg.Broker.TierRouting.Enabled = true
+			cfg.Broker.TierRouting.FailureMode = tier.FailureModePassThrough
+			cfg.Pools[0].Backends[model.BackendARC] = model.BackendConfig{Enabled: true, Healthy: true, MaxRunners: 1}
+			service := NewService(cfg, backend.NewRegistry(testBackend{name: model.BackendKubernetes}, testBackend{name: model.BackendARC}), nil)
+			now := time.Now().UTC()
+			service.now = func() time.Time { return now }
+			manager := tier.NewManager()
+			manager.SetDecision(tier.Decision{Pool: model.PoolFull, Backend: model.BackendARC, State: tier.StateExceeded, Action: tier.ActionDisable, UpdatedAt: now})
+			manager.SetDecision(tier.Decision{Pool: model.PoolFull, Backend: model.BackendKubernetes, State: state, Action: tier.ActionDeprioritize, UpdatedAt: now})
+			service.SetTierManager(manager)
+			first := ownershipAllocate(t, service, 6001)
+			if first.SelectedBackend != model.BackendKubernetes {
+				t.Fatalf("pressure-blocked primary was used: %+v", first)
+			}
+			if _, err := service.Allocate(context.Background(), model.AllocationRequest{Pool: model.PoolFull}); !errors.Is(err, scheduler.ErrNoCapacity) {
+				t.Fatalf("API should report full fallback, not a tier rejection: %v", err)
+			}
+			pending := ownershipAllocate(t, service, 6002)
+			for i := 0; i < 3; i++ {
+				now = now.Add(2 * time.Second)
+				service.ReconcileQueue(context.Background(), now)
+				got, _ := service.Get(pending.ID)
+				if got.State != model.StatePending || got.Attempts != 0 {
+					t.Fatalf("full tier-eligible fallback lost demand: %+v", got)
+				}
+			}
+			if _, _, err := service.FinalizeWorkflowJob(context.Background(), 6001, "success", ownedRunner(first)); err != nil {
+				t.Fatal(err)
+			}
+			now = now.Add(2 * time.Second)
+			service.ReconcileQueue(context.Background(), now)
+			got, _ := service.Get(pending.ID)
+			if got.State != model.StateReady || got.SelectedBackend != model.BackendKubernetes || !got.ExpiresAt.Equal(pending.ExpiresAt) {
+				t.Fatalf("fallback did not drain safely: %+v", got)
+			}
+		})
 	}
 }

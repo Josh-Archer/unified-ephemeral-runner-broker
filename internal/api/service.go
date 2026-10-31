@@ -2063,6 +2063,14 @@ func (s *Service) filterBackendsByTierState(pool model.PoolConfig, request model
 		s.observer.ObserveTierFallback(pool.Name, "deprioritize", "approaching")
 		return deprioritized, nil
 	}
+	// Tier-eligible backends without a free slot were omitted above. Their
+	// temporary capacity shortage must not make the remaining tier-blocked
+	// backends look like an all-backends policy rejection.
+	for name, cfg := range pool.Backends {
+		if _, denied := blocked[name]; !denied && cfg.Enabled && cfg.Healthy && cfg.MaxRunners > 0 {
+			return model.PoolConfig{}, scheduler.ErrNoCapacity
+		}
+	}
 	if len(blocked) == 0 {
 		return pool, nil
 	}
