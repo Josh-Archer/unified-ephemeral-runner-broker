@@ -267,6 +267,8 @@ are never touched by webhooks.
 
 ```yaml
 broker:
+  queue:
+    enabled: true                 # retain webhook demand while all runner slots are full
   githubWebhook:
     secretRef: uecb-github-webhook   # Kubernetes secret; key defaults to webhook_secret
     # secretKey: webhook_secret
@@ -284,7 +286,8 @@ Behavior:
 - `POST /webhooks/github` verifies `X-Hub-Signature-256` (HMAC-SHA256 over the raw body) and answers `401` for a missing or wrong signature. Only `workflow_job` events with action `queued` or `completed` are acted on; everything else (including `ping`) is acknowledged with `200` and counted as ignored.
 - A job matches a pool when every `runs-on` label is in the pool's `webhookLabels` (case-insensitive) and at least one label is not `self-hosted`. The first matching pool in config order wins; two pools may not share an identical label set.
 - On `queued` the allocation is requested with the pool's static labels, so the runner registers with them (JIT config) instead of a per-allocation label, and `workflow_job.id` is recorded on the allocation. A duplicate `queued` for the same job id never creates a second allocation.
-- On `completed` the allocation is finalized by `workflow_job.id`: `cancelled` conclusions cancel it (also removing it from the admission queue), anything else completes it. Lost events are covered by the [stuck-allocation reaper](#stuck-allocation-reaper-orphan-cleanup): the allocation expires after `job_timeout`.
+- With `broker.queue.enabled`, temporary scheduler/provider capacity exhaustion persists matching webhook demand as `pending` and returns `202`. It retries when slots open, survives a durable state-store restart, and expires at its job deadline. Waiting for occupied slots does not consume the backend failure retry budget. Normal API allocations retain their fail-fast capacity behavior.
+- On `in_progress` and `completed`, the actual runner name/ID identifies the allocation: GitHub may exchange runners that share labels. Cancellation removes pending demand without deleting another job's runner. Lost events are covered by the [stuck-allocation reaper](#stuck-allocation-reaper-orphan-cleanup).
 - Idempotency: deliveries are deduplicated on `X-GitHub-Delivery`. A delivery whose processing failed (`500`) is not remembered, so GitHub redelivery retries it.
 - Only the reconciliation leader acts, but no delivery is lost. With `broker.ha` enabled, a replica that does not hold the lease persists the delivery to a durable shared inbox (`uecb_webhook_inbox` in the postgres state store, deduplicated on `X-GitHub-Delivery`) and answers `202`. The leader drains the inbox every 5s (and before handling any direct delivery, to keep `queued`/`completed` ordering); a failed delivery stays queued and is retried every 30s, and entries older than 24h are dropped. If the inbox write itself fails the replica returns `503`. The in-memory delivery cache is per process; job-id lookup in the shared store keeps allocation creation idempotent across restarts.
 

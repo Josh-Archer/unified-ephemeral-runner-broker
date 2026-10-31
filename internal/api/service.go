@@ -1066,7 +1066,9 @@ func (s *Service) prepareAllocation(ctx context.Context, request model.Allocatio
 	allocation.PriorityClass = request.PriorityClass
 	allocation.RequestedLabels = append([]string(nil), request.Labels...)
 	allocation.Metadata = map[string]string{backend.MetadataLaunchModeKey: launchModeCold}
-	allocation.ExpiresAt = s.now().Add(timeout)
+	if request.WorkflowJobID == 0 || existing.ID == "" || allocation.ExpiresAt.IsZero() {
+		allocation.ExpiresAt = s.now().Add(timeout)
+	}
 	allocation.RetryAfter = time.Time{}
 	allocation.State = model.StateReserved
 	allocation.Error = ""
@@ -1114,10 +1116,11 @@ func (s *Service) saveReservedAllocation(allocation model.AllocationStatus, pool
 }
 
 func (s *Service) queueAllocation(ctx context.Context, request model.AllocationRequest, pool model.PoolName, selected model.BackendName, cause error, existing model.AllocationStatus) (model.AllocationStatus, bool) {
-	if !s.queueEnabled() || !queueableError(cause) {
+	capacityWait := workflowCapacityError(request, cause)
+	if !s.queueEnabled() || (!queueableError(cause) && !capacityWait) {
 		return model.AllocationStatus{}, false
 	}
-	if existing.ID != "" && existing.Attempts >= normalizeQueueMaxAttempts(s.cfg.Broker.Queue) {
+	if existing.ID != "" && existing.Attempts >= normalizeQueueMaxAttempts(s.cfg.Broker.Queue) && !capacityWait {
 		return model.AllocationStatus{}, false
 	}
 
@@ -1169,41 +1172,55 @@ func (s *Service) ReconcileQueue(ctx context.Context, now time.Time) int {
 	}
 	updated := 0
 	for _, status := range s.store.List() {
-		if status.State != model.StatePending {
-			continue
+		if status.State == model.StatePending {
+			updated += s.reconcileQueuedAllocation(ctx, status, now)
 		}
-		if !status.RetryAfter.IsZero() && status.RetryAfter.After(now) {
-			continue
-		}
-		if status.Request == nil {
-			s.markState(status.ID, model.StateFailed, now, "pending allocation is missing original request")
-			updated++
-			continue
-		}
-		if status.ExpiresAt.Before(now) {
-			s.markState(status.ID, model.StateExpired, now, "pending allocation expired")
-			updated++
-			continue
-		}
-		if status.Attempts >= normalizeQueueMaxAttempts(s.cfg.Broker.Queue) {
-			s.markState(status.ID, model.StateFailed, now, "pending allocation retry attempts exhausted")
-			updated++
-			continue
-		}
-		status.Attempts++
-		status.RetryAfter = now.Add(normalizeQueueRetryAfter(s.cfg.Broker.Queue))
-		_ = s.store.Save(status)
-		if _, err := s.allocateNow(ctx, *status.Request, status); err != nil {
-			if queued, ok := s.queueAllocation(ctx, *status.Request, status.Pool, status.SelectedBackend, err, status); ok {
-				_ = s.store.Save(queued)
-			} else {
-				s.markState(status.ID, model.StateFailed, now, err.Error())
-			}
-		}
-		updated++
 	}
 	s.observeState()
 	return updated
+}
+
+func (s *Service) reconcileQueuedAllocation(ctx context.Context, status model.AllocationStatus, now time.Time) int {
+	if status.Request != nil && status.Request.WorkflowJobID > 0 {
+		// Cancellation and shared-label execution binding use the same lock.
+		// Re-read after taking it so a stale queue snapshot cannot resurrect demand.
+		s.workflowJobMu.Lock()
+		defer s.workflowJobMu.Unlock()
+		var ok bool
+		status, ok = s.store.Get(status.ID)
+		if !ok {
+			return 0
+		}
+	}
+	if status.State != model.StatePending || (!status.RetryAfter.IsZero() && status.RetryAfter.After(now)) {
+		return 0
+	}
+	if status.Request == nil {
+		s.markState(status.ID, model.StateFailed, now, "pending allocation is missing original request")
+		return 1
+	}
+	if status.ExpiresAt.Before(now) {
+		s.markState(status.ID, model.StateExpired, now, "pending allocation expired")
+		return 1
+	}
+	capacityWait := waitingForWorkflowCapacity(status)
+	if !capacityWait && status.Attempts >= normalizeQueueMaxAttempts(s.cfg.Broker.Queue) {
+		s.markState(status.ID, model.StateFailed, now, "pending allocation retry attempts exhausted")
+		return 1
+	}
+	// Occupied slots are normal for a workflow backlog, not failed launches.
+	// Keep its deadline while preserving retry limits for actual backend failures.
+	if !capacityWait {
+		status.Attempts++
+	}
+	status.RetryAfter = now.Add(normalizeQueueRetryAfter(s.cfg.Broker.Queue))
+	_ = s.store.Save(status)
+	if _, err := s.allocateNow(ctx, *status.Request, status); err != nil {
+		if _, ok := s.queueAllocation(ctx, *status.Request, status.Pool, status.SelectedBackend, err, status); !ok {
+			s.markState(status.ID, model.StateFailed, now, err.Error())
+		}
+	}
+	return 1
 }
 
 func (s *Service) ReconcileWarmPools() {
