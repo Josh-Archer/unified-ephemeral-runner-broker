@@ -37,7 +37,7 @@ func TestRestartRebuildsLostAllocationsFromLiveRunners(t *testing.T) {
 		runners: []backend.LiveRunner{{
 			AllocationID:  "alloc-lost-1",
 			Pool:          model.PoolFull,
-			Repository:    "Josh-Archer/home",
+			Repository:    "example/project",
 			WorkflowJobID: 4242,
 			Metadata:      map[string]string{"namespace": "arc-runners", "pod_name": "uecb-runner-alloc-lost-1", "github_runner_id": "77"},
 		}},

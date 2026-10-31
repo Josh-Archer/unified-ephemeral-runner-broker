@@ -321,7 +321,7 @@ func TestLiveRunnersRebuildsIdentityFromPods(t *testing.T) {
 	api := &fakeAPI{responses: map[string]response{
 		"GET /api/v1/namespaces/arc-runners/pods": {status: http.StatusOK, body: `{"items":[
  {"metadata":{"name":"uecb-runner-alloc-1","labels":{"uecb.josh-archer.dev/pool":"full","uecb.josh-archer.dev/allocation-id":"alloc-1"},
-  "annotations":{"uecb.josh-archer.dev/allocation-id":"alloc-1","uecb.josh-archer.dev/github-runner-id":"9","uecb.josh-archer.dev/workflow-job-id":"55","uecb.josh-archer.dev/repository":"Josh-Archer/home"}},"status":{"phase":"Running"}},
+  "annotations":{"uecb.josh-archer.dev/allocation-id":"alloc-1","uecb.josh-archer.dev/github-runner-id":"9","uecb.josh-archer.dev/workflow-job-id":"55","uecb.josh-archer.dev/repository":"example/project"}},"status":{"phase":"Running"}},
  {"metadata":{"name":"uecb-runner-alloc-2","labels":{"uecb.josh-archer.dev/pool":"full","uecb.josh-archer.dev/allocation-id":"alloc-2"}},"status":{"phase":"Succeeded"}},
  {"metadata":{"name":"uecb-runner-alloc-3","deletionTimestamp":"2026-10-31T00:00:00Z","labels":{"uecb.josh-archer.dev/allocation-id":"alloc-3"}},"status":{"phase":"Running"}},
  {"metadata":{"name":"something-else","labels":{"uecb.josh-archer.dev/allocation-id":"alloc-4"}},"status":{"phase":"Running"}}
@@ -336,7 +336,7 @@ func TestLiveRunnersRebuildsIdentityFromPods(t *testing.T) {
 		t.Fatalf("expected 1 live runner, got %+v", runners)
 	}
 	r := runners[0]
-	if r.AllocationID != "alloc-1" || r.Pool != "full" || r.WorkflowJobID != 55 || r.Repository != "Josh-Archer/home" || r.Metadata[metadataRunnerID] != "9" || r.Metadata["pod_name"] != "uecb-runner-alloc-1" {
+	if r.AllocationID != "alloc-1" || r.Pool != "full" || r.WorkflowJobID != 55 || r.Repository != "example/project" || r.Metadata[metadataRunnerID] != "9" || r.Metadata["pod_name"] != "uecb-runner-alloc-1" {
 		t.Fatalf("unexpected live runner: %+v", r)
 	}
 }
