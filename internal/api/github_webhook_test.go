@@ -521,3 +521,48 @@ func TestWarmRunnersOnlyServeTheDefaultRepositoryUnderOwnerScope(t *testing.T) {
 		t.Fatal("without a default repository there are no warm runners to share")
 	}
 }
+
+func TestGitHubWebhookRejectsForkPullRequestJobs(t *testing.T) {
+	h := newWebhookHarness(t, true)
+	h.service.cfg.GitHub.Scope = model.GitHubScope{Type: model.GitHubScopeOwner, Owner: "example-owner"}
+	heads := map[int64]string{1: "example-owner/questkit", 2: "attacker/questkit"}
+	lookups := 0
+	h.server.githubWebhook.opts.HeadRepository = func(_ context.Context, repo string, runID int64) (string, error) {
+		lookups++
+		if repo != "example-owner/questkit" {
+			t.Errorf("looked up %q", repo)
+		}
+		if head, ok := heads[runID]; ok {
+			return head, nil
+		}
+		return "", fmt.Errorf("run %d not found", runID)
+	}
+	body := func(jobID, runID int64) string {
+		b := repoJobBody("queued", jobID, "example-owner/questkit", "self-hosted", "uecb-full")
+		return strings.Replace(b, fmt.Sprintf(`"id":%d,`, jobID), fmt.Sprintf(`"id":%d,"run_id":%d,`, jobID, runID), 1)
+	}
+
+	if rec := h.send("workflow_job", "f1", body(701, 1)); rec.Code != http.StatusAccepted {
+		t.Fatalf("same-repository job: got %d %s", rec.Code, rec.Body)
+	}
+	rec := h.send("workflow_job", "f2", body(702, 2))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "fork_pull_request") {
+		t.Fatalf("fork job: got %d %s", rec.Code, rec.Body)
+	}
+	if _, ok := h.service.findByWorkflowJobID(702); ok {
+		t.Fatal("a fork pull request job must not get a runner")
+	}
+	if rec := h.send("workflow_job", "f3", body(703, 3)); rec.Code < 500 {
+		t.Fatalf("a failed lookup must fail the delivery, got %d %s", rec.Code, rec.Body)
+	}
+	if _, ok := h.service.findByWorkflowJobID(703); ok {
+		t.Fatal("a failed lookup must not allocate")
+	}
+	before := lookups
+	if rec := h.send("workflow_job", "f1-dup", body(701, 1)); rec.Code != http.StatusOK {
+		t.Fatalf("duplicate: got %d", rec.Code)
+	}
+	if lookups != before {
+		t.Fatal("an already allocated job needs no second lookup")
+	}
+}

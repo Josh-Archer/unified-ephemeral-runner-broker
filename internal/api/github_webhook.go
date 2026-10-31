@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"log/slog"
@@ -46,6 +47,11 @@ type GitHubWebhookOptions struct {
 	// drains it (DrainGitHubWebhookInbox). Nil means non-leader deliveries are
 	// rejected with 503, which is only safe for a single replica.
 	Inbox store.WebhookInbox
+	// HeadRepository returns the repository a workflow run's code comes from.
+	// When set, queued jobs whose run comes from another repository (pull
+	// requests from forks) get no runner, and a failed lookup fails the
+	// delivery rather than allocating.
+	HeadRepository func(ctx context.Context, repository string, runID int64) (string, error)
 }
 
 type githubWebhookMetrics struct {
@@ -158,6 +164,7 @@ type workflowJobPayload struct {
 	Action      string `json:"action"`
 	WorkflowJob struct {
 		ID         int64    `json:"id"`
+		RunID      int64    `json:"run_id"`
 		RunnerName string   `json:"runner_name"`
 		Labels     []string `json:"labels"`
 		Conclusion string   `json:"conclusion"`
@@ -369,6 +376,17 @@ func (h *githubWebhookHandler) process(ctx context.Context, payload workflowJobP
 		repository := strings.TrimSpace(payload.Repository.FullName)
 		if !h.service.AcceptsWebhookRepository(repository) {
 			return ignored("foreign_repository")
+		}
+		if h.opts.HeadRepository != nil {
+			if _, exists := h.service.findByWorkflowJobID(jobID); !exists {
+				head, err := h.opts.HeadRepository(ctx, repository, payload.WorkflowJob.RunID)
+				if err != nil {
+					return nil, 0, fmt.Errorf("check workflow run %d of %s: %w", payload.WorkflowJob.RunID, repository, err)
+				}
+				if !strings.EqualFold(strings.TrimSpace(head), repository) {
+					return ignored("fork_pull_request")
+				}
+			}
 		}
 		allocation, created, err := h.service.AllocateForWorkflowJob(ctx, pool, jobID, repository)
 		if err != nil {

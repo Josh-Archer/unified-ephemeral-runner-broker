@@ -3,6 +3,7 @@ package kubernetes
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/config"
+	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/github"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 	"gopkg.in/yaml.v3"
 )
@@ -46,6 +48,35 @@ func (f *fakeAPI) Do(_ context.Context, method, path string, body any) (int, []b
 	return http.StatusCreated, []byte(`{}`), nil
 }
 
+type registration struct {
+	scope  model.GitHubScope
+	group  string
+	name   string
+	labels []string
+}
+
+type fakeRegistrar struct {
+	registered []registration
+	deleted    []int64
+	nextID     int64
+	err        error
+	deleteErr  error
+}
+
+func (f *fakeRegistrar) GenerateJITConfig(_ context.Context, scope model.GitHubScope, group, name string, labels []string) (github.JITConfig, error) {
+	if f.err != nil {
+		return github.JITConfig{}, f.err
+	}
+	f.nextID++
+	f.registered = append(f.registered, registration{scope, group, name, labels})
+	return github.JITConfig{RunnerID: 100 + f.nextID, Encoded: "jit-" + name}, nil
+}
+
+func (f *fakeRegistrar) DeleteRunner(_ context.Context, _ model.GitHubScope, id int64) error {
+	f.deleted = append(f.deleted, id)
+	return f.deleteErr
+}
+
 const podSpecYAML = `
 nodeSelector:
   kubernetes.io/arch: amd64
@@ -56,6 +87,8 @@ containers:
     env:
       - name: DOCKER_HOST
         value: unix:///var/run/docker/docker.sock
+      - name: ACTIONS_RUNNER_INPUT_JITCONFIG
+        value: must-be-replaced
   - name: dind
     image: docker:dind
     securityContext: {privileged: true}
@@ -80,7 +113,6 @@ func newConfig(t *testing.T) model.BrokerConfig {
 			MaxRunners: 6,
 			Kubernetes: &model.KubernetesBackendConfig{
 				Namespace: "arc-runners",
-				Image:     "ghcr.io/example/launcher:v1",
 				PodSpec:   podSpec,
 			},
 		}
@@ -88,8 +120,7 @@ func newConfig(t *testing.T) model.BrokerConfig {
 	return cfg
 }
 
-func envMap(t *testing.T, container map[string]any) map[string]any {
-	t.Helper()
+func envMap(container map[string]any) map[string]any {
 	result := map[string]any{}
 	for _, raw := range container["env"].([]any) {
 		entry := raw.(map[string]any)
@@ -102,9 +133,10 @@ func envMap(t *testing.T, container map[string]any) map[string]any {
 	return result
 }
 
-func TestProvisionCreatesRunnerPodForRequestingRepository(t *testing.T) {
+func TestProvisionRegistersRunnerAndPassesOnlyJITConfig(t *testing.T) {
 	api := &fakeAPI{}
-	b := New(newConfig(t), api)
+	reg := &fakeRegistrar{}
+	b := New(newConfig(t), api, reg)
 	request := model.AllocationRequest{
 		Pool:             model.PoolFull,
 		JobTimeout:       20 * time.Minute,
@@ -120,10 +152,21 @@ func TestProvisionCreatesRunnerPodForRequestingRepository(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
-	if provisioned.RunnerLabel != "uecb-kubernetes-Alloc_123" {
-		t.Fatalf("runner label = %q", provisioned.RunnerLabel)
+
+	if len(reg.registered) != 1 {
+		t.Fatalf("registrations = %+v", reg.registered)
 	}
-	if provisioned.Metadata["namespace"] != "arc-runners" || provisioned.Metadata["target_url"] != "https://github.com/example-owner/questkit" {
+	got := reg.registered[0]
+	if got.scope.Type != model.GitHubScopeRepository || got.scope.Owner != "example-owner" || got.scope.Repository != "questkit" {
+		t.Fatalf("runner registered on %+v, want example-owner/questkit", got.scope)
+	}
+	if got.name != "uecb-kubernetes-Alloc_123" || strings.Join(got.labels, ",") != "self-hosted,linux,x64,uecb,uecb-full,uecb-kubernetes-Alloc_123" {
+		t.Fatalf("registration = %+v", got)
+	}
+	if provisioned.RunnerLabel != "uecb-kubernetes-Alloc_123" || provisioned.Metadata[metadataRunnerID] != "101" {
+		t.Fatalf("provisioned = %+v", provisioned)
+	}
+	if provisioned.Metadata["target_url"] != "https://github.com/example-owner/questkit" || provisioned.Metadata["namespace"] != "arc-runners" {
 		t.Fatalf("metadata = %+v", provisioned.Metadata)
 	}
 
@@ -132,108 +175,111 @@ func TestProvisionCreatesRunnerPodForRequestingRepository(t *testing.T) {
 	}
 	pod := api.calls[0].body
 	metadata := pod["metadata"].(map[string]any)
-	if metadata["name"] != "uecb-runner-alloc-123" {
-		t.Fatalf("pod name = %v", metadata["name"])
-	}
-	if metadata["annotations"].(map[string]any)[annotationRepository] != "example-owner/questkit" {
-		t.Fatalf("annotations = %v", metadata["annotations"])
+	if metadata["name"] != "uecb-runner-alloc-123" || metadata["annotations"].(map[string]any)[annotationRepository] != "example-owner/questkit" {
+		t.Fatalf("metadata = %+v", metadata)
 	}
 	spec := pod["spec"].(map[string]any)
 	if spec["restartPolicy"] != "Never" || spec["activeDeadlineSeconds"].(float64) != 30*60 {
 		t.Fatalf("spec = %+v", spec)
 	}
-	if spec["nodeSelector"].(map[string]any)["kubernetes.io/arch"] != "amd64" {
-		t.Fatalf("podSpec template not kept: %+v", spec)
-	}
 	containers := spec["containers"].([]any)
-	if len(containers) != 2 {
-		t.Fatalf("containers = %+v", containers)
-	}
 	runner := containers[0].(map[string]any)
-	if runner["image"] != "ghcr.io/example/launcher:v1" {
-		t.Fatalf("runner image = %v", runner["image"])
+	if runner["image"] != defaultRunnerImage || runner["command"].([]any)[0] != defaultRunnerCommand {
+		t.Fatalf("runner = %+v", runner)
 	}
-	env := envMap(t, runner)
-	want := map[string]string{
-		"DOCKER_HOST":       "unix:///var/run/docker/docker.sock",
-		"GITHUB_SCOPE_TYPE": "repository",
-		"GITHUB_OWNER":      "example-owner",
-		"GITHUB_REPOSITORY": "questkit",
-		"GITHUB_TARGET_URL": "https://github.com/example-owner/questkit",
-		"RUNNER_NAME":       "uecb-kubernetes-Alloc_123",
+	env := envMap(runner)
+	if env[envJITConfig] != "jit-uecb-kubernetes-Alloc_123" || env["DOCKER_HOST"] == nil || len(env) != 2 {
+		t.Fatalf("env = %+v", env)
 	}
-	for name, value := range want {
-		if env[name] != value {
-			t.Errorf("env %s = %v, want %q", name, env[name], value)
+	encoded, _ := json.Marshal(pod)
+	for _, leak := range []string{"GITHUB_TOKEN", "secretKeyRef", "uecb-github-app", "must-be-replaced"} {
+		if strings.Contains(string(encoded), leak) {
+			t.Errorf("pod must not carry %q: %s", leak, encoded)
 		}
-	}
-	if labels := env["RUNNER_LABELS"].(string); !strings.Contains(labels, "uecb-full") || !strings.HasSuffix(labels, "uecb-kubernetes-Alloc_123") || strings.Count(labels, "self-hosted") != 1 {
-		t.Errorf("RUNNER_LABELS = %q", labels)
-	}
-	token := env["GITHUB_TOKEN"].(map[string]any)["secretKeyRef"].(map[string]any)
-	if token["name"] != "uecb-github-app" || token["key"] != "github_token" {
-		t.Errorf("GITHUB_TOKEN = %+v", token)
 	}
 	if containers[1].(map[string]any)["image"] != "docker:dind" {
 		t.Fatalf("sidecar changed: %+v", containers[1])
 	}
-
-	// The template is copied, not mutated, so the next pod gets clean env.
-	if _, err := b.Provision(context.Background(), request, model.AllocationStatus{ID: "second", Pool: model.PoolFull, Request: &request}); err != nil {
-		t.Fatal(err)
-	}
-	second := api.calls[1].body["spec"].(map[string]any)["containers"].([]any)[0].(map[string]any)
-	if got := len(second["env"].([]any)); got != len(runner["env"].([]any)) {
-		t.Fatalf("env grew across pods: %d vs %d", got, len(runner["env"].([]any)))
+	if len(reg.deleted) != 0 {
+		t.Fatalf("a successful provision must keep its registration: %v", reg.deleted)
 	}
 }
 
-func TestProvisionRejectsForeignRepositoryAndHandlesAPIErrors(t *testing.T) {
-	api := &fakeAPI{}
-	b := New(newConfig(t), api)
-	foreign := model.AllocationStatus{ID: "x", Pool: model.PoolFull, Repository: "someone-else/repo"}
-	if _, err := b.Provision(context.Background(), model.AllocationRequest{Pool: model.PoolFull}, foreign); err == nil || len(api.calls) != 0 {
-		t.Fatalf("foreign repository must not create a pod: err=%v calls=%d", err, len(api.calls))
-	}
-
+func TestProvisionFailuresRemoveTheRegistration(t *testing.T) {
 	owned := model.AllocationStatus{ID: "y", Pool: model.PoolFull, Repository: "example-owner/deskquest"}
-	api.responses = map[string]response{"POST /api/v1/namespaces/arc-runners/pods": {http.StatusConflict, `{}`}}
-	if _, err := b.Provision(context.Background(), model.AllocationRequest{Pool: model.PoolFull}, owned); err != nil {
-		t.Fatalf("an existing pod (retry) should be accepted: %v", err)
+
+	for _, tc := range []struct {
+		name     string
+		resp     response
+		capacity bool
+	}{
+		{"conflict", response{http.StatusConflict, `{}`}, false},
+		{"quota", response{http.StatusForbidden, `{"message":"pods \"x\" is forbidden: exceeded quota: runners"}`}, true},
+		{"server error", response{http.StatusInternalServerError, `boom`}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := &fakeAPI{responses: map[string]response{"POST /api/v1/namespaces/arc-runners/pods": tc.resp}}
+			reg := &fakeRegistrar{}
+			_, err := New(newConfig(t), api, reg).Provision(context.Background(), model.AllocationRequest{Pool: model.PoolFull}, owned)
+			if err == nil || backend.IsCapacityExhausted(err) != tc.capacity {
+				t.Fatalf("err = %v, capacity exhausted want %v", err, tc.capacity)
+			}
+			if len(reg.deleted) != 1 || reg.deleted[0] != 101 {
+				t.Fatalf("registration not removed: %v", reg.deleted)
+			}
+		})
 	}
 
-	api.responses["POST /api/v1/namespaces/arc-runners/pods"] = response{http.StatusForbidden, `{"message":"pods \"x\" is forbidden: exceeded quota: runners"}`}
-	_, err := b.Provision(context.Background(), model.AllocationRequest{Pool: model.PoolFull}, owned)
-	if !backend.IsCapacityExhausted(err) {
-		t.Fatalf("quota rejection should be capacity exhaustion, got %v", err)
+	api := &fakeAPI{}
+	reg := &fakeRegistrar{}
+	b := New(newConfig(t), api, reg)
+	if _, err := b.Provision(context.Background(), model.AllocationRequest{Pool: model.PoolFull}, model.AllocationStatus{ID: "x", Pool: model.PoolFull, Repository: "someone-else/repo"}); err == nil || len(reg.registered) != 0 || len(api.calls) != 0 {
+		t.Fatalf("a foreign repository must get neither a registration nor a pod: err=%v", err)
 	}
-
-	api.responses["POST /api/v1/namespaces/arc-runners/pods"] = response{http.StatusInternalServerError, `boom`}
-	if _, err := b.Provision(context.Background(), model.AllocationRequest{Pool: model.PoolFull}, owned); err == nil || backend.IsCapacityExhausted(err) {
-		t.Fatalf("server error should fail without capacity exhaustion, got %v", err)
+	reg.err = errors.New("github down")
+	if _, err := b.Provision(context.Background(), model.AllocationRequest{Pool: model.PoolFull}, owned); err == nil || len(api.calls) != 0 {
+		t.Fatalf("no pod without a registration: err=%v calls=%d", err, len(api.calls))
 	}
-
-	if _, err := New(newConfig(t), nil).Provision(context.Background(), model.AllocationRequest{Pool: model.PoolFull}, owned); err == nil {
+	if _, err := New(newConfig(t), api, nil).Provision(context.Background(), model.AllocationRequest{Pool: model.PoolFull}, owned); err == nil {
+		t.Fatal("no registrar should fail")
+	}
+	if _, err := New(newConfig(t), nil, reg).Provision(context.Background(), model.AllocationRequest{Pool: model.PoolFull}, owned); err == nil {
 		t.Fatal("no Kubernetes API should fail")
 	}
 }
 
-func TestCleanupDeletesPodAndToleratesMissing(t *testing.T) {
+func TestCleanupDeletesPodAndRegistration(t *testing.T) {
 	api := &fakeAPI{responses: map[string]response{
 		"DELETE /api/v1/namespaces/arc-runners/pods/uecb-runner-gone": {http.StatusNotFound, `{}`},
 		"DELETE /api/v1/namespaces/arc-runners/pods/uecb-runner-bad":  {http.StatusInternalServerError, `{"message":"etcd down"}`},
 	}}
-	b := New(newConfig(t), api)
-	for _, id := range []string{"live", "gone"} {
-		if err := b.Cleanup(context.Background(), model.AllocationStatus{ID: id, Pool: model.PoolFull, Metadata: map[string]string{"namespace": "arc-runners"}}); err != nil {
-			t.Fatalf("Cleanup(%s): %v", id, err)
-		}
+	reg := &fakeRegistrar{}
+	b := New(newConfig(t), api, reg)
+	status := func(id, runnerID string) model.AllocationStatus {
+		return model.AllocationStatus{ID: id, Pool: model.PoolFull, Repository: "example-owner/questkit",
+			Metadata: map[string]string{"namespace": "arc-runners", metadataRunnerID: runnerID}}
 	}
-	if err := b.Cleanup(context.Background(), model.AllocationStatus{ID: "bad", Pool: model.PoolFull}); err == nil || !strings.Contains(err.Error(), "etcd down") {
-		t.Fatalf("expected delete failure, got %v", err)
+	if err := b.Cleanup(context.Background(), status("live", "7")); err != nil {
+		t.Fatalf("Cleanup: %v", err)
 	}
-	if api.calls[0].method != http.MethodDelete || api.calls[0].path != "/api/v1/namespaces/arc-runners/pods/uecb-runner-live" {
+	if err := b.Cleanup(context.Background(), status("gone", "8")); err != nil {
+		t.Fatalf("missing pod: %v", err)
+	}
+	if strings.Join([]string{api.calls[0].method, api.calls[0].path}, " ") != "DELETE /api/v1/namespaces/arc-runners/pods/uecb-runner-live" {
 		t.Fatalf("calls = %+v", api.calls)
+	}
+	if len(reg.deleted) != 2 || reg.deleted[0] != 7 || reg.deleted[1] != 8 {
+		t.Fatalf("registrations deleted = %v", reg.deleted)
+	}
+
+	// A runner still running its job (422) is left for GitHub to remove.
+	reg.deleteErr = &github.StatusError{Code: http.StatusUnprocessableEntity, Message: "runner busy"}
+	if err := b.Cleanup(context.Background(), status("busy", "9")); err != nil {
+		t.Fatalf("busy runner: %v", err)
+	}
+	reg.deleteErr = errors.New("github down")
+	if err := b.Cleanup(context.Background(), status("bad", "10")); err == nil || !strings.Contains(err.Error(), "etcd down") || !strings.Contains(err.Error(), "github down") {
+		t.Fatalf("expected both failures, got %v", err)
 	}
 }
 
@@ -247,7 +293,7 @@ func TestCapacityCountsLiveRunnerPods(t *testing.T) {
 			{"metadata":{"deletionTimestamp":"2026-10-31T00:00:00Z"},"status":{"phase":"Running"}}
 		]}`},
 	}}
-	status, err := New(newConfig(t), api).Capacity(context.Background())
+	status, err := New(newConfig(t), api, &fakeRegistrar{}).Capacity(context.Background())
 	if err != nil {
 		t.Fatalf("Capacity: %v", err)
 	}
@@ -264,14 +310,8 @@ func TestValidateKubernetesBackend(t *testing.T) {
 	if err := config.Validate(cfg); err != nil {
 		t.Fatalf("valid config rejected: %v", err)
 	}
-	for i := range cfg.Pools {
-		if cfg.Pools[i].Name == model.PoolFull {
-			backendCfg := cfg.Pools[i].Backends[model.BackendKubernetes]
-			backendCfg.Kubernetes = &model.KubernetesBackendConfig{}
-			cfg.Pools[i].Backends[model.BackendKubernetes] = backendCfg
-		}
-	}
-	if err := config.Validate(cfg); err == nil || !strings.Contains(err.Error(), "image") {
-		t.Fatalf("missing image should be rejected, got %v", err)
+	cfg.GitHub.Auth.SecretRef = ""
+	if err := config.Validate(cfg); err == nil || !strings.Contains(err.Error(), "secretRef") {
+		t.Fatalf("missing github.auth.secretRef should be rejected, got %v", err)
 	}
 }

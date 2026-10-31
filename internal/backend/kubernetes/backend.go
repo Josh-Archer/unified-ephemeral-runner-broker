@@ -1,27 +1,37 @@
 // Package kubernetes launches one ephemeral GitHub Actions runner pod per
-// allocation in the broker's cluster, using the launcher image
-// (docker/launcher). Each pod registers on the scope the allocation resolves
-// to, so with github.scope.type owner one pool serves every repository.
+// allocation in the broker's cluster. The broker registers the runner itself
+// (a single-use just-in-time config on the scope the allocation resolves to)
+// and the pod only receives that config, never the broker's GitHub token. With
+// github.scope.type owner one pool serves every repository.
 package kubernetes
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend"
+	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/github"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 )
 
 const (
 	defaultRunnerContainer = "runner"
-	defaultTokenKey        = "github_token"
+	defaultRunnerImage     = "ghcr.io/actions/actions-runner:latest"
+	defaultRunnerCommand   = "/home/runner/run.sh"
 	defaultDeadlineGrace   = 10 * time.Minute
+
+	// envJITConfig is read by the actions runner as its --jitconfig argument.
+	envJITConfig = "ACTIONS_RUNNER_INPUT_JITCONFIG"
+
+	metadataRunnerID = "github_runner_id"
 
 	labelManagedBy    = "app.kubernetes.io/managed-by"
 	labelManagedByVal = "unified-ephemeral-runner-broker"
@@ -38,15 +48,22 @@ type API interface {
 	Do(ctx context.Context, method, path string, body any) (int, []byte, error)
 }
 
+// Registrar registers and removes runners on GitHub with the broker's token.
+type Registrar interface {
+	GenerateJITConfig(ctx context.Context, scope model.GitHubScope, runnerGroup, name string, labels []string) (github.JITConfig, error)
+	DeleteRunner(ctx context.Context, scope model.GitHubScope, runnerID int64) error
+}
+
 type Backend struct {
-	cfg model.BrokerConfig
-	api API
+	cfg       model.BrokerConfig
+	api       API
+	registrar Registrar
 }
 
 // New returns the backend. api may be nil when the broker runs outside
 // Kubernetes; Provision then fails and Capacity reports an error.
-func New(cfg model.BrokerConfig, api API) *Backend {
-	return &Backend{cfg: cfg, api: api}
+func New(cfg model.BrokerConfig, api API, registrar Registrar) *Backend {
+	return &Backend{cfg: cfg, api: api, registrar: registrar}
 }
 
 func (b *Backend) Name() model.BackendName {
@@ -72,12 +89,29 @@ func (b *Backend) Provision(ctx context.Context, request model.AllocationRequest
 		return backend.ProvisionedRunner{}, err
 	}
 
+	if b.registrar == nil {
+		return backend.ProvisionedRunner{}, fmt.Errorf("backend %s needs a GitHub client to register runners", model.BackendKubernetes)
+	}
+
 	runnerLabel := backend.DefaultRunnerLabel(model.BackendKubernetes, allocation.ID)
 	timeout := request.JobTimeout
 	if timeout <= 0 {
 		timeout = b.cfg.Broker.DefaultJobTimeout
 	}
-	pod, err := b.buildPod(pool, backendCfg, allocation, scope, targetURL, runnerLabel, timeout)
+	labels := runnerLabels(pool.Labels, allocation.RequestedLabels, runnerLabel)
+	jit, err := b.registrar.GenerateJITConfig(ctx, scope, scope.RunnerGroup(pool.Name), runnerLabel, labels)
+	if err != nil {
+		return backend.ProvisionedRunner{}, err
+	}
+	// The registration is useless without its pod, so remove it on any failure.
+	created := false
+	defer func() {
+		if !created {
+			_ = b.registrar.DeleteRunner(context.WithoutCancel(ctx), scope, jit.RunnerID)
+		}
+	}()
+
+	pod, err := b.buildPod(pool, backendCfg, allocation, jit.Encoded, timeout)
 	if err != nil {
 		return backend.ProvisionedRunner{}, err
 	}
@@ -88,8 +122,6 @@ func (b *Backend) Provision(ctx context.Context, request model.AllocationRequest
 		return backend.ProvisionedRunner{}, err
 	}
 	switch {
-	case status == http.StatusConflict:
-		// A retried Provision for the same allocation finds its pod already there.
 	case status == http.StatusForbidden && strings.Contains(strings.ToLower(kubeMessage(body)), "exceeded quota"):
 		// A ResourceQuota rejection means the namespace has no room for the pod.
 		return backend.ProvisionedRunner{}, backend.NewAllocationError(
@@ -98,43 +130,59 @@ func (b *Backend) Provision(ctx context.Context, request model.AllocationRequest
 			true,
 		)
 	case status < 200 || status >= 300:
+		// 409 included: a pod left over for this allocation holds a stale
+		// registration, so fail rather than adopt it.
 		return backend.ProvisionedRunner{}, fmt.Errorf("create runner pod in %s: status %d: %s", namespace, status, kubeMessage(body))
 	}
+	created = true
 
 	metadata := backend.WithCapabilitiesMetadata(backendCfg, map[string]string{
-		"provisioner":  "kubernetes-pod",
-		"lifecycle":    "ephemeral",
-		"namespace":    namespace,
-		"pod_name":     podName(allocation.ID),
-		"runner_label": runnerLabel,
-		"target_url":   targetURL,
-		"scope_type":   scope.Type,
+		"provisioner":    "kubernetes-pod",
+		"lifecycle":      "ephemeral",
+		"namespace":      namespace,
+		"pod_name":       podName(allocation.ID),
+		"runner_label":   runnerLabel,
+		"target_url":     targetURL,
+		"scope_type":     scope.Type,
+		metadataRunnerID: strconv.FormatInt(jit.RunnerID, 10),
 	})
 	return backend.ProvisionedRunner{RunnerLabel: runnerLabel, Metadata: metadata}, nil
 }
 
-// Cleanup deletes the allocation's runner pod. A pod that is already gone is
-// not an error.
+// Cleanup deletes the allocation's runner pod and its runner registration.
+// Either being gone already is not an error. An ephemeral runner that ran its
+// job is removed by GitHub; one that never got a job is removed here.
 func (b *Backend) Cleanup(ctx context.Context, status model.AllocationStatus) error {
-	if b.api == nil {
-		return nil
-	}
-	namespace := strings.TrimSpace(status.Metadata["namespace"])
-	if namespace == "" {
-		pool, ok := b.pool(status.Pool)
-		if !ok {
-			return nil
+	var errs []error
+	if b.api != nil {
+		namespace := strings.TrimSpace(status.Metadata["namespace"])
+		if namespace == "" {
+			if pool, ok := b.pool(status.Pool); ok {
+				namespace = b.namespace(pool.Backends[model.BackendKubernetes])
+			}
 		}
-		namespace = b.namespace(pool.Backends[model.BackendKubernetes])
+		if namespace != "" {
+			code, body, err := b.api.Do(ctx, http.MethodDelete, podsPath(namespace, podName(status.ID)), nil)
+			switch {
+			case err != nil:
+				errs = append(errs, err)
+			case code != http.StatusNotFound && (code < 200 || code >= 300):
+				errs = append(errs, fmt.Errorf("delete runner pod %s/%s: status %d: %s", namespace, podName(status.ID), code, kubeMessage(body)))
+			}
+		}
 	}
-	code, body, err := b.api.Do(ctx, http.MethodDelete, podsPath(namespace, podName(status.ID)), nil)
-	if err != nil {
-		return err
+	if runnerID, err := strconv.ParseInt(status.Metadata[metadataRunnerID], 10, 64); err == nil && runnerID > 0 && b.registrar != nil {
+		scope, err := b.cfg.GitHub.Scope.ForRepository(status.TargetRepository())
+		if err == nil {
+			err = b.registrar.DeleteRunner(ctx, scope, runnerID)
+		}
+		var apiErr *github.StatusError
+		// 422: the runner is running a job; GitHub removes it when the job ends.
+		if err != nil && !(errors.As(err, &apiErr) && apiErr.Code == http.StatusUnprocessableEntity) {
+			errs = append(errs, fmt.Errorf("delete runner %d: %w", runnerID, err))
+		}
 	}
-	if code == http.StatusNotFound || (code >= 200 && code < 300) {
-		return nil
-	}
-	return fmt.Errorf("delete runner pod %s/%s: status %d: %s", namespace, podName(status.ID), code, kubeMessage(body))
+	return errors.Join(errs...)
 }
 
 // Capacity counts this backend's live runner pods against the summed
@@ -212,7 +260,7 @@ func (b *Backend) namespace(cfg model.BackendConfig) string {
 	return ""
 }
 
-func (b *Backend) buildPod(pool model.PoolConfig, cfg model.BackendConfig, allocation model.AllocationStatus, scope model.GitHubScope, targetURL, runnerLabel string, timeout time.Duration) (map[string]any, error) {
+func (b *Backend) buildPod(pool model.PoolConfig, cfg model.BackendConfig, allocation model.AllocationStatus, jitConfig string, timeout time.Duration) (map[string]any, error) {
 	kcfg := model.KubernetesBackendConfig{}
 	if cfg.Kubernetes != nil {
 		kcfg = *cfg.Kubernetes
@@ -251,42 +299,25 @@ func (b *Backend) buildPod(pool model.PoolConfig, cfg model.BackendConfig, alloc
 	}
 	runner := containers[runnerIndex].(map[string]any)
 	if image, _ := runner["image"].(string); strings.TrimSpace(image) == "" {
-		if strings.TrimSpace(kcfg.Image) == "" {
-			return nil, fmt.Errorf("pools[%s].backends[%s]: set kubernetes.image or an image on container %q", pool.Name, model.BackendKubernetes, containerName)
+		image = strings.TrimSpace(kcfg.Image)
+		if image == "" {
+			image = defaultRunnerImage
 		}
-		runner["image"] = strings.TrimSpace(kcfg.Image)
+		runner["image"] = image
+	}
+	if _, ok := runner["command"]; !ok {
+		runner["command"] = []any{defaultRunnerCommand}
 	}
 
-	tokenSecret := strings.TrimSpace(kcfg.TokenSecret.Name)
-	if tokenSecret == "" {
-		tokenSecret = strings.TrimSpace(b.cfg.GitHub.Auth.SecretRef)
-	}
-	if tokenSecret == "" {
-		return nil, fmt.Errorf("pools[%s].backends[%s]: set kubernetes.tokenSecret.name or github.auth.secretRef", pool.Name, model.BackendKubernetes)
-	}
-	tokenKey := strings.TrimSpace(kcfg.TokenSecret.Key)
-	if tokenKey == "" {
-		tokenKey = defaultTokenKey
-	}
-
-	env := []any{
-		map[string]any{"name": "GITHUB_TOKEN", "valueFrom": map[string]any{"secretKeyRef": map[string]any{"name": tokenSecret, "key": tokenKey}}},
-		envVar("GITHUB_SCOPE_TYPE", scope.Type),
-		envVar("GITHUB_TARGET_URL", targetURL),
-		envVar("RUNNER_NAME", runnerLabel),
-		envVar("RUNNER_LABELS", strings.Join(runnerLabels(pool.Labels, allocation.RequestedLabels, runnerLabel), ",")),
-	}
-	switch scope.Type {
-	case model.GitHubScopeOrganization:
-		env = append(env, envVar("GITHUB_ORGANIZATION", scope.Organization))
-		if group := scope.RunnerGroup(pool.Name); group != "" {
-			env = append(env, envVar("RUNNER_GROUP", group))
+	env, _ := runner["env"].([]any)
+	filtered := make([]any, 0, len(env)+1)
+	for _, raw := range env {
+		if entry, ok := raw.(map[string]any); ok && entry["name"] == envJITConfig {
+			continue
 		}
-	case model.GitHubScopeRepository:
-		env = append(env, envVar("GITHUB_OWNER", scope.Owner), envVar("GITHUB_REPOSITORY", scope.Repository))
+		filtered = append(filtered, raw)
 	}
-	existing, _ := runner["env"].([]any)
-	runner["env"] = append(existing, env...)
+	runner["env"] = append(filtered, map[string]any{"name": envJITConfig, "value": jitConfig})
 	containers[runnerIndex] = runner
 	spec["containers"] = containers
 
@@ -320,10 +351,6 @@ type podList struct {
 			Phase string `json:"phase"`
 		} `json:"status"`
 	} `json:"items"`
-}
-
-func envVar(name, value string) map[string]any {
-	return map[string]any{"name": name, "value": value}
 }
 
 func runnerLabels(base, requested []string, runnerLabel string) []string {

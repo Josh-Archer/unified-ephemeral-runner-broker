@@ -25,6 +25,7 @@ import (
 	lambdabackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/lambda"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/capacity"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/config"
+	githubapi "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/github"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/runtime"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/store"
@@ -69,7 +70,11 @@ func main() {
 		runnerPods = kubeAPI
 	}
 
-	registry, desktopBackend := buildRegistry(cfg, secretReader, runnerPods)
+	// The broker's own GitHub client: registers kubernetes-backend runners and
+	// checks webhook jobs. Its token never leaves the broker.
+	githubClient := githubapi.NewClient(githubapi.TokenFromSecret(secretReader, cfg.GitHub.Auth.SecretRef, ""), nil)
+
+	registry, desktopBackend := buildRegistry(cfg, secretReader, runnerPods, githubClient)
 	healthChecker, err := runtime.NewSecretRefCheckerFromEnv(cfg)
 	if err != nil {
 		log.Fatalf("configure runtime dependencies: %v", err)
@@ -132,9 +137,14 @@ func main() {
 	useLeaderElection := config.HAEnabled(cfg.Broker)
 
 	if webhookPoolsConfigured(cfg) {
+		var headRepository func(context.Context, string, int64) (string, error)
+		if cfg.GitHub.Scope.IsPerRepository() && !cfg.Broker.GitHubWebhook.AllowForkPullRequests {
+			headRepository = githubClient.WorkflowRunHeadRepository
+		}
 		server.SetGitHubWebhook(api.GitHubWebhookOptions{
-			Secret: api.GitHubWebhookSecretFunc(cfg.Broker.GitHubWebhook, secretReader.ReadSecret),
-			Inbox:  store.AsWebhookInbox(service.Store()),
+			HeadRepository: headRepository,
+			Secret:         api.GitHubWebhookSecretFunc(cfg.Broker.GitHubWebhook, secretReader.ReadSecret),
+			Inbox:          store.AsWebhookInbox(service.Store()),
 			IsLeader: func(ctx context.Context) (bool, error) {
 				if !useLeaderElection {
 					return true, nil
@@ -265,7 +275,7 @@ func leaderIdentity(configured string) string {
 	return "broker"
 }
 
-func buildRegistry(cfg model.BrokerConfig, secretReader runtime.SecretReader, runnerPods kubernetesbackend.API) (*backend.Registry, *desktopbackend.Backend) {
+func buildRegistry(cfg model.BrokerConfig, secretReader runtime.SecretReader, runnerPods kubernetesbackend.API, registrar kubernetesbackend.Registrar) (*backend.Registry, *desktopbackend.Backend) {
 	desktopBackend := desktopbackend.New(cfg)
 	registry := backend.NewRegistry(
 		arcbackend.New(cfg, secretReader),
@@ -275,7 +285,7 @@ func buildRegistry(cfg model.BrokerConfig, secretReader runtime.SecretReader, ru
 		azurebackend.New(cfg, secretReader),
 		azurevmbackend.New(cfg),
 		desktopBackend,
-		kubernetesbackend.New(cfg, runnerPods),
+		kubernetesbackend.New(cfg, runnerPods, registrar),
 		ec2backend.New(cfg, secretReader),
 		gcebackend.New(cfg, secretReader),
 	)

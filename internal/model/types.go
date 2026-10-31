@@ -183,6 +183,11 @@ type GitHubWebhookConfig struct {
 	SecretRef string `yaml:"secretRef,omitempty" json:"secretRef,omitempty"`
 	// SecretKey is the key inside SecretRef (default: webhook_secret).
 	SecretKey string `yaml:"secretKey,omitempty" json:"secretKey,omitempty"`
+	// AllowForkPullRequests lets jobs whose code comes from another repository
+	// (pull requests from forks) get a runner under github.scope.type owner.
+	// Off by default: anyone can open such a pull request on a public
+	// repository and choose its runs-on labels.
+	AllowForkPullRequests bool `yaml:"allowForkPullRequests,omitempty" json:"allowForkPullRequests,omitempty"`
 }
 
 // WebhooksConfig controls outbound allocation lifecycle event delivery.
@@ -320,15 +325,13 @@ type DesktopConfig struct {
 type KubernetesBackendConfig struct {
 	// Namespace holds the runner pods. Empty means the broker's namespace.
 	Namespace string `yaml:"namespace,omitempty" json:"namespace,omitempty"`
-	// Image is the runner launcher image (docker/launcher). It is used for the
-	// runner container when PodSpec does not set one.
+	// Image is the actions runner image for the runner container when PodSpec
+	// does not set one. Defaults to ghcr.io/actions/actions-runner:latest; the
+	// container command defaults to /home/runner/run.sh.
 	Image string `yaml:"image,omitempty" json:"image,omitempty"`
-	// RunnerContainer names the container in PodSpec that runs the launcher and
-	// receives the GitHub environment. Defaults to "runner".
+	// RunnerContainer names the container in PodSpec that runs the actions
+	// runner and receives its just-in-time config. Defaults to "runner".
 	RunnerContainer string `yaml:"runnerContainer,omitempty" json:"runnerContainer,omitempty"`
-	// TokenSecret holds the GitHub token the launcher uses to register. Name
-	// defaults to github.auth.secretRef and Key to github_token.
-	TokenSecret SecretKeyRef `yaml:"tokenSecret,omitempty" json:"tokenSecret,omitempty"`
 	// PodSpec is a Kubernetes PodSpec (affinity, resources, a dind sidecar,
 	// volumes, ...) used as the template for every runner pod. When empty the
 	// pod has only the runner container.
@@ -336,12 +339,6 @@ type KubernetesBackendConfig struct {
 	// DeadlineGrace is added to the job timeout to form the pod's
 	// activeDeadlineSeconds. Defaults to 10 minutes.
 	DeadlineGrace time.Duration `yaml:"deadlineGrace,omitempty" json:"deadlineGrace,omitempty"`
-}
-
-// SecretKeyRef points at one key of a Kubernetes Secret.
-type SecretKeyRef struct {
-	Name string `yaml:"name,omitempty" json:"name,omitempty"`
-	Key  string `yaml:"key,omitempty" json:"key,omitempty"`
 }
 
 type BackendConfig struct {

@@ -647,10 +647,11 @@ Owner scope requires `github.scope.owner`. `github.scope.repository` is optional
 - The GitHub token (`github.auth.secretRef`) must be able to register runners on every repository that will use the pool.
 - Warm runners register on the default repository and are handed only to allocations from that repository. Without a default repository, warm runners are rejected at config load.
 - Webhook allocations use the repository, lower-cased, as their fair-share tenant, so `fairShare.quotas` can cap a single repository.
+- Webhook jobs whose code comes from another repository get no runner (ignored with reason `fork_pull_request`). For a `pull_request` from a fork, the fork author writes the workflow, including its `runs-on` labels. The broker reads the job's workflow run (`head_repository`) with its own token. If that lookup fails, the delivery fails instead of allocating. Set `broker.githubWebhook.allowForkPullRequests: true` only if fork code may run on these runners.
 
 ### Shared in-cluster pool (`kubernetes` backend)
 
-The `arc` backend only hands out the label of an existing ARC runner scale set, and a scale set registers on one repository or organization. The `kubernetes` backend instead starts one runner pod per allocation from the launcher image. The pod registers on the allocation's resolved scope, so together with owner scope one pool serves every repository:
+The `arc` backend only hands out the label of an existing ARC runner scale set, and a scale set registers on one repository or organization. The `kubernetes` backend instead registers one ephemeral runner per allocation on the allocation's resolved scope, then starts a pod for it, so together with owner scope one pool serves every repository. The broker registers the runner with its own token (`generate-jitconfig`). The pod receives only that runner's single-use just-in-time config, never the GitHub token, so a job cannot read credentials for other repositories:
 
 ```yaml
 github:
@@ -675,7 +676,6 @@ pools:
         capabilities: [cluster-local, docker, privileged]
         kubernetes:
           namespace: arc-runners
-          image: ghcr.io/josh-archer/unified-ephemeral-runner-broker/launcher:v0.1.28
           podSpec:
             nodeSelector: {kubernetes.io/arch: amd64}
             containers:
@@ -691,8 +691,11 @@ pools:
             volumes: [{name: dind-sock, emptyDir: {}}]
 ```
 
-- `podSpec` is a plain Kubernetes PodSpec used as the template. The broker sets `restartPolicy: Never` and `activeDeadlineSeconds` (job timeout plus `deadlineGrace`, default 10m). It adds the launcher environment (`GITHUB_TOKEN` from `tokenSecret`, scope, target URL, runner name and labels) to the container named `runnerContainer` (default `runner`), which runs `image` unless the template sets one.
-- `tokenSecret` defaults to `{name: <github.auth.secretRef>, key: github_token}`. That secret must exist in the runner namespace.
+- `podSpec` is a plain Kubernetes PodSpec used as the template. The broker sets `restartPolicy: Never` and `activeDeadlineSeconds` (job timeout plus `deadlineGrace`, default 10m).
+- The broker sets `ACTIONS_RUNNER_INPUT_JITCONFIG` on the container named `runnerContainer` (default `runner`). That container runs `image` (default `ghcr.io/actions/actions-runner:latest`) with command `/home/runner/run.sh` unless the template sets them.
+- The JIT config is a pod environment value, so anyone who can read pods in the namespace can see it until the runner has used it. Keep `pods/get` there limited to the broker and admins.
+- The broker reads its token from `github.auth.secretRef` (key `github_token`). It deletes the runner registration if the pod cannot be created, and again on finalize or reap if the runner never ran a job.
+- Jobs from different repositories share the namespace and nodes. Give the pods a service account with no RBAC bindings and `automountServiceAccountToken: false`, and limit privileges to the dind sidecar.
 - The broker needs pod `create`, `delete`, `get` and `list` there (`runnerPods.enabled` in the Helm chart).
 - Pods are named `uecb-runner-<allocation-id>` and deleted when the allocation finishes or is reaped.
 - `Capacity()` counts live pods. Unschedulable pods count as pending, so a full cluster shows no free slots.

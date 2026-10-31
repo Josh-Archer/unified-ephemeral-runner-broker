@@ -229,7 +229,8 @@ func validatePerRepositoryScope(cfg model.BrokerConfig) error {
 }
 
 // validateKubernetesBackends checks the runner pod settings of enabled
-// kubernetes backends: an image, a token secret and a sane podSpec.
+// kubernetes backends. The broker registers their runners itself, so it needs
+// github.auth.secretRef.
 func validateKubernetesBackends(cfg model.BrokerConfig) error {
 	for _, pool := range cfg.Pools {
 		backendCfg, ok := pool.Backends[model.BackendKubernetes]
@@ -244,36 +245,22 @@ func validateKubernetesBackends(cfg model.BrokerConfig) error {
 		if kcfg.DeadlineGrace < 0 {
 			return fmt.Errorf("%s.kubernetes.deadlineGrace must not be negative", prefix)
 		}
-		if strings.TrimSpace(kcfg.TokenSecret.Name) == "" && strings.TrimSpace(cfg.GitHub.Auth.SecretRef) == "" {
-			return fmt.Errorf("%s.kubernetes.tokenSecret.name is required when github.auth.secretRef is empty", prefix)
+		if strings.TrimSpace(cfg.GitHub.Auth.SecretRef) == "" {
+			return fmt.Errorf("%s: github.auth.secretRef is required; the broker registers these runners", prefix)
 		}
 		if backendCfg.WarmMin > 0 || backendCfg.WarmMax > 0 {
 			return fmt.Errorf("%s: warm runners are not supported; runner pods start per allocation", prefix)
 		}
-		runnerName := strings.TrimSpace(kcfg.RunnerContainer)
-		if runnerName == "" {
-			runnerName = "runner"
-		}
-		runnerImage := strings.TrimSpace(kcfg.Image)
 		if raw, present := kcfg.PodSpec["containers"]; present {
 			containers, ok := raw.([]any)
 			if !ok {
 				return fmt.Errorf("%s.kubernetes.podSpec.containers must be a list", prefix)
 			}
 			for index, rawContainer := range containers {
-				container, ok := rawContainer.(map[string]any)
-				if !ok {
+				if _, ok := rawContainer.(map[string]any); !ok {
 					return fmt.Errorf("%s.kubernetes.podSpec.containers[%d] must be a mapping", prefix, index)
 				}
-				if container["name"] == runnerName {
-					if image, _ := container["image"].(string); strings.TrimSpace(image) != "" {
-						runnerImage = image
-					}
-				}
 			}
-		}
-		if runnerImage == "" {
-			return fmt.Errorf("%s: set kubernetes.image or an image on podSpec container %q", prefix, runnerName)
 		}
 	}
 	return nil
