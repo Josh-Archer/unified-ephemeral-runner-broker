@@ -566,3 +566,47 @@ func TestGitHubWebhookRejectsForkPullRequestJobs(t *testing.T) {
 		t.Fatal("an already allocated job needs no second lookup")
 	}
 }
+
+func TestGitHubWebhookPoolRepositoryAllowlist(t *testing.T) {
+	h := newWebhookHarness(t, true)
+	h.service.cfg.GitHub.Scope = model.GitHubScope{Type: model.GitHubScopeOwner, Owner: "example-owner", Repository: "home"}
+	for i := range h.service.cfg.Pools {
+		if h.service.cfg.Pools[i].Name == model.PoolFull {
+			h.service.cfg.Pools[i].WebhookRepositories = []string{"Example-Owner/home"}
+		}
+	}
+
+	rec := h.send("workflow_job", "r1", repoJobBody("queued", 801, "example-owner/home", "self-hosted", "uecb-full"))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("allowed repository: got %d %s", rec.Code, rec.Body)
+	}
+	rec = h.send("workflow_job", "r2", repoJobBody("queued", 802, "example-owner/public-repo", "self-hosted", "uecb-full"))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "repository_not_allowed") {
+		t.Fatalf("other repository: got %d %s", rec.Code, rec.Body)
+	}
+	if _, ok := h.service.findByWorkflowJobID(802); ok {
+		t.Fatal("a repository outside webhookRepositories must not get a runner from the pool")
+	}
+}
+
+func TestMatchWebhookPoolForRepositoryFallsThrough(t *testing.T) {
+	service := newServiceWithConfig(func(pool *model.PoolConfig) {
+		switch pool.Name {
+		case model.PoolFull:
+			pool.WebhookLabels = []string{"self-hosted", "shared"}
+			pool.WebhookRepositories = []string{"owner/home"}
+		case model.PoolLite:
+			pool.WebhookLabels = []string{"self-hosted", "shared", "linux"}
+			pool.WebhookRepositories = []string{"owner/*"}
+		}
+	})
+	if pool, ok := service.MatchWebhookPoolForRepository([]string{"shared"}, "owner/home"); !ok || pool.Name != model.PoolFull {
+		t.Fatalf("home: %v %v", pool.Name, ok)
+	}
+	if pool, ok := service.MatchWebhookPoolForRepository([]string{"shared"}, "OWNER/questkit"); !ok || pool.Name != model.PoolLite {
+		t.Fatalf("questkit should fall through to the owner/* pool: %v %v", pool.Name, ok)
+	}
+	if _, ok := service.MatchWebhookPoolForRepository([]string{"shared"}, "other/questkit"); ok {
+		t.Fatal("another owner matches no pool")
+	}
+}

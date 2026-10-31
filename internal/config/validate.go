@@ -723,7 +723,16 @@ func validateWebhookLabels(cfg model.BrokerConfig) error {
 		if pool.WebhookJobTimeout < 0 {
 			return fmt.Errorf("pools[%s].webhookJobTimeout must not be negative", pool.Name)
 		}
+		for i, entry := range pool.WebhookRepositories {
+			owner, repo, ok := strings.Cut(strings.TrimSpace(entry), "/")
+			if !ok || owner == "" || repo == "" || strings.Contains(repo, "/") || (strings.Contains(repo, "*") && repo != "*") {
+				return fmt.Errorf("pools[%s].webhookRepositories[%d] %q must be owner/repo or owner/*", pool.Name, i, entry)
+			}
+		}
 		if len(pool.WebhookLabels) == 0 {
+			if len(pool.WebhookRepositories) > 0 {
+				return fmt.Errorf("pools[%s].webhookRepositories needs webhookLabels", pool.Name)
+			}
 			continue
 		}
 		enabled = true

@@ -293,3 +293,26 @@ func TestValidateWebhookJobTimeout(t *testing.T) {
 		t.Fatal("negative webhookJobTimeout accepted")
 	}
 }
+
+func TestValidateWebhookRepositories(t *testing.T) {
+	base := Default()
+	base.Broker.GitHubWebhook.Secret = "s"
+	for _, tc := range []struct {
+		labels, repos []string
+		ok            bool
+	}{
+		{[]string{"self-hosted", "x"}, []string{"owner/repo", "owner/*"}, true},
+		{[]string{"self-hosted", "x"}, []string{"repo"}, false},
+		{[]string{"self-hosted", "x"}, []string{"owner/re*po"}, false},
+		{[]string{"self-hosted", "x"}, []string{"owner/a/b"}, false},
+		{nil, []string{"owner/repo"}, false},
+	} {
+		cfg := base
+		cfg.Pools = append([]model.PoolConfig(nil), base.Pools...)
+		cfg.Pools[0].WebhookLabels = tc.labels
+		cfg.Pools[0].WebhookRepositories = tc.repos
+		if err := Validate(cfg); (err == nil) != tc.ok {
+			t.Errorf("labels %v repos %v: err=%v want ok=%v", tc.labels, tc.repos, err, tc.ok)
+		}
+	}
+}

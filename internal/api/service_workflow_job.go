@@ -26,6 +26,15 @@ func waitingForWorkflowCapacity(status model.AllocationStatus) bool {
 	return reason == "no-capacity" || reason == "live-capacity"
 }
 
+// MatchWebhookPoolForRepository is MatchWebhookPool restricted to pools whose
+// webhookRepositories allow repository. A pool that matches the labels but not
+// the repository is skipped, so a later pool with the same labels can serve it.
+func (s *Service) MatchWebhookPoolForRepository(jobLabels []string, repository string) (model.PoolConfig, bool) {
+	return s.matchWebhookPool(jobLabels, func(pool model.PoolConfig) bool {
+		return pool.ServesWebhookRepository(repository)
+	})
+}
+
 // MatchWebhookPool returns the pool opted into webhook mode whose webhookLabels
 // cover every runs-on label of a job. GitHub routes a job to a runner whose
 // label set is a superset of the job's labels, so the job labels must be a
@@ -33,6 +42,10 @@ func waitingForWorkflowCapacity(status model.AllocationStatus) bool {
 // because it would be ambiguous across pools. Matching is case-insensitive and
 // the first pool in config order wins.
 func (s *Service) MatchWebhookPool(jobLabels []string) (model.PoolConfig, bool) {
+	return s.matchWebhookPool(jobLabels, nil)
+}
+
+func (s *Service) matchWebhookPool(jobLabels []string, allow func(model.PoolConfig) bool) (model.PoolConfig, bool) {
 	wanted := normalizeLabelSet(jobLabels)
 	specific := false
 	for label := range wanted {
@@ -44,7 +57,7 @@ func (s *Service) MatchWebhookPool(jobLabels []string) (model.PoolConfig, bool) 
 		return model.PoolConfig{}, false
 	}
 	for _, pool := range s.cfg.Pools {
-		if len(pool.WebhookLabels) == 0 {
+		if len(pool.WebhookLabels) == 0 || (allow != nil && !allow(pool)) {
 			continue
 		}
 		have := normalizeLabelSet(pool.WebhookLabels)

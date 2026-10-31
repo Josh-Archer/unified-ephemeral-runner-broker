@@ -375,8 +375,11 @@ func (h *githubWebhookHandler) process(ctx context.Context, payload workflowJobP
 	runner := WorkflowJobRunner{Repository: repository, Name: payload.WorkflowJob.RunnerName, ID: payload.WorkflowJob.RunnerID}
 	switch payload.Action {
 	case "queued":
-		pool, ok := h.service.MatchWebhookPool(payload.WorkflowJob.Labels)
+		pool, ok := h.service.MatchWebhookPoolForRepository(payload.WorkflowJob.Labels, repository)
 		if !ok {
+			if _, labelsMatch := h.service.MatchWebhookPool(payload.WorkflowJob.Labels); labelsMatch {
+				return ignored("repository_not_allowed")
+			}
 			return ignored("no_matching_pool")
 		}
 		if h.opts.HeadRepository != nil {
