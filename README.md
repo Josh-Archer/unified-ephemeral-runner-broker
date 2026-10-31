@@ -642,10 +642,10 @@ are in [docs/image-attestations.md](docs/image-attestations.md).
 
 Repository scope requires `github.scope.owner` and `github.scope.repository`. Organization scope requires `github.scope.organization`.
 
-Owner scope requires `github.scope.owner` and no repository. Each runner registers on the repository that asked for it: the `repository.full_name` of a `workflow_job` webhook, or the `repository` claim of the caller's OIDC token. Repositories of other owners are refused, and webhook deliveries from them are ignored with reason `foreign_repository`. Use it when the owner is a personal account. Personal accounts have no organization-level runners, so a repository or organization scope cannot serve all of their repositories from one pool. Under owner scope:
+Owner scope requires `github.scope.owner`. `github.scope.repository` is optional there: it is the default repository for allocations that name none, such as warm runners or unauthenticated callers. Each runner registers on the repository that asked for it: the `repository.full_name` of a `workflow_job` webhook, or the `repository` claim of the caller's OIDC token. Repositories of other owners are refused, and webhook deliveries from them are ignored with reason `foreign_repository`. Use it when the owner is a personal account. Personal accounts have no organization-level runners, so a repository or organization scope cannot serve all of their repositories from one pool. Under owner scope:
 
 - The GitHub token (`github.auth.secretRef`) must be able to register runners on every repository that will use the pool.
-- Warm runners are rejected at config load, because they would register before a repository is known.
+- Warm runners register on the default repository and are handed only to allocations from that repository. Without a default repository, warm runners are rejected at config load.
 - Webhook allocations use the repository, lower-cased, as their fair-share tenant, so `fairShare.quotas` can cap a single repository.
 
 ### Shared in-cluster pool (`kubernetes` backend)

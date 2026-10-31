@@ -12,7 +12,8 @@ const (
 	// it, for any repository owned by github.scope.owner. It lets one pool serve
 	// every repository of a personal account, which has no organization-level
 	// runners. The repository comes from the workflow_job webhook or the
-	// caller's OIDC token; see ForRepository.
+	// caller's OIDC token; an optional github.scope.repository is the default
+	// for allocations with neither, such as warm runners. See ForRepository.
 	GitHubScopeOwner = "owner"
 )
 
@@ -36,8 +37,8 @@ func (s GitHubScope) Validate() error {
 		if strings.TrimSpace(s.Owner) == "" {
 			return fmt.Errorf("github.scope.owner is required when github.scope.type=%q", GitHubScopeOwner)
 		}
-		if strings.TrimSpace(s.Repository) != "" {
-			return fmt.Errorf("github.scope.repository must be empty when github.scope.type=%q; the repository comes from each allocation", GitHubScopeOwner)
+		if strings.Contains(strings.TrimSpace(s.Repository), "/") {
+			return fmt.Errorf("github.scope.repository is a repository name under github.scope.owner, not owner/repo")
 		}
 		return nil
 	default:
@@ -51,16 +52,26 @@ func (s GitHubScope) IsPerRepository() bool {
 	return strings.TrimSpace(s.Type) == GitHubScopeOwner
 }
 
+// HasDefaultRepository reports whether owner scope has a default repository
+// for allocations that name none.
+func (s GitHubScope) HasDefaultRepository() bool {
+	return s.IsPerRepository() && strings.TrimSpace(s.Repository) != ""
+}
+
 // ForRepository returns the concrete scope a runner registers under for an
 // allocation requested by fullName ("owner/repo"). Organization and repository
 // scopes are returned unchanged. Owner scope becomes a repository scope for
-// fullName, which must belong to the configured owner.
+// fullName, which must belong to the configured owner; an empty fullName uses
+// the default github.scope.repository when one is set.
 func (s GitHubScope) ForRepository(fullName string) (GitHubScope, error) {
 	if !s.IsPerRepository() {
 		return s, nil
 	}
 	if err := s.Validate(); err != nil {
 		return GitHubScope{}, err
+	}
+	if strings.TrimSpace(fullName) == "" && s.HasDefaultRepository() {
+		fullName = strings.TrimSpace(s.Owner) + "/" + strings.TrimSpace(s.Repository)
 	}
 	owner, repo, ok := strings.Cut(strings.TrimSpace(fullName), "/")
 	owner, repo = strings.TrimSpace(owner), strings.TrimSpace(repo)

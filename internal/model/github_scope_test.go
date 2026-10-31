@@ -26,6 +26,17 @@ func TestGitHubScopeForRepository(t *testing.T) {
 		t.Error("owner scope has no single target URL")
 	}
 
+	withDefault := GitHubScope{Type: GitHubScopeOwner, Owner: "example-owner", Repository: "home"}
+	if scope, err := withDefault.ForRepository(""); err != nil || scope.Repository != "home" {
+		t.Fatalf("empty repository should use the default, got %+v, %v", scope, err)
+	}
+	if scope, err := withDefault.ForRepository("example-owner/questkit"); err != nil || scope.Repository != "questkit" {
+		t.Fatalf("a named repository wins over the default, got %+v, %v", scope, err)
+	}
+	if err := (GitHubScope{Type: GitHubScopeOwner, Owner: "o", Repository: "o/r"}).Validate(); err == nil {
+		t.Error("default repository must be a bare name")
+	}
+
 	fixed := GitHubScope{Type: GitHubScopeRepository, Owner: "example-owner", Repository: "home"}
 	if scope, err := fixed.ForRepository("example-owner/questkit"); err != nil || scope != fixed {
 		t.Fatalf("repository scope should pass through unchanged, got %+v, %v", scope, err)

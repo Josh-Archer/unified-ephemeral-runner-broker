@@ -494,3 +494,30 @@ func TestGitHubWebhookOwnerScopeRecordsRepositoryAndRejectsOthers(t *testing.T) 
 		t.Fatalf("foreign_repository ignored delta = %v", after-before)
 	}
 }
+
+func TestWarmRunnersOnlyServeTheDefaultRepositoryUnderOwnerScope(t *testing.T) {
+	service := newServiceWithConfig(func(*model.PoolConfig) {})
+	request := func(repo string) model.AllocationStatus { return model.AllocationStatus{Repository: repo} }
+
+	if !service.warmRunnerServes(request("anyone/anything")) {
+		t.Fatal("fixed scopes keep sharing warm runners")
+	}
+
+	service.cfg.GitHub.Scope = model.GitHubScope{Type: model.GitHubScopeOwner, Owner: "example-owner", Repository: "home"}
+	for repo, want := range map[string]bool{
+		"example-owner/home":     true,
+		"Example-Owner/HOME":     true,
+		"":                       true,
+		"example-owner/questkit": false,
+		"someone-else/home":      false,
+	} {
+		if got := service.warmRunnerServes(request(repo)); got != want {
+			t.Errorf("warmRunnerServes(%q) = %v, want %v", repo, got, want)
+		}
+	}
+
+	service.cfg.GitHub.Scope.Repository = ""
+	if service.warmRunnerServes(request("example-owner/home")) {
+		t.Fatal("without a default repository there are no warm runners to share")
+	}
+}

@@ -202,7 +202,8 @@ func validateWarmPools(cfg model.BrokerConfig) error {
 }
 
 // validatePerRepositoryScope checks github.scope.type owner. Warm runners
-// register before any job names a repository, so they cannot be used with it.
+// register before any job names a repository, so they need the default
+// github.scope.repository to register on.
 func validatePerRepositoryScope(cfg model.BrokerConfig) error {
 	scope := cfg.GitHub.Scope
 	if !scope.IsPerRepository() {
@@ -211,13 +212,16 @@ func validatePerRepositoryScope(cfg model.BrokerConfig) error {
 	if err := scope.Validate(); err != nil {
 		return err
 	}
+	if scope.HasDefaultRepository() {
+		return nil
+	}
 	for _, pool := range cfg.Pools {
 		for name, backendCfg := range pool.Backends {
 			if !backendCfg.Enabled {
 				continue
 			}
 			if backendCfg.WarmMin > 0 || backendCfg.WarmMax > 0 || backendCfg.WarmSchedule != nil {
-				return fmt.Errorf("pools[%s].backends[%s]: warm runners are not supported with github.scope.type=%q because they register before a repository is known", pool.Name, name, model.GitHubScopeOwner)
+				return fmt.Errorf("pools[%s].backends[%s]: warm runners with github.scope.type=%q need github.scope.repository, the repository they register on before a job names one", pool.Name, name, model.GitHubScopeOwner)
 			}
 		}
 	}

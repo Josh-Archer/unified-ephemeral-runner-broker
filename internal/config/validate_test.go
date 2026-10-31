@@ -253,9 +253,9 @@ func TestValidatePerRepositoryScope(t *testing.T) {
 	}
 
 	withRepo := cfg
-	withRepo.GitHub.Scope.Repository = "fixed"
+	withRepo.GitHub.Scope.Repository = "owner/fixed"
 	if err := Validate(withRepo); err == nil {
-		t.Fatal("owner scope with a fixed repository should be rejected")
+		t.Fatal("owner scope with an owner/repo default should be rejected")
 	}
 
 	noOwner := cfg
@@ -272,6 +272,10 @@ func TestValidatePerRepositoryScope(t *testing.T) {
 		break
 	}
 	if err := Validate(cfg); err == nil {
-		t.Fatal("owner scope with warm runners should be rejected")
+		t.Fatal("owner scope with warm runners and no default repository should be rejected")
+	}
+	cfg.GitHub.Scope.Repository = "home"
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("warm runners with a default repository should validate: %v", err)
 	}
 }
