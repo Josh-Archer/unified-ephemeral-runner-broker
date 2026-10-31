@@ -8,6 +8,7 @@ import (
 
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend"
 	desktopbackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/desktop"
+	kubernetesbackend "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/kubernetes"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/store"
 )
@@ -105,5 +106,19 @@ func TestBuildRegistryIncludesIndependentKubernetesTargets(t *testing.T) {
 	named, ok := registry.Get("kubernetes-desktop")
 	if !ok || named.Name() != "kubernetes-desktop" || named == builtin {
 		t.Fatalf("named=%v builtin=%v", named, builtin)
+	}
+}
+
+func TestBuildRegistryMigratesLogicalARCDriver(t *testing.T) {
+	cfg := model.BrokerConfig{Pools: []model.PoolConfig{{Name: model.PoolFull, Backends: map[model.BackendName]model.BackendConfig{
+		model.BackendARC: {Driver: "kubernetes", Enabled: true, MaxRunners: 5, CrossPoolMaxRunners: 5},
+	}}}}
+	registry, _ := buildRegistry(cfg, nil, nil, nil)
+	target, ok := registry.Get(model.BackendARC)
+	if !ok || target.Name() != model.BackendARC {
+		t.Fatalf("logical arc target missing: %v", target)
+	}
+	if _, ok := target.(*kubernetesbackend.Backend); !ok {
+		t.Fatalf("logical arc target still uses label-only adapter: %T", target)
 	}
 }

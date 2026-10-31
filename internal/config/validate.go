@@ -245,7 +245,7 @@ func validateKubernetesBackends(cfg model.BrokerConfig) error {
 				if backendCfg.Driver != "kubernetes" {
 					return fmt.Errorf("%s.driver: unsupported driver %q", prefix, backendCfg.Driver)
 				}
-				if builtin[name] || !validName.MatchString(string(name)) {
+				if (builtin[name] && name != model.BackendARC) || !validName.MatchString(string(name)) {
 					return fmt.Errorf("%s.driver requires a unique non-builtin DNS label backend name", prefix)
 				}
 				if backendCfg.MaxRunners <= 0 || backendCfg.CrossPoolMaxRunners <= 0 {

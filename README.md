@@ -1208,3 +1208,10 @@ The pack observes allocate, backend dispatch, finalize, and cancel lifecycle eve
 ## License
 
 Apache-2.0
+
+Existing allocation clients may retain the logical backend name `arc` while
+migrating its physical implementation with `driver: kubernetes`. Configure the
+same driver in every pool using that name. The target then creates JIT runner
+pods, enforces Kubernetes capacity and owns cleanup; the legacy label-only ARC
+adapter is replaced. This preserves explicit backend pins and ARC-first
+selection without changing consuming workflows.

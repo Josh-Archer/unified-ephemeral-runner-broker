@@ -148,7 +148,7 @@ func TestNamedTargetValidationRejectsUnsafeConfiguration(t *testing.T) {
 		mutate func(*model.BrokerConfig)
 	}{
 		{"builtin-collision", func(cfg *model.BrokerConfig) {
-			cfg.Pools[0].Backends[model.BackendARC] = cfg.Pools[0].Backends[desktopName]
+			cfg.Pools[0].Backends[model.BackendEC2] = cfg.Pools[0].Backends[desktopName]
 		}},
 		{"missing-cap", func(cfg *model.BrokerConfig) {
 			c := cfg.Pools[0].Backends[desktopName]
@@ -222,5 +222,20 @@ func TestConfiguredPodMetadataCannotReplaceBrokerOwnership(t *testing.T) {
 	annotations := metadata["annotations"].(map[string]any)
 	if annotations[annotationRepository] != "example-owner/home" || annotations["interactive-controller/eviction-policy"] != "lossy" {
 		t.Fatalf("annotations=%v", annotations)
+	}
+}
+
+func TestLogicalARCNameCanMigrateToKubernetesDriver(t *testing.T) {
+	cfg := namedConfig(t)
+	for i := range cfg.Pools {
+		cfg.Pools[i].Backends[model.BackendARC] = cfg.Pools[i].Backends[desktopName]
+		delete(cfg.Pools[i].Backends, desktopName)
+	}
+	if err := config.Validate(cfg); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Pools[1].Backends[model.BackendARC] = model.BackendConfig{Enabled: true, Healthy: true, MaxRunners: 5}
+	if err := config.Validate(cfg); err == nil {
+		t.Fatal("mixed physical drivers accepted under logical arc name")
 	}
 }
