@@ -137,14 +137,12 @@ func main() {
 	useLeaderElection := config.HAEnabled(cfg.Broker)
 
 	if webhookPoolsConfigured(cfg) {
-		var headRepository func(context.Context, string, int64) (string, error)
-		if cfg.GitHub.Scope.IsPerRepository() && !cfg.Broker.GitHubWebhook.AllowForkPullRequests {
-			headRepository = githubClient.WorkflowRunHeadRepository
-		}
 		server.SetGitHubWebhook(api.GitHubWebhookOptions{
-			HeadRepository: headRepository,
-			Secret:         api.GitHubWebhookSecretFunc(cfg.Broker.GitHubWebhook, secretReader.ReadSecret),
-			Inbox:          store.AsWebhookInbox(service.Store()),
+			WorkflowRun:   githubClient.GetWorkflowRun,
+			RejectForks:   cfg.GitHub.Scope.IsPerRepository() && !cfg.Broker.GitHubWebhook.AllowForkPullRequests,
+			AllowedActors: cfg.Broker.GitHubWebhook.AllowedActors,
+			Secret:        api.GitHubWebhookSecretFunc(cfg.Broker.GitHubWebhook, secretReader.ReadSecret),
+			Inbox:         store.AsWebhookInbox(service.Store()),
 			IsLeader: func(ctx context.Context) (bool, error) {
 				if !useLeaderElection {
 					return true, nil

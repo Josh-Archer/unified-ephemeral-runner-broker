@@ -46,6 +46,7 @@ type OIDCClaims struct {
 	RepositoryOwner string      `json:"repository_owner,omitempty"`
 	WorkflowRef     string      `json:"workflow_ref,omitempty"`
 	JobWorkflowRef  string      `json:"job_workflow_ref,omitempty"`
+	Actor           string      `json:"actor,omitempty"`
 }
 
 // EffectiveRepository returns the repository claim, or derives owner/repo from sub.
@@ -247,6 +248,9 @@ func audienceMatches(value interface{}, expected string) bool {
 // Empty policy (no repositories and no owners) allows any authenticated identity.
 // When either allowlist is non-empty, the caller must match at least one entry.
 func AuthorizeOIDCPolicy(claims OIDCClaims, policy model.OIDCPolicyConfig) error {
+	if actors := normalizeAllowlist(policy.AllowedActors); len(actors) > 0 && !matchActor(claims.Actor, actors) {
+		return ErrOIDCPolicyDenied
+	}
 	repos := normalizeAllowlist(policy.AllowedRepositories)
 	owners := normalizeAllowlist(policy.AllowedOwners)
 	if len(repos) == 0 && len(owners) == 0 {
@@ -263,6 +267,21 @@ func AuthorizeOIDCPolicy(claims OIDCClaims, policy model.OIDCPolicyConfig) error
 		return nil
 	}
 	return ErrOIDCPolicyDenied
+}
+
+// matchActor compares a GitHub login exactly (case-insensitive), without the
+// wildcard forms the repository allowlist accepts.
+func matchActor(actor string, allowed []string) bool {
+	actor = strings.TrimSpace(actor)
+	if actor == "" {
+		return false
+	}
+	for _, entry := range allowed {
+		if strings.EqualFold(entry, actor) {
+			return true
+		}
+	}
+	return false
 }
 
 func normalizeAllowlist(entries []string) []string {

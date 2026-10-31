@@ -94,6 +94,9 @@ type GitHubConfig struct {
 type OIDCPolicyConfig struct {
 	AllowedRepositories []string `yaml:"allowedRepositories,omitempty" json:"allowedRepositories,omitempty"`
 	AllowedOwners       []string `yaml:"allowedOwners,omitempty" json:"allowedOwners,omitempty"`
+	// AllowedActors additionally requires the token's actor claim (the user
+	// whose event started the workflow) to be one of these logins.
+	AllowedActors []string `yaml:"allowedActors,omitempty" json:"allowedActors,omitempty"`
 }
 
 type BrokerAPIConfig struct {
@@ -188,6 +191,11 @@ type GitHubWebhookConfig struct {
 	// Off by default: anyone can open such a pull request on a public
 	// repository and choose its runs-on labels.
 	AllowForkPullRequests bool `yaml:"allowForkPullRequests,omitempty" json:"allowForkPullRequests,omitempty"`
+	// AllowedActors, when set, gives runners only to workflow runs that were
+	// both created (actor) and started or re-run (triggering_actor) by one of
+	// these GitHub logins. Pushes and pull requests by collaborators or bots,
+	// and re-runs of their runs, get no runner. Matching is case-insensitive.
+	AllowedActors []string `yaml:"allowedActors,omitempty" json:"allowedActors,omitempty"`
 }
 
 // WebhooksConfig controls outbound allocation lifecycle event delivery.
@@ -468,10 +476,15 @@ type PoolConfig struct {
 	// runners register with these static labels instead of a per-allocation one.
 	// WebhookJobTimeout bounds webhook jobs, which do not expose their workflow
 	// timeout. Zero uses broker.defaultJobTimeout; API allocations are unchanged.
-	WebhookJobTimeout time.Duration                 `yaml:"webhookJobTimeout,omitempty" json:"webhookJobTimeout,omitempty"`
-	WebhookLabels     []string                      `yaml:"webhookLabels,omitempty" json:"webhookLabels,omitempty"`
-	CapabilityProfile CapabilityProfile             `yaml:"capabilityProfile" json:"capabilityProfile"`
-	Backends          map[BackendName]BackendConfig `yaml:"backends" json:"backends"`
+	WebhookJobTimeout time.Duration `yaml:"webhookJobTimeout,omitempty" json:"webhookJobTimeout,omitempty"`
+	WebhookLabels     []string      `yaml:"webhookLabels,omitempty" json:"webhookLabels,omitempty"`
+	// WebhookRepositories limits which repositories' workflow_job deliveries
+	// this pool serves ("owner/repo" or "owner/*", case-insensitive). Empty
+	// serves every repository the GitHub scope accepts. Use it under owner
+	// scope to keep privileged pools to the repositories they were built for.
+	WebhookRepositories []string                      `yaml:"webhookRepositories,omitempty" json:"webhookRepositories,omitempty"`
+	CapabilityProfile   CapabilityProfile             `yaml:"capabilityProfile" json:"capabilityProfile"`
+	Backends            map[BackendName]BackendConfig `yaml:"backends" json:"backends"`
 }
 
 type BrokerConfig struct {
@@ -559,4 +572,27 @@ func (f FairShareConfig) Quota(tenant string) (int, bool) {
 // PriorityClassWeight returns the configured weight for class, matching keys case-insensitively.
 func (f FairShareConfig) PriorityClassWeight(class string) (int, bool) {
 	return lookupFold(f.PriorityClasses, class)
+}
+
+// ServesWebhookRepository reports whether the pool's webhookRepositories allow
+// repository ("owner/repo").
+func (p PoolConfig) ServesWebhookRepository(repository string) bool {
+	if len(p.WebhookRepositories) == 0 {
+		return true
+	}
+	repository = strings.TrimSpace(repository)
+	owner, _, ok := strings.Cut(repository, "/")
+	if !ok {
+		return false
+	}
+	for _, entry := range p.WebhookRepositories {
+		entry = strings.TrimSpace(entry)
+		if strings.EqualFold(entry, repository) {
+			return true
+		}
+		if prefix, found := strings.CutSuffix(entry, "/*"); found && strings.EqualFold(prefix, owner) {
+			return true
+		}
+	}
+	return false
 }

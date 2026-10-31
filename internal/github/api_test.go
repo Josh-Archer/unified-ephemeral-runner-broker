@@ -88,3 +88,15 @@ func TestClientRegistersRunnersAndChecksRuns(t *testing.T) {
 		t.Fatal("missing token must fail")
 	}
 }
+
+func TestGetWorkflowRunReadsActors(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"head_repository":{"full_name":"owner/repo"},"actor":{"login":"dependabot[bot]"},"triggering_actor":{"login":"owner"}}`))
+	}))
+	defer server.Close()
+	client := NewClient(func(context.Context) (string, error) { return "tok", nil }, nil).WithBaseURL(server.URL)
+	run, err := client.GetWorkflowRun(context.Background(), "owner/repo", 1)
+	if err != nil || run != (WorkflowRun{HeadRepository: "owner/repo", Actor: "dependabot[bot]", TriggeringActor: "owner"}) {
+		t.Fatalf("run = %+v, %v", run, err)
+	}
+}

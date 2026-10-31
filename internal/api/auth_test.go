@@ -269,3 +269,26 @@ func bigEndianInt(value int) []byte {
 	}
 	return encoded
 }
+
+func TestAuthorizeOIDCPolicyActors(t *testing.T) {
+	policy := model.OIDCPolicyConfig{AllowedRepositories: []string{"owner/home"}, AllowedActors: []string{"Owner", "renovate[bot]"}}
+	for _, tc := range []struct {
+		repo, actor string
+		ok          bool
+	}{
+		{"owner/home", "owner", true},
+		{"owner/home", "renovate[bot]", true},
+		{"owner/home", "collaborator", false},
+		{"owner/home", "", false},
+		{"owner/other", "owner", false},
+	} {
+		err := AuthorizeOIDCPolicy(OIDCClaims{Sub: "repo:" + tc.repo + ":ref:refs/heads/main", Repository: tc.repo, Actor: tc.actor}, policy)
+		if (err == nil) != tc.ok {
+			t.Errorf("%s by %q: err=%v want ok=%v", tc.repo, tc.actor, err, tc.ok)
+		}
+	}
+	// Actors alone also restrict an otherwise open policy.
+	if err := AuthorizeOIDCPolicy(OIDCClaims{Sub: "x", Actor: "stranger"}, model.OIDCPolicyConfig{AllowedActors: []string{"owner"}}); err == nil {
+		t.Error("an unlisted actor must be denied")
+	}
+}
