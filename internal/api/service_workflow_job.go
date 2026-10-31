@@ -6,8 +6,25 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
+	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/scheduler"
 )
+
+// Webhook deliveries have no caller retry loop: GitHub does not retry HTTP500.
+// Retain temporary capacity waits without changing API clients' fail-fast path.
+func workflowCapacityError(request model.AllocationRequest, err error) bool {
+	return request.WorkflowJobID > 0 && (errors.Is(err, scheduler.ErrNoCapacity) ||
+		errors.Is(err, ErrBackendLiveCapacity) || backend.IsCapacityExhausted(err))
+}
+
+func waitingForWorkflowCapacity(status model.AllocationStatus) bool {
+	if status.Request == nil || status.Request.WorkflowJobID <= 0 {
+		return false
+	}
+	reason := status.Metadata["queue_reason"]
+	return reason == "no-capacity" || reason == "live-capacity"
+}
 
 // MatchWebhookPool returns the pool opted into webhook mode whose webhookLabels
 // cover every runs-on label of a job. GitHub routes a job to a runner whose
@@ -112,15 +129,22 @@ func (s *Service) AllocateForWorkflowJob(ctx context.Context, pool model.PoolCon
 		// One pool serves every repository, so fair-share quotas apply per repository.
 		tenant = strings.ToLower(strings.TrimSpace(repository))
 	}
-	status, err = s.Allocate(ctx, model.AllocationRequest{
+	request := model.AllocationRequest{
 		Pool:             pool.Name,
 		JobTimeout:       pool.WebhookJobTimeout,
 		Tenant:           tenant,
 		Labels:           append([]string(nil), pool.WebhookLabels...),
 		WorkflowJobID:    jobID,
 		TargetRepository: strings.TrimSpace(repository),
-	})
+	}
+	status, err = s.Allocate(ctx, request)
 	if err != nil {
+		// Provider rejection can leave the selection loop before its queue path.
+		if workflowCapacityError(request, err) {
+			if pending, ok := s.queueAllocation(ctx, request, pool.Name, "", err, model.AllocationStatus{}); ok {
+				return pending, true, nil
+			}
+		}
 		return model.AllocationStatus{}, false, err
 	}
 	return status, true, nil

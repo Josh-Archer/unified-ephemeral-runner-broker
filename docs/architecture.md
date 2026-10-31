@@ -203,6 +203,13 @@ block allocation state transitions.
 
 Queued admission is optional and disabled by default.
 
+Matching `workflow_job` webhook demand uses this queue for temporary scheduler
+or provider capacity exhaustion. GitHub does not retry failed deliveries, so
+the broker persists that demand and acknowledges it with `202`. Capacity waits
+use the job deadline without spending transient backend failure retries;
+pending cancellation and reconciliation are serialized. API allocations keep
+the fail-fast capacity policy described below.
+
 When enabled, the broker stores retryable allocation failures as `pending`
 instead of failing the workflow immediately. Retryable failures include
 temporary provider dispatch errors and open backend circuits. Capacity
