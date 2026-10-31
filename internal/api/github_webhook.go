@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/github"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/store"
 	"github.com/prometheus/client_golang/prometheus"
@@ -47,11 +48,16 @@ type GitHubWebhookOptions struct {
 	// drains it (DrainGitHubWebhookInbox). Nil means non-leader deliveries are
 	// rejected with 503, which is only safe for a single replica.
 	Inbox store.WebhookInbox
-	// HeadRepository returns the repository a workflow run's code comes from.
-	// When set, queued jobs whose run comes from another repository (pull
-	// requests from forks) get no runner, and a failed lookup fails the
-	// delivery rather than allocating.
-	HeadRepository func(ctx context.Context, repository string, runID int64) (string, error)
+	// WorkflowRun reads the run a queued job belongs to. It is required when
+	// RejectForks or AllowedActors is set; a failed lookup fails the delivery
+	// rather than allocating.
+	WorkflowRun func(ctx context.Context, repository string, runID int64) (github.WorkflowRun, error)
+	// RejectForks gives no runner to jobs whose run comes from another
+	// repository (pull requests from forks).
+	RejectForks bool
+	// AllowedActors, when set, gives runners only to runs whose actor and
+	// triggering actor are both listed.
+	AllowedActors []string
 }
 
 type githubWebhookMetrics struct {
@@ -382,16 +388,10 @@ func (h *githubWebhookHandler) process(ctx context.Context, payload workflowJobP
 			}
 			return ignored("no_matching_pool")
 		}
-		if h.opts.HeadRepository != nil {
-			if _, exists := h.service.findByWorkflowJobID(jobID); !exists {
-				head, err := h.opts.HeadRepository(ctx, repository, payload.WorkflowJob.RunID)
-				if err != nil {
-					return nil, 0, fmt.Errorf("check workflow run %d of %s: %w", payload.WorkflowJob.RunID, repository, err)
-				}
-				if !strings.EqualFold(strings.TrimSpace(head), repository) {
-					return ignored("fork_pull_request")
-				}
-			}
+		if reason, err := h.checkWorkflowRun(ctx, repository, jobID, payload.WorkflowJob.RunID); err != nil {
+			return nil, 0, err
+		} else if reason != "" {
+			return ignored(reason)
 		}
 		allocation, created, err := h.service.AllocateForWorkflowJob(ctx, pool, jobID, repository)
 		if err != nil {
@@ -423,6 +423,31 @@ func (h *githubWebhookHandler) process(ctx context.Context, payload workflowJobP
 		h.metrics.matched.WithLabelValues(string(allocation.Pool), "completed").Inc()
 		return map[string]string{"status": "finalized", "allocation_id": allocation.ID, "state": string(allocation.State)}, http.StatusOK, nil
 	}
+}
+
+// checkWorkflowRun applies the fork and actor policies to a newly queued job.
+// It returns an ignore reason, or an error when the run cannot be read.
+func (h *githubWebhookHandler) checkWorkflowRun(ctx context.Context, repository string, jobID, runID int64) (string, error) {
+	if !h.opts.RejectForks && len(h.opts.AllowedActors) == 0 {
+		return "", nil
+	}
+	if _, exists := h.service.findByWorkflowJobID(jobID); exists {
+		return "", nil
+	}
+	if h.opts.WorkflowRun == nil {
+		return "", errors.New("workflow run lookup is not configured")
+	}
+	run, err := h.opts.WorkflowRun(ctx, repository, runID)
+	if err != nil {
+		return "", fmt.Errorf("check workflow run %d of %s: %w", runID, repository, err)
+	}
+	if h.opts.RejectForks && !strings.EqualFold(strings.TrimSpace(run.HeadRepository), repository) {
+		return "fork_pull_request", nil
+	}
+	if len(h.opts.AllowedActors) > 0 && (!matchActor(run.Actor, h.opts.AllowedActors) || !matchActor(run.TriggeringActor, h.opts.AllowedActors)) {
+		return "actor_not_allowed", nil
+	}
+	return "", nil
 }
 
 func (h *githubWebhookHandler) ignore(s *Server, w http.ResponseWriter, reason string) {

@@ -132,27 +132,55 @@ func (c *Client) DeleteRunner(ctx context.Context, scope model.GitHubScope, runn
 	return err
 }
 
-// WorkflowRunHeadRepository returns the full name of the repository a
-// workflow run's code comes from. For a pull request from a fork it differs
-// from repository.
-func (c *Client) WorkflowRunHeadRepository(ctx context.Context, repository string, runID int64) (string, error) {
+// WorkflowRun is what the broker needs to know about who a run is for.
+type WorkflowRun struct {
+	// HeadRepository is where the run's code comes from; for a pull request
+	// from a fork it differs from the run's repository.
+	HeadRepository string
+	// Actor is the user whose event (push, pull request, ...) created the run.
+	Actor string
+	// TriggeringActor started this attempt; it differs from Actor on re-runs.
+	TriggeringActor string
+}
+
+// GetWorkflowRun reads the run that a workflow job belongs to.
+func (c *Client) GetWorkflowRun(ctx context.Context, repository string, runID int64) (WorkflowRun, error) {
 	owner, repo, ok := strings.Cut(strings.TrimSpace(repository), "/")
 	if !ok || owner == "" || repo == "" || runID <= 0 {
-		return "", fmt.Errorf("invalid workflow run %s#%d", repository, runID)
+		return WorkflowRun{}, fmt.Errorf("invalid workflow run %s#%d", repository, runID)
+	}
+	type login struct {
+		Login string `json:"login"`
 	}
 	var out struct {
 		HeadRepository *struct {
 			FullName string `json:"full_name"`
 		} `json:"head_repository"`
+		Actor           *login `json:"actor"`
+		TriggeringActor *login `json:"triggering_actor"`
 	}
 	path := fmt.Sprintf("/repos/%s/%s/actions/runs/%d", url.PathEscape(owner), url.PathEscape(repo), runID)
 	if err := c.do(ctx, http.MethodGet, path, nil, &out, http.StatusOK); err != nil {
-		return "", fmt.Errorf("get workflow run: %w", err)
+		return WorkflowRun{}, fmt.Errorf("get workflow run: %w", err)
 	}
 	if out.HeadRepository == nil || strings.TrimSpace(out.HeadRepository.FullName) == "" {
-		return "", errors.New("get workflow run: no head_repository")
+		return WorkflowRun{}, errors.New("get workflow run: no head_repository")
 	}
-	return out.HeadRepository.FullName, nil
+	run := WorkflowRun{HeadRepository: out.HeadRepository.FullName}
+	if out.Actor != nil {
+		run.Actor = out.Actor.Login
+	}
+	if out.TriggeringActor != nil {
+		run.TriggeringActor = out.TriggeringActor.Login
+	}
+	return run, nil
+}
+
+// WorkflowRunHeadRepository returns the repository a workflow run's code
+// comes from.
+func (c *Client) WorkflowRunHeadRepository(ctx context.Context, repository string, runID int64) (string, error) {
+	run, err := c.GetWorkflowRun(ctx, repository, runID)
+	return run.HeadRepository, err
 }
 
 func (c *Client) runnerGroupID(ctx context.Context, base, name string) (int64, error) {

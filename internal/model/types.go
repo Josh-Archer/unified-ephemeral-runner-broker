@@ -94,6 +94,9 @@ type GitHubConfig struct {
 type OIDCPolicyConfig struct {
 	AllowedRepositories []string `yaml:"allowedRepositories,omitempty" json:"allowedRepositories,omitempty"`
 	AllowedOwners       []string `yaml:"allowedOwners,omitempty" json:"allowedOwners,omitempty"`
+	// AllowedActors additionally requires the token's actor claim (the user
+	// whose event started the workflow) to be one of these logins.
+	AllowedActors []string `yaml:"allowedActors,omitempty" json:"allowedActors,omitempty"`
 }
 
 type BrokerAPIConfig struct {
@@ -188,6 +191,11 @@ type GitHubWebhookConfig struct {
 	// Off by default: anyone can open such a pull request on a public
 	// repository and choose its runs-on labels.
 	AllowForkPullRequests bool `yaml:"allowForkPullRequests,omitempty" json:"allowForkPullRequests,omitempty"`
+	// AllowedActors, when set, gives runners only to workflow runs that were
+	// both created (actor) and started or re-run (triggering_actor) by one of
+	// these GitHub logins. Pushes and pull requests by collaborators or bots,
+	// and re-runs of their runs, get no runner. Matching is case-insensitive.
+	AllowedActors []string `yaml:"allowedActors,omitempty" json:"allowedActors,omitempty"`
 }
 
 // WebhooksConfig controls outbound allocation lifecycle event delivery.

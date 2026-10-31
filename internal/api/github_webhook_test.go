@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/github"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/store"
 	"github.com/prometheus/client_golang/prometheus"
@@ -527,15 +528,16 @@ func TestGitHubWebhookRejectsForkPullRequestJobs(t *testing.T) {
 	h.service.cfg.GitHub.Scope = model.GitHubScope{Type: model.GitHubScopeOwner, Owner: "example-owner"}
 	heads := map[int64]string{1: "example-owner/questkit", 2: "attacker/questkit"}
 	lookups := 0
-	h.server.githubWebhook.opts.HeadRepository = func(_ context.Context, repo string, runID int64) (string, error) {
+	h.server.githubWebhook.opts.RejectForks = true
+	h.server.githubWebhook.opts.WorkflowRun = func(_ context.Context, repo string, runID int64) (github.WorkflowRun, error) {
 		lookups++
 		if repo != "example-owner/questkit" {
 			t.Errorf("looked up %q", repo)
 		}
 		if head, ok := heads[runID]; ok {
-			return head, nil
+			return github.WorkflowRun{HeadRepository: head, Actor: "someone", TriggeringActor: "someone"}, nil
 		}
-		return "", fmt.Errorf("run %d not found", runID)
+		return github.WorkflowRun{}, fmt.Errorf("run %d not found", runID)
 	}
 	body := func(jobID, runID int64) string {
 		b := repoJobBody("queued", jobID, "example-owner/questkit", "self-hosted", "uecb-full")
@@ -608,5 +610,40 @@ func TestMatchWebhookPoolForRepositoryFallsThrough(t *testing.T) {
 	}
 	if _, ok := service.MatchWebhookPoolForRepository([]string{"shared"}, "other/questkit"); ok {
 		t.Fatal("another owner matches no pool")
+	}
+}
+
+func TestGitHubWebhookOnlyAllowedActorsGetRunners(t *testing.T) {
+	h := newWebhookHarness(t, true)
+	h.service.cfg.GitHub.Scope = model.GitHubScope{Type: model.GitHubScopeOwner, Owner: "example-owner"}
+	runs := map[int64]github.WorkflowRun{
+		1: {Actor: "Example-Owner", TriggeringActor: "example-owner"},
+		2: {Actor: "collaborator", TriggeringActor: "collaborator"},
+		3: {Actor: "collaborator", TriggeringActor: "example-owner"}, // owner re-runs someone else's run
+		4: {Actor: "dependabot[bot]", TriggeringActor: "dependabot[bot]"},
+		5: {Actor: "dependabot[bot]", TriggeringActor: "example-owner"},
+		6: {Actor: "", TriggeringActor: "example-owner"},
+	}
+	h.server.githubWebhook.opts.RejectForks = true
+	h.server.githubWebhook.opts.AllowedActors = []string{"example-owner", "dependabot[bot]"}
+	h.server.githubWebhook.opts.WorkflowRun = func(_ context.Context, repo string, runID int64) (github.WorkflowRun, error) {
+		run := runs[runID]
+		run.HeadRepository = repo
+		return run, nil
+	}
+	body := func(jobID, runID int64) string {
+		b := repoJobBody("queued", jobID, "example-owner/questkit", "self-hosted", "uecb-full")
+		return strings.Replace(b, fmt.Sprintf(`"id":%d,`, jobID), fmt.Sprintf(`"id":%d,"run_id":%d,`, jobID, runID), 1)
+	}
+	for runID, allowed := range map[int64]bool{1: true, 2: false, 3: false, 4: true, 5: true, 6: false} {
+		jobID := 900 + runID
+		rec := h.send("workflow_job", fmt.Sprintf("a%d", runID), body(jobID, runID))
+		_, got := h.service.findByWorkflowJobID(jobID)
+		if got != allowed {
+			t.Errorf("run %d (%+v): allocated=%v want %v (%d %s)", runID, runs[runID], got, allowed, rec.Code, rec.Body)
+		}
+		if !allowed && !strings.Contains(rec.Body.String(), "actor_not_allowed") {
+			t.Errorf("run %d: want actor_not_allowed, got %s", runID, rec.Body)
+		}
 	}
 }
