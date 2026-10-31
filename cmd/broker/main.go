@@ -222,7 +222,8 @@ func main() {
 		addr = ":8080"
 	}
 
-	httpServer := &http.Server{Addr: addr, Handler: server.Handler()}
+	// /webhooks/github can be exposed publicly; bound slow header reads.
+	httpServer := &http.Server{Addr: addr, Handler: server.Handler(), ReadHeaderTimeout: 10 * time.Second}
 	go func() {
 		log.Printf("listening on %s stateStore=%s ha=%v", addr, strings.TrimSpace(cfg.Broker.StateStore.Type), useLeaderElection)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
