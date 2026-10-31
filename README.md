@@ -675,7 +675,7 @@ pools:
         capabilities: [cluster-local, docker, privileged]
         kubernetes:
           namespace: arc-runners
-          image: ghcr.io/josh-archer/unified-ephemeral-runner-broker/launcher:v0.1.27
+          image: ghcr.io/josh-archer/unified-ephemeral-runner-broker/launcher:v0.1.28
           podSpec:
             nodeSelector: {kubernetes.io/arch: amd64}
             containers:
