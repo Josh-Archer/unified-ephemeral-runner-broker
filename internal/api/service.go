@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend"
@@ -49,6 +50,9 @@ type LifecycleNotifier interface {
 }
 
 type Service struct {
+	// draining is set on SIGTERM: no new provisioning starts, so a rollout
+	// cannot interrupt a provision mid-flight. See BeginDrain.
+	draining    atomic.Bool
 	cfg         model.BrokerConfig
 	registry    *backend.Registry
 	scheds      *scheduler.Registry
@@ -576,7 +580,22 @@ func (s *Service) Allocate(ctx context.Context, request model.AllocationRequest)
 	return status, nil
 }
 
+// ErrDraining wraps scheduler.ErrNoCapacity so webhook demand that arrives
+// during shutdown is persisted as pending and picked up by the next process,
+// and API callers see a retryable capacity error.
+var ErrDraining = fmt.Errorf("broker is draining for shutdown: %w", scheduler.ErrNoCapacity)
+
+// BeginDrain stops new allocations, queue retries and warm-pool provisioning.
+// In-flight provisions finish; the caller then shuts the HTTP server down.
+func (s *Service) BeginDrain() { s.draining.Store(true) }
+
+// Draining reports whether BeginDrain was called.
+func (s *Service) Draining() bool { return s.draining.Load() }
+
 func (s *Service) allocateNow(ctx context.Context, request model.AllocationRequest, existing model.AllocationStatus) (model.AllocationStatus, error) {
+	if s.draining.Load() {
+		return model.AllocationStatus{}, ErrDraining
+	}
 	started := s.now()
 	resultPool := request.Pool
 	var resultBackend model.BackendName
@@ -1167,7 +1186,7 @@ func (s *Service) queueAllocation(ctx context.Context, request model.AllocationR
 }
 
 func (s *Service) ReconcileQueue(ctx context.Context, now time.Time) int {
-	if !s.queueEnabled() {
+	if !s.queueEnabled() || s.draining.Load() {
 		return 0
 	}
 	updated := 0
@@ -1224,6 +1243,9 @@ func (s *Service) reconcileQueuedAllocation(ctx context.Context, status model.Al
 }
 
 func (s *Service) ReconcileWarmPools() {
+	if s.draining.Load() {
+		return
+	}
 	s.warmMu.Lock()
 	defer s.warmMu.Unlock()
 
