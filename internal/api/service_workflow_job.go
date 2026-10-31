@@ -259,6 +259,20 @@ func (s *Service) suppressSurplusDemand(jobID int64, repository string, actual m
 	}
 }
 
+// legacyARCWorkflowAllocation identifies the label-only adapter, which owns no
+// runner resource. A logical arc target migrated to Kubernetes owns JIT pods.
+func (s *Service) legacyARCWorkflowAllocation(status model.AllocationStatus) bool {
+	if status.SelectedBackend != model.BackendARC {
+		return false
+	}
+	for _, pool := range s.cfg.Pools {
+		if pool.Name == status.Pool {
+			return pool.Backends[model.BackendARC].Driver != "kubernetes"
+		}
+	}
+	return false
+}
+
 // FinalizeWorkflowJob uses actual runner ownership whenever supplied. A job
 // canceled before assignment cannot safely delete the runner launched for its
 // queued event: that runner may already be executing a different queued job.
@@ -297,7 +311,7 @@ func (s *Service) FinalizeWorkflowJob(ctx context.Context, jobID int64, conclusi
 		return status, true, nil
 	}
 	// ARC owns no runner resource in this broker; retain its legacy accounting.
-	if status.SelectedBackend == model.BackendARC {
+	if s.legacyARCWorkflowAllocation(status) {
 		return s.finishWorkflowExecution(ctx, status, conclusion)
 	}
 	if status.State == model.StatePending {
@@ -350,7 +364,7 @@ func (s *Service) ClaimWorkflowJob(ctx context.Context, jobID int64, runnerName 
 		// ARC has no provider resource to delete and retains its static-label
 		// accounting. Never apply this fallback to broker-created runner pods.
 		origin, ok := s.findByWorkflowJobID(jobID)
-		if !ok || origin.SelectedBackend != model.BackendARC || !s.allocationServesRepository(origin, runner.Repository) {
+		if !ok || !s.legacyARCWorkflowAllocation(origin) || !s.allocationServesRepository(origin, runner.Repository) {
 			return model.AllocationStatus{}, false, nil
 		}
 		status, found = origin, true

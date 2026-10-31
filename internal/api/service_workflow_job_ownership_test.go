@@ -266,3 +266,21 @@ func TestWorkflowJobPoolTimeoutDoesNotChangeAPIDefault(t *testing.T) {
 		t.Fatalf("webhook default changed=%v", got)
 	}
 }
+
+func TestMigratedARCTargetKeepsKubernetesOwnershipRules(t *testing.T) {
+	service, cleanup := ownershipService(t)
+	cleanup.testBackend.name = model.BackendARC
+	c := service.cfg.Pools[0].Backends[model.BackendKubernetes]
+	c.Driver = "kubernetes"
+	service.cfg.Pools[0].Backends = map[model.BackendName]model.BackendConfig{model.BackendARC: c}
+	service = NewService(service.cfg, backend.NewRegistry(cleanup), nil)
+	status := ownershipAllocate(t, service, 801)
+	_, found, err := service.FinalizeWorkflowJob(context.Background(), 801, "cancelled", WorkflowJobRunner{Repository: "example/project"})
+	if err != nil || !found {
+		t.Fatalf("deferred cancellation: found=%v err=%v", found, err)
+	}
+	current, _ := service.Get(status.ID)
+	if current.State != model.StateReady || *cleanup.cleanupCount != 0 {
+		t.Fatalf("logical arc was treated as resource-free: %+v", current)
+	}
+}

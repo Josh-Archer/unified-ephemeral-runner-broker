@@ -278,8 +278,17 @@ func leaderIdentity(configured string) string {
 
 func buildRegistry(cfg model.BrokerConfig, secretReader runtime.SecretReader, runnerPods kubernetesbackend.API, registrar kubernetesbackend.Registrar) (*backend.Registry, *desktopbackend.Backend) {
 	desktopBackend := desktopbackend.New(cfg)
+	// Preserve a logical ARC backend name when migrating its physical driver.
+	// Existing allocation clients can keep pinning arc without workflow edits.
+	var arcTarget backend.Backend = arcbackend.New(cfg, secretReader)
+	for _, pool := range cfg.Pools {
+		if pool.Backends[model.BackendARC].Driver == "kubernetes" {
+			arcTarget = kubernetesbackend.NewNamed(cfg, runnerPods, registrar, model.BackendARC)
+			break
+		}
+	}
 	entries := []backend.Backend{
-		arcbackend.New(cfg, secretReader),
+		arcTarget,
 		codebuildbackend.New(cfg, secretReader),
 		lambdabackend.New(cfg, secretReader),
 		cloudbackend.New(cfg, secretReader),
@@ -290,7 +299,7 @@ func buildRegistry(cfg model.BrokerConfig, secretReader runtime.SecretReader, ru
 		ec2backend.New(cfg, secretReader),
 		gcebackend.New(cfg, secretReader),
 	}
-	seen := map[model.BackendName]bool{}
+	seen := map[model.BackendName]bool{model.BackendARC: true}
 	for _, pool := range cfg.Pools {
 		for name, target := range pool.Backends {
 			if target.Driver == "kubernetes" && !seen[name] {
