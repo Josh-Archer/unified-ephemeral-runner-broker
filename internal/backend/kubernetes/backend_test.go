@@ -315,3 +315,46 @@ func TestValidateKubernetesBackend(t *testing.T) {
 		t.Fatalf("missing github.auth.secretRef should be rejected, got %v", err)
 	}
 }
+
+func TestLiveRunnersRebuildsIdentityFromPods(t *testing.T) {
+	cfg := newConfig(t)
+	api := &fakeAPI{responses: map[string]response{
+		"GET /api/v1/namespaces/arc-runners/pods": {status: http.StatusOK, body: `{"items":[
+ {"metadata":{"name":"uecb-runner-alloc-1","labels":{"uecb.josh-archer.dev/pool":"full","uecb.josh-archer.dev/allocation-id":"alloc-1"},
+  "annotations":{"uecb.josh-archer.dev/allocation-id":"alloc-1","uecb.josh-archer.dev/github-runner-id":"9","uecb.josh-archer.dev/workflow-job-id":"55","uecb.josh-archer.dev/repository":"example/project"}},"status":{"phase":"Running"}},
+ {"metadata":{"name":"uecb-runner-alloc-2","labels":{"uecb.josh-archer.dev/pool":"full","uecb.josh-archer.dev/allocation-id":"alloc-2"}},"status":{"phase":"Succeeded"}},
+ {"metadata":{"name":"uecb-runner-alloc-3","deletionTimestamp":"2026-10-31T00:00:00Z","labels":{"uecb.josh-archer.dev/allocation-id":"alloc-3"}},"status":{"phase":"Running"}},
+ {"metadata":{"name":"something-else","labels":{"uecb.josh-archer.dev/allocation-id":"alloc-4"}},"status":{"phase":"Running"}}
+]}`},
+	}}
+	b := New(cfg, api, &fakeRegistrar{})
+	runners, err := b.LiveRunners(context.Background())
+	if err != nil {
+		t.Fatalf("LiveRunners: %v", err)
+	}
+	if len(runners) != 1 {
+		t.Fatalf("expected 1 live runner, got %+v", runners)
+	}
+	r := runners[0]
+	if r.AllocationID != "alloc-1" || r.Pool != "full" || r.WorkflowJobID != 55 || r.Repository != "example/project" || r.Metadata[metadataRunnerID] != "9" || r.Metadata["pod_name"] != "uecb-runner-alloc-1" {
+		t.Fatalf("unexpected live runner: %+v", r)
+	}
+}
+
+func TestProvisionAnnotatesPodWithAllocationIdentity(t *testing.T) {
+	api := &fakeAPI{}
+	b := New(newConfig(t), api, &fakeRegistrar{})
+	request := model.AllocationRequest{Pool: model.PoolFull, WorkflowJobID: 31, TargetRepository: "example-owner/questkit"}
+	if _, err := b.Provision(context.Background(), request, model.AllocationStatus{ID: "Alloc_9", Pool: model.PoolFull, Request: &request}); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	var annotations map[string]any
+	for _, c := range api.calls {
+		if c.method == http.MethodPost {
+			annotations = c.body["metadata"].(map[string]any)["annotations"].(map[string]any)
+		}
+	}
+	if annotations[annotationAllocationID] != "Alloc_9" || annotations[annotationRunnerID] != "101" || annotations[annotationWorkflowJob] != "31" {
+		t.Fatalf("annotations = %+v", annotations)
+	}
+}

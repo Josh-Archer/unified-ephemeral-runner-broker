@@ -8,6 +8,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 )
@@ -60,6 +61,23 @@ type CapacityStatus struct {
 	ActiveRunners  int
 	PendingRunners int
 	WarmRunners    int
+}
+
+// LiveRunner is a provider runner that still holds a slot, with the identity
+// the broker recorded when it provisioned it.
+type LiveRunner struct {
+	AllocationID  string
+	Pool          model.PoolName
+	Repository    string
+	WorkflowJobID int64
+	CreatedAt     time.Time
+	Metadata      map[string]string
+}
+
+// InventoryBackend lists live runners so a restarted broker can rebuild
+// allocation records it lost, instead of only holding anonymous capacity.
+type InventoryBackend interface {
+	LiveRunners(ctx context.Context) ([]LiveRunner, error)
 }
 
 // FreeSlots returns non-negative free runner slots from a capacity snapshot.

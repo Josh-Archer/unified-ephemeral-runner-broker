@@ -353,6 +353,7 @@ func (s *Service) reconcileRestartOrphans(ctx context.Context) error {
 	_ = s.terminalizeIncompleteReserved(ctx, now)
 
 	if store.IsProcessLocal(storeType) {
+		s.rebuildFromLiveRunners(ctx, now)
 		s.reconcileProviderCapacityGaps(ctx, now)
 	}
 
@@ -478,6 +479,125 @@ func (s *Service) reconcileProviderCapacityGaps(ctx context.Context, now time.Ti
 			})
 		}
 	}
+}
+
+const restoredFromProviderMetadataKey = "restored_from_provider"
+
+// rebuildFromLiveRunners recreates ready allocations for provider runners
+// (e.g. uecb-runner-* pods) that the local store no longer knows about, so a
+// restart keeps their slots accounted and their completion webhooks and
+// Cleanup still resolve. Runners without a verifiable allocation id are left
+// to the capacity-gap holds.
+func (s *Service) rebuildFromLiveRunners(ctx context.Context, now time.Time) int {
+	if s.registry == nil {
+		return 0
+	}
+	timeout := s.cfg.Broker.DefaultJobTimeout
+	if timeout <= 0 {
+		timeout = 60 * time.Minute
+	}
+	rebuilt := 0
+	seen := map[model.BackendName]struct{}{}
+	for _, pool := range s.cfg.Pools {
+		for backendName, cfg := range pool.Backends {
+			if !cfg.Enabled {
+				continue
+			}
+			if _, ok := seen[backendName]; ok {
+				continue
+			}
+			seen[backendName] = struct{}{}
+			impl, ok := s.registry.Get(backendName)
+			if !ok {
+				continue
+			}
+			inventory, ok := impl.(backend.InventoryBackend)
+			if !ok {
+				continue
+			}
+			probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			runners, err := inventory.LiveRunners(probeCtx)
+			cancel()
+			if err != nil {
+				logAllocationEvent(ctx, "restart_inventory_failed", map[string]string{
+					"backend": string(backendName),
+					"error":   err.Error(),
+				})
+				continue
+			}
+			for _, runner := range runners {
+				if _, exists := s.store.Get(runner.AllocationID); exists {
+					continue
+				}
+				runnerPool, err := s.resolvePool(runner.Pool)
+				if err != nil {
+					continue
+				}
+				if _, ok := runnerPool.Backends[backendName]; !ok {
+					continue
+				}
+				if s.rebuildLiveRunner(ctx, runnerPool, backendName, runner, now, timeout) {
+					rebuilt++
+				}
+			}
+		}
+	}
+	return rebuilt
+}
+
+func (s *Service) rebuildLiveRunner(ctx context.Context, pool model.PoolConfig, backendName model.BackendName, runner backend.LiveRunner, now time.Time, timeout time.Duration) bool {
+	metadata := map[string]string{restoredFromProviderMetadataKey: "true"}
+	for key, value := range runner.Metadata {
+		metadata[key] = value
+	}
+	request := &model.AllocationRequest{
+		Pool:             pool.Name,
+		Backend:          backendNamePtr(backendName),
+		TargetRepository: runner.Repository,
+		WorkflowJobID:    runner.WorkflowJobID,
+	}
+	created := runner.CreatedAt
+	if created.IsZero() {
+		created = now
+	}
+	registered := created
+	status := model.AllocationStatus{
+		ID:              runner.AllocationID,
+		Pool:            pool.Name,
+		SelectedBackend: backendName,
+		RunnerLabel:     backend.DefaultRunnerLabel(backendName, runner.AllocationID),
+		Repository:      runner.Repository,
+		CreatedAt:       created,
+		RegisteredAt:    &registered,
+		ExpiresAt:       now.Add(timeout),
+		State:           model.StateReady,
+		Error:           "rebuilt after restart from live provider runner",
+		Metadata:        metadata,
+		Request:         request,
+	}
+	if label := metadata["runner_label"]; label != "" {
+		status.RunnerLabel = label
+	}
+	// Account the slot. Without room, leave it to the capacity-gap holds.
+	if _, err := s.reserve(pool, model.AllocationRequest{Pool: pool.Name, Backend: backendNamePtr(backendName)}); err != nil {
+		logAllocationEvent(ctx, "restart_inventory_unaccounted", map[string]string{
+			"allocation_id": allocationIDLabel(status.ID),
+			"pool":          string(pool.Name),
+			"backend":       string(backendName),
+			"error":         err.Error(),
+		})
+		return false
+	}
+	if err := s.store.Save(status); err != nil {
+		s.release(context.Background(), pool, backendName, status)
+		return false
+	}
+	logAllocationEvent(ctx, "allocation_restart_rebuilt", map[string]string{
+		"allocation_id": allocationIDLabel(status.ID),
+		"pool":          string(pool.Name),
+		"backend":       string(backendName),
+	})
+	return true
 }
 
 func (s *Service) countLocalAccounted(backendName model.BackendName) int {
