@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
@@ -74,16 +75,25 @@ func (s *Service) findByWorkflowJobID(jobID int64) (model.AllocationStatus, bool
 	return found, ok
 }
 
-// AcceptsWebhookRepository reports whether a workflow_job from repository
-// ("owner/repo") may allocate. With github.scope.type owner the repository must
-// belong to that owner, because the runner registers on it; other scopes
-// register on a fixed target and accept any delivery the signature verified.
+// AcceptsWebhookRepository confines every webhook action to the runner scope.
+// A valid signature authenticates the sender, not the repository named by it.
 func (s *Service) AcceptsWebhookRepository(repository string) bool {
-	if !s.cfg.GitHub.Scope.IsPerRepository() {
-		return true
+	repository = strings.TrimSpace(repository)
+	owner, name, ok := strings.Cut(repository, "/")
+	if !ok || owner == "" || name == "" || strings.Contains(name, "/") {
+		return false
 	}
-	_, err := s.cfg.GitHub.Scope.ForRepository(repository)
-	return err == nil
+	switch strings.TrimSpace(s.cfg.GitHub.Scope.Type) {
+	case model.GitHubScopeOwner:
+		_, err := s.cfg.GitHub.Scope.ForRepository(repository)
+		return err == nil
+	case model.GitHubScopeRepository:
+		return strings.EqualFold(repository, strings.TrimSpace(s.cfg.GitHub.Scope.Owner)+"/"+strings.TrimSpace(s.cfg.GitHub.Scope.Repository))
+	case model.GitHubScopeOrganization:
+		return strings.EqualFold(owner, strings.TrimSpace(s.cfg.GitHub.Scope.Organization))
+	default:
+		return false
+	}
 }
 
 // AllocateForWorkflowJob allocates capacity for a queued workflow job through
@@ -104,6 +114,7 @@ func (s *Service) AllocateForWorkflowJob(ctx context.Context, pool model.PoolCon
 	}
 	status, err = s.Allocate(ctx, model.AllocationRequest{
 		Pool:             pool.Name,
+		JobTimeout:       pool.WebhookJobTimeout,
 		Tenant:           tenant,
 		Labels:           append([]string(nil), pool.WebhookLabels...),
 		WorkflowJobID:    jobID,
@@ -115,18 +126,196 @@ func (s *Service) AllocateForWorkflowJob(ctx context.Context, pool model.PoolCon
 	return status, true, nil
 }
 
-// FinalizeWorkflowJob finalizes the allocation recorded for jobID. Canceled
-// jobs (and allocations still waiting in the admission queue) are canceled;
-// all other conclusions complete the allocation. found is false when no
-// allocation exists for the job; already-terminal allocations are a no-op.
-func (s *Service) FinalizeWorkflowJob(ctx context.Context, jobID int64, conclusion string) (status model.AllocationStatus, found bool, err error) {
+// WorkflowJobRunner identifies the runner GitHub actually assigned. Queued
+// demand is not ownership: runners sharing static labels may exchange jobs.
+type WorkflowJobRunner struct {
+	Repository string
+	Name       string
+	ID         int64
+}
+
+const (
+	executionJobKey       = "workflow_job_execution_id"
+	deferredConclusionKey = "workflow_job_deferred_conclusion"
+)
+
+// allocationServesRepository also checks the original repository for owner
+// scope, where a single broker serves several independently registered repos.
+func (s *Service) allocationServesRepository(status model.AllocationStatus, repository string) bool {
+	if repository == "" {
+		// Compatibility for direct service callers; the HTTP handler always
+		// requires and validates repository before reaching these methods.
+		return true
+	}
+	if !s.AcceptsWebhookRepository(repository) {
+		return false
+	}
+	if target := status.TargetRepository(); target != "" {
+		return strings.EqualFold(target, repository)
+	}
+	return !s.cfg.GitHub.Scope.IsPerRepository()
+}
+
+func executionJob(status model.AllocationStatus) int64 {
+	id, _ := strconv.ParseInt(status.Metadata[executionJobKey], 10, 64)
+	return id
+}
+
+func copyWorkflowMetadata(status *model.AllocationStatus) {
+	metadata := make(map[string]string, len(status.Metadata)+1)
+	for key, value := range status.Metadata {
+		metadata[key] = value
+	}
+	status.Metadata = metadata
+}
+
+// executionAllocation resolves a known runner or an already persisted binding.
+// Shared runs-on labels alone are never evidence of runner identity.
+func (s *Service) executionAllocation(jobID int64, runner WorkflowJobRunner) (model.AllocationStatus, bool) {
+	hasIdentity := runner.Name != "" || runner.ID > 0
+	for _, status := range s.store.List() {
+		if !s.allocationServesRepository(status, runner.Repository) {
+			continue
+		}
+		if hasIdentity {
+			if runner.Name != "" && !strings.EqualFold(strings.TrimSpace(status.RunnerLabel), strings.TrimSpace(runner.Name)) {
+				continue
+			}
+			if runner.ID > 0 {
+				id := status.Metadata["github_runner_id"]
+				if id != "" && id != strconv.FormatInt(runner.ID, 10) {
+					continue
+				}
+				if runner.Name == "" && id == "" {
+					continue
+				}
+			}
+			if bound := executionJob(status); bound != 0 && bound != jobID {
+				continue
+			}
+			return status, true
+		}
+		if executionJob(status) == jobID {
+			return status, true
+		}
+	}
+	return model.AllocationStatus{}, false
+}
+
+func (s *Service) bindWorkflowExecution(status model.AllocationStatus, jobID int64) (model.AllocationStatus, error) {
+	if executionJob(status) == jobID {
+		return status, nil
+	}
+	copyWorkflowMetadata(&status)
+	status.Metadata[executionJobKey] = strconv.FormatInt(jobID, 10)
+	saved, err := s.store.SaveIfState(status, status.State)
+	if err != nil {
+		return status, err
+	}
+	if !saved {
+		return status, ErrAllocationAlreadyCompleted
+	}
+	return status, nil
+}
+
+// recordDemandConclusion records completion independently of runner ownership.
+// An allocation launched for this demand may currently execute another job.
+func (s *Service) recordDemandConclusion(jobID int64, repository, conclusion string) error {
+	origin, found := s.findByWorkflowJobID(jobID)
+	if !found || !s.allocationServesRepository(origin, repository) {
+		return nil
+	}
+	copyWorkflowMetadata(&origin)
+	origin.Metadata[deferredConclusionKey] = conclusion
+	_, err := s.store.SaveIfState(origin, origin.State)
+	return err
+}
+
+// cancelPendingWorkflowDemand cannot race a reservation into provider cleanup:
+// Pending has no scheduler reservation or resource; Reserved may already have
+// registered a shared-label runner and must await a proven execution identity.
+func (s *Service) cancelPendingWorkflowDemand(status model.AllocationStatus) (model.AllocationStatus, bool) {
+	updated, ok := s.store.CompareAndMarkState(status.ID, model.StatePending, model.StateCanceled, s.now(), "workflow demand no longer pending")
+	if ok {
+		s.notifyLifecycleTerminal(updated)
+		s.observeState()
+	}
+	return updated, ok
+}
+
+// suppressSurplusDemand only removes a pending origin when the actual runner
+// has no displaced live demand. Otherwise that pending allocation remains the
+// supply for the original job whose runner GitHub assigned elsewhere.
+func (s *Service) suppressSurplusDemand(jobID int64, repository string, actual model.AllocationStatus) {
+	if actual.Request == nil || actual.Request.WorkflowJobID == jobID {
+		return
+	}
+	if _, completed := actual.Metadata[deferredConclusionKey]; !completed {
+		return
+	}
+	origin, found := s.findByWorkflowJobID(jobID)
+	if found && origin.ID != actual.ID && s.allocationServesRepository(origin, repository) && origin.State == model.StatePending {
+		s.cancelPendingWorkflowDemand(origin)
+	}
+}
+
+// FinalizeWorkflowJob uses actual runner ownership whenever supplied. A job
+// canceled before assignment cannot safely delete the runner launched for its
+// queued event: that runner may already be executing a different queued job.
+func (s *Service) FinalizeWorkflowJob(ctx context.Context, jobID int64, conclusion string, runners ...WorkflowJobRunner) (status model.AllocationStatus, found bool, err error) {
+	s.workflowJobMu.Lock()
+	defer s.workflowJobMu.Unlock()
+	runner := WorkflowJobRunner{}
+	if len(runners) > 0 {
+		runner = runners[0]
+	}
+	if err := s.recordDemandConclusion(jobID, runner.Repository, conclusion); err != nil {
+		return status, false, err
+	}
+	status, found = s.executionAllocation(jobID, runner)
+	if found {
+		if isTerminalAllocationState(status.State) {
+			return status, true, nil
+		}
+		status, err = s.bindWorkflowExecution(status, jobID)
+		if err != nil {
+			return status, true, err
+		}
+		s.suppressSurplusDemand(jobID, runner.Repository, status)
+		return s.finishWorkflowExecution(ctx, status, conclusion)
+	}
+	// A supplied but unknown runner belongs to ARC, another controller, or
+	// another repository. It must never release an unrelated JIT runner.
+	if runner.Name != "" || runner.ID > 0 {
+		return model.AllocationStatus{}, false, nil
+	}
 	status, found = s.findByWorkflowJobID(jobID)
-	if !found {
+	if !found || !s.allocationServesRepository(status, runner.Repository) {
 		return model.AllocationStatus{}, false, nil
 	}
 	if isTerminalAllocationState(status.State) {
 		return status, true, nil
 	}
+	// ARC owns no runner resource in this broker; retain its legacy accounting.
+	if status.SelectedBackend == model.BackendARC {
+		return s.finishWorkflowExecution(ctx, status, conclusion)
+	}
+	if status.State == model.StatePending {
+		if updated, ok := s.cancelPendingWorkflowDemand(status); ok {
+			return updated, true, nil
+		}
+		// A queue worker may have reserved it since we read the record. Do
+		// not fall through to Cancel, which would delete a newly born runner.
+		current, ok := s.store.Get(status.ID)
+		return current, ok, nil
+	}
+	// Persist an out-of-order cancellation/completion until an event identifies
+	// the actual runner. Keep any already launched runner available for demand.
+
+	return status, true, nil
+}
+
+func (s *Service) finishWorkflowExecution(ctx context.Context, status model.AllocationStatus, conclusion string) (model.AllocationStatus, bool, error) {
 	canceled := strings.EqualFold(strings.TrimSpace(conclusion), "cancelled") || strings.EqualFold(strings.TrimSpace(conclusion), "canceled")
 	if canceled || status.State == model.StatePending {
 		updated, ok := s.Cancel(ctx, status.ID)
@@ -145,50 +334,56 @@ func (s *Service) FinalizeWorkflowJob(ctx context.Context, jobID int64, conclusi
 	return updated, true, nil
 }
 
-// ClaimWorkflowJob claims the allocation recorded for jobID or matching runner labels.
-func (s *Service) ClaimWorkflowJob(ctx context.Context, jobID int64, runnerName string, labels []string) (status model.AllocationStatus, found bool, err error) {
+// ClaimWorkflowJob binds the execution to the actual unique runner name/id.
+// Job labels and the originating demand's job id are insufficient for JIT
+// runners because GitHub independently assigns jobs sharing those labels.
+func (s *Service) ClaimWorkflowJob(ctx context.Context, jobID int64, runnerName string, labels []string, runners ...WorkflowJobRunner) (status model.AllocationStatus, found bool, err error) {
 	s.workflowJobMu.Lock()
 	defer s.workflowJobMu.Unlock()
-
-	if jobID > 0 {
-		status, found = s.findByWorkflowJobID(jobID)
-		if found && !isTerminalAllocationState(status.State) {
-			claimed, ok, claimErr := s.Claim(ctx, status.ID)
-			return claimed, ok, claimErr
+	runner := WorkflowJobRunner{Name: runnerName}
+	if len(runners) > 0 {
+		runner = runners[0]
+		runner.Name = runnerName
+	}
+	status, found = s.executionAllocation(jobID, runner)
+	if !found {
+		// ARC has no provider resource to delete and retains its static-label
+		// accounting. Never apply this fallback to broker-created runner pods.
+		origin, ok := s.findByWorkflowJobID(jobID)
+		if !ok || origin.SelectedBackend != model.BackendARC || !s.allocationServesRepository(origin, runner.Repository) {
+			return model.AllocationStatus{}, false, nil
+		}
+		status, found = origin, true
+	}
+	if isTerminalAllocationState(status.State) {
+		return status, true, nil
+	}
+	status, err = s.bindWorkflowExecution(status, jobID)
+	if err != nil {
+		return status, true, err
+	}
+	now := s.now()
+	if status.ClaimedAt == nil || status.ClaimedAt.IsZero() {
+		status.ClaimedAt = &now
+	}
+	if status.RegisteredAt == nil || status.RegisteredAt.IsZero() {
+		status.RegisteredAt = &now
+	}
+	saved, err := s.store.SaveIfState(status, status.State)
+	if err != nil {
+		return status, true, err
+	}
+	if !saved {
+		return status, true, ErrAllocationAlreadyCompleted
+	}
+	claimed := status
+	s.suppressSurplusDemand(jobID, runner.Repository, claimed)
+	// If completion arrived without runner identity before in_progress, it is
+	// now safe to release precisely the runner that executed that canceled job.
+	if origin, exists := s.findByWorkflowJobID(jobID); exists && s.allocationServesRepository(origin, runner.Repository) {
+		if conclusion, deferred := origin.Metadata[deferredConclusionKey]; deferred {
+			return s.finishWorkflowExecution(ctx, claimed, conclusion)
 		}
 	}
-
-	wanted := normalizeLabelSet(labels)
-	normalizedRunnerName := strings.ToLower(strings.TrimSpace(runnerName))
-	var oldestUnclaimed model.AllocationStatus
-	foundMatch := false
-	for _, alloc := range s.store.List() {
-		if !isActiveAllocationState(alloc.State) {
-			continue
-		}
-		if alloc.ClaimedAt != nil && !alloc.ClaimedAt.IsZero() {
-			continue
-		}
-		allocLabel := strings.ToLower(strings.TrimSpace(alloc.RunnerLabel))
-		if allocLabel == "" {
-			continue
-		}
-		matched := false
-		if _, ok := wanted[allocLabel]; ok {
-			matched = true
-		} else if normalizedRunnerName != "" && allocLabel == normalizedRunnerName {
-			matched = true
-		}
-		if matched {
-			if !foundMatch || alloc.CreatedAt.Before(oldestUnclaimed.CreatedAt) {
-				oldestUnclaimed = alloc
-				foundMatch = true
-			}
-		}
-	}
-	if foundMatch {
-		claimed, ok, claimErr := s.Claim(ctx, oldestUnclaimed.ID)
-		return claimed, ok, claimErr
-	}
-	return model.AllocationStatus{}, false, nil
+	return claimed, true, nil
 }

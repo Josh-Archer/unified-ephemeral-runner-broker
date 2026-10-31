@@ -55,6 +55,7 @@ type Registrar interface {
 }
 
 type Backend struct {
+	name      model.BackendName
 	cfg       model.BrokerConfig
 	api       API
 	registrar Registrar
@@ -63,22 +64,36 @@ type Backend struct {
 // New returns the backend. api may be nil when the broker runs outside
 // Kubernetes; Provision then fails and Capacity reports an error.
 func New(cfg model.BrokerConfig, api API, registrar Registrar) *Backend {
-	return &Backend{cfg: cfg, api: api, registrar: registrar}
+	return NewNamed(cfg, api, registrar, model.BackendKubernetes)
+}
+
+// NewNamed isolates one Kubernetes target by its configuration key and pod labels.
+func NewNamed(cfg model.BrokerConfig, api API, registrar Registrar, name model.BackendName) *Backend {
+	return &Backend{name: name, cfg: cfg, api: api, registrar: registrar}
 }
 
 func (b *Backend) Name() model.BackendName {
-	return model.BackendKubernetes
+	return b.name
 }
 
 func (b *Backend) Provision(ctx context.Context, request model.AllocationRequest, allocation model.AllocationStatus) (backend.ProvisionedRunner, error) {
 	if b.api == nil {
-		return backend.ProvisionedRunner{}, fmt.Errorf("backend %s needs the broker to run in Kubernetes", model.BackendKubernetes)
+		return backend.ProvisionedRunner{}, backend.NewAllocationError(fmt.Errorf("backend %s needs the broker to run in Kubernetes", b.name), backend.ErrBackendCapacityExhausted, true)
 	}
 	pool, ok := b.pool(allocation.Pool)
 	if !ok {
-		return backend.ProvisionedRunner{}, fmt.Errorf("backend %s is not configured for pool %s", model.BackendKubernetes, allocation.Pool)
+		return backend.ProvisionedRunner{}, fmt.Errorf("backend %s is not configured for pool %s", b.name, allocation.Pool)
 	}
-	backendCfg := pool.Backends[model.BackendKubernetes]
+	backendCfg := pool.Backends[b.name]
+	if backendCfg.Kubernetes != nil && backendCfg.Kubernetes.NodeGuard != nil {
+		capacity, err := b.Capacity(ctx)
+		if err != nil || backend.FreeSlots(capacity) == 0 {
+			if err == nil {
+				err = fmt.Errorf("guarded target %s is unavailable or has no free runner slots", b.name)
+			}
+			return backend.ProvisionedRunner{}, backend.NewAllocationError(err, backend.ErrBackendCapacityExhausted, true)
+		}
+	}
 
 	scope, err := b.cfg.GitHub.Scope.ForRepository(allocation.TargetRepository())
 	if err != nil {
@@ -90,10 +105,10 @@ func (b *Backend) Provision(ctx context.Context, request model.AllocationRequest
 	}
 
 	if b.registrar == nil {
-		return backend.ProvisionedRunner{}, fmt.Errorf("backend %s needs a GitHub client to register runners", model.BackendKubernetes)
+		return backend.ProvisionedRunner{}, fmt.Errorf("backend %s needs a GitHub client to register runners", b.name)
 	}
 
-	runnerLabel := backend.DefaultRunnerLabel(model.BackendKubernetes, allocation.ID)
+	runnerLabel := backend.DefaultRunnerLabel(b.name, allocation.ID)
 	timeout := request.JobTimeout
 	if timeout <= 0 {
 		timeout = b.cfg.Broker.DefaultJobTimeout
@@ -158,7 +173,7 @@ func (b *Backend) Cleanup(ctx context.Context, status model.AllocationStatus) er
 		namespace := strings.TrimSpace(status.Metadata["namespace"])
 		if namespace == "" {
 			if pool, ok := b.pool(status.Pool); ok {
-				namespace = b.namespace(pool.Backends[model.BackendKubernetes])
+				namespace = b.namespace(pool.Backends[b.name])
 			}
 		}
 		if namespace != "" {
@@ -189,26 +204,51 @@ func (b *Backend) Cleanup(ctx context.Context, status model.AllocationStatus) er
 // maxRunners of its enabled pools. Pods that cannot be scheduled count as
 // pending, so a full cluster reports no free slots and allocations fall back
 // to other backends.
-func (b *Backend) Capacity(ctx context.Context) (backend.CapacityStatus, error) {
+func (b *Backend) Capacity(ctx context.Context) (result backend.CapacityStatus, resultErr error) {
 	maxRunners := 0
+	sharedMax := 0
+	var guard *model.KubernetesNodeGuardConfig
 	namespaces := map[string]struct{}{}
 	for _, pool := range b.cfg.Pools {
-		cfg, ok := pool.Backends[model.BackendKubernetes]
+		cfg, ok := pool.Backends[b.name]
 		if !ok || !cfg.Enabled {
 			continue
 		}
 		maxRunners += cfg.MaxRunners
+		if cfg.CrossPoolMaxRunners > 0 && (sharedMax == 0 || cfg.CrossPoolMaxRunners < sharedMax) {
+			sharedMax = cfg.CrossPoolMaxRunners
+		}
+		if cfg.Kubernetes != nil && cfg.Kubernetes.NodeGuard != nil {
+			guard = cfg.Kubernetes.NodeGuard
+		}
 		namespaces[b.namespace(cfg)] = struct{}{}
 	}
+	if sharedMax > 0 && sharedMax < maxRunners {
+		maxRunners = sharedMax
+	}
+	defer func() {
+		if guard != nil && resultErr != nil {
+			result = backend.CapacityStatus{MaxRunners: maxRunners, ActiveRunners: maxRunners}
+			resultErr = nil
+		}
+	}()
 	if maxRunners <= 0 {
-		return backend.CapacityStatus{}, fmt.Errorf("backend %s has no configured maxRunners", model.BackendKubernetes)
+		return backend.CapacityStatus{}, fmt.Errorf("backend %s has no configured maxRunners", b.name)
 	}
 	if b.api == nil {
-		return backend.CapacityStatus{}, fmt.Errorf("backend %s needs the broker to run in Kubernetes", model.BackendKubernetes)
+		return backend.CapacityStatus{}, fmt.Errorf("backend %s needs the broker to run in Kubernetes", b.name)
 	}
 
 	status := backend.CapacityStatus{MaxRunners: maxRunners}
-	selector := url.QueryEscape(fmt.Sprintf("%s=%s,%s=%s", labelManagedBy, labelManagedByVal, labelBackend, model.BackendKubernetes))
+	if guard != nil {
+		if err := b.checkNodeGuard(ctx, guard); err != nil {
+			// Capacity collection may pass through errors. A known zero-free snapshot
+			// keeps this guarded target closed even under that policy.
+			status.ActiveRunners = maxRunners
+			return status, nil
+		}
+	}
+	selector := url.QueryEscape(fmt.Sprintf("%s=%s,%s=%s", labelManagedBy, labelManagedByVal, labelBackend, b.name))
 	for namespace := range namespaces {
 		code, body, err := b.api.Do(ctx, http.MethodGet, podsPath(namespace, "")+"?labelSelector="+selector, nil)
 		if err != nil {
@@ -221,14 +261,16 @@ func (b *Backend) Capacity(ctx context.Context) (backend.CapacityStatus, error) 
 		if err := json.Unmarshal(body, &list); err != nil {
 			return backend.CapacityStatus{}, fmt.Errorf("decode runner pods in %s: %w", namespace, err)
 		}
+		if guard != nil && list.Items == nil {
+			return backend.CapacityStatus{}, fmt.Errorf("runner inventory did not contain items")
+		}
 		for _, item := range list.Items {
-			if item.Metadata.DeletionTimestamp != "" {
-				continue
-			}
 			switch item.Status.Phase {
 			case "Running":
 				status.ActiveRunners++
-			case "Pending", "":
+			case "Succeeded", "Failed":
+				// Terminal pods no longer occupy runner capacity.
+			default:
 				status.PendingRunners++
 			}
 		}
@@ -241,7 +283,7 @@ func (b *Backend) pool(name model.PoolName) (model.PoolConfig, bool) {
 		if pool.Name != name {
 			continue
 		}
-		if _, ok := pool.Backends[model.BackendKubernetes]; ok {
+		if _, ok := pool.Backends[b.name]; ok {
 			return pool, true
 		}
 	}
@@ -272,6 +314,11 @@ func (b *Backend) buildPod(pool model.PoolConfig, cfg model.BackendConfig, alloc
 	}
 	if spec == nil {
 		spec = map[string]any{}
+	}
+	if kcfg.NodeGuard != nil {
+		if err := enforceNodeGuard(spec, kcfg.NodeGuard); err != nil {
+			return nil, err
+		}
 	}
 	spec["restartPolicy"] = "Never"
 	grace := kcfg.DeadlineGrace
@@ -321,7 +368,18 @@ func (b *Backend) buildPod(pool model.PoolConfig, cfg model.BackendConfig, alloc
 	containers[runnerIndex] = runner
 	spec["containers"] = containers
 
+	labels := map[string]any{}
+	for key, value := range kcfg.PodLabels {
+		labels[key] = value
+	}
+	labels[labelManagedBy] = labelManagedByVal
+	labels[labelBackend] = string(b.name)
+	labels[labelAllocation] = labelValue(allocation.ID)
+	labels[labelPool] = labelValue(string(pool.Name))
 	annotations := map[string]any{}
+	for key, value := range kcfg.PodAnnotations {
+		annotations[key] = value
+	}
 	if repo := allocation.TargetRepository(); repo != "" {
 		annotations[annotationRepository] = repo
 	}
@@ -329,13 +387,8 @@ func (b *Backend) buildPod(pool model.PoolConfig, cfg model.BackendConfig, alloc
 		"apiVersion": "v1",
 		"kind":       "Pod",
 		"metadata": map[string]any{
-			"name": podName(allocation.ID),
-			"labels": map[string]any{
-				labelManagedBy:  labelManagedByVal,
-				labelBackend:    string(model.BackendKubernetes),
-				labelAllocation: labelValue(allocation.ID),
-				labelPool:       labelValue(string(pool.Name)),
-			},
+			"name":        podName(allocation.ID),
+			"labels":      labels,
 			"annotations": annotations,
 		},
 		"spec": spec,

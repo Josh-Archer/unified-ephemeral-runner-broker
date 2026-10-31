@@ -278,7 +278,7 @@ func leaderIdentity(configured string) string {
 
 func buildRegistry(cfg model.BrokerConfig, secretReader runtime.SecretReader, runnerPods kubernetesbackend.API, registrar kubernetesbackend.Registrar) (*backend.Registry, *desktopbackend.Backend) {
 	desktopBackend := desktopbackend.New(cfg)
-	registry := backend.NewRegistry(
+	entries := []backend.Backend{
 		arcbackend.New(cfg, secretReader),
 		codebuildbackend.New(cfg, secretReader),
 		lambdabackend.New(cfg, secretReader),
@@ -289,7 +289,17 @@ func buildRegistry(cfg model.BrokerConfig, secretReader runtime.SecretReader, ru
 		kubernetesbackend.New(cfg, runnerPods, registrar),
 		ec2backend.New(cfg, secretReader),
 		gcebackend.New(cfg, secretReader),
-	)
+	}
+	seen := map[model.BackendName]bool{}
+	for _, pool := range cfg.Pools {
+		for name, target := range pool.Backends {
+			if target.Driver == "kubernetes" && !seen[name] {
+				entries = append(entries, kubernetesbackend.NewNamed(cfg, runnerPods, registrar, name))
+				seen[name] = true
+			}
+		}
+	}
+	registry := backend.NewRegistry(entries...)
 	return registry, desktopBackend
 }
 

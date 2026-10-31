@@ -36,7 +36,7 @@ func jobBody(action string, id int64, conclusion string, labels ...string) strin
 	if conclusion != "" {
 		concl = fmt.Sprintf("%q", conclusion)
 	}
-	return fmt.Sprintf(`{"action":%q,"workflow_job":{"id":%d,"conclusion":%s,"labels":[%s]}}`, action, id, concl, strings.Join(quoted, ","))
+	return fmt.Sprintf(`{"action":%q,"workflow_job":{"id":%d,"conclusion":%s,"labels":[%s]},"repository":{"full_name":"my-org/home"}}`, action, id, concl, strings.Join(quoted, ","))
 }
 
 type webhookHarness struct {
@@ -458,7 +458,7 @@ func TestGitHubWebhookSecretFunc(t *testing.T) {
 
 func repoJobBody(action string, id int64, repository string, labels ...string) string {
 	body := jobBody(action, id, "", labels...)
-	return strings.TrimSuffix(body, "}") + fmt.Sprintf(`,"repository":{"full_name":%q}}`, repository)
+	return strings.Replace(body, `"full_name":"my-org/home"`, fmt.Sprintf(`"full_name":%q`, repository), 1)
 }
 
 func TestGitHubWebhookOwnerScopeRecordsRepositoryAndRejectsOthers(t *testing.T) {

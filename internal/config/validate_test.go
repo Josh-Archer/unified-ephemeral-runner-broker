@@ -279,3 +279,17 @@ func TestValidatePerRepositoryScope(t *testing.T) {
 		t.Fatalf("warm runners with a default repository should validate: %v", err)
 	}
 }
+
+func TestValidateWebhookJobTimeout(t *testing.T) {
+	cfg := Default()
+	for _, timeout := range []time.Duration{0, 6 * time.Hour} {
+		cfg.Pools[0].WebhookJobTimeout = timeout
+		if err := Validate(cfg); err != nil {
+			t.Fatalf("timeout=%v rejected: %v", timeout, err)
+		}
+	}
+	cfg.Pools[0].WebhookJobTimeout = -time.Second
+	if err := Validate(cfg); err == nil {
+		t.Fatal("negative webhookJobTimeout accepted")
+	}
+}

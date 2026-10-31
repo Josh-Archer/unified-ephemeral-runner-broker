@@ -2,6 +2,8 @@ package config
 
 import (
 	"fmt"
+	"reflect"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -232,34 +234,103 @@ func validatePerRepositoryScope(cfg model.BrokerConfig) error {
 // kubernetes backends. The broker registers their runners itself, so it needs
 // github.auth.secretRef.
 func validateKubernetesBackends(cfg model.BrokerConfig) error {
+	aliases := map[model.BackendName]model.BackendConfig{}
+	guardedTargets := map[model.BackendName]model.BackendConfig{}
+	validName := regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
+	builtin := map[model.BackendName]bool{model.BackendARC: true, model.BackendKubernetes: true, model.BackendCodeBuild: true, model.BackendLambda: true, model.BackendCloudRun: true, model.BackendAzureFunctions: true, model.BackendAzureVM: true, model.BackendEC2: true, model.BackendGCE: true, model.BackendDesktop: true}
 	for _, pool := range cfg.Pools {
-		backendCfg, ok := pool.Backends[model.BackendKubernetes]
-		if !ok || !backendCfg.Enabled {
-			continue
-		}
-		prefix := fmt.Sprintf("pools[%s].backends[%s]", pool.Name, model.BackendKubernetes)
-		kcfg := backendCfg.Kubernetes
-		if kcfg == nil {
-			return fmt.Errorf("%s.kubernetes is required when the backend is enabled", prefix)
-		}
-		if kcfg.DeadlineGrace < 0 {
-			return fmt.Errorf("%s.kubernetes.deadlineGrace must not be negative", prefix)
-		}
-		if strings.TrimSpace(cfg.GitHub.Auth.SecretRef) == "" {
-			return fmt.Errorf("%s: github.auth.secretRef is required; the broker registers these runners", prefix)
-		}
-		if backendCfg.WarmMin > 0 || backendCfg.WarmMax > 0 {
-			return fmt.Errorf("%s: warm runners are not supported; runner pods start per allocation", prefix)
-		}
-		if raw, present := kcfg.PodSpec["containers"]; present {
-			containers, ok := raw.([]any)
-			if !ok {
-				return fmt.Errorf("%s.kubernetes.podSpec.containers must be a list", prefix)
-			}
-			for index, rawContainer := range containers {
-				if _, ok := rawContainer.(map[string]any); !ok {
-					return fmt.Errorf("%s.kubernetes.podSpec.containers[%d] must be a mapping", prefix, index)
+		for name, backendCfg := range pool.Backends {
+			prefix := fmt.Sprintf("pools[%s].backends[%s]", pool.Name, name)
+			if backendCfg.Driver != "" {
+				if backendCfg.Driver != "kubernetes" {
+					return fmt.Errorf("%s.driver: unsupported driver %q", prefix, backendCfg.Driver)
 				}
+				if builtin[name] || !validName.MatchString(string(name)) {
+					return fmt.Errorf("%s.driver requires a unique non-builtin DNS label backend name", prefix)
+				}
+				if backendCfg.MaxRunners <= 0 || backendCfg.CrossPoolMaxRunners <= 0 {
+					return fmt.Errorf("%s requires positive maxRunners and crossPoolMaxRunners", prefix)
+				}
+				if old, ok := aliases[name]; ok && (old.Driver != backendCfg.Driver || old.CrossPoolMaxRunners != backendCfg.CrossPoolMaxRunners || !reflect.DeepEqual(old.Kubernetes, backendCfg.Kubernetes)) {
+					return fmt.Errorf("%s must use the same driver, kubernetes target and crossPoolMaxRunners in every pool", prefix)
+				}
+				aliases[name] = backendCfg
+			}
+			if name != model.BackendKubernetes && backendCfg.Driver != "kubernetes" {
+				if backendCfg.Kubernetes != nil {
+					return fmt.Errorf("%s.kubernetes requires driver: kubernetes", prefix)
+				}
+				continue
+			}
+			if !backendCfg.Enabled {
+				continue
+			}
+			kcfg := backendCfg.Kubernetes
+			if kcfg == nil {
+				return fmt.Errorf("%s.kubernetes is required when the backend is enabled", prefix)
+			}
+			if kcfg.DeadlineGrace < 0 {
+				return fmt.Errorf("%s.kubernetes.deadlineGrace must not be negative", prefix)
+			}
+			if strings.TrimSpace(cfg.GitHub.Auth.SecretRef) == "" {
+				return fmt.Errorf("%s: github.auth.secretRef is required; the broker registers these runners", prefix)
+			}
+			if backendCfg.WarmMin > 0 || backendCfg.WarmMax > 0 {
+				return fmt.Errorf("%s: warm runners are not supported; runner pods start per allocation", prefix)
+			}
+			if guard := kcfg.NodeGuard; guard != nil {
+				guardedTargets[name] = backendCfg
+				if guard.NodeName == "" || len(guard.NodeName) > 253 || strings.ContainsAny(guard.NodeName, "/ ") || len(guard.RequiredLabels) == 0 {
+					return fmt.Errorf("%s.kubernetes.nodeGuard requires a nodeName and requiredLabels", prefix)
+				}
+				for key, value := range guard.RequiredLabels {
+					if strings.TrimSpace(key) == "" || strings.TrimSpace(value) == "" {
+						return fmt.Errorf("%s.kubernetes.nodeGuard requiredLabels must be nonempty", prefix)
+					}
+				}
+				if nodeName, present := kcfg.PodSpec["nodeName"]; present && nodeName != "" {
+					return fmt.Errorf("%s.kubernetes.podSpec.nodeName bypasses guarded scheduler admission", prefix)
+				}
+				if selector, present := kcfg.PodSpec["nodeSelector"]; present {
+					mapping, ok := selector.(map[string]any)
+					if !ok {
+						return fmt.Errorf("%s.kubernetes.podSpec.nodeSelector must be a mapping", prefix)
+					}
+					for key, want := range guard.RequiredLabels {
+						if value, exists := mapping[key]; exists && value != want {
+							return fmt.Errorf("%s.kubernetes.podSpec.nodeSelector conflicts with guard label %s", prefix, key)
+						}
+					}
+				}
+			}
+			if raw, present := kcfg.PodSpec["containers"]; present {
+				containers, ok := raw.([]any)
+				if !ok {
+					return fmt.Errorf("%s.kubernetes.podSpec.containers must be a list", prefix)
+				}
+				for index, rawContainer := range containers {
+					if _, ok := rawContainer.(map[string]any); !ok {
+						return fmt.Errorf("%s.kubernetes.podSpec.containers[%d] must be a mapping", prefix, index)
+					}
+				}
+			}
+		}
+	}
+	// A guarded target has one physical node admission contract. Mixing an
+	// unguarded pool or different pod placement under the same key would make
+	// the global capacity snapshot depend on pool order.
+	for _, pool := range cfg.Pools {
+		for name, target := range pool.Backends {
+			if guarded, ok := guardedTargets[name]; ok && target.Enabled && !reflect.DeepEqual(guarded.Kubernetes, target.Kubernetes) {
+				return fmt.Errorf("backend %s must use the same guarded kubernetes target in every enabled pool", name)
+			}
+		}
+	}
+	// An alias must never silently resolve to a different driver in another pool.
+	for _, pool := range cfg.Pools {
+		for name, target := range pool.Backends {
+			if alias, ok := aliases[name]; ok && target.Driver != alias.Driver {
+				return fmt.Errorf("backend %s has inconsistent drivers across pools", name)
 			}
 		}
 	}
@@ -649,6 +720,9 @@ func validateWebhookLabels(cfg model.BrokerConfig) error {
 	seen := map[string]model.PoolName{}
 	enabled := false
 	for _, pool := range cfg.Pools {
+		if pool.WebhookJobTimeout < 0 {
+			return fmt.Errorf("pools[%s].webhookJobTimeout must not be negative", pool.Name)
+		}
 		if len(pool.WebhookLabels) == 0 {
 			continue
 		}

@@ -225,6 +225,9 @@ func CostClass(name model.BackendName, cfg model.BackendConfig) int {
 	if cfg.CostClass > 0 {
 		return cfg.CostClass
 	}
+	if cfg.Driver == "kubernetes" {
+		return 10
+	}
 	switch name {
 	case model.BackendARC, model.BackendKubernetes, model.BackendDesktop:
 		return 10

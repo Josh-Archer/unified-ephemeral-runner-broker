@@ -321,8 +321,19 @@ type DesktopConfig struct {
 	CheckPort int    `yaml:"checkPort" json:"checkPort"`
 }
 
+// KubernetesNodeGuardConfig gates a target on fresh cluster admission state.
+// Matching labels are also enforced on every runner pod at scheduling time.
+type KubernetesNodeGuardConfig struct {
+	NodeName       string            `yaml:"nodeName" json:"nodeName"`
+	RequiredLabels map[string]string `yaml:"requiredLabels" json:"requiredLabels"`
+}
+
 // KubernetesBackendConfig configures the kubernetes backend's runner pods.
 type KubernetesBackendConfig struct {
+	// PodLabels and PodAnnotations attach operator metadata; broker ownership labels win.
+	PodLabels      map[string]string          `yaml:"podLabels,omitempty" json:"podLabels,omitempty"`
+	PodAnnotations map[string]string          `yaml:"podAnnotations,omitempty" json:"podAnnotations,omitempty"`
+	NodeGuard      *KubernetesNodeGuardConfig `yaml:"nodeGuard,omitempty" json:"nodeGuard,omitempty"`
 	// Namespace holds the runner pods. Empty means the broker's namespace.
 	Namespace string `yaml:"namespace,omitempty" json:"namespace,omitempty"`
 	// Image is the actions runner image for the runner container when PodSpec
@@ -342,9 +353,11 @@ type KubernetesBackendConfig struct {
 }
 
 type BackendConfig struct {
-	Enabled    bool `yaml:"enabled" json:"enabled"`
-	Healthy    bool `yaml:"healthy" json:"healthy"`
-	MaxRunners int  `yaml:"maxRunners" json:"maxRunners"`
+	// Driver allows an independently counted target using a built-in adapter.
+	Driver     string `yaml:"driver,omitempty" json:"driver,omitempty"`
+	Enabled    bool   `yaml:"enabled" json:"enabled"`
+	Healthy    bool   `yaml:"healthy" json:"healthy"`
+	MaxRunners int    `yaml:"maxRunners" json:"maxRunners"`
 	// CrossPoolMaxRunners limits concurrent active allocations for this backend across all pools.
 	CrossPoolMaxRunners int           `yaml:"crossPoolMaxRunners,omitempty" json:"crossPoolMaxRunners,omitempty"`
 	RegistrationTimeout time.Duration `yaml:"registrationTimeout,omitempty" json:"registrationTimeout,omitempty"`
@@ -453,6 +466,9 @@ type PoolConfig struct {
 	// A queued job whose runs-on labels are all contained in this set (and that
 	// names at least one label besides self-hosted) is allocated from this pool;
 	// runners register with these static labels instead of a per-allocation one.
+	// WebhookJobTimeout bounds webhook jobs, which do not expose their workflow
+	// timeout. Zero uses broker.defaultJobTimeout; API allocations are unchanged.
+	WebhookJobTimeout time.Duration                 `yaml:"webhookJobTimeout,omitempty" json:"webhookJobTimeout,omitempty"`
 	WebhookLabels     []string                      `yaml:"webhookLabels,omitempty" json:"webhookLabels,omitempty"`
 	CapabilityProfile CapabilityProfile             `yaml:"capabilityProfile" json:"capabilityProfile"`
 	Backends          map[BackendName]BackendConfig `yaml:"backends" json:"backends"`

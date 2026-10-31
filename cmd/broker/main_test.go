@@ -92,3 +92,18 @@ func TestBuildRegistryIncludesDesktopBackend(t *testing.T) {
 		t.Fatalf("registry.Get(model.BackendDesktop) = %v, want %v", got, desktop)
 	}
 }
+
+func TestBuildRegistryIncludesIndependentKubernetesTargets(t *testing.T) {
+	cfg := model.BrokerConfig{Pools: []model.PoolConfig{{Name: model.PoolLite, Backends: map[model.BackendName]model.BackendConfig{
+		"kubernetes-desktop": {Driver: "kubernetes", Enabled: true, MaxRunners: 5, CrossPoolMaxRunners: 5},
+	}}}}
+	registry, _ := buildRegistry(cfg, nil, nil, nil)
+	builtin, ok := registry.Get(model.BackendKubernetes)
+	if !ok {
+		t.Fatal("builtin kubernetes backend missing")
+	}
+	named, ok := registry.Get("kubernetes-desktop")
+	if !ok || named.Name() != "kubernetes-desktop" || named == builtin {
+		t.Fatalf("named=%v builtin=%v", named, builtin)
+	}
+}
