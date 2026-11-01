@@ -322,7 +322,7 @@ func TestListRunnersCapsPages(t *testing.T) {
 }
 
 // home#4157: with a GitHub App installation token, /users/{owner}/repos lists
-// only public repositories, so the private Josh-Archer/home was never
+// only public repositories, so a private repository was never
 // reconciled (the deep pass ended after the 44 public repos). The installation
 // listing includes private repositories.
 func TestListRepositoriesIncludesPrivateInstallationRepositories(t *testing.T) {
@@ -335,7 +335,7 @@ func TestListRepositoriesIncludesPrivateInstallationRepositories(t *testing.T) {
 			}
 			_, _ = w.Write([]byte(`{"total_count":3,"repositories":[
 				{"full_name":"Josh-Archer/public-tool","private":false},
-				{"full_name":"Josh-Archer/home","private":true},
+				{"full_name":"Josh-Archer/private-app","private":true},
 				{"full_name":"someone-else/shared","private":false}]}`))
 		case "/orgs/Josh-Archer/repos", "/users/Josh-Archer/repos":
 			ownerListed = true
@@ -352,7 +352,7 @@ func TestListRepositoriesIncludesPrivateInstallationRepositories(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(repos) != 2 || repos[0] != "Josh-Archer/public-tool" || repos[1] != "Josh-Archer/home" {
+	if len(repos) != 2 || repos[0] != "Josh-Archer/public-tool" || repos[1] != "Josh-Archer/private-app" {
 		t.Fatalf("repos=%v, want the public and the private Josh-Archer repository only", repos)
 	}
 	if ownerListed {

@@ -210,7 +210,7 @@ func (c *Client) ListRepositories(ctx context.Context, scope model.GitHubScope) 
 	// A GitHub App installation token sees its private repositories only
 	// through /installation/repositories; /users/{owner}/repos lists public
 	// repositories alone, which silently dropped private repos such as
-	// Josh-Archer/home from the queued-job reconcile (home#4157). Other
+	// a private home-lab repository from the queued-job reconcile (home#4157). Other
 	// tokens (PATs) get 401/403/404 here and use the owner listing below.
 	if repos, ok, err := c.listInstallationRepositories(ctx, owner); ok {
 		return repos, err
