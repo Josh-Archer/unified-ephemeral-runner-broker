@@ -434,7 +434,7 @@ const (
 	// backends can hang (home#4157), and without a deadline one cycle held
 	// the reconcile lock and the worker goroutine for many intervals.
 	reconcileCycleTimeout = 50 * time.Second
-	reconcileReposTTL      = 5 * time.Minute
+	reconcileReposTTL     = 5 * time.Minute
 	// reconcileTruncatedReposTTL is how long a repository list cut at its page
 	// cap is reused, so a truncated listing is retried soon.
 	reconcileTruncatedReposTTL = time.Minute
