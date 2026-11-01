@@ -73,7 +73,7 @@ type githubWebhookMetrics struct {
 	expired  prometheus.Counter
 	pageCap  *prometheus.CounterVec
 	budget   prometheus.Counter
-	skipped  prometheus.Counter
+	skipped  *prometheus.CounterVec
 }
 
 func newGitHubWebhookMetrics() *githubWebhookMetrics {
@@ -106,10 +106,10 @@ func newGitHubWebhookMetrics() *githubWebhookMetrics {
 			Name: "uecb_github_reconcile_budget_exhausted_total",
 			Help: "Queued-job reconcile cycles stopped at the per-cycle GitHub API call budget; the next cycle resumes at the next repository.",
 		}),
-		skipped: prometheus.NewCounter(prometheus.CounterOpts{
+		skipped: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "uecb_reconcile_run_skipped_total",
-			Help: "Queued workflow runs skipped by a reconcile scan after reconcileRunMaxCutoffs consecutive deadline cutoffs.",
-		}),
+			Help: "Reconcile scan units skipped after reconcileRunMaxCutoffs consecutive deadline cutoffs, by unit (run: a run's job check; repo: a repository's queued-run listing).",
+		}, []string{"unit"}),
 	}
 }
 
@@ -200,8 +200,9 @@ type reconcileState struct {
 	deepOpen bool      // a deep pass started and has not covered every repo yet
 	// lastDeepSpent is the deep scan's call count in the last cycle.
 	lastDeepSpent int64
-	// cutoffs counts consecutive deadline cutoffs per "repo#runID@window"
-	// (one count per scan); reset when that run's check finishes.
+	// cutoffs counts consecutive deadline cutoffs per scan unit, keyed
+	// "repo#runID@window" for a run's check and "repo@window" for a repo's
+	// run listing (one count per scan); reset when that unit finishes.
 	cutoffs  map[string]int
 	repos    []string
 	reposAt  time.Time
@@ -688,9 +689,9 @@ type reconcileRun struct {
 	firstErr  error
 }
 
-// cutoff records a deadline cutoff for key and reports whether the run hit
-// reconcileRunMaxCutoffs in a row and should be skipped.
-func (r *reconcileRun) cutoff(key string) bool {
+// cutoff records a deadline cutoff for key and reports whether the unit hit
+// reconcileRunMaxCutoffs in a row and should be skipped this pass.
+func (r *reconcileRun) cutoff(unit, key string) bool {
 	state := &r.h.reconcile
 	if state.cutoffs == nil {
 		state.cutoffs = map[string]int{}
@@ -700,8 +701,8 @@ func (r *reconcileRun) cutoff(key string) bool {
 		return false
 	}
 	delete(state.cutoffs, key)
-	r.h.metrics.skipped.Inc()
-	log.Printf("github reconcile WARNING: run %s hit the scan deadline %d times in a row; skipping it this pass", key, reconcileRunMaxCutoffs)
+	r.h.metrics.skipped.WithLabelValues(unit).Inc()
+	log.Printf("github reconcile WARNING: %s %s hit the scan deadline %d times in a row; skipping it this pass", unit, key, reconcileRunMaxCutoffs)
 	return true
 }
 
@@ -731,9 +732,16 @@ func (r *reconcileRun) scan(ctx context.Context, sc *repoScanner, repos []string
 				return err
 			}
 			runs, err := lister.ListQueuedWorkflowRuns(ctx, repository, since)
+			repoKey := fmt.Sprintf("%s@%s", repository, window)
 			if ctxErr := ctx.Err(); ctxErr != nil {
-				return ctxErr // re-list this repository next cycle
+				if r.cutoff("repo", repoKey) {
+					// Skip a listing that keeps hanging.
+					sc.cursor = idx + 1
+					sc.remaining--
+				}
+				return ctxErr // otherwise re-list this repository next cycle
 			}
+			delete(h.reconcile.cutoffs, repoKey)
 			sc.cursor = idx + 1
 			if err != nil {
 				if !errors.Is(err, github.ErrPageCapReached) {
@@ -757,7 +765,7 @@ func (r *reconcileRun) scan(ctx context.Context, sc *repoScanner, repos []string
 			key := fmt.Sprintf("%s#%d@%s", sc.repo, runID, window)
 			r.processRun(ctx, sc.repo, runID)
 			if ctxErr := ctx.Err(); ctxErr != nil {
-				if r.cutoff(key) {
+				if r.cutoff("run", key) {
 					sc.pos++ // skip a run that keeps hanging
 				}
 				return ctxErr // otherwise retry this run next cycle; allocation is idempotent

@@ -1354,7 +1354,7 @@ func TestReconcileQueuedGitHubJobsSkipsRunThatAlwaysHangs(t *testing.T) {
 	l.runsDeep["my-org/r00"] = []int64{777, 1000}
 	l.hang["jobs:777"] = -1
 	state := &server.githubWebhook.reconcile
-	skippedBefore := testutil.ToFloat64(server.githubWebhook.metrics.skipped)
+	skippedBefore := testutil.ToFloat64(server.githubWebhook.metrics.skipped.WithLabelValues("run"))
 	recentPassed := false
 	for cycle := 0; cycle < 12 && (state.deepOpen || cycle == 0); cycle++ {
 		if _, err := server.ReconcileQueuedGitHubJobs(context.Background()); err != nil {
@@ -1376,7 +1376,7 @@ func TestReconcileQueuedGitHubJobsSkipsRunThatAlwaysHangs(t *testing.T) {
 			t.Fatalf("run %d starved behind the hung run", id)
 		}
 	}
-	if got := testutil.ToFloat64(server.githubWebhook.metrics.skipped) - skippedBefore; got < 2 {
+	if got := testutil.ToFloat64(server.githubWebhook.metrics.skipped.WithLabelValues("run")) - skippedBefore; got < 2 {
 		t.Fatalf("skipped metric delta=%v, want >= 2 (once per scan)", got)
 	}
 	if n := l.jobLists[777]; n > 2*reconcileRunMaxCutoffs {
@@ -1400,7 +1400,41 @@ func TestReconcileQueuedGitHubJobsCutoffResetsOnSuccess(t *testing.T) {
 	if n := state.cutoffs[fmt.Sprintf("my-org/r00#777@%s", reconcileRecentWindow)]; n != 0 {
 		t.Fatalf("cutoff count %d after a successful check, want 0", n)
 	}
-	if got := testutil.ToFloat64(server.githubWebhook.metrics.skipped); got != 0 {
+	if got := testutil.ToFloat64(server.githubWebhook.metrics.skipped.WithLabelValues("run")); got != 0 {
 		t.Fatalf("run skipped %v times though it succeeded before the limit", got)
+	}
+}
+
+// A repo whose run listing hangs every time, in both windows, is skipped
+// after reconcileRunMaxCutoffs consecutive cutoffs per scan.
+func TestReconcileQueuedGitHubJobsSkipsRepoListingThatAlwaysHangs(t *testing.T) {
+	server, l, now := deepRepoFixture(t, 3, 2)
+	l.hang[fmt.Sprintf("runs:my-org/r01:%s", reconcileRecentWindow)] = -1
+	l.hang[fmt.Sprintf("runs:my-org/r01:%s", reconcileRunWindow)] = -1
+	state := &server.githubWebhook.reconcile
+	skippedBefore := testutil.ToFloat64(server.githubWebhook.metrics.skipped.WithLabelValues("repo"))
+	recentPassed := false
+	for cycle := 0; cycle < 12 && (state.deepOpen || cycle == 0); cycle++ {
+		if _, err := server.ReconcileQueuedGitHubJobs(context.Background()); err != nil {
+			t.Fatalf("cycle %d: %v", cycle, err)
+		}
+		if state.recent.cursor%len(l.repos) != 1 {
+			recentPassed = true
+		}
+		*now = now.Add(time.Minute)
+	}
+	if state.deepOpen {
+		t.Fatalf("deep pass never finished; deep cursor %+v", state.deep)
+	}
+	if !recentPassed {
+		t.Fatalf("recent cursor stayed parked on the hung repo: %+v", state.recent)
+	}
+	for _, id := range []int64{1000, 1001, 1200, 1201, 90000, 90002} {
+		if l.jobLists[id] == 0 {
+			t.Fatalf("run %d starved behind the hung repo listing", id)
+		}
+	}
+	if got := testutil.ToFloat64(server.githubWebhook.metrics.skipped.WithLabelValues("repo")) - skippedBefore; got < 2 {
+		t.Fatalf("repo skipped metric delta=%v, want >= 2 (once per scan)", got)
 	}
 }
