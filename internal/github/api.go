@@ -9,7 +9,9 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
@@ -60,6 +62,39 @@ type Client struct {
 	baseURL string
 	token   TokenFunc
 	http    *http.Client
+
+	rateMu        sync.Mutex
+	rateRemaining int
+	rateReset     time.Time
+	rateKnown     bool
+}
+
+// RateLimit reports the last X-RateLimit-Remaining/Reset seen on a response.
+func (c *Client) RateLimit() (remaining int, reset time.Time, ok bool) {
+	if c == nil {
+		return 0, time.Time{}, false
+	}
+	c.rateMu.Lock()
+	defer c.rateMu.Unlock()
+	return c.rateRemaining, c.rateReset, c.rateKnown
+}
+
+func (c *Client) recordRateLimit(header http.Header) {
+	raw := strings.TrimSpace(header.Get("X-RateLimit-Remaining"))
+	if raw == "" {
+		return
+	}
+	remaining, err := strconv.Atoi(raw)
+	if err != nil {
+		return
+	}
+	var reset time.Time
+	if secs, err := strconv.ParseInt(strings.TrimSpace(header.Get("X-RateLimit-Reset")), 10, 64); err == nil && secs > 0 {
+		reset = time.Unix(secs, 0).UTC()
+	}
+	c.rateMu.Lock()
+	c.rateRemaining, c.rateReset, c.rateKnown = remaining, reset, true
+	c.rateMu.Unlock()
 }
 
 func NewClient(token TokenFunc, httpClient *http.Client) *Client {
@@ -200,24 +235,28 @@ func (c *Client) ListRepositories(ctx context.Context, scope model.GitHubScope) 
 	}
 }
 
-// ListQueuedWorkflowRuns returns run ids that can contain queued jobs in one
-// repository. A workflow run may be in progress while one of its jobs remains
-// queued, so both run states are inspected.
-func (c *Client) ListQueuedWorkflowRuns(ctx context.Context, repository string) ([]int64, error) {
+// ListQueuedWorkflowRuns returns ids of queued workflow runs in one repository
+// created at or after since (zero means no bound). In-progress runs are not
+// scanned: their queued jobs are rare and scanning them dominates API usage.
+func (c *Client) ListQueuedWorkflowRuns(ctx context.Context, repository string, since time.Time) ([]int64, error) {
 	base, err := repositoryPath(repository)
 	if err != nil {
 		return nil, err
 	}
 	var ids []int64
 	seen := map[int64]struct{}{}
-	for _, status := range []string{"queued", "in_progress"} {
+	created := ""
+	if !since.IsZero() {
+		created = "&created=" + url.QueryEscape(">="+since.UTC().Format(time.RFC3339))
+	}
+	for _, status := range []string{"queued"} {
 		for page := 1; ; page++ {
 			var out struct {
 				WorkflowRuns []struct {
 					ID int64 `json:"id"`
 				} `json:"workflow_runs"`
 			}
-			path := fmt.Sprintf("%s/actions/runs?status=%s&per_page=100&page=%d", base, status, page)
+			path := fmt.Sprintf("%s/actions/runs?status=%s%s&per_page=100&page=%d", base, status, created, page)
 			if err := c.do(ctx, http.MethodGet, path, nil, &out, http.StatusOK); err != nil {
 				return nil, fmt.Errorf("list %s workflow runs for %s: %w", status, repository, err)
 			}
@@ -376,6 +415,7 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any, wan
 		return err
 	}
 	defer func() { _ = resp.Body.Close() }()
+	c.recordRateLimit(resp.Header)
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode != want {
 		var msg struct {

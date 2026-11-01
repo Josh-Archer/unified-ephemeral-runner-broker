@@ -61,6 +61,11 @@ type CapacityStatus struct {
 	ActiveRunners  int
 	PendingRunners int
 	WarmRunners    int
+	// NodeUnavailable is set when the node this backend is pinned to is
+	// NotReady, unschedulable, or tainted NoSchedule/NoExecute. The backend then
+	// has no usable capacity regardless of its counters, and routing must not
+	// pass it through even when the snapshot later goes stale or errors.
+	NodeUnavailable string
 }
 
 // LiveRunner is a provider runner that still holds a slot, with the identity

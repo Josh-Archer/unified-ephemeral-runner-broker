@@ -93,3 +93,19 @@ func TestMarkStale(t *testing.T) {
 		t.Fatalf("expected snapshot marked stale, got %+v ok=%v", snap, ok)
 	}
 }
+
+func TestEffectiveMaxRunnersNodeUnavailableIsZeroEvenWhenStale(t *testing.T) {
+	status := backend.CapacityStatus{MaxRunners: 5, ActiveRunners: 1, NodeUnavailable: "guarded node is not Ready"}
+	for _, snap := range []Snapshot{
+		{Status: status, Source: "live"},
+		{Status: status, Source: "live", Stale: true},
+		{Status: status, Source: "error", Err: "timeout"},
+	} {
+		for _, mode := range []string{"pass-through", "block"} {
+			max, ok, reason := EffectiveMaxRunners(5, 1, snap, true, mode)
+			if ok || max != 0 || reason != "node-unavailable" {
+				t.Fatalf("snap=%+v mode=%s => max=%d ok=%v reason=%s", snap, mode, max, ok, reason)
+			}
+		}
+	}
+}

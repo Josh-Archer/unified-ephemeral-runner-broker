@@ -136,7 +136,11 @@ func (s *Service) AllocateForWorkflowJob(ctx context.Context, pool model.PoolCon
 	s.workflowJobMu.Lock()
 	defer s.workflowJobMu.Unlock()
 	if existing, ok := s.findByWorkflowJobID(jobID); ok {
-		return existing, false, nil
+		// Reconcile only runs for jobs GitHub still reports as queued, so a
+		// failed earlier attempt is stale and the job deserves a new runner.
+		if !(existing.State == model.StateFailed && retryFailedWorkflowJob(ctx)) {
+			return existing, false, nil
+		}
 	}
 	tenant := ""
 	if s.cfg.GitHub.Scope.IsPerRepository() {
@@ -485,4 +489,17 @@ func (s *Service) managedPersistentRunner(name, repository string) bool {
 		}
 	}
 	return false
+}
+
+type retryFailedWorkflowJobKey struct{}
+
+// withRetryFailedWorkflowJob marks ctx so AllocateForWorkflowJob replaces a
+// failed allocation instead of returning it.
+func withRetryFailedWorkflowJob(ctx context.Context) context.Context {
+	return context.WithValue(ctx, retryFailedWorkflowJobKey{}, true)
+}
+
+func retryFailedWorkflowJob(ctx context.Context) bool {
+	retry, _ := ctx.Value(retryFailedWorkflowJobKey{}).(bool)
+	return retry
 }

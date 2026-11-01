@@ -59,7 +59,7 @@ type fakeWorkflowJobLister struct {
 func (f fakeWorkflowJobLister) ListRepositories(context.Context, model.GitHubScope) ([]string, error) {
 	return f.repos, f.err
 }
-func (f fakeWorkflowJobLister) ListQueuedWorkflowRuns(_ context.Context, repository string) ([]int64, error) {
+func (f fakeWorkflowJobLister) ListQueuedWorkflowRuns(_ context.Context, repository string, _ time.Time) ([]int64, error) {
 	return f.runs[repository], f.err
 }
 func (f fakeWorkflowJobLister) ListWorkflowJobs(_ context.Context, _ string, runID int64) ([]github.WorkflowJob, error) {
@@ -95,6 +95,92 @@ func TestReconcileQueuedGitHubJobsAllocatesIdempotentlyAndRespectsLabels(t *test
 	}
 	if allocation, ok := service.findByWorkflowJobID(99); !ok || allocation.Request.TargetRepository != "my-org/home" {
 		t.Fatalf("queued job allocation missing or wrong repository: %+v found=%v", allocation, ok)
+	}
+}
+
+type rateLimitedLister struct {
+	fakeWorkflowJobLister
+	remaining int
+	reset     time.Time
+	calls     *int
+}
+
+func (l rateLimitedLister) RateLimit() (int, time.Time, bool) { return l.remaining, l.reset, true }
+func (l rateLimitedLister) ListRepositories(ctx context.Context, scope model.GitHubScope) ([]string, error) {
+	*l.calls++
+	return l.fakeWorkflowJobLister.ListRepositories(ctx, scope)
+}
+
+func TestReconcileQueuedGitHubJobsBacksOffBelowRateLimitFloor(t *testing.T) {
+	service := newServiceWithConfig(nil)
+	server := newTestServer(t, service)
+	calls := 0
+	server.SetGitHubWebhook(GitHubWebhookOptions{WorkflowJobs: rateLimitedLister{
+		fakeWorkflowJobLister: fakeWorkflowJobLister{repos: []string{"my-org/home"}},
+		remaining:             999,
+		reset:                 time.Now().Add(time.Hour),
+		calls:                 &calls,
+	}})
+	if _, err := server.ReconcileQueuedGitHubJobs(context.Background()); !errors.Is(err, ErrReconcileRateLimited) {
+		t.Fatalf("err=%v, want rate-limit backoff", err)
+	}
+	if calls != 0 {
+		t.Fatalf("reconcile called GitHub %d times while rate limited", calls)
+	}
+	server.SetGitHubWebhook(GitHubWebhookOptions{WorkflowJobs: rateLimitedLister{
+		fakeWorkflowJobLister: fakeWorkflowJobLister{repos: []string{"my-org/home"}},
+		remaining:             1000,
+		calls:                 &calls,
+	}})
+	if _, err := server.ReconcileQueuedGitHubJobs(context.Background()); err != nil || calls != 1 {
+		t.Fatalf("err=%v calls=%d, want a scan at the floor", err, calls)
+	}
+}
+
+func TestReconcileQueuedGitHubJobsStopsWhenContextCancelled(t *testing.T) {
+	server := newTestServer(t, newServiceWithConfig(nil))
+	server.SetGitHubWebhook(GitHubWebhookOptions{WorkflowJobs: fakeWorkflowJobLister{repos: []string{"my-org/home"}}})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := server.ReconcileQueuedGitHubJobs(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err=%v, want context.Canceled", err)
+	}
+}
+
+func TestReconcileQueuedGitHubJobsRetriesFailedAllocation(t *testing.T) {
+	service := newServiceWithConfig(func(pool *model.PoolConfig) {
+		if pool.Name == model.PoolFull {
+			pool.WebhookLabels = []string{"self-hosted", "uecb-full"}
+		}
+	})
+	server := newTestServer(t, service)
+	server.SetGitHubWebhook(GitHubWebhookOptions{WorkflowJobs: fakeWorkflowJobLister{
+		repos: []string{"my-org/home"},
+		runs:  map[string][]int64{"my-org/home": {12}},
+		jobs: map[string][]github.WorkflowJob{"12": {
+			{ID: 99, RunID: 12, Status: "queued", Labels: []string{"self-hosted", "uecb-full"}},
+		}},
+	}})
+	if got, err := server.ReconcileQueuedGitHubJobs(context.Background()); err != nil || got != 1 {
+		t.Fatalf("first reconcile allocated=%d err=%v", got, err)
+	}
+	failed, ok := service.findByWorkflowJobID(99)
+	if !ok {
+		t.Fatal("allocation missing")
+	}
+	failed.State = model.StateFailed
+	if err := service.Store().Save(failed); err != nil {
+		t.Fatalf("save failed allocation: %v", err)
+	}
+	if got, err := server.ReconcileQueuedGitHubJobs(context.Background()); err != nil || got != 1 {
+		t.Fatalf("retry reconcile allocated=%d err=%v, want the still-queued failed job retried", got, err)
+	}
+	if retried, ok := service.findByWorkflowJobID(99); !ok || retried.ID == failed.ID || retried.State == model.StateFailed {
+		t.Fatalf("retried allocation = %+v ok=%v", retried, ok)
+	}
+	// A webhook redelivery (no reconcile context) must not replace a failed allocation.
+	if _, created, err := service.AllocateForWorkflowJob(context.Background(), service.cfg.Pools[0], 99, "my-org/home"); err != nil || created {
+		t.Fatalf("webhook path created=%v err=%v, want existing allocation returned", created, err)
 	}
 }
 

@@ -239,3 +239,53 @@ func TestLogicalARCNameCanMigrateToKubernetesDriver(t *testing.T) {
 		t.Fatal("mixed physical drivers accepted under logical arc name")
 	}
 }
+
+func TestGuardUnavailableReportsNodeUnavailable(t *testing.T) {
+	notReady := strings.Replace(admittedNode, `"status":"True"`, `"status":"Unknown"`, 1)
+	api := &fakeAPI{responses: map[string]response{"GET /api/v1/nodes/desktop": {200, notReady}, "GET /api/v1/namespaces/arc-runners/pods": {200, `{"items":[]}`}}}
+	status, err := NewNamed(namedConfig(t), api, &fakeRegistrar{}, desktopName).Capacity(context.Background())
+	if err != nil || status.NodeUnavailable == "" || backend.FreeSlots(status) != 0 {
+		t.Fatalf("capacity=%+v err=%v, want node-unavailable zero capacity", status, err)
+	}
+}
+
+func pinnedConfig(t *testing.T) model.BrokerConfig {
+	t.Helper()
+	cfg := newConfig(t)
+	target := model.BackendConfig{Enabled: true, Healthy: true, Driver: "kubernetes", MaxRunners: 5, Kubernetes: &model.KubernetesBackendConfig{
+		Namespace: "arc-runners",
+		PodSpec:   map[string]any{"nodeSelector": map[string]any{"kubernetes.io/hostname": "desktop"}},
+	}}
+	for i := range cfg.Pools {
+		cfg.Pools[i].Backends[desktopName] = target
+	}
+	return cfg
+}
+
+func TestPinnedNodeWithoutGuardGatesCapacityAndProvision(t *testing.T) {
+	cases := map[string]string{
+		"not-ready": strings.Replace(admittedNode, `"status":"True"`, `"status":"False"`, 1),
+		"cordoned":  strings.Replace(admittedNode, `"spec":{}`, `"spec":{"unschedulable":true}`, 1),
+		"tainted":   strings.Replace(admittedNode, `"spec":{}`, `"spec":{"taints":[{"effect":"NoSchedule"}]}`, 1),
+	}
+	for name, node := range cases {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{responses: map[string]response{"GET /api/v1/nodes/desktop": {200, node}, "GET /api/v1/namespaces/arc-runners/pods": {200, `{"items":[]}`}}}
+			reg := &fakeRegistrar{}
+			b := NewNamed(pinnedConfig(t), api, reg, desktopName)
+			status, err := b.Capacity(context.Background())
+			if err != nil || backend.FreeSlots(status) != 0 || status.NodeUnavailable == "" {
+				t.Fatalf("capacity=%+v err=%v", status, err)
+			}
+			_, err = b.Provision(context.Background(), model.AllocationRequest{}, model.AllocationStatus{ID: "a", Pool: model.PoolLite, Repository: "example-owner/home"})
+			if !backend.IsCapacityExhausted(err) || len(reg.registered) != 0 {
+				t.Fatalf("want capacity fallback without registration, got %v registered=%d", err, len(reg.registered))
+			}
+		})
+	}
+	api := &fakeAPI{responses: map[string]response{"GET /api/v1/nodes/desktop": {200, admittedNode}, "GET /api/v1/namespaces/arc-runners/pods": {200, `{"items":[{"status":{"phase":"Running"}}]}`}}}
+	status, err := NewNamed(pinnedConfig(t), api, &fakeRegistrar{}, desktopName).Capacity(context.Background())
+	if err != nil || status.NodeUnavailable != "" || backend.FreeSlots(status) != status.MaxRunners-1 {
+		t.Fatalf("ready pinned node capacity=%+v err=%v", status, err)
+	}
+}
