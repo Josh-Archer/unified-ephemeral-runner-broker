@@ -73,6 +73,7 @@ type githubWebhookMetrics struct {
 	expired  prometheus.Counter
 	pageCap  *prometheus.CounterVec
 	budget   prometheus.Counter
+	skipped  *prometheus.CounterVec
 }
 
 func newGitHubWebhookMetrics() *githubWebhookMetrics {
@@ -105,11 +106,15 @@ func newGitHubWebhookMetrics() *githubWebhookMetrics {
 			Name: "uecb_github_reconcile_budget_exhausted_total",
 			Help: "Queued-job reconcile cycles stopped at the per-cycle GitHub API call budget; the next cycle resumes at the next repository.",
 		}),
+		skipped: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "uecb_reconcile_run_skipped_total",
+			Help: "Reconcile scan units skipped after reconcileRunMaxCutoffs consecutive deadline cutoffs, by unit (run: a run's job check; repo: a repository's queued-run listing).",
+		}, []string{"unit"}),
 	}
 }
 
 func (m *githubWebhookMetrics) register() {
-	for _, c := range []prometheus.Collector{m.received, m.matched, m.ignored, m.enqueued, m.expired, m.pageCap, m.budget} {
+	for _, c := range []prometheus.Collector{m.received, m.matched, m.ignored, m.enqueued, m.expired, m.pageCap, m.budget, m.skipped} {
 		if err := prometheus.Register(c); err != nil {
 			if _, ok := err.(prometheus.AlreadyRegisteredError); !ok {
 				panic(err)
@@ -168,6 +173,10 @@ type githubWebhookHandler struct {
 	metrics    *githubWebhookMetrics
 	deliveries *deliveryTracker
 	reconcile  reconcileState
+	// recentTimeout and deepTimeout override reconcileRecentTimeout and
+	// reconcileDeepTimeout when > 0 (tests).
+	recentTimeout time.Duration
+	deepTimeout   time.Duration
 }
 
 // repoScanner walks the repository list round-robin. It keeps the repository
@@ -189,6 +198,12 @@ type reconcileState struct {
 	deep     repoScanner
 	lastDeep time.Time // when the last full deep pass completed
 	deepOpen bool      // a deep pass started and has not covered every repo yet
+	// lastDeepSpent is the deep scan's call count in the last cycle.
+	lastDeepSpent int64
+	// cutoffs counts consecutive deadline cutoffs per scan unit, keyed
+	// "repo#runID@window" for a run's check and "repo@window" for a repo's
+	// run listing (one count per scan); reset when that unit finishes.
+	cutoffs  map[string]int
 	repos    []string
 	reposAt  time.Time
 	reposTTL time.Duration // reconcileReposTTL, or reconcileTruncatedReposTTL for a capped listing
@@ -424,6 +439,24 @@ const (
 	// while a deep pass is open, so repositories the deep cursor has not
 	// reached yet still get their recent queued runs checked every cycle.
 	reconcileRecentReserve = 30
+	// reconcileDeepReserve is the share of the budget guaranteed to an open
+	// deep pass. The recent scan stops at reconcileCallBudget minus this, and
+	// the deep scan always gets at least this many calls after the recent scan
+	// finishes, even when a multi-page listing pushed the recent scan past its
+	// limit (the client counts every page, so one listing can overshoot).
+	reconcileDeepReserve = 40
+	// reconcileRecentTimeout and reconcileDeepTimeout bound the two scans of
+	// one cycle independently. Allocation calls into backends can hang
+	// (home#4157); without a deadline one cycle held the reconcile lock and
+	// the worker goroutine for many intervals, and a shared deadline let a
+	// hung recent scan starve the deep scan. Together they stay under the
+	// default 1m worker interval.
+	reconcileRecentTimeout = 25 * time.Second
+	reconcileDeepTimeout   = 25 * time.Second
+	// reconcileRunMaxCutoffs is how many consecutive deadline cutoffs a run
+	// gets before a scan skips past it, so a run that hangs every time
+	// cannot park a scan cursor forever.
+	reconcileRunMaxCutoffs = 3
 	reconcileReposTTL      = 5 * time.Minute
 	// reconcileTruncatedReposTTL is how long a repository list cut at its page
 	// cap is reused, so a truncated listing is retried soon.
@@ -480,7 +513,10 @@ func (s *Server) ReconcileQueuedGitHubJobs(ctx context.Context) (int, error) {
 	if reconcileRateLimited(lister, now) {
 		return 0, ErrReconcileRateLimited
 	}
-	h.reconcile.mu.Lock()
+	if !h.reconcile.mu.TryLock() {
+		log.Printf("github reconcile: previous cycle still running; skipping this cycle")
+		return 0, nil
+	}
 	defer h.reconcile.mu.Unlock()
 	state := &h.reconcile
 	ctx = withRetryFailedWorkflowJob(ctx)
@@ -503,33 +539,76 @@ func (s *Server) ReconcileQueuedGitHubJobs(ctx context.Context) (int, error) {
 	run := &reconcileRun{h: h, budget: budget}
 	recentLimit := int64(reconcileCallBudget)
 	if state.deepOpen {
-		recentLimit = reconcileRecentReserve
+		recentLimit = reconcileCallBudget - reconcileDeepReserve
 	}
 	// The recent scan visits each repository at most once per cycle.
 	state.recent.remaining = len(repos)
-	err = run.scan(ctx, &state.recent, repos, now.Add(-reconcileRecentWindow), reconcileRecentWindow, recentLimit)
-	if errors.Is(err, errReconcileBudgetSpent) && state.deepOpen {
-		// The recent reserve is spent; the deep scan gets the rest.
-		err = nil
-	}
-	if err == nil && state.deepOpen {
-		err = run.scan(ctx, &state.deep, repos, now.Add(-reconcileRunWindow), reconcileRunWindow, reconcileCallBudget)
-		if err == nil && state.deep.remaining <= 0 {
+	recentCtx, cancelRecent := context.WithTimeout(ctx, h.timeout(h.recentTimeout, reconcileRecentTimeout))
+	recentErr := run.scan(recentCtx, &state.recent, repos, now.Add(-reconcileRecentWindow), reconcileRecentWindow, recentLimit)
+	cancelRecent()
+	recentSpent := budget.spent()
+	h.logScanStop("recent", recentErr, budget, recentSpent, state)
+
+	// The deep scan runs whatever stopped the recent scan (budget, its
+	// deadline, a hung backend), with its own deadline and call share. Only
+	// the rate-limit floor or a cancelled parent context skip it.
+	var deepErr error
+	deepSpent := int64(0)
+	if state.deepOpen && ctx.Err() == nil && !errors.Is(recentErr, ErrReconcileRateLimited) {
+		deepCtx, cancelDeep := context.WithTimeout(ctx, h.timeout(h.deepTimeout, reconcileDeepTimeout))
+		deepErr = run.scan(deepCtx, &state.deep, repos, now.Add(-reconcileRunWindow), reconcileRunWindow, deepScanLimit(recentSpent))
+		cancelDeep()
+		deepSpent = budget.spent() - recentSpent
+		if deepErr == nil && state.deep.remaining <= 0 {
 			state.deepOpen, state.lastDeep = false, now
 		}
+		h.logScanStop("deep", deepErr, budget, deepSpent, state)
 	}
-	switch {
-	case errors.Is(err, errReconcileBudgetSpent):
-		{
-			h.metrics.budget.Inc()
-			log.Printf("github reconcile: API call budget %d spent (%d used); recent scan resumes at repo %d, deep scan at %q run %d next cycle",
-				reconcileCallBudget, budget.spent(), state.recent.cursor, state.deep.repo, state.deep.pos)
+	h.reconcile.lastDeepSpent = deepSpent
+	log.Printf("github reconcile: cycle done (%d API calls: recent %d, deep %d; deep open=%v at repo %d %q run %d, %d repos left; allocated=%d)",
+		budget.spent(), recentSpent, deepSpent, state.deepOpen, state.deep.cursor, state.deep.repo, state.deep.pos, state.deep.remaining, run.allocated)
+	for _, err := range []error{recentErr, deepErr} {
+		if err != nil && !errors.Is(err, errReconcileBudgetSpent) && !errors.Is(err, context.DeadlineExceeded) {
+			return run.allocated, err
 		}
-		return run.allocated, run.firstErr
-	case err != nil:
-		return run.allocated, err
 	}
 	return run.allocated, run.firstErr
+}
+
+func (h *githubWebhookHandler) timeout(override, def time.Duration) time.Duration {
+	if override > 0 {
+		return override
+	}
+	return def
+}
+
+func (h *githubWebhookHandler) logScanStop(name string, err error, budget *cycleBudget, spent int64, state *reconcileState) {
+	switch {
+	case errors.Is(err, errReconcileBudgetSpent):
+		h.metrics.budget.Inc()
+		log.Printf("github reconcile: %s scan stopped at its API call share (%d calls, cycle total %d, budget %d); recent resumes at repo %d, deep at repo %d %q run %d next cycle",
+			name, spent, budget.spent(), reconcileCallBudget, state.recent.cursor, state.deep.cursor, state.deep.repo, state.deep.pos)
+	case errors.Is(err, context.DeadlineExceeded):
+		log.Printf("github reconcile: %s scan hit its deadline after %d calls; it resumes at the same repo and run next cycle", name, spent)
+	}
+}
+
+// deepScanLimit is the cumulative call limit for the deep scan after the
+// recent scan spent recentSpent calls: the rest of the budget, but never less
+// than reconcileDeepReserve calls.
+//
+// Worst case a cycle therefore exceeds reconcileCallBudget: the recent scan
+// can overshoot its 60-call share up to the page overshoot of its last list
+// request, and the deep scan still gets 40 calls on top, plus the page
+// overshoot of its own last request. With the client page caps that is about
+// 140 calls (100 + 40), a little more for very deep page caps. This is
+// intended: the 1000-remaining rate-limit floor is the hard guard.
+func deepScanLimit(recentSpent int64) int64 {
+	limit := int64(reconcileCallBudget)
+	if recentSpent+reconcileDeepReserve > limit {
+		limit = recentSpent + reconcileDeepReserve
+	}
+	return limit
 }
 
 var errReconcileBudgetSpent = errors.New("reconcile API call budget spent")
@@ -610,6 +689,23 @@ type reconcileRun struct {
 	firstErr  error
 }
 
+// cutoff records a deadline cutoff for key and reports whether the unit hit
+// reconcileRunMaxCutoffs in a row and should be skipped this pass.
+func (r *reconcileRun) cutoff(unit, key string) bool {
+	state := &r.h.reconcile
+	if state.cutoffs == nil {
+		state.cutoffs = map[string]int{}
+	}
+	state.cutoffs[key]++
+	if state.cutoffs[key] < reconcileRunMaxCutoffs {
+		return false
+	}
+	delete(state.cutoffs, key)
+	r.h.metrics.skipped.WithLabelValues(unit).Inc()
+	log.Printf("github reconcile WARNING: %s %s hit the scan deadline %d times in a row; skipping it this pass", unit, key, reconcileRunMaxCutoffs)
+	return true
+}
+
 func (r *reconcileRun) keepErr(err error) {
 	if r.firstErr == nil {
 		r.firstErr = err
@@ -617,8 +713,9 @@ func (r *reconcileRun) keepErr(err error) {
 }
 
 // scan advances sc through repos until sc.remaining reaches zero or the call
-// budget, rate limit or context stops it. Progress is saved in sc after every
-// call, so the next cycle resumes at the same repository and run.
+// budget, rate limit or context stops it. A repository or run is marked done
+// only after its work finished; when ctx ends mid-call the cursor stays put and
+// the next cycle retries the same repository or run.
 func (r *reconcileRun) scan(ctx context.Context, sc *repoScanner, repos []string, since time.Time, window time.Duration, limit int64) error {
 	h := r.h
 	lister := h.opts.WorkflowJobs
@@ -634,8 +731,18 @@ func (r *reconcileRun) scan(ctx context.Context, sc *repoScanner, repos []string
 			if err := r.budget.take(ctx, limit); err != nil {
 				return err
 			}
-			sc.cursor = idx + 1
 			runs, err := lister.ListQueuedWorkflowRuns(ctx, repository, since)
+			repoKey := fmt.Sprintf("%s@%s", repository, window)
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				if r.cutoff("repo", repoKey) {
+					// Skip a listing that keeps hanging.
+					sc.cursor = idx + 1
+					sc.remaining--
+				}
+				return ctxErr // otherwise re-list this repository next cycle
+			}
+			delete(h.reconcile.cutoffs, repoKey)
+			sc.cursor = idx + 1
 			if err != nil {
 				if !errors.Is(err, github.ErrPageCapReached) {
 					r.keepErr(err)
@@ -652,8 +759,19 @@ func (r *reconcileRun) scan(ctx context.Context, sc *repoScanner, repos []string
 				return err
 			}
 			runID := sc.runs[sc.pos]
-			sc.pos++
+			// Counted per scan window: the two scans interleave their
+			// cutoffs of a shared run, and one scan skipping it must not
+			// reset the other's count.
+			key := fmt.Sprintf("%s#%d@%s", sc.repo, runID, window)
 			r.processRun(ctx, sc.repo, runID)
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				if r.cutoff("run", key) {
+					sc.pos++ // skip a run that keeps hanging
+				}
+				return ctxErr // otherwise retry this run next cycle; allocation is idempotent
+			}
+			delete(h.reconcile.cutoffs, key)
+			sc.pos++
 		}
 		sc.repo, sc.runs, sc.pos = "", nil, 0
 		sc.remaining--
@@ -664,6 +782,9 @@ func (r *reconcileRun) scan(ctx context.Context, sc *repoScanner, repos []string
 func (r *reconcileRun) processRun(ctx context.Context, repository string, runID int64) {
 	h := r.h
 	jobs, err := h.opts.WorkflowJobs.ListWorkflowJobs(ctx, repository, runID)
+	if ctx.Err() != nil {
+		return // the caller retries this run next cycle
+	}
 	if err != nil {
 		if !errors.Is(err, github.ErrPageCapReached) {
 			r.keepErr(err)

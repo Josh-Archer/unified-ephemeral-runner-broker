@@ -841,6 +841,9 @@ type countingLister struct {
 	now        func() time.Time
 	// rateFloorAfter, when > 0, reports remaining=999 once that many calls were made.
 	rateFloorAfter int64
+	// jobPages, when > 1, charges that many API calls per job listing,
+	// mimicking a multi-page listing that overshoots the per-call check.
+	jobPages int64
 }
 
 type listerLog struct {
@@ -848,6 +851,21 @@ type listerLog struct {
 	repoLists int
 	runLists  []runListCall
 	jobLists  map[int64]int
+	// hang counts how many more times a call blocks until ctx ends, keyed by
+	// "runs:<repo>:<window>" or "jobs:<runID>"; -1 hangs forever.
+	hang map[string]int
+}
+
+func (l *listerLog) hangs(ctx context.Context, key string) bool {
+	n := l.hang[key]
+	if n == 0 {
+		return false
+	}
+	if n > 0 {
+		l.hang[key] = n - 1
+	}
+	<-ctx.Done()
+	return true
 }
 
 type runListCall struct {
@@ -856,7 +874,7 @@ type runListCall struct {
 }
 
 func newCountingLister(now func() time.Time) countingLister {
-	return countingLister{listerLog: &listerLog{jobLists: map[int64]int{}}, now: now}
+	return countingLister{listerLog: &listerLog{jobLists: map[int64]int{}, hang: map[string]int{}}, now: now}
 }
 
 func (l countingLister) APICalls() int64 { return l.calls }
@@ -871,18 +889,27 @@ func (l countingLister) ListRepositories(context.Context, model.GitHubScope) ([]
 	l.repoLists++
 	return l.repos, l.repoErr
 }
-func (l countingLister) ListQueuedWorkflowRuns(_ context.Context, repository string, since time.Time) ([]int64, error) {
+func (l countingLister) ListQueuedWorkflowRuns(ctx context.Context, repository string, since time.Time) ([]int64, error) {
 	l.calls++
 	window := l.now().Sub(since).Round(time.Hour)
 	l.runLists = append(l.runLists, runListCall{repository, window})
+	if l.hangs(ctx, fmt.Sprintf("runs:%s:%s", repository, window)) {
+		return nil, ctx.Err()
+	}
 	if window > reconcileRecentWindow {
 		return l.runsDeep[repository], l.runErr[repository]
 	}
 	return l.runsRecent[repository], l.runErr[repository]
 }
-func (l countingLister) ListWorkflowJobs(_ context.Context, _ string, runID int64) ([]github.WorkflowJob, error) {
+func (l countingLister) ListWorkflowJobs(ctx context.Context, _ string, runID int64) ([]github.WorkflowJob, error) {
 	l.calls++
+	if l.jobPages > 1 {
+		l.calls += l.jobPages - 1
+	}
 	l.jobLists[runID]++
+	if l.hangs(ctx, fmt.Sprintf("jobs:%d", runID)) {
+		return nil, ctx.Err()
+	}
 	return l.jobs[fmt.Sprint(runID)], l.jobErr[runID]
 }
 
@@ -1118,5 +1145,296 @@ func TestReconcileQueuedGitHubJobsRefreshesTruncatedRepositoryListSooner(t *test
 	reconcileCycle(t, server, l)
 	if l.repoLists != 2 {
 		t.Fatalf("truncated repository list fetched %d times after %v, want 2 (must not be cached for %v)", l.repoLists, reconcileTruncatedReposTTL, reconcileReposTTL)
+	}
+}
+
+// home#4157 (v0.1.40): multi-page recent listings pushed the cycle to the full
+// budget before the deep scan took a single call, so the deep cursor never
+// moved. The deep scan must get its reserve and advance every cycle.
+func TestReconcileQueuedGitHubJobsDeepScanGetsReserveWhenRecentOvershoots(t *testing.T) {
+	service := newServiceWithConfig(nil)
+	now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+	service.now = func() time.Time { return now }
+	server := newTestServer(t, service)
+	l := newCountingLister(service.now)
+	l.jobPages = 50
+	for i := 0; i < 40; i++ {
+		r := fmt.Sprintf("my-org/r%02d", i)
+		l.repos = append(l.repos, r)
+		if l.runsRecent == nil {
+			l.runsRecent, l.runsDeep = map[string][]int64{}, map[string][]int64{}
+		}
+		l.runsRecent[r] = manyRuns(10000+i*100, 5)
+		l.runsDeep[r] = []int64{int64(500 + i)}
+	}
+	server.SetGitHubWebhook(GitHubWebhookOptions{WorkflowJobs: l})
+	state := &server.githubWebhook.reconcile
+	prevRemaining := -1
+	for cycle := 0; cycle < 3; cycle++ {
+		if _, err := server.ReconcileQueuedGitHubJobs(context.Background()); err != nil {
+			t.Fatalf("cycle %d: %v", cycle, err)
+		}
+		if state.lastDeepSpent < reconcileDeepReserve && state.deepOpen {
+			t.Fatalf("cycle %d: deep scan got %d calls, want >= %d", cycle, state.lastDeepSpent, reconcileDeepReserve)
+		}
+		if !state.deepOpen {
+			break
+		}
+		if state.deep.cursor == 0 {
+			t.Fatalf("cycle %d: deep cursor never advanced (%+v)", cycle, state.deep)
+		}
+		if prevRemaining >= 0 && state.deep.remaining >= prevRemaining {
+			t.Fatalf("cycle %d: deep remaining %d did not drop from %d", cycle, state.deep.remaining, prevRemaining)
+		}
+		prevRemaining = state.deep.remaining
+		now = now.Add(time.Minute)
+	}
+	deep := 0
+	for _, c := range l.runLists {
+		if c.window == reconcileRunWindow {
+			deep++
+		}
+	}
+	if deep == 0 {
+		t.Fatal("deep scan listed no repositories")
+	}
+}
+
+func TestDeepScanLimitGuaranteesReserve(t *testing.T) {
+	for _, tc := range []struct{ spent, want int64 }{
+		{0, reconcileCallBudget},
+		{reconcileCallBudget - reconcileDeepReserve, reconcileCallBudget},
+		{reconcileCallBudget, reconcileCallBudget + reconcileDeepReserve},
+	} {
+		if got := deepScanLimit(tc.spent); got != tc.want {
+			t.Fatalf("deepScanLimit(%d)=%d want %d", tc.spent, got, tc.want)
+		}
+	}
+}
+
+// An overlapping cycle skips instead of queueing behind the lock.
+func TestReconcileQueuedGitHubJobsSkipsWhileCycleRunning(t *testing.T) {
+	service := newServiceWithConfig(nil)
+	server := newTestServer(t, service)
+	l := newCountingLister(service.now)
+	l.repos = []string{"my-org/a"}
+	server.SetGitHubWebhook(GitHubWebhookOptions{WorkflowJobs: l})
+	server.githubWebhook.reconcile.mu.Lock()
+	done := make(chan struct{})
+	go func() {
+		_, _ = server.ReconcileQueuedGitHubJobs(context.Background())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("overlapping cycle blocked on the reconcile lock")
+	}
+	server.githubWebhook.reconcile.mu.Unlock()
+	if l.calls != 0 {
+		t.Fatalf("skipped cycle made %d calls", l.calls)
+	}
+}
+
+func shortDeadlines(server *Server) {
+	server.githubWebhook.recentTimeout = 30 * time.Millisecond
+	server.githubWebhook.deepTimeout = 30 * time.Millisecond
+}
+
+func deepRepoFixture(t *testing.T, n, runsPer int) (*Server, countingLister, *time.Time) {
+	t.Helper()
+	service := newServiceWithConfig(nil)
+	now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+	service.now = func() time.Time { return now }
+	server := newTestServer(t, service)
+	l := newCountingLister(service.now)
+	l.runsRecent, l.runsDeep = map[string][]int64{}, map[string][]int64{}
+	for i := 0; i < n; i++ {
+		r := fmt.Sprintf("my-org/r%02d", i)
+		l.repos = append(l.repos, r)
+		l.runsRecent[r] = []int64{int64(90000 + i)}
+		l.runsDeep[r] = manyRuns(1000+i*100, runsPer)
+	}
+	server.SetGitHubWebhook(GitHubWebhookOptions{WorkflowJobs: l})
+	shortDeadlines(server)
+	return server, l, &now
+}
+
+// A recent scan that hangs every cycle until its deadline must not starve the
+// deep scan: the deep scan runs with its own deadline and gets >= 40 calls.
+func TestReconcileQueuedGitHubJobsDeepScanRunsWhenRecentHitsDeadline(t *testing.T) {
+	server, l, now := deepRepoFixture(t, 20, 20)
+	l.hang["jobs:90000"] = -1 // the first repo's recent run hangs forever
+	state := &server.githubWebhook.reconcile
+	for cycle := 0; cycle < 3; cycle++ {
+		if _, err := server.ReconcileQueuedGitHubJobs(context.Background()); err != nil {
+			t.Fatalf("cycle %d: %v", cycle, err)
+		}
+		// While deep work is left it must get its full share; the last
+		// cycle may finish the pass with fewer calls.
+		if state.deepOpen && state.lastDeepSpent < reconcileDeepReserve || state.lastDeepSpent == 0 {
+			t.Fatalf("cycle %d: deep scan got %d calls with the recent scan hung, want >= %d", cycle, state.lastDeepSpent, reconcileDeepReserve)
+		}
+		if cycle < reconcileRunMaxCutoffs-1 && (state.recent.cursor != 1 || state.recent.repo != "my-org/r00" || state.recent.pos != 0) {
+			t.Fatalf("cycle %d: recent cursor %+v, want parked on the hung run", cycle, state.recent)
+		}
+		*now = now.Add(time.Minute)
+	}
+}
+
+// A deep run cut off by the real scan deadline is retried next cycle, not
+// dropped from the pass.
+func TestReconcileQueuedGitHubJobsDeadlineKeepsDeepRun(t *testing.T) {
+	server, l, now := deepRepoFixture(t, 2, 3)
+	hung := int64(1001) // second run of my-org/r00 in the deep window
+	l.hang[fmt.Sprintf("jobs:%d", hung)] = 1
+	state := &server.githubWebhook.reconcile
+	if _, err := server.ReconcileQueuedGitHubJobs(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if state.deep.repo != "my-org/r00" || state.deep.pos != 1 {
+		t.Fatalf("deep cursor after deadline = %+v, want my-org/r00 pos 1", state.deep)
+	}
+	*now = now.Add(time.Minute)
+	if _, err := server.ReconcileQueuedGitHubJobs(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if l.jobLists[hung] != 2 {
+		t.Fatalf("hung run listed %d times, want 2 (cut, then retried)", l.jobLists[hung])
+	}
+	for _, id := range append(manyRuns(1000, 3), manyRuns(1100, 3)...) {
+		if l.jobLists[id] == 0 {
+			t.Fatalf("deep run %d dropped from the pass", id)
+		}
+	}
+	if state.deepOpen {
+		t.Fatalf("deep pass still open: %+v", state.deep)
+	}
+}
+
+// A deep repo listing cut off by the deadline is re-listed next cycle.
+func TestReconcileQueuedGitHubJobsDeadlineKeepsDeepRepo(t *testing.T) {
+	server, l, now := deepRepoFixture(t, 3, 1)
+	l.hang[fmt.Sprintf("runs:my-org/r01:%s", reconcileRunWindow)] = 1
+	state := &server.githubWebhook.reconcile
+	if _, err := server.ReconcileQueuedGitHubJobs(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if state.deep.cursor != 1 || state.deep.remaining != 2 {
+		t.Fatalf("deep cursor after deadline = %+v, want cursor 1 with 2 repos left", state.deep)
+	}
+	*now = now.Add(time.Minute)
+	if _, err := server.ReconcileQueuedGitHubJobs(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if l.jobLists[1100] == 0 {
+		t.Fatal("deep run of the re-listed repo was never scanned")
+	}
+	if state.deepOpen {
+		t.Fatalf("deep pass still open: %+v", state.deep)
+	}
+}
+
+func TestReconcileTimeoutsDefault(t *testing.T) {
+	h := &githubWebhookHandler{}
+	if h.timeout(h.recentTimeout, reconcileRecentTimeout) != reconcileRecentTimeout || h.timeout(h.deepTimeout, reconcileDeepTimeout) != reconcileDeepTimeout {
+		t.Fatal("default scan deadlines not used")
+	}
+	if reconcileRecentTimeout+reconcileDeepTimeout >= time.Minute {
+		t.Fatal("scan deadlines must fit in the default 1m interval")
+	}
+}
+
+// A run that hangs every time, in both windows, is skipped after
+// reconcileRunMaxCutoffs consecutive cutoffs so neither cursor parks on it.
+func TestReconcileQueuedGitHubJobsSkipsRunThatAlwaysHangs(t *testing.T) {
+	server, l, now := deepRepoFixture(t, 3, 2)
+	// Run 777 is queued in the first repo in both the 1h and 7d windows.
+	l.runsRecent["my-org/r00"] = []int64{777}
+	l.runsDeep["my-org/r00"] = []int64{777, 1000}
+	l.hang["jobs:777"] = -1
+	state := &server.githubWebhook.reconcile
+	skippedBefore := testutil.ToFloat64(server.githubWebhook.metrics.skipped.WithLabelValues("run"))
+	recentPassed := false
+	for cycle := 0; cycle < 12 && (state.deepOpen || cycle == 0); cycle++ {
+		if _, err := server.ReconcileQueuedGitHubJobs(context.Background()); err != nil {
+			t.Fatalf("cycle %d: %v", cycle, err)
+		}
+		if state.recent.repo != "my-org/r00" {
+			recentPassed = true
+		}
+		*now = now.Add(time.Minute)
+	}
+	if state.deepOpen {
+		t.Fatalf("deep pass never finished; deep cursor %+v", state.deep)
+	}
+	if !recentPassed {
+		t.Fatalf("recent cursor stayed parked on the hung run: %+v", state.recent)
+	}
+	for _, id := range []int64{1000, 1100, 1101, 1200, 1201, 90001, 90002} {
+		if l.jobLists[id] == 0 {
+			t.Fatalf("run %d starved behind the hung run", id)
+		}
+	}
+	if got := testutil.ToFloat64(server.githubWebhook.metrics.skipped.WithLabelValues("run")) - skippedBefore; got < 2 {
+		t.Fatalf("skipped metric delta=%v, want >= 2 (once per scan)", got)
+	}
+	if n := l.jobLists[777]; n > 2*reconcileRunMaxCutoffs {
+		t.Fatalf("hung run checked %d times, want <= %d before both scans skip it", n, 2*reconcileRunMaxCutoffs)
+	}
+}
+
+// A successful check resets the run's cutoff count.
+func TestReconcileQueuedGitHubJobsCutoffResetsOnSuccess(t *testing.T) {
+	server, l, now := deepRepoFixture(t, 1, 1)
+	l.runsRecent["my-org/r00"] = []int64{777}
+	l.runsDeep["my-org/r00"] = nil
+	l.hang["jobs:777"] = reconcileRunMaxCutoffs - 1
+	state := &server.githubWebhook.reconcile
+	for cycle := 0; cycle < reconcileRunMaxCutoffs; cycle++ {
+		if _, err := server.ReconcileQueuedGitHubJobs(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		*now = now.Add(time.Minute)
+	}
+	if n := state.cutoffs[fmt.Sprintf("my-org/r00#777@%s", reconcileRecentWindow)]; n != 0 {
+		t.Fatalf("cutoff count %d after a successful check, want 0", n)
+	}
+	if got := testutil.ToFloat64(server.githubWebhook.metrics.skipped.WithLabelValues("run")); got != 0 {
+		t.Fatalf("run skipped %v times though it succeeded before the limit", got)
+	}
+}
+
+// A repo whose run listing hangs every time, in both windows, is skipped
+// after reconcileRunMaxCutoffs consecutive cutoffs per scan.
+func TestReconcileQueuedGitHubJobsSkipsRepoListingThatAlwaysHangs(t *testing.T) {
+	server, l, now := deepRepoFixture(t, 3, 2)
+	l.hang[fmt.Sprintf("runs:my-org/r01:%s", reconcileRecentWindow)] = -1
+	l.hang[fmt.Sprintf("runs:my-org/r01:%s", reconcileRunWindow)] = -1
+	state := &server.githubWebhook.reconcile
+	skippedBefore := testutil.ToFloat64(server.githubWebhook.metrics.skipped.WithLabelValues("repo"))
+	recentPassed := false
+	for cycle := 0; cycle < 12 && (state.deepOpen || cycle == 0); cycle++ {
+		if _, err := server.ReconcileQueuedGitHubJobs(context.Background()); err != nil {
+			t.Fatalf("cycle %d: %v", cycle, err)
+		}
+		if state.recent.cursor%len(l.repos) != 1 {
+			recentPassed = true
+		}
+		*now = now.Add(time.Minute)
+	}
+	if state.deepOpen {
+		t.Fatalf("deep pass never finished; deep cursor %+v", state.deep)
+	}
+	if !recentPassed {
+		t.Fatalf("recent cursor stayed parked on the hung repo: %+v", state.recent)
+	}
+	for _, id := range []int64{1000, 1001, 1200, 1201, 90000, 90002} {
+		if l.jobLists[id] == 0 {
+			t.Fatalf("run %d starved behind the hung repo listing", id)
+		}
+	}
+	if got := testutil.ToFloat64(server.githubWebhook.metrics.skipped.WithLabelValues("repo")) - skippedBefore; got < 2 {
+		t.Fatalf("repo skipped metric delta=%v, want >= 2 (once per scan)", got)
 	}
 }
