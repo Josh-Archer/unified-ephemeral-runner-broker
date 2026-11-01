@@ -338,6 +338,23 @@ broker:
 	}
 }
 
+func TestGitHubWebhookReconcileIntervalDefaultsAndLoads(t *testing.T) {
+	if got := Default().Broker.GitHubWebhook.ReconcileInterval; got != time.Minute {
+		t.Fatalf("default reconcile interval=%s, want 1m", got)
+	}
+	path := filepath.Join(t.TempDir(), "broker.yaml")
+	if err := os.WriteFile(path, []byte("broker:\n  githubWebhook:\n    reconcileInterval: 45s\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Broker.GitHubWebhook.ReconcileInterval; got != 45*time.Second {
+		t.Fatalf("loaded reconcile interval=%s, want 45s", got)
+	}
+}
+
 func TestValidateQualityAware(t *testing.T) {
 	cfg := Default()
 	cfg.Broker.QualityAware.Enabled = true

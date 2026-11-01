@@ -3,6 +3,7 @@ package capacity_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -109,4 +110,33 @@ func TestRefreshSkipsDisabledBackends(t *testing.T) {
 	if snaps := manager.Snapshot(); len(snaps) != 0 {
 		t.Fatalf("expected no snapshots for disabled backends, got %+v", snaps)
 	}
+}
+
+func TestStartRefreshLoopRetriesStartupCapacityProbeInBackground(t *testing.T) {
+	cfg := config.Default()
+	for i := range cfg.Pools {
+		if cfg.Pools[i].Name != model.PoolLite {
+			continue
+		}
+		backendCfg := cfg.Pools[i].Backends[model.BackendCodeBuild]
+		backendCfg.Enabled = true
+		cfg.Pools[i].Backends[model.BackendCodeBuild] = backendCfg
+	}
+	probe := fakecapacity.NewBackend(model.BackendCodeBuild, fakecapacity.Free(3, 2))
+	probe.SetError(errors.New("Kubernetes API timeout"))
+	manager := capacity.NewManager()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	capacity.StartRefreshLoop(ctx, manager, fakecapacity.MapReporter{model.BackendCodeBuild: probe}, cfg, time.Hour)
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if snapshot, ok := manager.Get(model.BackendCodeBuild); ok {
+			if !strings.Contains(snapshot.Err, "timeout") {
+				t.Fatalf("snapshot=%+v, expected timeout to be retained for retry", snapshot)
+			}
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("startup capacity probe was not retried asynchronously")
 }

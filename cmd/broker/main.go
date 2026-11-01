@@ -139,6 +139,7 @@ func main() {
 	if webhookPoolsConfigured(cfg) {
 		server.SetGitHubWebhook(api.GitHubWebhookOptions{
 			WorkflowRun:   githubClient.GetWorkflowRun,
+			WorkflowJobs:  githubClient,
 			RejectForks:   cfg.GitHub.Scope.IsPerRepository() && !cfg.Broker.GitHubWebhook.AllowForkPullRequests,
 			AllowedActors: cfg.Broker.GitHubWebhook.AllowedActors,
 			Secret:        api.GitHubWebhookSecretFunc(cfg.Broker.GitHubWebhook, secretReader.ReadSecret),
@@ -196,6 +197,32 @@ func main() {
 				log.Printf("github webhook inbox drain: %v", err)
 			}
 		})
+		reconcileInterval := cfg.Broker.GitHubWebhook.ReconcileInterval
+		if reconcileInterval <= 0 {
+			reconcileInterval = time.Minute
+		}
+		reconcileQueuedJobs := func() {
+			if useLeaderElection {
+				ok, err := elector.TryAcquireLeadership(ctx, store.LeaderLeaseName, identity, leaseTTL)
+				if err != nil {
+					log.Printf("queued workflow reconciliation leader election failed: %v", err)
+					return
+				}
+				if !ok {
+					return
+				}
+			}
+			count, err := server.ReconcileQueuedGitHubJobs(context.Background())
+			if err != nil {
+				log.Printf("queued workflow reconciliation failed: %v", err)
+				return
+			}
+			if count > 0 {
+				log.Printf("queued workflow reconciliation allocated jobs=%d", count)
+			}
+		}
+		go reconcileQueuedJobs()
+		startBackground("reconcile-github-queued-jobs", reconcileInterval, func(time.Time) { reconcileQueuedJobs() })
 	}
 
 	if tierManager != nil {

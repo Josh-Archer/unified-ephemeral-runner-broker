@@ -196,6 +196,9 @@ type GitHubWebhookConfig struct {
 	// these GitHub logins. Pushes and pull requests by collaborators or bots,
 	// and re-runs of their runs, get no runner. Matching is case-insensitive.
 	AllowedActors []string `yaml:"allowedActors,omitempty" json:"allowedActors,omitempty"`
+	// ReconcileInterval polls GitHub for queued jobs that arrived before a
+	// webhook was delivered. The runtime defaults this to one minute.
+	ReconcileInterval time.Duration `yaml:"reconcileInterval,omitempty" json:"reconcileInterval,omitempty"`
 }
 
 // WebhooksConfig controls outbound allocation lifecycle event delivery.

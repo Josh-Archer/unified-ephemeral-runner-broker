@@ -101,6 +101,67 @@ func TestGetWorkflowRunReadsActors(t *testing.T) {
 	}
 }
 
+func TestListsRepositoriesRunsAndJobsForQueuedReconciliation(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case "GET /orgs/my-org/repos":
+			if r.URL.Query().Get("page") != "1" || r.URL.Query().Get("per_page") != "100" {
+				t.Errorf("repository pagination query = %s", r.URL.RawQuery)
+			}
+			_, _ = w.Write([]byte(`[{"full_name":"my-org/home"}]`))
+		case "GET /repos/my-org/home/actions/runs":
+			if r.URL.Query().Get("status") != "queued" {
+				t.Errorf("run status = %q", r.URL.Query().Get("status"))
+			}
+			_, _ = w.Write([]byte(`{"workflow_runs":[{"id":12}]}`))
+		case "GET /repos/my-org/home/actions/runs/12/jobs":
+			_, _ = w.Write([]byte(`{"jobs":[{"id":99,"status":"queued","labels":["self-hosted","uecb-shared"]}]}`))
+		default:
+			t.Errorf("unexpected GitHub request %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	client := NewClient(func(context.Context) (string, error) { return "tok", nil }, nil).WithBaseURL(server.URL)
+	scope := model.GitHubScope{Type: model.GitHubScopeOwner, Owner: "my-org"}
+	repos, err := client.ListRepositories(context.Background(), scope)
+	if err != nil || len(repos) != 1 || repos[0] != "my-org/home" {
+		t.Fatalf("repos=%v err=%v", repos, err)
+	}
+	runs, err := client.ListQueuedWorkflowRuns(context.Background(), repos[0])
+	if err != nil || len(runs) != 1 || runs[0] != 12 {
+		t.Fatalf("runs=%v err=%v", runs, err)
+	}
+	jobs, err := client.ListWorkflowJobs(context.Background(), repos[0], runs[0])
+	if err != nil || len(jobs) != 1 || jobs[0].ID != 99 || jobs[0].RunID != 12 || jobs[0].Status != "queued" || len(jobs[0].Labels) != 2 {
+		t.Fatalf("jobs=%+v err=%v", jobs, err)
+	}
+}
+
+func TestListRepositoriesSupportsPersonalOwnerScope(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/orgs/Josh-Archer/repos":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"message":"Not Found"}`))
+		case "/users/Josh-Archer/repos":
+			if r.URL.Query().Get("type") != "owner" {
+				t.Errorf("user repository query=%s", r.URL.RawQuery)
+			}
+			_, _ = w.Write([]byte(`[{"full_name":"Josh-Archer/home"}]`))
+		default:
+			t.Errorf("unexpected repository-list path %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	client := NewClient(func(context.Context) (string, error) { return "tok", nil }, nil).WithBaseURL(server.URL)
+	repos, err := client.ListRepositories(context.Background(), model.GitHubScope{Type: model.GitHubScopeOwner, Owner: "Josh-Archer"})
+	if err != nil || len(repos) != 1 || repos[0] != "Josh-Archer/home" {
+		t.Fatalf("repos=%v err=%v", repos, err)
+	}
+}
+
 func TestManagedRunnerLabelAPI(t *testing.T) {
 	var adds []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

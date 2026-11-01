@@ -88,6 +88,10 @@ func StartRefreshLoop(ctx context.Context, manager *Manager, reporter Reporter, 
 		interval = 30 * time.Second
 	}
 	go func() {
+		// Retry startup probes immediately in the background. A Kubernetes API
+		// timeout must not block broker startup; this first refresh recovers the
+		// live snapshot without waiting for the full periodic interval.
+		Refresh(ctx, manager, reporter, cfg, time.Now().UTC())
 		timer := time.NewTimer(jitter(interval))
 		defer timer.Stop()
 		for {

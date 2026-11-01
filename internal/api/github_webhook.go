@@ -51,7 +51,12 @@ type GitHubWebhookOptions struct {
 	// WorkflowRun reads the run a queued job belongs to. It is required when
 	// RejectForks or AllowedActors is set; a failed lookup fails the delivery
 	// rather than allocating.
-	WorkflowRun func(ctx context.Context, repository string, runID int64) (github.WorkflowRun, error)
+	WorkflowRun  func(ctx context.Context, repository string, runID int64) (github.WorkflowRun, error)
+	WorkflowJobs interface {
+		ListRepositories(context.Context, model.GitHubScope) ([]string, error)
+		ListQueuedWorkflowRuns(context.Context, string) ([]int64, error)
+		ListWorkflowJobs(context.Context, string, int64) ([]github.WorkflowJob, error)
+	}
 	// RejectForks gives no runner to jobs whose run comes from another
 	// repository (pull requests from forks).
 	RejectForks bool
@@ -366,6 +371,74 @@ func (s *Server) DrainGitHubWebhookInbox(ctx context.Context) (int, error) {
 		return 0, nil
 	}
 	return s.githubWebhook.drainInbox(ctx)
+}
+
+// ReconcileQueuedGitHubJobs discovers jobs whose queued webhook was missed.
+// AllocateForWorkflowJob makes this safe to overlap with webhook delivery and
+// repeated polls; existing job ids are never allocated twice.
+func (s *Server) ReconcileQueuedGitHubJobs(ctx context.Context) (int, error) {
+	if s == nil || s.githubWebhook == nil || s.githubWebhook.opts.WorkflowJobs == nil {
+		return 0, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	h := s.githubWebhook
+	repos, err := h.opts.WorkflowJobs.ListRepositories(ctx, h.service.cfg.GitHub.Scope)
+	if err != nil {
+		return 0, err
+	}
+	allocated := 0
+	var firstErr error
+	for _, repository := range repos {
+		repository = strings.TrimSpace(repository)
+		if !h.service.AcceptsWebhookRepository(repository) {
+			continue
+		}
+		runs, err := h.opts.WorkflowJobs.ListQueuedWorkflowRuns(ctx, repository)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		for _, runID := range runs {
+			jobs, err := h.opts.WorkflowJobs.ListWorkflowJobs(ctx, repository, runID)
+			if err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+			for _, job := range jobs {
+				if job.ID <= 0 || (job.Status != "queued" && job.Status != "waiting") {
+					continue
+				}
+				if _, ok := h.service.MatchWebhookPoolForRepository(job.Labels, repository); !ok {
+					continue
+				}
+				if job.RunID == 0 {
+					job.RunID = runID
+				}
+				payload := workflowJobPayload{Action: "queued"}
+				payload.WorkflowJob.ID = job.ID
+				payload.WorkflowJob.RunID = job.RunID
+				payload.WorkflowJob.Labels = job.Labels
+				payload.Repository.FullName = repository
+				result, _, err := h.process(ctx, payload)
+				if err != nil {
+					if firstErr == nil {
+						firstErr = fmt.Errorf("reconcile %s job %d: %w", repository, job.ID, err)
+					}
+					continue
+				}
+				if result["status"] == "allocated" {
+					allocated++
+				}
+			}
+		}
+	}
+	return allocated, firstErr
 }
 
 // process handles an authenticated, leader-owned queued/completed delivery.
