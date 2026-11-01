@@ -832,6 +832,7 @@ func TestReconcileQueuedGitHubJobsScansAWeekAcrossReposAndSharedPool(t *testing.
 type countingLister struct {
 	*listerLog
 	repos      []string
+	repoErr    error
 	runsRecent map[string][]int64
 	runsDeep   map[string][]int64
 	runErr     map[string]error
@@ -868,7 +869,7 @@ func (l countingLister) RateLimit() (int, time.Time, bool) {
 func (l countingLister) ListRepositories(context.Context, model.GitHubScope) ([]string, error) {
 	l.calls++
 	l.repoLists++
-	return l.repos, nil
+	return l.repos, l.repoErr
 }
 func (l countingLister) ListQueuedWorkflowRuns(_ context.Context, repository string, since time.Time) ([]int64, error) {
 	l.calls++
@@ -1095,5 +1096,27 @@ func TestReconcileQueuedGitHubJobsReportsPageCapAndKeepsTruncatedResults(t *test
 	}
 	if d := testutil.ToFloat64(m.WithLabelValues("jobs")) - jobsBefore; d < 1 {
 		t.Fatalf("jobs page-cap metric delta=%v", d)
+	}
+}
+
+func TestReconcileQueuedGitHubJobsRefreshesTruncatedRepositoryListSooner(t *testing.T) {
+	service := newServiceWithConfig(nil)
+	now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+	service.now = func() time.Time { return now }
+	server := newTestServer(t, service)
+	l := newCountingLister(service.now)
+	l.repos = []string{"my-org/home"}
+	l.repoErr = fmt.Errorf("list: %w", github.ErrPageCapReached)
+	server.SetGitHubWebhook(GitHubWebhookOptions{WorkflowJobs: l})
+	reconcileCycle(t, server, l)
+	now = now.Add(reconcileTruncatedReposTTL / 2)
+	reconcileCycle(t, server, l)
+	if l.repoLists != 1 {
+		t.Fatalf("truncated repository list fetched %d times within its TTL, want 1", l.repoLists)
+	}
+	now = now.Add(reconcileTruncatedReposTTL)
+	reconcileCycle(t, server, l)
+	if l.repoLists != 2 {
+		t.Fatalf("truncated repository list fetched %d times after %v, want 2 (must not be cached for %v)", l.repoLists, reconcileTruncatedReposTTL, reconcileReposTTL)
 	}
 }
