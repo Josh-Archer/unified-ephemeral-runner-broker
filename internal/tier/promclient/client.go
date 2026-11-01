@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -117,14 +118,37 @@ func (r response) value() (float64, error) {
 		if err := json.Unmarshal(r.Data.Result, &result); err != nil {
 			return 0, err
 		}
-		if len(result) != 1 || len(result[0].Value) != 2 {
-			return 0, fmt.Errorf("expected a single-sample vector")
+		// A query like `a / b or vector(0)` yields two series when a/b has
+		// labels (the label-less vector(0) does not match them), and exporter
+		// duplicates do the same. Usage is a pressure signal, so take the
+		// highest sample rather than failing the whole tier refresh.
+		if len(result) == 0 {
+			return 0, fmt.Errorf("empty vector result")
 		}
-		var value string
-		if err := json.Unmarshal(result[0].Value[1], &value); err != nil {
-			return 0, err
+		best := math.Inf(-1)
+		for _, sample := range result {
+			if len(sample.Value) != 2 {
+				return 0, fmt.Errorf("unexpected vector sample shape")
+			}
+			var raw string
+			if err := json.Unmarshal(sample.Value[1], &raw); err != nil {
+				return 0, err
+			}
+			value, err := strconv.ParseFloat(raw, 64)
+			if err != nil {
+				return 0, err
+			}
+			if math.IsNaN(value) {
+				continue
+			}
+			if value > best {
+				best = value
+			}
 		}
-		return strconv.ParseFloat(value, 64)
+		if math.IsInf(best, -1) {
+			return 0, fmt.Errorf("vector result has no numeric samples")
+		}
+		return best, nil
 	default:
 		return 0, fmt.Errorf("unsupported result type %q", r.Data.ResultType)
 	}
