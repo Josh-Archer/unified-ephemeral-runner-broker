@@ -186,6 +186,9 @@ func main() {
 	startBackground("reconcile-queue", 10*time.Second, func(now time.Time) {
 		service.ReconcileQueue(context.Background(), now)
 	})
+	startBackground("reconcile-finished-runners", 30*time.Second, func(time.Time) {
+		service.ReconcileFinishedRunners(context.Background())
+	})
 
 	if webhookPoolsConfigured(cfg) {
 		startBackground("github-webhook-inbox", 5*time.Second, func(time.Time) {
