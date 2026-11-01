@@ -63,6 +63,7 @@ func Default() model.BrokerConfig {
 				FailureMode:      "pass-through",
 				RefreshOnStartup: true,
 			},
+			GitHubWebhook: model.GitHubWebhookConfig{ReconcileInterval: time.Minute},
 			QualityAware: model.QualityAwareConfig{
 				Enabled:    false,
 				Window:     15 * time.Minute,

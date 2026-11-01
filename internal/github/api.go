@@ -143,6 +143,140 @@ type WorkflowRun struct {
 	TriggeringActor string
 }
 
+// WorkflowJob is the queued-job subset needed by the broker reconciler.
+type WorkflowJob struct {
+	ID     int64    `json:"id"`
+	RunID  int64    `json:"run_id"`
+	Status string   `json:"status"`
+	Labels []string `json:"labels"`
+}
+
+// ListRepositories returns repositories visible to the configured owner or
+// organization installation. Repository scopes return their single repo.
+func (c *Client) ListRepositories(ctx context.Context, scope model.GitHubScope) ([]string, error) {
+	if scope.Type == model.GitHubScopeRepository {
+		repo, err := scope.ForRepository("")
+		if err != nil {
+			return nil, err
+		}
+		return []string{repo.Owner + "/" + repo.Repository}, nil
+	}
+	owner := strings.TrimSpace(scope.Owner)
+	if scope.Type == model.GitHubScopeOrganization {
+		owner = strings.TrimSpace(scope.Organization)
+	}
+	if owner == "" {
+		return nil, errors.New("GitHub owner scope is empty")
+	}
+	path := "/orgs/" + url.PathEscape(owner) + "/repos"
+	var repos []string
+	for page := 1; ; page++ {
+		var out []struct {
+			FullName string `json:"full_name"`
+		}
+		query := "type=all"
+		err := c.do(ctx, http.MethodGet, fmt.Sprintf("%s?%s&per_page=100&page=%d", path, query, page), nil, &out, http.StatusOK)
+		if page == 1 && scope.Type == model.GitHubScopeOwner {
+			var status *StatusError
+			if errors.As(err, &status) && status.Code == http.StatusNotFound {
+				// Owner scope also supports a personal account; GitHub exposes
+				// those repositories through /users/{username}/repos.
+				path = "/users/" + url.PathEscape(owner) + "/repos"
+				query = "type=owner"
+				err = c.do(ctx, http.MethodGet, fmt.Sprintf("%s?%s&per_page=100&page=%d", path, query, page), nil, &out, http.StatusOK)
+			}
+		}
+		if err != nil {
+			return nil, fmt.Errorf("list repositories for %s: %w", owner, err)
+		}
+		for _, repo := range out {
+			if strings.TrimSpace(repo.FullName) != "" {
+				repos = append(repos, repo.FullName)
+			}
+		}
+		if len(out) < 100 {
+			return repos, nil
+		}
+	}
+}
+
+// ListQueuedWorkflowRuns returns run ids that can contain queued jobs in one
+// repository. A workflow run may be in progress while one of its jobs remains
+// queued, so both run states are inspected.
+func (c *Client) ListQueuedWorkflowRuns(ctx context.Context, repository string) ([]int64, error) {
+	base, err := repositoryPath(repository)
+	if err != nil {
+		return nil, err
+	}
+	var ids []int64
+	seen := map[int64]struct{}{}
+	for _, status := range []string{"queued", "in_progress"} {
+		for page := 1; ; page++ {
+			var out struct {
+				WorkflowRuns []struct {
+					ID int64 `json:"id"`
+				} `json:"workflow_runs"`
+			}
+			path := fmt.Sprintf("%s/actions/runs?status=%s&per_page=100&page=%d", base, status, page)
+			if err := c.do(ctx, http.MethodGet, path, nil, &out, http.StatusOK); err != nil {
+				return nil, fmt.Errorf("list %s workflow runs for %s: %w", status, repository, err)
+			}
+			for _, run := range out.WorkflowRuns {
+				if run.ID <= 0 {
+					continue
+				}
+				if _, ok := seen[run.ID]; ok {
+					continue
+				}
+				seen[run.ID] = struct{}{}
+				ids = append(ids, run.ID)
+			}
+			if len(out.WorkflowRuns) < 100 {
+				break
+			}
+		}
+	}
+	return ids, nil
+}
+
+// ListWorkflowJobs returns all jobs for one workflow run, following pages.
+func (c *Client) ListWorkflowJobs(ctx context.Context, repository string, runID int64) ([]WorkflowJob, error) {
+	base, err := repositoryPath(repository)
+	if err != nil {
+		return nil, err
+	}
+	if runID <= 0 {
+		return nil, errors.New("workflow run id must be positive")
+	}
+	var jobs []WorkflowJob
+	for page := 1; ; page++ {
+		var out struct {
+			Jobs []WorkflowJob `json:"jobs"`
+		}
+		path := fmt.Sprintf("%s/actions/runs/%d/jobs?per_page=100&page=%d", base, runID, page)
+		if err := c.do(ctx, http.MethodGet, path, nil, &out, http.StatusOK); err != nil {
+			return nil, fmt.Errorf("list workflow jobs for %s run %d: %w", repository, runID, err)
+		}
+		for i := range out.Jobs {
+			if out.Jobs[i].RunID == 0 {
+				out.Jobs[i].RunID = runID
+			}
+		}
+		jobs = append(jobs, out.Jobs...)
+		if len(out.Jobs) < 100 {
+			return jobs, nil
+		}
+	}
+}
+
+func repositoryPath(repository string) (string, error) {
+	owner, repo, ok := strings.Cut(strings.TrimSpace(repository), "/")
+	if !ok || owner == "" || repo == "" || strings.Contains(repo, "/") {
+		return "", fmt.Errorf("invalid repository %q", repository)
+	}
+	return fmt.Sprintf("/repos/%s/%s", url.PathEscape(owner), url.PathEscape(repo)), nil
+}
+
 // GetWorkflowRun reads the run that a workflow job belongs to.
 func (c *Client) GetWorkflowRun(ctx context.Context, repository string, runID int64) (WorkflowRun, error) {
 	owner, repo, ok := strings.Cut(strings.TrimSpace(repository), "/")

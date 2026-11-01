@@ -49,6 +49,63 @@ type webhookHarness struct {
 	server  *Server
 }
 
+type fakeWorkflowJobLister struct {
+	repos []string
+	runs  map[string][]int64
+	jobs  map[string][]github.WorkflowJob
+	err   error
+}
+
+func (f fakeWorkflowJobLister) ListRepositories(context.Context, model.GitHubScope) ([]string, error) {
+	return f.repos, f.err
+}
+func (f fakeWorkflowJobLister) ListQueuedWorkflowRuns(_ context.Context, repository string) ([]int64, error) {
+	return f.runs[repository], f.err
+}
+func (f fakeWorkflowJobLister) ListWorkflowJobs(_ context.Context, _ string, runID int64) ([]github.WorkflowJob, error) {
+	return f.jobs[fmt.Sprint(runID)], f.err
+}
+
+func TestReconcileQueuedGitHubJobsAllocatesIdempotentlyAndRespectsLabels(t *testing.T) {
+	service := newServiceWithConfig(func(pool *model.PoolConfig) {
+		if pool.Name == model.PoolFull {
+			pool.WebhookLabels = []string{"self-hosted", "uecb-full"}
+		}
+	})
+	server := newTestServer(t, service)
+	server.SetGitHubWebhook(GitHubWebhookOptions{
+		WorkflowJobs: fakeWorkflowJobLister{
+			repos: []string{"my-org/home"},
+			runs:  map[string][]int64{"my-org/home": {12}},
+			jobs: map[string][]github.WorkflowJob{"12": {
+				{ID: 99, RunID: 12, Status: "queued", Labels: []string{"self-hosted", "uecb-full"}},
+				{ID: 100, RunID: 12, Status: "queued", Labels: []string{"self-hosted", "unserved"}},
+				{ID: 101, RunID: 12, Status: "in_progress", Labels: []string{"self-hosted", "uecb-full"}},
+			}},
+		},
+	})
+	for attempt, want := range []int{1, 0} {
+		got, err := server.ReconcileQueuedGitHubJobs(context.Background())
+		if err != nil || got != want {
+			t.Fatalf("attempt %d allocated=%d err=%v, want %d", attempt, got, err, want)
+		}
+	}
+	if got := len(service.Store().List()); got != 1 {
+		t.Fatalf("allocations=%d, want one idempotent allocation", got)
+	}
+	if allocation, ok := service.findByWorkflowJobID(99); !ok || allocation.Request.TargetRepository != "my-org/home" {
+		t.Fatalf("queued job allocation missing or wrong repository: %+v found=%v", allocation, ok)
+	}
+}
+
+func TestReconcileQueuedGitHubJobsReturnsDiscoveryErrorsForRetry(t *testing.T) {
+	server := newTestServer(t, newServiceWithConfig(nil))
+	server.SetGitHubWebhook(GitHubWebhookOptions{WorkflowJobs: fakeWorkflowJobLister{err: errors.New("GitHub API timeout")}})
+	if _, err := server.ReconcileQueuedGitHubJobs(context.Background()); err == nil || !strings.Contains(err.Error(), "timeout") {
+		t.Fatalf("reconciliation error=%v, want retryable discovery error", err)
+	}
+}
+
 func newWebhookHarness(t *testing.T, enable bool) *webhookHarness {
 	t.Helper()
 	service := newServiceWithConfig(func(pool *model.PoolConfig) {
