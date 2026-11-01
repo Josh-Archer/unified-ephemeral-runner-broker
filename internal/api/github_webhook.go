@@ -424,6 +424,16 @@ const (
 	// while a deep pass is open, so repositories the deep cursor has not
 	// reached yet still get their recent queued runs checked every cycle.
 	reconcileRecentReserve = 30
+	// reconcileDeepReserve is the share of the budget guaranteed to an open
+	// deep pass. The recent scan stops at reconcileCallBudget minus this, and
+	// the deep scan always gets at least this many calls after the recent scan
+	// finishes, even when a multi-page listing pushed the recent scan past its
+	// limit (the client counts every page, so one listing can overshoot).
+	reconcileDeepReserve = 40
+	// reconcileCycleTimeout bounds one reconcile cycle. Allocation calls into
+	// backends can hang (home#4157), and without a deadline one cycle held
+	// the reconcile lock and the worker goroutine for many intervals.
+	reconcileCycleTimeout = 50 * time.Second
 	reconcileReposTTL      = 5 * time.Minute
 	// reconcileTruncatedReposTTL is how long a repository list cut at its page
 	// cap is reused, so a truncated listing is retried soon.
@@ -480,9 +490,14 @@ func (s *Server) ReconcileQueuedGitHubJobs(ctx context.Context) (int, error) {
 	if reconcileRateLimited(lister, now) {
 		return 0, ErrReconcileRateLimited
 	}
-	h.reconcile.mu.Lock()
+	if !h.reconcile.mu.TryLock() {
+		log.Printf("github reconcile: previous cycle still running; skipping this cycle")
+		return 0, nil
+	}
 	defer h.reconcile.mu.Unlock()
 	state := &h.reconcile
+	ctx, cancel := context.WithTimeout(ctx, reconcileCycleTimeout)
+	defer cancel()
 	ctx = withRetryFailedWorkflowJob(ctx)
 	budget := newCycleBudget(lister, func() time.Time { return h.service.now() })
 
@@ -503,33 +518,49 @@ func (s *Server) ReconcileQueuedGitHubJobs(ctx context.Context) (int, error) {
 	run := &reconcileRun{h: h, budget: budget}
 	recentLimit := int64(reconcileCallBudget)
 	if state.deepOpen {
-		recentLimit = reconcileRecentReserve
+		recentLimit = reconcileCallBudget - reconcileDeepReserve
 	}
 	// The recent scan visits each repository at most once per cycle.
 	state.recent.remaining = len(repos)
 	err = run.scan(ctx, &state.recent, repos, now.Add(-reconcileRecentWindow), reconcileRecentWindow, recentLimit)
+	recentSpent := budget.spent()
 	if errors.Is(err, errReconcileBudgetSpent) && state.deepOpen {
-		// The recent reserve is spent; the deep scan gets the rest.
+		// The recent share is spent; the deep scan still gets its reserve.
 		err = nil
 	}
+	deepRan := false
 	if err == nil && state.deepOpen {
-		err = run.scan(ctx, &state.deep, repos, now.Add(-reconcileRunWindow), reconcileRunWindow, reconcileCallBudget)
+		deepRan = true
+		err = run.scan(ctx, &state.deep, repos, now.Add(-reconcileRunWindow), reconcileRunWindow, deepScanLimit(recentSpent))
 		if err == nil && state.deep.remaining <= 0 {
 			state.deepOpen, state.lastDeep = false, now
 		}
 	}
 	switch {
 	case errors.Is(err, errReconcileBudgetSpent):
-		{
-			h.metrics.budget.Inc()
-			log.Printf("github reconcile: API call budget %d spent (%d used); recent scan resumes at repo %d, deep scan at %q run %d next cycle",
-				reconcileCallBudget, budget.spent(), state.recent.cursor, state.deep.repo, state.deep.pos)
-		}
+		h.metrics.budget.Inc()
+		log.Printf("github reconcile: API call budget %d spent (%d used, recent %d); recent scan resumes at repo %d, deep scan (open=%v) at repo %d %q run %d with %d repos left next cycle",
+			reconcileCallBudget, budget.spent(), recentSpent, state.recent.cursor, state.deepOpen, state.deep.cursor, state.deep.repo, state.deep.pos, state.deep.remaining)
+		return run.allocated, run.firstErr
+	case errors.Is(err, context.DeadlineExceeded):
+		log.Printf("github reconcile: cycle hit its %s deadline after %d API calls; scans resume where they stopped next cycle", reconcileCycleTimeout, budget.spent())
 		return run.allocated, run.firstErr
 	case err != nil:
 		return run.allocated, err
 	}
+	log.Printf("github reconcile: cycle complete (%d API calls, deep scan ran=%v open=%v, allocated=%d)", budget.spent(), deepRan, state.deepOpen, run.allocated)
 	return run.allocated, run.firstErr
+}
+
+// deepScanLimit is the cumulative call limit for the deep scan after the
+// recent scan spent recentSpent calls: the rest of the budget, but never less
+// than reconcileDeepReserve calls.
+func deepScanLimit(recentSpent int64) int64 {
+	limit := int64(reconcileCallBudget)
+	if recentSpent+reconcileDeepReserve > limit {
+		limit = recentSpent + reconcileDeepReserve
+	}
+	return limit
 }
 
 var errReconcileBudgetSpent = errors.New("reconcile API call budget spent")
