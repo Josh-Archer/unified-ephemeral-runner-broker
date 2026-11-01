@@ -798,22 +798,22 @@ func TestGitHubWebhookOnlyAllowedActorsGetRunners(t *testing.T) {
 func TestReconcileQueuedGitHubJobsScansAWeekAcrossReposAndSharedPool(t *testing.T) {
 	service := newServiceWithConfig(func(pool *model.PoolConfig) {
 		if pool.Name == model.PoolFull {
-			pool.WebhookLabels = []string{"self-hosted", "uecb-shared", "home-gh-runner-linux-quest"}
+			pool.WebhookLabels = []string{"self-hosted", "uecb-shared", "quest-linux"}
 		}
 	})
 	server := newTestServer(t, service)
 	var since time.Time
 	server.SetGitHubWebhook(GitHubWebhookOptions{
 		WorkflowJobs: fakeWorkflowJobLister{
-			repos: []string{"my-org/home", "my-org/questkit"},
-			runs:  map[string][]int64{"my-org/questkit": {41158879898}},
-			jobs: map[string][]github.WorkflowJob{"41158879898": {
-				{ID: 7, Status: "queued", Labels: []string{"home-gh-runner-linux-quest"}},
+			repos: []string{"my-org/home", "my-org/other"},
+			runs:  map[string][]int64{"my-org/other": {4242}},
+			jobs: map[string][]github.WorkflowJob{"4242": {
+				{ID: 7, Status: "queued", Labels: []string{"quest-linux"}},
 			}},
 			since: &since,
 		},
 		WorkflowRun: func(context.Context, string, int64) (github.WorkflowRun, error) {
-			return github.WorkflowRun{HeadRepository: "my-org/questkit"}, nil
+			return github.WorkflowRun{HeadRepository: "my-org/other"}, nil
 		},
 	})
 	count, err := server.ReconcileQueuedGitHubJobs(context.Background())
