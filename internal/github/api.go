@@ -200,32 +200,43 @@ func (c *Client) ListRepositories(ctx context.Context, scope model.GitHubScope) 
 	}
 }
 
-// ListQueuedWorkflowRuns returns run ids currently queued in one repository.
+// ListQueuedWorkflowRuns returns run ids that can contain queued jobs in one
+// repository. A workflow run may be in progress while one of its jobs remains
+// queued, so both run states are inspected.
 func (c *Client) ListQueuedWorkflowRuns(ctx context.Context, repository string) ([]int64, error) {
 	base, err := repositoryPath(repository)
 	if err != nil {
 		return nil, err
 	}
 	var ids []int64
-	for page := 1; ; page++ {
-		var out struct {
-			WorkflowRuns []struct {
-				ID int64 `json:"id"`
-			} `json:"workflow_runs"`
-		}
-		path := fmt.Sprintf("%s/actions/runs?status=queued&per_page=100&page=%d", base, page)
-		if err := c.do(ctx, http.MethodGet, path, nil, &out, http.StatusOK); err != nil {
-			return nil, fmt.Errorf("list queued workflow runs for %s: %w", repository, err)
-		}
-		for _, run := range out.WorkflowRuns {
-			if run.ID > 0 {
+	seen := map[int64]struct{}{}
+	for _, status := range []string{"queued", "in_progress"} {
+		for page := 1; ; page++ {
+			var out struct {
+				WorkflowRuns []struct {
+					ID int64 `json:"id"`
+				} `json:"workflow_runs"`
+			}
+			path := fmt.Sprintf("%s/actions/runs?status=%s&per_page=100&page=%d", base, status, page)
+			if err := c.do(ctx, http.MethodGet, path, nil, &out, http.StatusOK); err != nil {
+				return nil, fmt.Errorf("list %s workflow runs for %s: %w", status, repository, err)
+			}
+			for _, run := range out.WorkflowRuns {
+				if run.ID <= 0 {
+					continue
+				}
+				if _, ok := seen[run.ID]; ok {
+					continue
+				}
+				seen[run.ID] = struct{}{}
 				ids = append(ids, run.ID)
 			}
-		}
-		if len(out.WorkflowRuns) < 100 {
-			return ids, nil
+			if len(out.WorkflowRuns) < 100 {
+				break
+			}
 		}
 	}
+	return ids, nil
 }
 
 // ListWorkflowJobs returns all jobs for one workflow run, following pages.

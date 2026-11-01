@@ -411,7 +411,7 @@ func (s *Server) ReconcileQueuedGitHubJobs(ctx context.Context) (int, error) {
 				continue
 			}
 			for _, job := range jobs {
-				if job.ID <= 0 || (job.Status != "queued" && job.Status != "waiting") {
+				if job.ID <= 0 || job.Status != "queued" {
 					continue
 				}
 				if _, ok := h.service.MatchWebhookPoolForRepository(job.Labels, repository); !ok {

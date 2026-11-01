@@ -110,10 +110,15 @@ func TestListsRepositoriesRunsAndJobsForQueuedReconciliation(t *testing.T) {
 			}
 			_, _ = w.Write([]byte(`[{"full_name":"my-org/home"}]`))
 		case "GET /repos/my-org/home/actions/runs":
-			if r.URL.Query().Get("status") != "queued" {
+			switch r.URL.Query().Get("status") {
+			case "queued":
+				_, _ = w.Write([]byte(`{"workflow_runs":[{"id":12}]}`))
+			case "in_progress":
+				_, _ = w.Write([]byte(`{"workflow_runs":[{"id":12},{"id":13}]}`))
+			default:
 				t.Errorf("run status = %q", r.URL.Query().Get("status"))
+				w.WriteHeader(http.StatusBadRequest)
 			}
-			_, _ = w.Write([]byte(`{"workflow_runs":[{"id":12}]}`))
 		case "GET /repos/my-org/home/actions/runs/12/jobs":
 			_, _ = w.Write([]byte(`{"jobs":[{"id":99,"status":"queued","labels":["self-hosted","uecb-shared"]}]}`))
 		default:
@@ -129,7 +134,7 @@ func TestListsRepositoriesRunsAndJobsForQueuedReconciliation(t *testing.T) {
 		t.Fatalf("repos=%v err=%v", repos, err)
 	}
 	runs, err := client.ListQueuedWorkflowRuns(context.Background(), repos[0])
-	if err != nil || len(runs) != 1 || runs[0] != 12 {
+	if err != nil || len(runs) != 2 || runs[0] != 12 || runs[1] != 13 {
 		t.Fatalf("runs=%v err=%v", runs, err)
 	}
 	jobs, err := client.ListWorkflowJobs(context.Background(), repos[0], runs[0])
