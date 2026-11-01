@@ -1438,3 +1438,17 @@ func TestReconcileQueuedGitHubJobsSkipsRepoListingThatAlwaysHangs(t *testing.T) 
 		t.Fatalf("repo skipped metric delta=%v, want >= 2 (once per scan)", got)
 	}
 }
+
+// home#4157: QA could not find uecb_reconcile_unit_skipped_total on /metrics
+// because a labelled counter is exported only after its first Inc.
+func TestReconcileSkipCounterExportedBeforeFirstSkip(t *testing.T) {
+	m := newGitHubWebhookMetrics()
+	if got := testutil.CollectAndCount(m.skipped, "uecb_reconcile_unit_skipped_total"); got != 2 {
+		t.Fatalf("exported series=%d, want run and repo at 0", got)
+	}
+	for _, unit := range []string{"run", "repo"} {
+		if v := testutil.ToFloat64(m.skipped.WithLabelValues(unit)); v != 0 {
+			t.Fatalf("unit %s=%v", unit, v)
+		}
+	}
+}
