@@ -207,6 +207,14 @@ func (c *Client) ListRepositories(ctx context.Context, scope model.GitHubScope) 
 	if owner == "" {
 		return nil, errors.New("GitHub owner scope is empty")
 	}
+	// A GitHub App installation token sees its private repositories only
+	// through /installation/repositories; /users/{owner}/repos lists public
+	// repositories alone, which silently dropped private repos such as
+	// a private home-lab repository from the queued-job reconcile (home#4157). Other
+	// tokens (PATs) get 401/403/404 here and use the owner listing below.
+	if repos, ok, err := c.listInstallationRepositories(ctx, owner); ok {
+		return repos, err
+	}
 	path := "/orgs/" + url.PathEscape(owner) + "/repos"
 	var repos []string
 	for page := 1; page <= MaxRepositoryPages; page++ {
@@ -239,6 +247,38 @@ func (c *Client) ListRepositories(ctx context.Context, scope model.GitHubScope) 
 	}
 	log.Printf("github: repository listing for %s stopped at the %d-page cap; later repositories were skipped", owner, MaxRepositoryPages)
 	return repos, fmt.Errorf("list repositories for %s: %w (%d pages)", owner, ErrPageCapReached, MaxRepositoryPages)
+}
+
+// listInstallationRepositories lists the repositories of the token's GitHub
+// App installation that belong to owner. ok is false when the token is not an
+// installation token, so the caller falls back to the owner listing.
+func (c *Client) listInstallationRepositories(ctx context.Context, owner string) (repos []string, ok bool, err error) {
+	for page := 1; page <= MaxRepositoryPages; page++ {
+		var out struct {
+			Repositories []struct {
+				FullName string `json:"full_name"`
+			} `json:"repositories"`
+		}
+		err := c.do(ctx, http.MethodGet, fmt.Sprintf("/installation/repositories?per_page=100&page=%d", page), nil, &out, http.StatusOK)
+		if err != nil {
+			var status *StatusError
+			if page == 1 && errors.As(err, &status) && (status.Code == http.StatusUnauthorized || status.Code == http.StatusForbidden || status.Code == http.StatusNotFound) {
+				return nil, false, nil
+			}
+			return nil, true, fmt.Errorf("list installation repositories for %s: %w", owner, err)
+		}
+		for _, repo := range out.Repositories {
+			name := strings.TrimSpace(repo.FullName)
+			if repoOwner, _, found := strings.Cut(name, "/"); found && strings.EqualFold(repoOwner, owner) {
+				repos = append(repos, name)
+			}
+		}
+		if len(out.Repositories) < 100 {
+			return repos, true, nil
+		}
+	}
+	log.Printf("github: installation repository listing for %s stopped at the %d-page cap; later repositories were skipped", owner, MaxRepositoryPages)
+	return repos, true, fmt.Errorf("list installation repositories for %s: %w (%d pages)", owner, ErrPageCapReached, MaxRepositoryPages)
 }
 
 // MaxQueuedRunPages caps the queued-run pages read per repository per

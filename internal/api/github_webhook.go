@@ -77,7 +77,7 @@ type githubWebhookMetrics struct {
 }
 
 func newGitHubWebhookMetrics() *githubWebhookMetrics {
-	return &githubWebhookMetrics{
+	m := &githubWebhookMetrics{
 		received: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "uecb_github_webhook_events_received_total",
 			Help: "GitHub webhook deliveries received with a valid signature, by event type.",
@@ -111,6 +111,12 @@ func newGitHubWebhookMetrics() *githubWebhookMetrics {
 			Help: "Reconcile scan units skipped after reconcileRunMaxCutoffs consecutive deadline cutoffs, by unit (run: a run's job check; repo: a repository's queued-run listing).",
 		}, []string{"unit"}),
 	}
+	// Export the skip counter at 0 for both units so dashboards and alerts
+	// see the series before the first skip.
+	for _, unit := range []string{"run", "repo"} {
+		m.skipped.WithLabelValues(unit)
+	}
+	return m
 }
 
 func (m *githubWebhookMetrics) register() {

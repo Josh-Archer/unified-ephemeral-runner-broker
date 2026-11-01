@@ -107,6 +107,8 @@ func TestGetWorkflowRunReadsActors(t *testing.T) {
 func TestListsRepositoriesRunsAndJobsForQueuedReconciliation(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method + " " + r.URL.Path {
+		case "GET /installation/repositories":
+			w.WriteHeader(http.StatusNotFound)
 		case "GET /orgs/my-org/repos":
 			if r.URL.Query().Get("page") != "1" || r.URL.Query().Get("per_page") != "100" {
 				t.Errorf("repository pagination query = %s", r.URL.RawQuery)
@@ -156,6 +158,10 @@ func TestListsRepositoriesRunsAndJobsForQueuedReconciliation(t *testing.T) {
 func TestListRepositoriesSupportsPersonalOwnerScope(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
+		case "/installation/repositories":
+			// A personal access token is not an installation token.
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"message":"Resource not accessible by personal access token"}`))
 		case "/orgs/personal-owner/repos":
 			w.WriteHeader(http.StatusNotFound)
 			_, _ = w.Write([]byte(`{"message":"Not Found"}`))
@@ -275,6 +281,10 @@ func TestListWorkflowJobsShortRunIsNotTruncated(t *testing.T) {
 func fullPageServer(t *testing.T, key string, pages *int) *httptest.Server {
 	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/installation/repositories" && key != "repositories" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		*pages++
 		page := r.URL.Query().Get("page")
 		items := make([]string, 100)
@@ -308,5 +318,68 @@ func TestListRunnersCapsPages(t *testing.T) {
 	runners, err := client.ListRunners(context.Background(), model.GitHubScope{Type: model.GitHubScopeOrganization, Organization: "o"})
 	if !errors.Is(err, ErrPageCapReached) || pages != MaxRunnerPages || len(runners) != MaxRunnerPages*100 {
 		t.Fatalf("pages=%d runners=%d err=%v", pages, len(runners), err)
+	}
+}
+
+// home#4157: with a GitHub App installation token, /users/{owner}/repos lists
+// only public repositories, so a private repository was never
+// reconciled (the deep pass ended after the 44 public repos). The installation
+// listing includes private repositories.
+func TestListRepositoriesIncludesPrivateInstallationRepositories(t *testing.T) {
+	ownerListed := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/installation/repositories":
+			if r.URL.Query().Get("per_page") != "100" || r.URL.Query().Get("page") != "1" {
+				t.Errorf("installation query=%s", r.URL.RawQuery)
+			}
+			_, _ = w.Write([]byte(`{"total_count":3,"repositories":[
+				{"full_name":"Josh-Archer/public-tool","private":false},
+				{"full_name":"Josh-Archer/private-app","private":true},
+				{"full_name":"someone-else/shared","private":false}]}`))
+		case "/orgs/Josh-Archer/repos", "/users/Josh-Archer/repos":
+			ownerListed = true
+			// What GitHub returns to an installation token: public repos only.
+			_, _ = w.Write([]byte(`[{"full_name":"Josh-Archer/public-tool"}]`))
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	client := NewClient(func(context.Context) (string, error) { return "tok", nil }, nil).WithBaseURL(server.URL)
+	repos, err := client.ListRepositories(context.Background(), model.GitHubScope{Type: model.GitHubScopeOwner, Owner: "josh-archer"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repos) != 2 || repos[0] != "Josh-Archer/public-tool" || repos[1] != "Josh-Archer/private-app" {
+		t.Fatalf("repos=%v, want the public and the private Josh-Archer repository only", repos)
+	}
+	if ownerListed {
+		t.Fatal("owner listing used although the installation listing succeeded")
+	}
+}
+
+func TestListRepositoriesInstallationErrorIsNotMaskedByFallback(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/installation/repositories" {
+			t.Errorf("unexpected fallback to %s", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	client := NewClient(func(context.Context) (string, error) { return "tok", nil }, nil).WithBaseURL(server.URL)
+	if _, err := client.ListRepositories(context.Background(), model.GitHubScope{Type: model.GitHubScopeOwner, Owner: "o"}); err == nil {
+		t.Fatal("want the installation listing error")
+	}
+}
+
+func TestListInstallationRepositoriesCapsPages(t *testing.T) {
+	pages := 0
+	server := fullPageServer(t, "repositories", &pages)
+	client := NewClient(func(context.Context) (string, error) { return "tok", nil }, nil).WithBaseURL(server.URL)
+	repos, err := client.ListRepositories(context.Background(), model.GitHubScope{Type: model.GitHubScopeOrganization, Organization: "o"})
+	if !errors.Is(err, ErrPageCapReached) || pages != MaxRepositoryPages || len(repos) != MaxRepositoryPages*100 {
+		t.Fatalf("pages=%d repos=%d err=%v", pages, len(repos), err)
 	}
 }
