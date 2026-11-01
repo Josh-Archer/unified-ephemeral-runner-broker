@@ -373,10 +373,12 @@ func (s *Server) DrainGitHubWebhookInbox(ctx context.Context) (int, error) {
 	return s.githubWebhook.drainInbox(ctx)
 }
 
-// Reconcile bounds: only recent queued runs are scanned, and the scan stops
-// while the GitHub API budget is nearly spent.
+// Reconcile bounds: queued runs from the last week are scanned (the GitHub
+// client also caps pages per repository), and the scan stops while the GitHub
+// API budget is nearly spent. A 24h window silently stranded jobs whose
+// queued webhook was missed more than a day ago (home#4157).
 const (
-	reconcileRunWindow       = 24 * time.Hour
+	reconcileRunWindow       = 7 * 24 * time.Hour
 	reconcileRateLimitFloor  = 1000
 	reconcileRateLimitBackof = 5 * time.Minute
 )
