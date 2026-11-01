@@ -107,7 +107,7 @@ func newGitHubWebhookMetrics() *githubWebhookMetrics {
 			Help: "Queued-job reconcile cycles stopped at the per-cycle GitHub API call budget; the next cycle resumes at the next repository.",
 		}),
 		skipped: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "uecb_reconcile_run_skipped_total",
+			Name: "uecb_reconcile_unit_skipped_total",
 			Help: "Reconcile scan units skipped after reconcileRunMaxCutoffs consecutive deadline cutoffs, by unit (run: a run's job check; repo: a repository's queued-run listing).",
 		}, []string{"unit"}),
 	}
