@@ -297,7 +297,7 @@ func TestCapacityCountsLiveRunnerPods(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Capacity: %v", err)
 	}
-	if status.MaxRunners != 6 || status.ActiveRunners != 2 || status.PendingRunners != 1 || backend.FreeSlots(status) != 3 {
+	if status.MaxRunners != 6 || status.ActiveRunners != 1 || status.PendingRunners != 1 || backend.FreeSlots(status) != 4 {
 		t.Fatalf("status = %+v", status)
 	}
 	if !strings.Contains(api.calls[0].path, "labelSelector=") {
@@ -390,5 +390,59 @@ func TestFinishedRunnersListsExitedPods(t *testing.T) {
 	}
 	if failed, ok := byID["alloc-3"]; !ok || !failed {
 		t.Fatalf("alloc-3 should be a failed runner: %+v", runners)
+	}
+}
+
+const notReadyNode = `{"kind":"Node","metadata":{"name":"desktop-node"},"status":{"conditions":[{"type":"Ready","status":"Unknown"}]}}`
+const readyNode = `{"kind":"Node","metadata":{"name":"worker-node"},"status":{"conditions":[{"type":"Ready","status":"True"}]}}`
+
+// Regression: Terminating pods and pods on a NotReady node
+// must not count as used slots.
+func TestCapacityExcludesTerminatingAndNotReadyNodePods(t *testing.T) {
+	api := &fakeAPI{responses: map[string]response{
+		"GET /api/v1/nodes/desktop-node": {http.StatusOK, notReadyNode},
+		"GET /api/v1/nodes/worker-node":      {http.StatusOK, readyNode},
+		"GET /api/v1/nodes/gone":           {http.StatusNotFound, `{}`},
+		"GET /api/v1/namespaces/arc-runners/pods": {http.StatusOK, `{"items":[
+			{"spec":{"nodeName":"worker-node"},"status":{"phase":"Running"}},
+			{"spec":{"nodeName":"worker-node"},"status":{"phase":"Pending"}},
+			{"status":{"phase":"Pending"}},
+			{"metadata":{"deletionTimestamp":"2026-11-01T00:00:00Z"},"spec":{"nodeName":"worker-node"},"status":{"phase":"Running"}},
+			{"spec":{"nodeName":"desktop-node"},"status":{"phase":"Running"}},
+			{"spec":{"nodeName":"desktop-node"},"status":{"phase":"Pending"}},
+			{"spec":{"nodeName":"gone"},"status":{"phase":"Running"}}
+		]}`},
+	}}
+	status, err := New(newConfig(t), api, &fakeRegistrar{}).Capacity(context.Background())
+	if err != nil {
+		t.Fatalf("Capacity: %v", err)
+	}
+	if status.ActiveRunners != 1 || status.PendingRunners != 2 {
+		t.Fatalf("status = %+v", status)
+	}
+	nodeLookups := 0
+	for _, c := range api.calls {
+		if strings.HasPrefix(c.path, "/api/v1/nodes/desktop-node") {
+			nodeLookups++
+		}
+	}
+	if nodeLookups != 1 {
+		t.Fatalf("node readiness should be cached per pass, got %d lookups", nodeLookups)
+	}
+}
+
+func TestLiveRunnersExcludesPodsOnNotReadyNode(t *testing.T) {
+	api := &fakeAPI{responses: map[string]response{
+		"GET /api/v1/nodes/desktop-node": {http.StatusOK, notReadyNode},
+		"GET /api/v1/namespaces/arc-runners/pods": {http.StatusOK, `{"items":[
+ {"metadata":{"name":"uecb-runner-alloc-1","labels":{"uecb.josh-archer.dev/pool":"full","uecb.josh-archer.dev/allocation-id":"alloc-1"}},"spec":{"nodeName":"desktop-node"},"status":{"phase":"Running"}}
+]}`},
+	}}
+	runners, err := New(newConfig(t), api, &fakeRegistrar{}).LiveRunners(context.Background())
+	if err != nil {
+		t.Fatalf("LiveRunners: %v", err)
+	}
+	if len(runners) != 0 {
+		t.Fatalf("pod on NotReady node must not be live: %+v", runners)
 	}
 }

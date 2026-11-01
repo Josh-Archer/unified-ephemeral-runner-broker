@@ -284,6 +284,7 @@ func (b *Backend) Capacity(ctx context.Context) (result backend.CapacityStatus, 
 		}
 	}
 	selector := url.QueryEscape(fmt.Sprintf("%s=%s,%s=%s", labelManagedBy, labelManagedByVal, labelBackend, b.name))
+	nodes := b.newNodeReadiness()
 	for namespace := range namespaces {
 		code, body, err := b.api.Do(ctx, http.MethodGet, podsPath(namespace, "")+"?labelSelector="+selector, nil)
 		if err != nil {
@@ -300,6 +301,11 @@ func (b *Backend) Capacity(ctx context.Context) (result backend.CapacityStatus, 
 			return backend.CapacityStatus{}, fmt.Errorf("runner inventory did not contain items")
 		}
 		for _, item := range list.Items {
+			// Terminating pods and pods on a NotReady node no longer run a job;
+			// counting them would hold slots the cluster cannot use.
+			if item.Metadata.DeletionTimestamp != "" || !nodes.ready(ctx, item.Spec.NodeName) {
+				continue
+			}
 			switch item.Status.Phase {
 			case "Running":
 				status.ActiveRunners++
@@ -440,6 +446,9 @@ type podList struct {
 			Labels            map[string]string `json:"labels"`
 			Annotations       map[string]string `json:"annotations"`
 		} `json:"metadata"`
+		Spec struct {
+			NodeName string `json:"nodeName"`
+		} `json:"spec"`
 		Status struct {
 			Phase string `json:"phase"`
 		} `json:"status"`
@@ -537,6 +546,7 @@ func (b *Backend) LiveRunners(ctx context.Context) ([]backend.LiveRunner, error)
 	}
 	selector := url.QueryEscape(fmt.Sprintf("%s=%s,%s=%s", labelManagedBy, labelManagedByVal, labelBackend, b.name))
 	var result []backend.LiveRunner
+	nodes := b.newNodeReadiness()
 	for namespace := range namespaces {
 		code, body, err := b.api.Do(ctx, http.MethodGet, podsPath(namespace, "")+"?labelSelector="+selector, nil)
 		if err != nil {
@@ -550,7 +560,7 @@ func (b *Backend) LiveRunners(ctx context.Context) ([]backend.LiveRunner, error)
 			return nil, fmt.Errorf("decode runner pods in %s: %w", namespace, err)
 		}
 		for _, item := range list.Items {
-			if item.Status.Phase == "Succeeded" || item.Status.Phase == "Failed" || item.Metadata.DeletionTimestamp != "" {
+			if item.Status.Phase == "Succeeded" || item.Status.Phase == "Failed" || item.Metadata.DeletionTimestamp != "" || !nodes.ready(ctx, item.Spec.NodeName) {
 				continue
 			}
 			id := strings.TrimSpace(item.Metadata.Annotations[annotationAllocationID])
