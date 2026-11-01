@@ -393,23 +393,23 @@ func TestFinishedRunnersListsExitedPods(t *testing.T) {
 	}
 }
 
-const notReadyNode = `{"kind":"Node","metadata":{"name":"homelabdesktop"},"status":{"conditions":[{"type":"Ready","status":"Unknown"}]}}`
-const readyNode = `{"kind":"Node","metadata":{"name":"homelabai"},"status":{"conditions":[{"type":"Ready","status":"True"}]}}`
+const notReadyNode = `{"kind":"Node","metadata":{"name":"desktop-node"},"status":{"conditions":[{"type":"Ready","status":"Unknown"}]}}`
+const readyNode = `{"kind":"Node","metadata":{"name":"worker-node"},"status":{"conditions":[{"type":"Ready","status":"True"}]}}`
 
-// Issue Josh-Archer/home#4157: Terminating pods and pods on a NotReady node
+// Regression: Terminating pods and pods on a NotReady node
 // must not count as used slots.
 func TestCapacityExcludesTerminatingAndNotReadyNodePods(t *testing.T) {
 	api := &fakeAPI{responses: map[string]response{
-		"GET /api/v1/nodes/homelabdesktop": {http.StatusOK, notReadyNode},
-		"GET /api/v1/nodes/homelabai":      {http.StatusOK, readyNode},
+		"GET /api/v1/nodes/desktop-node": {http.StatusOK, notReadyNode},
+		"GET /api/v1/nodes/worker-node":      {http.StatusOK, readyNode},
 		"GET /api/v1/nodes/gone":           {http.StatusNotFound, `{}`},
 		"GET /api/v1/namespaces/arc-runners/pods": {http.StatusOK, `{"items":[
-			{"spec":{"nodeName":"homelabai"},"status":{"phase":"Running"}},
-			{"spec":{"nodeName":"homelabai"},"status":{"phase":"Pending"}},
+			{"spec":{"nodeName":"worker-node"},"status":{"phase":"Running"}},
+			{"spec":{"nodeName":"worker-node"},"status":{"phase":"Pending"}},
 			{"status":{"phase":"Pending"}},
-			{"metadata":{"deletionTimestamp":"2026-11-01T00:00:00Z"},"spec":{"nodeName":"homelabai"},"status":{"phase":"Running"}},
-			{"spec":{"nodeName":"homelabdesktop"},"status":{"phase":"Running"}},
-			{"spec":{"nodeName":"homelabdesktop"},"status":{"phase":"Pending"}},
+			{"metadata":{"deletionTimestamp":"2026-11-01T00:00:00Z"},"spec":{"nodeName":"worker-node"},"status":{"phase":"Running"}},
+			{"spec":{"nodeName":"desktop-node"},"status":{"phase":"Running"}},
+			{"spec":{"nodeName":"desktop-node"},"status":{"phase":"Pending"}},
 			{"spec":{"nodeName":"gone"},"status":{"phase":"Running"}}
 		]}`},
 	}}
@@ -422,7 +422,7 @@ func TestCapacityExcludesTerminatingAndNotReadyNodePods(t *testing.T) {
 	}
 	nodeLookups := 0
 	for _, c := range api.calls {
-		if strings.HasPrefix(c.path, "/api/v1/nodes/homelabdesktop") {
+		if strings.HasPrefix(c.path, "/api/v1/nodes/desktop-node") {
 			nodeLookups++
 		}
 	}
@@ -433,9 +433,9 @@ func TestCapacityExcludesTerminatingAndNotReadyNodePods(t *testing.T) {
 
 func TestLiveRunnersExcludesPodsOnNotReadyNode(t *testing.T) {
 	api := &fakeAPI{responses: map[string]response{
-		"GET /api/v1/nodes/homelabdesktop": {http.StatusOK, notReadyNode},
+		"GET /api/v1/nodes/desktop-node": {http.StatusOK, notReadyNode},
 		"GET /api/v1/namespaces/arc-runners/pods": {http.StatusOK, `{"items":[
- {"metadata":{"name":"uecb-runner-alloc-1","labels":{"uecb.josh-archer.dev/pool":"full","uecb.josh-archer.dev/allocation-id":"alloc-1"}},"spec":{"nodeName":"homelabdesktop"},"status":{"phase":"Running"}}
+ {"metadata":{"name":"uecb-runner-alloc-1","labels":{"uecb.josh-archer.dev/pool":"full","uecb.josh-archer.dev/allocation-id":"alloc-1"}},"spec":{"nodeName":"desktop-node"},"status":{"phase":"Running"}}
 ]}`},
 	}}
 	runners, err := New(newConfig(t), api, &fakeRegistrar{}).LiveRunners(context.Background())

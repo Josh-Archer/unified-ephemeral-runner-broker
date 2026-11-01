@@ -31,7 +31,7 @@ func (b podInventoryBackend) LiveRunners(context.Context) ([]backend.LiveRunner,
 	return append([]backend.LiveRunner(nil), (*b.live)...), b.err
 }
 
-// Issue Josh-Archer/home#4157: allocations whose pod is gone (deleted,
+// Regression: allocations whose pod is gone (deleted,
 // Terminating, or on a NotReady node, all absent from LiveRunners) must stop
 // holding maxRunners slots.
 func TestReconcileOrphanedAllocationsReleasesAllocationsWithoutPods(t *testing.T) {
