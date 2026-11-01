@@ -141,14 +141,14 @@ func TestListsRepositoriesRunsAndJobsForQueuedReconciliation(t *testing.T) {
 func TestListRepositoriesSupportsPersonalOwnerScope(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/orgs/Josh-Archer/repos":
+		case "/orgs/personal-owner/repos":
 			w.WriteHeader(http.StatusNotFound)
 			_, _ = w.Write([]byte(`{"message":"Not Found"}`))
-		case "/users/Josh-Archer/repos":
+		case "/users/personal-owner/repos":
 			if r.URL.Query().Get("type") != "owner" {
 				t.Errorf("user repository query=%s", r.URL.RawQuery)
 			}
-			_, _ = w.Write([]byte(`[{"full_name":"Josh-Archer/home"}]`))
+			_, _ = w.Write([]byte(`[{"full_name":"personal-owner/project"}]`))
 		default:
 			t.Errorf("unexpected repository-list path %s", r.URL.Path)
 			w.WriteHeader(http.StatusNotFound)
@@ -156,8 +156,8 @@ func TestListRepositoriesSupportsPersonalOwnerScope(t *testing.T) {
 	}))
 	defer server.Close()
 	client := NewClient(func(context.Context) (string, error) { return "tok", nil }, nil).WithBaseURL(server.URL)
-	repos, err := client.ListRepositories(context.Background(), model.GitHubScope{Type: model.GitHubScopeOwner, Owner: "Josh-Archer"})
-	if err != nil || len(repos) != 1 || repos[0] != "Josh-Archer/home" {
+	repos, err := client.ListRepositories(context.Background(), model.GitHubScope{Type: model.GitHubScopeOwner, Owner: "personal-owner"})
+	if err != nil || len(repos) != 1 || repos[0] != "personal-owner/project" {
 		t.Fatalf("repos=%v err=%v", repos, err)
 	}
 }
