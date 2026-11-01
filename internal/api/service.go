@@ -1341,6 +1341,8 @@ func (s *Service) noCapacityCaps(poolName model.PoolName) string {
 			limit = fmt.Sprintf("maxRunners(%d/%d)", active, cfg.MaxRunners)
 		case s.cfg.Broker.TierRouting.Enabled && s.tierMgr != nil && !s.pinnedBackendAllowedByTier(pool.Name, name):
 			limit = "pressure-auto-off"
+		case s.liveCapacityLimit(name, cfg, active) != "":
+			limit = s.liveCapacityLimit(name, cfg, active)
 		default:
 			limit = fmt.Sprintf("free(%d/%d)", active, cfg.MaxRunners)
 		}
@@ -3458,4 +3460,20 @@ func (s *Service) Register(ctx context.Context, id string) (model.AllocationStat
 		"runner_label":  strings.TrimSpace(status.RunnerLabel),
 	})
 	return status, true, nil
+}
+
+// liveCapacityLimit names the live-capacity reason a backend has no room, or
+// "" when live capacity is off or still admits work.
+func (s *Service) liveCapacityLimit(name model.BackendName, cfg model.BackendConfig, active int) string {
+	if !s.cfg.Broker.LiveCapacity.Enabled || s.capacityMgr == nil {
+		return ""
+	}
+	snap, ok := s.capacityMgr.Get(name)
+	if !ok {
+		return ""
+	}
+	if _, available, reason := capacity.EffectiveMaxRunners(cfg.MaxRunners, active, snap, true, s.cfg.Broker.LiveCapacity.FailureMode); !available {
+		return reason
+	}
+	return ""
 }

@@ -54,7 +54,7 @@ type GitHubWebhookOptions struct {
 	WorkflowRun  func(ctx context.Context, repository string, runID int64) (github.WorkflowRun, error)
 	WorkflowJobs interface {
 		ListRepositories(context.Context, model.GitHubScope) ([]string, error)
-		ListQueuedWorkflowRuns(context.Context, string) ([]int64, error)
+		ListQueuedWorkflowRuns(context.Context, string, time.Time) ([]int64, error)
 		ListWorkflowJobs(context.Context, string, int64) ([]github.WorkflowJob, error)
 	}
 	// RejectForks gives no runner to jobs whose run comes from another
@@ -373,9 +373,43 @@ func (s *Server) DrainGitHubWebhookInbox(ctx context.Context) (int, error) {
 	return s.githubWebhook.drainInbox(ctx)
 }
 
+// Reconcile bounds: only recent queued runs are scanned, and the scan stops
+// while the GitHub API budget is nearly spent.
+const (
+	reconcileRunWindow       = 24 * time.Hour
+	reconcileRateLimitFloor  = 1000
+	reconcileRateLimitBackof = 5 * time.Minute
+)
+
+// ErrReconcileRateLimited reports a reconcile pass skipped or cut short because
+// the GitHub rate-limit remaining dropped below reconcileRateLimitFloor.
+var ErrReconcileRateLimited = errors.New("queued job reconcile backing off: GitHub rate limit remaining below floor")
+
+type rateLimitReporter interface {
+	RateLimit() (remaining int, reset time.Time, ok bool)
+}
+
+// reconcileRateLimited reports whether the lister's last observed rate limit
+// is below the floor and its reset has not passed yet.
+func reconcileRateLimited(lister any, now time.Time) bool {
+	reporter, ok := lister.(rateLimitReporter)
+	if !ok {
+		return false
+	}
+	remaining, reset, known := reporter.RateLimit()
+	if !known || remaining >= reconcileRateLimitFloor {
+		return false
+	}
+	if reset.IsZero() {
+		reset = now.Add(reconcileRateLimitBackof)
+	}
+	return now.Before(reset)
+}
+
 // ReconcileQueuedGitHubJobs discovers jobs whose queued webhook was missed.
 // AllocateForWorkflowJob makes this safe to overlap with webhook delivery and
-// repeated polls; existing job ids are never allocated twice.
+// repeated polls; live job allocations are never duplicated, while a job whose
+// earlier allocation failed and is still queued is retried.
 func (s *Server) ReconcileQueuedGitHubJobs(ctx context.Context) (int, error) {
 	if s == nil || s.githubWebhook == nil || s.githubWebhook.opts.WorkflowJobs == nil {
 		return 0, nil
@@ -384,6 +418,13 @@ func (s *Server) ReconcileQueuedGitHubJobs(ctx context.Context) (int, error) {
 		ctx = context.Background()
 	}
 	h := s.githubWebhook
+	lister := h.opts.WorkflowJobs
+	now := h.service.now()
+	if reconcileRateLimited(lister, now) {
+		return 0, ErrReconcileRateLimited
+	}
+	since := now.Add(-reconcileRunWindow)
+	ctx = withRetryFailedWorkflowJob(ctx)
 	repos, err := h.opts.WorkflowJobs.ListRepositories(ctx, h.service.cfg.GitHub.Scope)
 	if err != nil {
 		return 0, err
@@ -391,11 +432,17 @@ func (s *Server) ReconcileQueuedGitHubJobs(ctx context.Context) (int, error) {
 	allocated := 0
 	var firstErr error
 	for _, repository := range repos {
+		if err := ctx.Err(); err != nil {
+			return allocated, err
+		}
+		if reconcileRateLimited(lister, h.service.now()) {
+			return allocated, ErrReconcileRateLimited
+		}
 		repository = strings.TrimSpace(repository)
 		if !h.service.AcceptsWebhookRepository(repository) {
 			continue
 		}
-		runs, err := h.opts.WorkflowJobs.ListQueuedWorkflowRuns(ctx, repository)
+		runs, err := h.opts.WorkflowJobs.ListQueuedWorkflowRuns(ctx, repository, since)
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err

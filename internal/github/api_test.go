@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 )
@@ -110,11 +111,14 @@ func TestListsRepositoriesRunsAndJobsForQueuedReconciliation(t *testing.T) {
 			}
 			_, _ = w.Write([]byte(`[{"full_name":"my-org/home"}]`))
 		case "GET /repos/my-org/home/actions/runs":
+			if got := r.URL.Query().Get("created"); got != ">=2026-11-01T00:00:00Z" {
+				t.Errorf("created filter = %q", got)
+			}
 			switch r.URL.Query().Get("status") {
 			case "queued":
+				w.Header().Set("X-RateLimit-Remaining", "4321")
+				w.Header().Set("X-RateLimit-Reset", "1793500000")
 				_, _ = w.Write([]byte(`{"workflow_runs":[{"id":12}]}`))
-			case "in_progress":
-				_, _ = w.Write([]byte(`{"workflow_runs":[{"id":12},{"id":13}]}`))
 			default:
 				t.Errorf("run status = %q", r.URL.Query().Get("status"))
 				w.WriteHeader(http.StatusBadRequest)
@@ -133,9 +137,13 @@ func TestListsRepositoriesRunsAndJobsForQueuedReconciliation(t *testing.T) {
 	if err != nil || len(repos) != 1 || repos[0] != "my-org/home" {
 		t.Fatalf("repos=%v err=%v", repos, err)
 	}
-	runs, err := client.ListQueuedWorkflowRuns(context.Background(), repos[0])
-	if err != nil || len(runs) != 2 || runs[0] != 12 || runs[1] != 13 {
-		t.Fatalf("runs=%v err=%v", runs, err)
+	since := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	runs, err := client.ListQueuedWorkflowRuns(context.Background(), repos[0], since)
+	if err != nil || len(runs) != 1 || runs[0] != 12 {
+		t.Fatalf("runs=%v err=%v (in_progress runs must not be scanned)", runs, err)
+	}
+	if remaining, reset, ok := client.RateLimit(); !ok || remaining != 4321 || reset.Unix() != 1793500000 {
+		t.Fatalf("rate limit = %d %v %v", remaining, reset, ok)
 	}
 	jobs, err := client.ListWorkflowJobs(context.Background(), repos[0], runs[0])
 	if err != nil || len(jobs) != 1 || jobs[0].ID != 99 || jobs[0].RunID != 12 || jobs[0].Status != "queued" || len(jobs[0].Labels) != 2 {

@@ -127,7 +127,10 @@ func main() {
 		cfg.Broker.API.OIDCPolicy,
 	)
 
-	ctx := context.Background()
+	// ctx is the server lifetime context; it is cancelled on SIGINT/SIGTERM
+	// so background loops such as the queued-job reconciler stop on shutdown.
+	ctx, cancelServer := context.WithCancel(context.Background())
+	defer cancelServer()
 	identity := leaderIdentity(cfg.Broker.HA.Identity)
 	leaseTTL := cfg.Broker.HA.LeaseTTL
 	if leaseTTL <= 0 {
@@ -212,7 +215,7 @@ func main() {
 					return
 				}
 			}
-			count, err := server.ReconcileQueuedGitHubJobs(context.Background())
+			count, err := server.ReconcileQueuedGitHubJobs(ctx)
 			if err != nil {
 				log.Printf("queued workflow reconciliation failed: %v", err)
 				return
@@ -262,6 +265,7 @@ func main() {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
+	cancelServer()
 
 	// Drain: stop starting new runners, then let in-flight requests (including
 	// provisions) finish within UECB_SHUTDOWN_TIMEOUT. Keep the pod's

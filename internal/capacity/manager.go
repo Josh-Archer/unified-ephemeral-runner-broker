@@ -95,6 +95,10 @@ func EffectiveMaxRunners(cfgMax, localActive int, snap Snapshot, hasSnapshot boo
 	if cfgMax <= 0 {
 		return 0, false, "disabled"
 	}
+	if hasSnapshot && snap.Status.NodeUnavailable != "" {
+		// A known-down node is never free capacity, even under pass-through.
+		return 0, false, "node-unavailable"
+	}
 	if localActive >= cfgMax {
 		return cfgMax, false, "local-full"
 	}

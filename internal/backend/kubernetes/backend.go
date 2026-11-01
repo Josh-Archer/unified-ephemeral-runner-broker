@@ -96,6 +96,13 @@ func (b *Backend) Provision(ctx context.Context, request model.AllocationRequest
 			}
 			return backend.ProvisionedRunner{}, backend.NewAllocationError(err, backend.ErrBackendCapacityExhausted, true)
 		}
+	} else if backendCfg.Kubernetes != nil {
+		if node := pinnedNodeName(backendCfg.Kubernetes.PodSpec); node != "" {
+			// A pod pinned to a NotReady node would sit Pending; fall back instead.
+			if err := b.checkNodeGuard(ctx, &model.KubernetesNodeGuardConfig{NodeName: node}); err != nil {
+				return backend.ProvisionedRunner{}, backend.NewAllocationError(fmt.Errorf("pinned node %s for %s: %w", node, b.name, err), backend.ErrBackendCapacityExhausted, true)
+			}
+		}
 	}
 
 	scope, err := b.cfg.GitHub.Scope.ForRepository(allocation.TargetRepository())
@@ -223,6 +230,7 @@ func (b *Backend) Capacity(ctx context.Context) (result backend.CapacityStatus, 
 	maxRunners := 0
 	sharedMax := 0
 	var guard *model.KubernetesNodeGuardConfig
+	pinnedNode := ""
 	namespaces := map[string]struct{}{}
 	for _, pool := range b.cfg.Pools {
 		cfg, ok := pool.Backends[b.name]
@@ -235,6 +243,9 @@ func (b *Backend) Capacity(ctx context.Context) (result backend.CapacityStatus, 
 		}
 		if cfg.Kubernetes != nil && cfg.Kubernetes.NodeGuard != nil {
 			guard = cfg.Kubernetes.NodeGuard
+		}
+		if cfg.Kubernetes != nil && pinnedNode == "" {
+			pinnedNode = pinnedNodeName(cfg.Kubernetes.PodSpec)
 		}
 		namespaces[b.namespace(cfg)] = struct{}{}
 	}
@@ -260,6 +271,15 @@ func (b *Backend) Capacity(ctx context.Context) (result backend.CapacityStatus, 
 			// Capacity collection may pass through errors. A known zero-free snapshot
 			// keeps this guarded target closed even under that policy.
 			status.ActiveRunners = maxRunners
+			status.NodeUnavailable = err.Error()
+			return status, nil
+		}
+	} else if pinnedNode != "" {
+		// Pods pinned to one node by nodeSelector/nodeName can only run there,
+		// so that node's readiness gates this backend like an explicit guard.
+		if err := b.checkNodeGuard(ctx, &model.KubernetesNodeGuardConfig{NodeName: pinnedNode}); err != nil {
+			status.ActiveRunners = maxRunners
+			status.NodeUnavailable = err.Error()
 			return status, nil
 		}
 	}
@@ -622,4 +642,22 @@ func (b *Backend) FinishedRunners(ctx context.Context) ([]backend.FinishedRunner
 		}
 	}
 	return result, nil
+}
+
+// pinnedNodeName returns the single node a pod spec is pinned to through
+// spec.nodeName or a kubernetes.io/hostname nodeSelector, or "" when the pod
+// may schedule onto more than one node.
+func pinnedNodeName(spec map[string]any) string {
+	if spec == nil {
+		return ""
+	}
+	if name, _ := spec["nodeName"].(string); strings.TrimSpace(name) != "" {
+		return strings.TrimSpace(name)
+	}
+	if selector, ok := spec["nodeSelector"].(map[string]any); ok {
+		if name, _ := selector["kubernetes.io/hostname"].(string); strings.TrimSpace(name) != "" {
+			return strings.TrimSpace(name)
+		}
+	}
+	return ""
 }
