@@ -60,6 +60,9 @@ func Validate(cfg model.BrokerConfig) error {
 	if err := validatePerRepositoryScope(cfg); err != nil {
 		return err
 	}
+	if err := validateManagedAzureVM(cfg); err != nil {
+		return err
+	}
 	if err := validateKubernetesBackends(cfg); err != nil {
 		return err
 	}
@@ -504,6 +507,11 @@ func ValidateReplicaSafety(cfg model.BrokerConfig, expectedReplicas int) error {
 	if expectedReplicas <= 1 {
 		return nil
 	}
+	for _, pool := range cfg.Pools {
+		if pool.Backends[model.BackendAzureVM].AzureVM != nil {
+			return fmt.Errorf("managed azure-vm requires exactly one broker replica")
+		}
+	}
 	storeType := normalizeStringDefault(cfg.Broker.StateStore.Type, "memory")
 	switch storeType {
 	case "postgres":
@@ -757,6 +765,61 @@ func validateWebhookLabels(cfg model.BrokerConfig) error {
 	gh := cfg.Broker.GitHubWebhook
 	if strings.TrimSpace(gh.Secret) == "" && strings.TrimSpace(gh.SecretRef) == "" {
 		return fmt.Errorf("broker.githubWebhook requires secret or secretRef when pools[].webhookLabels is set")
+	}
+	return nil
+}
+
+func validateManagedAzureVM(cfg model.BrokerConfig) error {
+	var managed *model.AzureVMBackendConfig
+	for _, pool := range cfg.Pools {
+		for name, target := range pool.Backends {
+			if target.AzureVM == nil {
+				continue
+			}
+			if name != model.BackendAzureVM {
+				return fmt.Errorf("azureVM configuration requires the azure-vm backend")
+			}
+			if HAEnabled(cfg.Broker) {
+				return fmt.Errorf("managed azure-vm requires a single broker without HA until distributed physical-runner claims are supported")
+			}
+			if cfg.GitHub.Auth.SecretRef == "" {
+				return fmt.Errorf("managed azure-vm requires github.auth.secretRef")
+			}
+			c := target.AzureVM
+			owner, repo, ok := strings.Cut(c.Repository, "/")
+			if !ok || owner == "" || repo == "" || strings.Contains(repo, "/") || len(c.RunnerNames) == 0 {
+				return fmt.Errorf("managed azure-vm requires a repository and runnerNames")
+			}
+			scope, err := cfg.GitHub.Scope.ForRepository(c.Repository)
+			if err != nil {
+				return err
+			}
+			if scope.Type != model.GitHubScopeRepository || !strings.EqualFold(scope.Owner+"/"+scope.Repository, c.Repository) {
+				return fmt.Errorf("managed azure-vm repository must match the broker repository scope")
+			}
+			seen := map[string]bool{}
+			for _, name := range c.RunnerNames {
+				key := strings.ToLower(strings.TrimSpace(name))
+				if key == "" || seen[key] {
+					return fmt.Errorf("managed azure-vm runnerNames must be nonempty and unique")
+				}
+				seen[key] = true
+			}
+			if target.WarmMin != 0 || target.WarmMax != 0 || target.MaxRunners > len(c.RunnerNames) || target.CrossPoolMaxRunners != len(c.RunnerNames) {
+				return fmt.Errorf("managed azure-vm requires no warm reservations and shared capacity equal to its named physical runners")
+			}
+			if managed != nil && !reflect.DeepEqual(managed, c) {
+				return fmt.Errorf("managed azure-vm target must be identical across pools")
+			}
+			managed = c
+		}
+	}
+	if managed != nil {
+		for _, pool := range cfg.Pools {
+			if target, ok := pool.Backends[model.BackendAzureVM]; ok && target.AzureVM == nil {
+				return fmt.Errorf("managed azure-vm cannot mix with legacy static-label pools")
+			}
+		}
 	}
 	return nil
 }

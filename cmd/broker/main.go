@@ -291,7 +291,7 @@ func buildRegistry(cfg model.BrokerConfig, secretReader runtime.SecretReader, ru
 		lambdabackend.New(cfg, secretReader),
 		cloudbackend.New(cfg, secretReader),
 		azurebackend.New(cfg, secretReader),
-		azurevmbackend.New(cfg),
+		azureVMBackend(cfg, registrar),
 		desktopBackend,
 		kubernetesbackend.New(cfg, runnerPods, registrar),
 		ec2backend.New(cfg, secretReader),
@@ -314,4 +314,9 @@ func wireDesktopActiveCounter(desktop *desktopbackend.Backend, s store.Store) {
 	if desktop != nil && s != nil {
 		desktop.WithActiveCounter(s)
 	}
+}
+
+func azureVMBackend(cfg model.BrokerConfig, registrar kubernetesbackend.Registrar) backend.Backend {
+	client, _ := registrar.(azurevmbackend.RunnerClient)
+	return azurevmbackend.New(cfg, client)
 }

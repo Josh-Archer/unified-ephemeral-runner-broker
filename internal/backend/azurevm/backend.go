@@ -13,8 +13,18 @@ type Backend struct {
 	cfg model.BrokerConfig
 }
 
-func New(cfg model.BrokerConfig) *Backend {
-	return &Backend{cfg: cfg}
+func New(cfg model.BrokerConfig, clients ...RunnerClient) backend.Backend {
+	b := &Backend{cfg: cfg}
+	for _, pool := range cfg.Pools {
+		if target, ok := pool.Backends[model.BackendAzureVM]; ok && target.AzureVM != nil {
+			m := &managedBackend{Backend: b}
+			if len(clients) > 0 {
+				m.client = clients[0]
+			}
+			return m
+		}
+	}
+	return b
 }
 
 func (b *Backend) Name() model.BackendName {

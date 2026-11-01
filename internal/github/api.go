@@ -271,3 +271,55 @@ func scopePath(scope model.GitHubScope) (string, error) {
 		return "", fmt.Errorf("github scope %q must be resolved to an organization or repository first", scope.Type)
 	}
 }
+
+// Runner is the public identity and scheduling state of a registered worker.
+type Runner struct {
+	ID     int64         `json:"id"`
+	Name   string        `json:"name"`
+	Status string        `json:"status"`
+	Busy   bool          `json:"busy"`
+	Labels []RunnerLabel `json:"labels"`
+}
+type RunnerLabel struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
+}
+
+func (c *Client) ListRunners(ctx context.Context, scope model.GitHubScope) ([]Runner, error) {
+	base, err := scopePath(scope)
+	if err != nil {
+		return nil, err
+	}
+	var result []Runner
+	for page := 1; ; page++ {
+		var out struct {
+			Runners []Runner `json:"runners"`
+		}
+		if err := c.do(ctx, http.MethodGet, fmt.Sprintf("%s/actions/runners?per_page=100&page=%d", base, page), nil, &out, http.StatusOK); err != nil {
+			return nil, err
+		}
+		result = append(result, out.Runners...)
+		if len(out.Runners) < 100 {
+			return result, nil
+		}
+	}
+}
+func (c *Client) AddRunnerLabels(ctx context.Context, scope model.GitHubScope, id int64, labels []string) error {
+	base, err := scopePath(scope)
+	if err != nil {
+		return err
+	}
+	return c.do(ctx, http.MethodPost, fmt.Sprintf("%s/actions/runners/%d/labels", base, id), map[string]any{"labels": labels}, nil, http.StatusOK)
+}
+func (c *Client) RemoveRunnerLabel(ctx context.Context, scope model.GitHubScope, id int64, label string) error {
+	base, err := scopePath(scope)
+	if err != nil {
+		return err
+	}
+	err = c.do(ctx, http.MethodDelete, fmt.Sprintf("%s/actions/runners/%d/labels/%s", base, id, url.PathEscape(label)), nil, nil, http.StatusOK)
+	var status *StatusError
+	if errors.As(err, &status) && status.Code == http.StatusNotFound {
+		return nil
+	}
+	return err
+}
