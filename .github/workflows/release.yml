@@ -11,11 +11,6 @@ on:
         required: false
         type: string
         default: ''
-      push_artifacts:
-        description: 'Push container images and Helm chart to GHCR'
-        required: true
-        type: boolean
-        default: true
       create_pin_pr:
         description: 'Open GitOps pin PR(s) in downstream consumer repositories'
         required: true
@@ -94,8 +89,7 @@ jobs:
             echo "| Version | \`${version}\` |"
             echo "| Version (plain) | \`${version_no_v}\` |"
             echo "| Commit SHA | \`${full_sha}\` (\`${short_sha}\`) |"
-            echo "| Push Artifacts | \`${{ inputs.push_artifacts != false }}\` |"
-            echo "| Create Pin PR | \`${{ inputs.create_pin_pr != false }}\` |"
+            echo "| Create Pin PR | \`${{ github.event_name != 'workflow_dispatch' || inputs.create_pin_pr }}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
   publish-images:
@@ -135,7 +129,6 @@ jobs:
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
-        if: ${{ inputs.push_artifacts != false }}
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -148,10 +141,10 @@ jobs:
           context: .
           file: ${{ matrix.image.dockerfile }}
           platforms: ${{ matrix.image.platform }}
-          push: ${{ inputs.push_artifacts != false }}
+          push: true
           provenance: false
           sbom: false
-          outputs: type=image,push=${{ inputs.push_artifacts != false }},oci-mediatypes=false
+          outputs: type=image,push=true,oci-mediatypes=false
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ matrix.image.package }}:${{ needs.validate.outputs.version }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ matrix.image.package }}:${{ needs.validate.outputs.version_no_v }}
@@ -159,7 +152,6 @@ jobs:
 
       - name: Capture image identity
         id: image
-        if: ${{ inputs.push_artifacts != false }}
         env:
           PACKAGE_NAME: ${{ matrix.image.package }}
           VERSION_TAG: ${{ needs.validate.outputs.version }}
@@ -177,7 +169,7 @@ jobs:
           echo "ref=${name}@${digest}" >> "${GITHUB_OUTPUT}"
           echo "tag_ref=${name}:${VERSION_TAG}" >> "${GITHUB_OUTPUT}"
       - name: Verify Lambda-compatible image manifest
-        if: ${{ inputs.push_artifacts != false && matrix.image.name == 'lambda' }}
+        if: ${{ matrix.image.name == 'lambda' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -193,7 +185,6 @@ jobs:
 
       - name: Generate SPDX SBOM
         id: sbom
-        if: ${{ inputs.push_artifacts != false }}
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           image: ${{ steps.image.outputs.ref }}
@@ -204,7 +195,6 @@ jobs:
           syft-version: ${{ env.SYFT_VERSION }}
 
       - name: Compact SBOM for attestation size limit
-        if: ${{ inputs.push_artifacts != false }}
         shell: bash
         env:
           SBOM_PATH: ${{ runner.temp }}/${{ matrix.image.name }}.spdx.json
@@ -236,7 +226,6 @@ jobs:
           PY
 
       - name: Attest build provenance
-        if: ${{ inputs.push_artifacts != false }}
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
           subject-name: ${{ steps.image.outputs.name }}
@@ -245,7 +234,6 @@ jobs:
           create-storage-record: false
 
       - name: Attest SBOM
-        if: ${{ inputs.push_artifacts != false }}
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
           subject-name: ${{ steps.image.outputs.name }}
@@ -253,6 +241,38 @@ jobs:
           sbom-path: ${{ runner.temp }}/${{ matrix.image.name }}.spdx.json
           push-to-registry: true
           create-storage-record: false
+
+  verify-images:
+    name: Verify published container image tags
+    needs: [validate, publish-images]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Inspect every published image tag
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          VERSION_NO_V: ${{ needs.validate.outputs.version_no_v }}
+          SHORT_SHA: ${{ needs.validate.outputs.short_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          images=(broker launcher lambda cloud-run azure-functions)
+          tags=("${VERSION}" "${VERSION_NO_V}" "sha-${SHORT_SHA}")
+          for image in "${images[@]}"; do
+            for tag in "${tags[@]}"; do
+              ref="${REGISTRY}/${IMAGE_OWNER}/unified-ephemeral-runner-broker/${image}:${tag}"
+              echo "Verifying ${ref}"
+              docker buildx imagetools inspect "${ref}" >/dev/null
+            done
+          done
 
   publish-chart:
     name: Package & publish Helm chart
@@ -278,12 +298,10 @@ jobs:
             --app-version "${VERSION_NO_V}" \
             --destination dist/
       - name: Log in to GHCR for Helm
-        if: ${{ inputs.push_artifacts != false }}
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io --username "${{ github.actor }}" --password-stdin
 
       - name: Push Helm chart OCI artifact
-        if: ${{ inputs.push_artifacts != false }}
         env:
           VERSION_NO_V: ${{ needs.validate.outputs.version_no_v }}
         shell: bash
@@ -293,8 +311,8 @@ jobs:
           helm push "${pkg}" "oci://${REGISTRY}/${IMAGE_OWNER}/charts"
   promote-consumers:
     name: Open GitOps consumer pin PRs
-    needs: [validate, publish-chart]
-    if: ${{ inputs.create_pin_pr != false && inputs.push_artifacts != false }}
+    needs: [validate, publish-chart, verify-images]
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.create_pin_pr }}
     runs-on: ubuntu-latest
     environment: release
     steps:
@@ -315,7 +333,6 @@ jobs:
   verify-drift:
     name: Verify release drift
     needs: [validate, publish-chart]
-    if: ${{ inputs.push_artifacts != false }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
