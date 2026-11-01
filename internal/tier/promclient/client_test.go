@@ -74,3 +74,25 @@ func TestQueryInstantAppliesTimeout(t *testing.T) {
 		t.Fatal("expected timeout error")
 	}
 }
+
+func TestQueryInstantTakesMaxOfMultiSeriesVector(t *testing.T) {
+	// `a / b or vector(0)` returns the labeled ratio plus a label-less 0 (home#4157).
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"status":"success","data":{"resultType":"vector","result":[{"metric":{"cloud":"azure"},"value":[1,"0.42"]},{"metric":{},"value":[1,"0"]},{"metric":{"x":"y"},"value":[1,"NaN"]}]}}`)
+	}))
+	defer server.Close()
+	value, err := (&Client{BaseURL: server.URL}).QueryInstant(context.Background(), "q")
+	if err != nil || value != 0.42 {
+		t.Fatalf("got %v, %v; want 0.42", value, err)
+	}
+}
+
+func TestQueryInstantRejectsEmptyVector(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"status":"success","data":{"resultType":"vector","result":[]}}`)
+	}))
+	defer server.Close()
+	if _, err := (&Client{BaseURL: server.URL}).QueryInstant(context.Background(), "q"); err == nil {
+		t.Fatal("expected error for empty vector")
+	}
+}
