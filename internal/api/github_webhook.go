@@ -71,6 +71,8 @@ type githubWebhookMetrics struct {
 	ignored  *prometheus.CounterVec
 	enqueued *prometheus.CounterVec
 	expired  prometheus.Counter
+	pageCap  *prometheus.CounterVec
+	budget   prometheus.Counter
 }
 
 func newGitHubWebhookMetrics() *githubWebhookMetrics {
@@ -95,11 +97,19 @@ func newGitHubWebhookMetrics() *githubWebhookMetrics {
 			Name: "uecb_github_webhook_inbox_expired_total",
 			Help: "Webhook inbox deliveries discarded after exceeding the maximum processing age.",
 		}),
+		pageCap: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "uecb_github_reconcile_page_cap_total",
+			Help: "Queued-job reconcile listings truncated at their page cap, by listing (runs or jobs); the oldest entries were skipped.",
+		}, []string{"listing"}),
+		budget: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "uecb_github_reconcile_budget_exhausted_total",
+			Help: "Queued-job reconcile cycles stopped at the per-cycle GitHub API call budget; the next cycle resumes at the next repository.",
+		}),
 	}
 }
 
 func (m *githubWebhookMetrics) register() {
-	for _, c := range []prometheus.Collector{m.received, m.matched, m.ignored, m.enqueued, m.expired} {
+	for _, c := range []prometheus.Collector{m.received, m.matched, m.ignored, m.enqueued, m.expired, m.pageCap, m.budget} {
 		if err := prometheus.Register(c); err != nil {
 			if _, ok := err.(prometheus.AlreadyRegisteredError); !ok {
 				panic(err)
@@ -157,6 +167,16 @@ type githubWebhookHandler struct {
 	service    *Service
 	metrics    *githubWebhookMetrics
 	deliveries *deliveryTracker
+	reconcile  reconcileState
+}
+
+// reconcileState carries the round-robin cursor and deep-scan schedule across
+// reconcile cycles.
+type reconcileState struct {
+	mu       sync.Mutex
+	cursor   int       // next repository index to scan
+	lastDeep time.Time // when the last full deep pass completed
+	deepOpen bool      // a deep pass started and has not covered every repo yet
 }
 
 // SetGitHubWebhook enables POST /webhooks/github. Without it the route
@@ -373,12 +393,18 @@ func (s *Server) DrainGitHubWebhookInbox(ctx context.Context) (int, error) {
 	return s.githubWebhook.drainInbox(ctx)
 }
 
-// Reconcile bounds: queued runs from the last week are scanned (the GitHub
-// client also caps pages per repository), and the scan stops while the GitHub
-// API budget is nearly spent. A 24h window silently stranded jobs whose
-// queued webhook was missed more than a day ago (home#4157).
+// Reconcile bounds. Every cycle scans queued runs from the last
+// reconcileRecentWindow; a deep pass over reconcileRunWindow runs at most every
+// reconcileDeepInterval (a 24h-only window silently stranded jobs whose queued
+// webhook was missed more than a day ago, home#4157). Each cycle spends at most
+// reconcileCallBudget GitHub API calls and resumes round-robin at the next
+// repository on the following cycle. The GitHub client also caps pages per
+// listing, and the scan stops while the rate limit is nearly spent.
 const (
 	reconcileRunWindow       = 7 * 24 * time.Hour
+	reconcileRecentWindow    = time.Hour
+	reconcileDeepInterval    = 10 * time.Minute
+	reconcileCallBudget      = 100
 	reconcileRateLimitFloor  = 1000
 	reconcileRateLimitBackof = 5 * time.Minute
 )
@@ -386,6 +412,12 @@ const (
 // ErrReconcileRateLimited reports a reconcile pass skipped or cut short because
 // the GitHub rate-limit remaining dropped below reconcileRateLimitFloor.
 var ErrReconcileRateLimited = errors.New("queued job reconcile backing off: GitHub rate limit remaining below floor")
+
+// apiCallCounter is implemented by github.Client; listers without it are
+// charged one call per list request.
+type apiCallCounter interface {
+	APICalls() int64
+}
 
 type rateLimitReporter interface {
 	RateLimit() (remaining int, reset time.Time, ok bool)
@@ -425,39 +457,91 @@ func (s *Server) ReconcileQueuedGitHubJobs(ctx context.Context) (int, error) {
 	if reconcileRateLimited(lister, now) {
 		return 0, ErrReconcileRateLimited
 	}
-	since := now.Add(-reconcileRunWindow)
+	h.reconcile.mu.Lock()
+	defer h.reconcile.mu.Unlock()
+	state := &h.reconcile
+
+	counter, counted := lister.(apiCallCounter)
+	var startCalls, fallbackCalls int64
+	if counted {
+		startCalls = counter.APICalls()
+	}
+	charge := func() { fallbackCalls++ }
+	spent := func() int64 {
+		if counted {
+			return counter.APICalls() - startCalls
+		}
+		return fallbackCalls
+	}
+
+	deep := state.deepOpen || state.lastDeep.IsZero() || now.Sub(state.lastDeep) >= reconcileDeepInterval
+	window := reconcileRecentWindow
+	if deep {
+		window = reconcileRunWindow
+		state.deepOpen = true
+	}
+	since := now.Add(-window)
 	ctx = withRetryFailedWorkflowJob(ctx)
+	charge()
 	repos, err := h.opts.WorkflowJobs.ListRepositories(ctx, h.service.cfg.GitHub.Scope)
 	if err != nil {
 		return 0, err
 	}
+	if len(repos) == 0 {
+		state.cursor = 0
+		if deep {
+			state.deepOpen, state.lastDeep = false, now
+		}
+		return 0, nil
+	}
+	start := state.cursor % len(repos)
 	allocated := 0
 	var firstErr error
-	for _, repository := range repos {
+	keepErr := func(err error) {
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	for i := 0; i < len(repos); i++ {
+		idx := (start + i) % len(repos)
 		if err := ctx.Err(); err != nil {
+			state.cursor = idx
 			return allocated, err
 		}
 		if reconcileRateLimited(lister, h.service.now()) {
+			state.cursor = idx
 			return allocated, ErrReconcileRateLimited
 		}
-		repository = strings.TrimSpace(repository)
+		if spent() >= reconcileCallBudget {
+			state.cursor = idx
+			h.metrics.budget.Inc()
+			log.Printf("github reconcile: API call budget %d spent; resuming at %s next cycle", reconcileCallBudget, strings.TrimSpace(repos[idx]))
+			return allocated, firstErr
+		}
+		repository := strings.TrimSpace(repos[idx])
 		if !h.service.AcceptsWebhookRepository(repository) {
 			continue
 		}
+		charge()
 		runs, err := h.opts.WorkflowJobs.ListQueuedWorkflowRuns(ctx, repository, since)
 		if err != nil {
-			if firstErr == nil {
-				firstErr = err
+			if !errors.Is(err, github.ErrPageCapReached) {
+				keepErr(err)
+				continue
 			}
-			continue
+			h.metrics.pageCap.WithLabelValues("runs").Inc()
+			log.Printf("github reconcile WARNING: %s hit the queued-run page cap (%d pages); its oldest queued runs in the %s window were skipped this cycle", repository, github.MaxQueuedRunPages, window)
 		}
 		for _, runID := range runs {
+			charge()
 			jobs, err := h.opts.WorkflowJobs.ListWorkflowJobs(ctx, repository, runID)
 			if err != nil {
-				if firstErr == nil {
-					firstErr = err
+				if !errors.Is(err, github.ErrPageCapReached) {
+					keepErr(err)
+					continue
 				}
-				continue
+				h.metrics.pageCap.WithLabelValues("jobs").Inc()
+				log.Printf("github reconcile WARNING: %s run %d hit the job page cap (%d pages); its remaining jobs were skipped this cycle", repository, runID, github.MaxWorkflowJobPages)
 			}
 			for _, job := range jobs {
 				if job.ID <= 0 || job.Status != "queued" {
@@ -476,9 +560,7 @@ func (s *Server) ReconcileQueuedGitHubJobs(ctx context.Context) (int, error) {
 				payload.Repository.FullName = repository
 				result, _, err := h.process(ctx, payload)
 				if err != nil {
-					if firstErr == nil {
-						firstErr = fmt.Errorf("reconcile %s job %d: %w", repository, job.ID, err)
-					}
+					keepErr(fmt.Errorf("reconcile %s job %d: %w", repository, job.ID, err))
 					continue
 				}
 				if result["status"] == "allocated" {
@@ -486,6 +568,11 @@ func (s *Server) ReconcileQueuedGitHubJobs(ctx context.Context) (int, error) {
 				}
 			}
 		}
+	}
+	// Every repository was visited: the next cycle starts over.
+	state.cursor = 0
+	if deep {
+		state.deepOpen, state.lastDeep = false, now
 	}
 	return allocated, firstErr
 }

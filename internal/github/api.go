@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
@@ -67,6 +68,8 @@ type Client struct {
 	rateRemaining int
 	rateReset     time.Time
 	rateKnown     bool
+
+	apiCalls atomic.Int64
 }
 
 // RateLimit reports the last X-RateLimit-Remaining/Reset seen on a response.
@@ -239,6 +242,21 @@ func (c *Client) ListRepositories(ctx context.Context, scope model.GitHubScope) 
 // reconcile pass so a deep backlog cannot exhaust the API budget.
 const MaxQueuedRunPages = 10
 
+// MaxWorkflowJobPages caps the job pages read for one workflow run.
+const MaxWorkflowJobPages = 10
+
+// ErrPageCapReached is wrapped by list calls that stopped at their page cap.
+// The results returned alongside it are valid but incomplete.
+var ErrPageCapReached = errors.New("page cap reached; results truncated")
+
+// APICalls reports how many GitHub API requests this client has issued.
+func (c *Client) APICalls() int64 {
+	if c == nil {
+		return 0
+	}
+	return c.apiCalls.Load()
+}
+
 // ListQueuedWorkflowRuns returns ids of queued workflow runs in one repository
 // created at or after since (zero means no bound). In-progress runs are not
 // scanned: their queued jobs are rare and scanning them dominates API usage.
@@ -248,6 +266,7 @@ func (c *Client) ListQueuedWorkflowRuns(ctx context.Context, repository string, 
 		return nil, err
 	}
 	var ids []int64
+	truncated := false
 	seen := map[int64]struct{}{}
 	created := ""
 	if !since.IsZero() {
@@ -277,12 +296,20 @@ func (c *Client) ListQueuedWorkflowRuns(ctx context.Context, repository string, 
 			if len(out.WorkflowRuns) < 100 {
 				break
 			}
+			if page == MaxQueuedRunPages {
+				truncated = true
+			}
 		}
+	}
+	if truncated {
+		return ids, fmt.Errorf("list queued workflow runs for %s: %w (%d pages)", repository, ErrPageCapReached, MaxQueuedRunPages)
 	}
 	return ids, nil
 }
 
-// ListWorkflowJobs returns all jobs for one workflow run, following pages.
+// ListWorkflowJobs returns the jobs for one workflow run, following at most
+// MaxWorkflowJobPages pages; a longer run returns the jobs read so far with an
+// error wrapping ErrPageCapReached.
 func (c *Client) ListWorkflowJobs(ctx context.Context, repository string, runID int64) ([]WorkflowJob, error) {
 	base, err := repositoryPath(repository)
 	if err != nil {
@@ -292,7 +319,7 @@ func (c *Client) ListWorkflowJobs(ctx context.Context, repository string, runID 
 		return nil, errors.New("workflow run id must be positive")
 	}
 	var jobs []WorkflowJob
-	for page := 1; ; page++ {
+	for page := 1; page <= MaxWorkflowJobPages; page++ {
 		var out struct {
 			Jobs []WorkflowJob `json:"jobs"`
 		}
@@ -310,6 +337,7 @@ func (c *Client) ListWorkflowJobs(ctx context.Context, repository string, runID 
 			return jobs, nil
 		}
 	}
+	return jobs, fmt.Errorf("list workflow jobs for %s run %d: %w (%d pages)", repository, runID, ErrPageCapReached, MaxWorkflowJobPages)
 }
 
 func repositoryPath(repository string) (string, error) {
@@ -396,6 +424,7 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any, wan
 	if err != nil {
 		return err
 	}
+	c.apiCalls.Add(1)
 	var reader io.Reader
 	if body != nil {
 		encoded, err := json.Marshal(body)
