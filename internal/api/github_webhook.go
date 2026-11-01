@@ -169,12 +169,13 @@ func (s *Server) SetGitHubWebhook(opts GitHubWebhookOptions) {
 type workflowJobPayload struct {
 	Action      string `json:"action"`
 	WorkflowJob struct {
-		ID         int64    `json:"id"`
-		RunID      int64    `json:"run_id"`
-		RunnerName string   `json:"runner_name"`
-		RunnerID   int64    `json:"runner_id"`
-		Labels     []string `json:"labels"`
-		Conclusion string   `json:"conclusion"`
+		ID         int64     `json:"id"`
+		RunID      int64     `json:"run_id"`
+		RunnerName string    `json:"runner_name"`
+		RunnerID   int64     `json:"runner_id"`
+		StartedAt  time.Time `json:"started_at"`
+		Labels     []string  `json:"labels"`
+		Conclusion string    `json:"conclusion"`
 	} `json:"workflow_job"`
 	Repository struct {
 		FullName string `json:"full_name"`
@@ -378,7 +379,7 @@ func (h *githubWebhookHandler) process(ctx context.Context, payload workflowJobP
 	if !h.service.AcceptsWebhookRepository(repository) {
 		return ignored("foreign_repository")
 	}
-	runner := WorkflowJobRunner{Repository: repository, Name: payload.WorkflowJob.RunnerName, ID: payload.WorkflowJob.RunnerID}
+	runner := WorkflowJobRunner{Repository: repository, Name: payload.WorkflowJob.RunnerName, ID: payload.WorkflowJob.RunnerID, StartedAt: payload.WorkflowJob.StartedAt}
 	switch payload.Action {
 	case "queued":
 		pool, ok := h.service.MatchWebhookPoolForRepository(payload.WorkflowJob.Labels, repository)

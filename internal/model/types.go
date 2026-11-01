@@ -384,6 +384,7 @@ type BackendConfig struct {
 	MaxJobDuration time.Duration            `yaml:"maxJobDuration,omitempty" json:"maxJobDuration,omitempty"`
 	Capabilities   []string                 `yaml:"capabilities,omitempty" json:"capabilities,omitempty"`
 	RunnerLabel    string                   `yaml:"runnerLabel,omitempty" json:"runnerLabel,omitempty"`
+	AzureVM        *AzureVMBackendConfig    `yaml:"azureVM,omitempty" json:"azureVM,omitempty"`
 	Template       string                   `yaml:"template,omitempty" json:"template,omitempty"`
 	SecretRef      string                   `yaml:"secretRef,omitempty" json:"secretRef,omitempty"`
 	CircuitBreaker CircuitBreakerConfig     `yaml:"circuitBreaker,omitempty" json:"circuitBreaker,omitempty"`
@@ -392,6 +393,12 @@ type BackendConfig struct {
 	TierRules      []TierRuleConfig         `yaml:"tierRules,omitempty" json:"tierRules,omitempty"`
 	Desktop        *DesktopConfig           `yaml:"desktop,omitempty" json:"desktop,omitempty"`
 	Kubernetes     *KubernetesBackendConfig `yaml:"kubernetes,omitempty" json:"kubernetes,omitempty"`
+}
+
+// AzureVMBackendConfig opts persistent repository runners into managed leases.
+type AzureVMBackendConfig struct {
+	Repository  string   `yaml:"repository" json:"repository"`
+	RunnerNames []string `yaml:"runnerNames" json:"runnerNames"`
 }
 
 // WarmScheduleConfig controls when warm pool targets apply. With no windows,

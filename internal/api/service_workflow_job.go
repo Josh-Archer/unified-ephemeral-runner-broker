@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
@@ -169,6 +170,7 @@ type WorkflowJobRunner struct {
 	Repository string
 	Name       string
 	ID         int64
+	StartedAt  time.Time
 }
 
 const (
@@ -210,33 +212,51 @@ func copyWorkflowMetadata(status *model.AllocationStatus) {
 // Shared runs-on labels alone are never evidence of runner identity.
 func (s *Service) executionAllocation(jobID int64, runner WorkflowJobRunner) (model.AllocationStatus, bool) {
 	hasIdentity := runner.Name != "" || runner.ID > 0
+	var chosen model.AllocationStatus
+	var chosenLease time.Time
+	found := false
 	for _, status := range s.store.List() {
 		if !s.allocationServesRepository(status, runner.Repository) {
 			continue
 		}
-		if hasIdentity {
-			if runner.Name != "" && !strings.EqualFold(strings.TrimSpace(status.RunnerLabel), strings.TrimSpace(runner.Name)) {
+		if !hasIdentity {
+			if executionJob(status) == jobID {
+				return status, true
+			}
+			continue
+		}
+		if runner.Name != "" && !strings.EqualFold(strings.TrimSpace(status.RunnerLabel), strings.TrimSpace(runner.Name)) {
+			continue
+		}
+		id := status.Metadata["github_runner_id"]
+		if runner.ID > 0 && id != "" && id != strconv.FormatInt(runner.ID, 10) {
+			continue
+		}
+		if runner.Name == "" && id == "" {
+			continue
+		}
+		bound := executionJob(status)
+		if bound != 0 && bound != jobID {
+			continue
+		}
+		var lease time.Time
+		if raw := status.Metadata["runner_lease_started_at"]; raw != "" {
+			var err error
+			lease, err = time.Parse(time.RFC3339, raw)
+			// Persistent workers reuse names. Require signed execution time and id;
+			// delayed events from an older lease cannot bind to a newer lease.
+			if err != nil || runner.ID <= 0 || id == "" || runner.StartedAt.IsZero() || runner.StartedAt.Before(lease) {
 				continue
 			}
-			if runner.ID > 0 {
-				id := status.Metadata["github_runner_id"]
-				if id != "" && id != strconv.FormatInt(runner.ID, 10) {
-					continue
-				}
-				if runner.Name == "" && id == "" {
-					continue
-				}
-			}
-			if bound := executionJob(status); bound != 0 && bound != jobID {
-				continue
-			}
+		}
+		if bound == jobID {
 			return status, true
 		}
-		if executionJob(status) == jobID {
-			return status, true
+		if !found || lease.After(chosenLease) || (lease.Equal(chosenLease) && isTerminalAllocationState(chosen.State) && !isTerminalAllocationState(status.State)) {
+			chosen, chosenLease, found = status, lease, true
 		}
 	}
-	return model.AllocationStatus{}, false
+	return chosen, found
 }
 
 func (s *Service) bindWorkflowExecution(status model.AllocationStatus, jobID int64) (model.AllocationStatus, error) {
@@ -398,6 +418,19 @@ func (s *Service) ClaimWorkflowJob(ctx context.Context, jobID int64, runnerName 
 	}
 	status, found = s.executionAllocation(jobID, runner)
 	if !found {
+		// Persistent workers can finish a job and accept another before the
+		// prior completion delivery removes routing labels. The signed event
+		// proves this demand is already served; remove only Pending demand,
+		// never a reservation or another allocation's runner resource.
+		if runner.ID > 0 && runner.Name != "" && s.managedPersistentRunner(runner.Name, runner.Repository) {
+			origin, ok := s.findByWorkflowJobID(jobID)
+			if ok && origin.State == model.StatePending && s.allocationServesRepository(origin, runner.Repository) {
+				updated, canceled := s.cancelPendingWorkflowDemand(origin)
+				if canceled {
+					return updated, true, nil
+				}
+			}
+		}
 		// ARC has no provider resource to delete and retains its static-label
 		// accounting. Never apply this fallback to broker-created runner pods.
 		origin, ok := s.findByWorkflowJobID(jobID)
@@ -437,4 +470,19 @@ func (s *Service) ClaimWorkflowJob(ctx context.Context, jobID int64, runnerName 
 		}
 	}
 	return claimed, true, nil
+}
+
+func (s *Service) managedPersistentRunner(name, repository string) bool {
+	for _, pool := range s.cfg.Pools {
+		target := pool.Backends[model.BackendAzureVM].AzureVM
+		if target == nil || !strings.EqualFold(target.Repository, repository) {
+			continue
+		}
+		for _, allowed := range target.RunnerNames {
+			if strings.EqualFold(allowed, name) {
+				return true
+			}
+		}
+	}
+	return false
 }

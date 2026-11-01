@@ -316,3 +316,53 @@ func TestValidateWebhookRepositories(t *testing.T) {
 		}
 	}
 }
+
+func TestManagedAzureVMValidation(t *testing.T) {
+	valid := func() model.BrokerConfig {
+		c := Default()
+		c.GitHub.Scope = model.GitHubScope{Type: model.GitHubScopeRepository, Owner: "example", Repository: "project"}
+		c.GitHub.Auth.SecretRef = "github"
+		c.Pools = []model.PoolConfig{{Name: model.PoolFull, Backends: map[model.BackendName]model.BackendConfig{model.BackendAzureVM: {Enabled: true, Healthy: true, MaxRunners: 2, CrossPoolMaxRunners: 2, AzureVM: &model.AzureVMBackendConfig{Repository: "example/project", RunnerNames: []string{"worker-1", "worker-2"}}}}}}
+		return c
+	}
+	if err := Validate(valid()); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name   string
+		change func(*model.BrokerConfig)
+	}{
+		{"ha", func(c *model.BrokerConfig) { v := true; c.Broker.HA.Enabled = &v }},
+		{"shared-overflow", func(c *model.BrokerConfig) {
+			b := c.Pools[0].Backends[model.BackendAzureVM]
+			b.CrossPoolMaxRunners = 3
+			c.Pools[0].Backends[model.BackendAzureVM] = b
+		}},
+		{"duplicate-workers", func(c *model.BrokerConfig) {
+			c.Pools[0].Backends[model.BackendAzureVM].AzureVM.RunnerNames = []string{"worker-1", "WORKER-1"}
+		}},
+		{"foreign-repo", func(c *model.BrokerConfig) {
+			c.Pools[0].Backends[model.BackendAzureVM].AzureVM.Repository = "attacker/project"
+		}},
+		{"mixed-mode", func(c *model.BrokerConfig) {
+			c.Pools = append(c.Pools, model.PoolConfig{Name: model.PoolLite, Backends: map[model.BackendName]model.BackendConfig{model.BackendAzureVM: {Enabled: true, Healthy: true, MaxRunners: 1}}})
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := valid()
+			tc.change(&c)
+			if err := Validate(c); err == nil {
+				t.Fatal("unsafe managed configuration accepted")
+			}
+		})
+	}
+}
+
+func TestManagedAzureVMReplicaCountCannotBypassGuard(t *testing.T) {
+	c := Default()
+	c.Broker.StateStore = model.StateStoreConfig{Type: "postgres"}
+	c.Pools = []model.PoolConfig{{Backends: map[model.BackendName]model.BackendConfig{model.BackendAzureVM: {AzureVM: &model.AzureVMBackendConfig{Repository: "example/project", RunnerNames: []string{"worker-1"}}}}}}
+	if err := ValidateReplicaSafety(c, 2); err == nil {
+		t.Fatal("managed physical claims cannot use multiple replicas")
+	}
+}

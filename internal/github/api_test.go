@@ -100,3 +100,42 @@ func TestGetWorkflowRunReadsActors(t *testing.T) {
 		t.Fatalf("run = %+v, %v", run, err)
 	}
 }
+
+func TestManagedRunnerLabelAPI(t *testing.T) {
+	var adds []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer tok" {
+			t.Error("missing authentication")
+		}
+		switch r.Method + " " + r.URL.Path {
+		case "GET /repos/example/project/actions/runners":
+			_ = json.NewEncoder(w).Encode(map[string]any{"runners": []map[string]any{{"id": 10, "name": "worker-1", "status": "online", "busy": false, "labels": []map[string]string{{"name": "Linux", "type": "read-only"}}}}})
+		case "POST /repos/example/project/actions/runners/10/labels":
+			var body struct {
+				Labels []string `json:"labels"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			adds = body.Labels
+			_, _ = w.Write([]byte(`{"labels":[]}`))
+		case "DELETE /repos/example/project/actions/runners/10/labels/shared-full":
+			_, _ = w.Write([]byte(`{"labels":[]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	client := NewClient(func(context.Context) (string, error) { return "tok", nil }, nil).WithBaseURL(server.URL)
+	scope := model.GitHubScope{Type: model.GitHubScopeRepository, Owner: "example", Repository: "project"}
+	rs, err := client.ListRunners(context.Background(), scope)
+	if err != nil || len(rs) != 1 || rs[0].Name != "worker-1" {
+		t.Fatalf("list %+v %v", rs, err)
+	}
+	if err := client.AddRunnerLabels(context.Background(), scope, 10, []string{"shared-full"}); err != nil || len(adds) != 1 {
+		t.Fatalf("add %v %v", adds, err)
+	}
+	for _, label := range []string{"shared-full", "already-removed"} {
+		if err := client.RemoveRunnerLabel(context.Background(), scope, 10, label); err != nil {
+			t.Fatal(err)
+		}
+	}
+}

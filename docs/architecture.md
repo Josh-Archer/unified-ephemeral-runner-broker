@@ -373,3 +373,34 @@ This keeps scheduling policy isolated in the scheduler registry while making cap
 ### Tier policy with occupied fallback capacity
 
 An automatic allocation with a policy-eligible but full backend is a capacity wait, even when another backend is disabled by a pressure tier. Webhook demand stays pending until that eligible backend has a free slot; it never bypasses the disabled backend. API callers still receive a capacity error. If every backend is actually tier-blocked, the tier rejection remains unchanged.
+
+## Managed persistent Azure VM workers
+
+The default Azure VM adapter retains legacy static-label behavior. Configure
+`azureVM: {repository: example/project, runnerNames: [worker-1, worker-2]}` on
+all Azure VM pool entries to lease existing persistent workers instead. Set
+`crossPoolMaxRunners` to the physical worker count and disable warm reservations.
+The same target must appear in every pool; this mode requires one broker replica
+and does not yet support HA/distributed physical claims.
+
+A lease selects only an explicitly named, online, idle, unleased runner. GitHub
+routing labels and lease-specific ownership proofs persist the claim through a
+broker restart. Cleanup removes only labels proved to belong to that lease;
+it never deletes the persistent runner or stops its current job. A failed label
+cleanup retains the lease marker, so the worker remains excluded until cleanup
+is retried. Offline workers reduce reported online capacity; provisioning
+rechecks real idle state even when stale capacity policy permits an attempt.
+
+Persistent names are reusable identities. Signed webhook `started_at` and
+`runner_id` must match the lease time and identity before execution is bound;
+a late completion cannot release a newer lease. The actual runner name is also
+added as a lease-owned label so API allocations can route to that worker.
+
+Label mutation uses GitHub's [self-hosted runner REST API](https://docs.github.com/en/rest/actions/self-hosted-runners).
+
+A persistent worker may take another compatible job before GitHub delivers the
+prior completion. A signed in-progress event from an explicitly managed worker
+can suppress only that job's still-Pending demand; it never cancels a Reserved
+resource or releases a different lease. This closes the asynchronous fast-job
+window without deleting persistent services or treating shared labels as proof
+of resource ownership.

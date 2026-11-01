@@ -284,3 +284,73 @@ func TestMigratedARCTargetKeepsKubernetesOwnershipRules(t *testing.T) {
 		t.Fatalf("logical arc was treated as resource-free: %+v", current)
 	}
 }
+
+func TestPersistentRunnerReuseSelectsCurrentLeaseAndRejectsOldEvents(t *testing.T) {
+	s, _ := ownershipService(t)
+	then := time.Now().UTC().Add(-time.Minute).Truncate(time.Second)
+	makeStatus := func(id string, at time.Time, state model.AllocationState, job int64) model.AllocationStatus {
+		m := map[string]string{"github_runner_id": "10", "runner_lease_started_at": at.Format(time.RFC3339)}
+		if job != 0 {
+			m[executionJobKey] = fmt.Sprint(job)
+		}
+		return model.AllocationStatus{ID: id, Pool: model.PoolFull, SelectedBackend: model.BackendKubernetes, RunnerLabel: "worker-1", State: state, Metadata: m}
+	}
+	old := makeStatus("old", then, model.StateCompleted, 1001)
+	current := makeStatus("current", then.Add(30*time.Second), model.StateReady, 0)
+	if err := s.store.Save(old); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.store.Save(current); err != nil {
+		t.Fatal(err)
+	}
+	runner := WorkflowJobRunner{Repository: "example/project", Name: "worker-1", ID: 10, StartedAt: then.Add(40 * time.Second)}
+	got, ok := s.executionAllocation(1002, runner)
+	if !ok || got.ID != "current" {
+		t.Fatalf("new lease not selected: %+v %v", got, ok)
+	}
+	runner.StartedAt = then.Add(5 * time.Second)
+	got, ok = s.executionAllocation(1001, runner)
+	if !ok || got.ID != "old" {
+		t.Fatalf("late event touched current lease: %+v %v", got, ok)
+	}
+	if _, ok := s.executionAllocation(9999, runner); ok {
+		t.Fatal("old execution time bound an unclaimed newer lease")
+	}
+	runner.StartedAt = time.Time{}
+	if _, ok := s.executionAllocation(1002, runner); ok {
+		t.Fatal("missing start time accepted for reused worker")
+	}
+	runner.StartedAt = then.Add(time.Minute)
+	runner.ID = 11
+	if _, ok := s.executionAllocation(1002, runner); ok {
+		t.Fatal("replacement identity accepted old lease")
+	}
+}
+
+func TestPersistentWorkerFastReuseOnlySuppressesPendingDemand(t *testing.T) {
+	s, cleanup := ownershipService(t)
+	s.cfg.Pools[0].Backends[model.BackendAzureVM] = model.BackendConfig{AzureVM: &model.AzureVMBackendConfig{Repository: "example/project", RunnerNames: []string{"worker-1"}}}
+	origin := model.AllocationStatus{ID: "pending", Pool: model.PoolFull, State: model.StatePending, Request: &model.AllocationRequest{WorkflowJobID: 3002, TargetRepository: "example/project"}}
+	if err := s.store.Save(origin); err != nil {
+		t.Fatal(err)
+	}
+	runner := WorkflowJobRunner{Name: "worker-1", ID: 10, Repository: "example/project", StartedAt: time.Now().UTC()}
+	got, found, err := s.ClaimWorkflowJob(context.Background(), 3002, runner.Name, nil, runner)
+	if err != nil || !found || got.State != model.StateCanceled || *cleanup.cleanupCount != 0 {
+		t.Fatalf("pending demand not safely satisfied: %+v %v %v", got, found, err)
+	}
+	// An already created resource is never released by this external observation.
+	origin.ID = "reserved"
+	origin.State = model.StateReserved
+	origin.Request.WorkflowJobID = 3003
+	if err := s.store.Save(origin); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := s.ClaimWorkflowJob(context.Background(), 3003, runner.Name, nil, runner); err != nil || found {
+		t.Fatalf("reserved supply was touched: %v %v", found, err)
+	}
+	current, _ := s.Get("reserved")
+	if current.State != model.StateReserved || *cleanup.cleanupCount != 0 {
+		t.Fatal("reserved runner was released")
+	}
+}
