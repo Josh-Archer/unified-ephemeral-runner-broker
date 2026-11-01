@@ -99,7 +99,7 @@ func newGitHubWebhookMetrics() *githubWebhookMetrics {
 		}),
 		pageCap: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "uecb_github_reconcile_page_cap_total",
-			Help: "Queued-job reconcile listings truncated at their page cap, by listing (runs or jobs); the oldest entries were skipped.",
+			Help: "Queued-job reconcile listings truncated at their page cap, by listing (repositories, runs or jobs); the oldest entries were skipped.",
 		}, []string{"listing"}),
 		budget: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "uecb_github_reconcile_budget_exhausted_total",
@@ -170,13 +170,27 @@ type githubWebhookHandler struct {
 	reconcile  reconcileState
 }
 
-// reconcileState carries the round-robin cursor and deep-scan schedule across
-// reconcile cycles.
+// repoScanner walks the repository list round-robin. It keeps the repository
+// whose runs are being processed and the next run position, so a cycle that
+// runs out of budget resumes mid-repository instead of restarting it.
+type repoScanner struct {
+	cursor    int     // next repository index to list
+	repo      string  // repository with runs still pending ("" when none)
+	runs      []int64 // queued run ids listed for repo
+	pos       int     // next index into runs
+	remaining int     // repositories left in the current pass
+}
+
+// reconcileState carries scanner cursors, the deep-scan schedule and the
+// cached repository list across reconcile cycles.
 type reconcileState struct {
 	mu       sync.Mutex
-	cursor   int       // next repository index to scan
+	recent   repoScanner
+	deep     repoScanner
 	lastDeep time.Time // when the last full deep pass completed
 	deepOpen bool      // a deep pass started and has not covered every repo yet
+	repos    []string
+	reposAt  time.Time
 }
 
 // SetGitHubWebhook enables POST /webhooks/github. Without it the route
@@ -401,10 +415,15 @@ func (s *Server) DrainGitHubWebhookInbox(ctx context.Context) (int, error) {
 // repository on the following cycle. The GitHub client also caps pages per
 // listing, and the scan stops while the rate limit is nearly spent.
 const (
-	reconcileRunWindow       = 7 * 24 * time.Hour
-	reconcileRecentWindow    = time.Hour
-	reconcileDeepInterval    = 10 * time.Minute
-	reconcileCallBudget      = 100
+	reconcileRunWindow    = 7 * 24 * time.Hour
+	reconcileRecentWindow = time.Hour
+	reconcileDeepInterval = 10 * time.Minute
+	reconcileCallBudget   = 100
+	// reconcileRecentReserve is the share of the budget held for the 1h scan
+	// while a deep pass is open, so repositories the deep cursor has not
+	// reached yet still get their recent queued runs checked every cycle.
+	reconcileRecentReserve   = 30
+	reconcileReposTTL        = 5 * time.Minute
 	reconcileRateLimitFloor  = 1000
 	reconcileRateLimitBackof = 5 * time.Minute
 )
@@ -460,121 +479,216 @@ func (s *Server) ReconcileQueuedGitHubJobs(ctx context.Context) (int, error) {
 	h.reconcile.mu.Lock()
 	defer h.reconcile.mu.Unlock()
 	state := &h.reconcile
-
-	counter, counted := lister.(apiCallCounter)
-	var startCalls, fallbackCalls int64
-	if counted {
-		startCalls = counter.APICalls()
-	}
-	charge := func() { fallbackCalls++ }
-	spent := func() int64 {
-		if counted {
-			return counter.APICalls() - startCalls
-		}
-		return fallbackCalls
-	}
-
-	deep := state.deepOpen || state.lastDeep.IsZero() || now.Sub(state.lastDeep) >= reconcileDeepInterval
-	window := reconcileRecentWindow
-	if deep {
-		window = reconcileRunWindow
-		state.deepOpen = true
-	}
-	since := now.Add(-window)
 	ctx = withRetryFailedWorkflowJob(ctx)
-	charge()
-	repos, err := h.opts.WorkflowJobs.ListRepositories(ctx, h.service.cfg.GitHub.Scope)
+	budget := newCycleBudget(lister, func() time.Time { return h.service.now() })
+
+	repos, err := h.reconcileRepositories(ctx, budget, now)
 	if err != nil {
 		return 0, err
 	}
 	if len(repos) == 0 {
-		state.cursor = 0
-		if deep {
-			state.deepOpen, state.lastDeep = false, now
-		}
+		state.recent, state.deep = repoScanner{}, repoScanner{}
+		state.deepOpen, state.lastDeep = false, now
 		return 0, nil
 	}
-	start := state.cursor % len(repos)
-	allocated := 0
-	var firstErr error
-	keepErr := func(err error) {
-		if firstErr == nil {
-			firstErr = err
+	if !state.deepOpen && (state.lastDeep.IsZero() || now.Sub(state.lastDeep) >= reconcileDeepInterval) {
+		state.deepOpen = true
+		state.deep.remaining = len(repos)
+	}
+
+	run := &reconcileRun{h: h, budget: budget}
+	recentLimit := int64(reconcileCallBudget)
+	if state.deepOpen {
+		recentLimit = reconcileRecentReserve
+	}
+	// The recent scan visits each repository at most once per cycle.
+	state.recent.remaining = len(repos)
+	err = run.scan(ctx, &state.recent, repos, now.Add(-reconcileRecentWindow), reconcileRecentWindow, recentLimit)
+	if errors.Is(err, errReconcileBudgetSpent) && state.deepOpen {
+		// The recent reserve is spent; the deep scan gets the rest.
+		err = nil
+	}
+	if err == nil && state.deepOpen {
+		err = run.scan(ctx, &state.deep, repos, now.Add(-reconcileRunWindow), reconcileRunWindow, reconcileCallBudget)
+		if err == nil && state.deep.remaining <= 0 {
+			state.deepOpen, state.lastDeep = false, now
 		}
 	}
-	for i := 0; i < len(repos); i++ {
-		idx := (start + i) % len(repos)
-		if err := ctx.Err(); err != nil {
-			state.cursor = idx
-			return allocated, err
-		}
-		if reconcileRateLimited(lister, h.service.now()) {
-			state.cursor = idx
-			return allocated, ErrReconcileRateLimited
-		}
-		if spent() >= reconcileCallBudget {
-			state.cursor = idx
+	switch {
+	case errors.Is(err, errReconcileBudgetSpent):
+		{
 			h.metrics.budget.Inc()
-			log.Printf("github reconcile: API call budget %d spent; resuming at %s next cycle", reconcileCallBudget, strings.TrimSpace(repos[idx]))
-			return allocated, firstErr
+			log.Printf("github reconcile: API call budget %d spent (%d used); recent scan resumes at repo %d, deep scan at %q run %d next cycle",
+				reconcileCallBudget, budget.spent(), state.recent.cursor, state.deep.repo, state.deep.pos)
 		}
-		repository := strings.TrimSpace(repos[idx])
-		if !h.service.AcceptsWebhookRepository(repository) {
-			continue
+		return run.allocated, run.firstErr
+	case err != nil:
+		return run.allocated, err
+	}
+	return run.allocated, run.firstErr
+}
+
+var errReconcileBudgetSpent = errors.New("reconcile API call budget spent")
+
+// cycleBudget counts the GitHub API calls of one reconcile cycle and checks
+// the per-cycle budget and the rate-limit floor before every call.
+type cycleBudget struct {
+	lister   any
+	counter  apiCallCounter
+	start    int64
+	fallback int64
+	now      func() time.Time
+}
+
+func newCycleBudget(lister any, now func() time.Time) *cycleBudget {
+	b := &cycleBudget{lister: lister, now: now}
+	if counter, ok := lister.(apiCallCounter); ok {
+		b.counter, b.start = counter, counter.APICalls()
+	}
+	return b
+}
+
+func (b *cycleBudget) spent() int64 {
+	if b.counter != nil {
+		return b.counter.APICalls() - b.start
+	}
+	return b.fallback
+}
+
+// take reserves one list request under limit. A list request may follow
+// several pages; the client page caps bound that overshoot.
+func (b *cycleBudget) take(ctx context.Context, limit int64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if reconcileRateLimited(b.lister, b.now()) {
+		return ErrReconcileRateLimited
+	}
+	if b.spent() >= limit {
+		return errReconcileBudgetSpent
+	}
+	b.fallback++
+	return nil
+}
+
+// reconcileRepositories returns the cached repository list, refreshing it
+// every reconcileReposTTL. A listing cut at its page cap is used as is.
+func (h *githubWebhookHandler) reconcileRepositories(ctx context.Context, budget *cycleBudget, now time.Time) ([]string, error) {
+	state := &h.reconcile
+	if state.repos != nil && now.Sub(state.reposAt) < reconcileReposTTL {
+		return state.repos, nil
+	}
+	if err := budget.take(ctx, reconcileCallBudget); err != nil {
+		return nil, err
+	}
+	repos, err := h.opts.WorkflowJobs.ListRepositories(ctx, h.service.cfg.GitHub.Scope)
+	if err != nil {
+		if !errors.Is(err, github.ErrPageCapReached) {
+			return nil, err
 		}
-		charge()
-		runs, err := h.opts.WorkflowJobs.ListQueuedWorkflowRuns(ctx, repository, since)
-		if err != nil {
-			if !errors.Is(err, github.ErrPageCapReached) {
-				keepErr(err)
+		h.metrics.pageCap.WithLabelValues("repositories").Inc()
+		log.Printf("github reconcile WARNING: repository listing hit its page cap; repositories past it are not reconciled: %v", err)
+	}
+	if repos == nil {
+		repos = []string{}
+	}
+	state.repos, state.reposAt = repos, now
+	return repos, nil
+}
+
+type reconcileRun struct {
+	h         *githubWebhookHandler
+	budget    *cycleBudget
+	allocated int
+	firstErr  error
+}
+
+func (r *reconcileRun) keepErr(err error) {
+	if r.firstErr == nil {
+		r.firstErr = err
+	}
+}
+
+// scan advances sc through repos until sc.remaining reaches zero or the call
+// budget, rate limit or context stops it. Progress is saved in sc after every
+// call, so the next cycle resumes at the same repository and run.
+func (r *reconcileRun) scan(ctx context.Context, sc *repoScanner, repos []string, since time.Time, window time.Duration, limit int64) error {
+	h := r.h
+	lister := h.opts.WorkflowJobs
+	for sc.remaining > 0 || sc.repo != "" {
+		if sc.repo == "" {
+			idx := sc.cursor % len(repos)
+			repository := strings.TrimSpace(repos[idx])
+			if !h.service.AcceptsWebhookRepository(repository) {
+				sc.cursor = idx + 1
+				sc.remaining--
 				continue
 			}
-			h.metrics.pageCap.WithLabelValues("runs").Inc()
-			log.Printf("github reconcile WARNING: %s hit the queued-run page cap (%d pages); its oldest queued runs in the %s window were skipped this cycle", repository, github.MaxQueuedRunPages, window)
-		}
-		for _, runID := range runs {
-			charge()
-			jobs, err := h.opts.WorkflowJobs.ListWorkflowJobs(ctx, repository, runID)
+			if err := r.budget.take(ctx, limit); err != nil {
+				return err
+			}
+			sc.cursor = idx + 1
+			runs, err := lister.ListQueuedWorkflowRuns(ctx, repository, since)
 			if err != nil {
 				if !errors.Is(err, github.ErrPageCapReached) {
-					keepErr(err)
+					r.keepErr(err)
+					sc.remaining--
 					continue
 				}
-				h.metrics.pageCap.WithLabelValues("jobs").Inc()
-				log.Printf("github reconcile WARNING: %s run %d hit the job page cap (%d pages); its remaining jobs were skipped this cycle", repository, runID, github.MaxWorkflowJobPages)
+				h.metrics.pageCap.WithLabelValues("runs").Inc()
+				log.Printf("github reconcile WARNING: %s hit the queued-run page cap (%d pages); its oldest queued runs in the %s window were skipped this pass", repository, github.MaxQueuedRunPages, window)
 			}
-			for _, job := range jobs {
-				if job.ID <= 0 || job.Status != "queued" {
-					continue
-				}
-				if _, ok := h.service.MatchWebhookPoolForRepository(job.Labels, repository); !ok {
-					continue
-				}
-				if job.RunID == 0 {
-					job.RunID = runID
-				}
-				payload := workflowJobPayload{Action: "queued"}
-				payload.WorkflowJob.ID = job.ID
-				payload.WorkflowJob.RunID = job.RunID
-				payload.WorkflowJob.Labels = job.Labels
-				payload.Repository.FullName = repository
-				result, _, err := h.process(ctx, payload)
-				if err != nil {
-					keepErr(fmt.Errorf("reconcile %s job %d: %w", repository, job.ID, err))
-					continue
-				}
-				if result["status"] == "allocated" {
-					allocated++
-				}
+			sc.repo, sc.runs, sc.pos = repository, runs, 0
+		}
+		for sc.pos < len(sc.runs) {
+			if err := r.budget.take(ctx, limit); err != nil {
+				return err
 			}
+			runID := sc.runs[sc.pos]
+			sc.pos++
+			r.processRun(ctx, sc.repo, runID)
+		}
+		sc.repo, sc.runs, sc.pos = "", nil, 0
+		sc.remaining--
+	}
+	return nil
+}
+
+func (r *reconcileRun) processRun(ctx context.Context, repository string, runID int64) {
+	h := r.h
+	jobs, err := h.opts.WorkflowJobs.ListWorkflowJobs(ctx, repository, runID)
+	if err != nil {
+		if !errors.Is(err, github.ErrPageCapReached) {
+			r.keepErr(err)
+			return
+		}
+		h.metrics.pageCap.WithLabelValues("jobs").Inc()
+		log.Printf("github reconcile WARNING: %s run %d hit the job page cap (%d pages); its remaining jobs were skipped", repository, runID, github.MaxWorkflowJobPages)
+	}
+	for _, job := range jobs {
+		if job.ID <= 0 || job.Status != "queued" {
+			continue
+		}
+		if _, ok := h.service.MatchWebhookPoolForRepository(job.Labels, repository); !ok {
+			continue
+		}
+		if job.RunID == 0 {
+			job.RunID = runID
+		}
+		payload := workflowJobPayload{Action: "queued"}
+		payload.WorkflowJob.ID = job.ID
+		payload.WorkflowJob.RunID = job.RunID
+		payload.WorkflowJob.Labels = job.Labels
+		payload.Repository.FullName = repository
+		result, _, err := h.process(ctx, payload)
+		if err != nil {
+			r.keepErr(fmt.Errorf("reconcile %s job %d: %w", repository, job.ID, err))
+			continue
+		}
+		if result["status"] == "allocated" {
+			r.allocated++
 		}
 	}
-	// Every repository was visited: the next cycle starts over.
-	state.cursor = 0
-	if deep {
-		state.deepOpen, state.lastDeep = false, now
-	}
-	return allocated, firstErr
 }
 
 // process handles an authenticated, leader-owned queued/completed delivery.

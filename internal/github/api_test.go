@@ -271,3 +271,42 @@ func TestListWorkflowJobsShortRunIsNotTruncated(t *testing.T) {
 		t.Fatalf("jobs=%d err=%v", len(jobs), err)
 	}
 }
+
+func fullPageServer(t *testing.T, key string, pages *int) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		*pages++
+		page := r.URL.Query().Get("page")
+		items := make([]string, 100)
+		for i := range items {
+			items[i] = fmt.Sprintf(`{"id":%s%03d,"full_name":"o/r%s-%d","name":"n%s-%d"}`, page, i+1, page, i, page, i)
+		}
+		body := "[" + strings.Join(items, ",") + "]"
+		if key != "" {
+			body = `{"` + key + `":` + body + `}`
+		}
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+func TestListRepositoriesCapsPages(t *testing.T) {
+	pages := 0
+	server := fullPageServer(t, "", &pages)
+	client := NewClient(func(context.Context) (string, error) { return "tok", nil }, nil).WithBaseURL(server.URL)
+	repos, err := client.ListRepositories(context.Background(), model.GitHubScope{Type: model.GitHubScopeOrganization, Organization: "o"})
+	if !errors.Is(err, ErrPageCapReached) || pages != MaxRepositoryPages || len(repos) != MaxRepositoryPages*100 {
+		t.Fatalf("pages=%d repos=%d err=%v", pages, len(repos), err)
+	}
+}
+
+func TestListRunnersCapsPages(t *testing.T) {
+	pages := 0
+	server := fullPageServer(t, "runners", &pages)
+	client := NewClient(func(context.Context) (string, error) { return "tok", nil }, nil).WithBaseURL(server.URL)
+	runners, err := client.ListRunners(context.Background(), model.GitHubScope{Type: model.GitHubScopeOrganization, Organization: "o"})
+	if !errors.Is(err, ErrPageCapReached) || pages != MaxRunnerPages || len(runners) != MaxRunnerPages*100 {
+		t.Fatalf("pages=%d runners=%d err=%v", pages, len(runners), err)
+	}
+}

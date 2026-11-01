@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -208,7 +209,7 @@ func (c *Client) ListRepositories(ctx context.Context, scope model.GitHubScope) 
 	}
 	path := "/orgs/" + url.PathEscape(owner) + "/repos"
 	var repos []string
-	for page := 1; ; page++ {
+	for page := 1; page <= MaxRepositoryPages; page++ {
 		var out []struct {
 			FullName string `json:"full_name"`
 		}
@@ -236,11 +237,19 @@ func (c *Client) ListRepositories(ctx context.Context, scope model.GitHubScope) 
 			return repos, nil
 		}
 	}
+	log.Printf("github: repository listing for %s stopped at the %d-page cap; later repositories were skipped", owner, MaxRepositoryPages)
+	return repos, fmt.Errorf("list repositories for %s: %w (%d pages)", owner, ErrPageCapReached, MaxRepositoryPages)
 }
 
 // MaxQueuedRunPages caps the queued-run pages read per repository per
 // reconcile pass so a deep backlog cannot exhaust the API budget.
 const MaxQueuedRunPages = 10
+
+// MaxRepositoryPages caps the repository pages read for one owner (10k repos).
+const MaxRepositoryPages = 100
+
+// MaxRunnerPages caps the self-hosted runner pages read for one scope (5k runners).
+const MaxRunnerPages = 50
 
 // MaxWorkflowJobPages caps the job pages read for one workflow run.
 const MaxWorkflowJobPages = 10
@@ -498,7 +507,7 @@ func (c *Client) ListRunners(ctx context.Context, scope model.GitHubScope) ([]Ru
 		return nil, err
 	}
 	var result []Runner
-	for page := 1; ; page++ {
+	for page := 1; page <= MaxRunnerPages; page++ {
 		var out struct {
 			Runners []Runner `json:"runners"`
 		}
@@ -510,6 +519,8 @@ func (c *Client) ListRunners(ctx context.Context, scope model.GitHubScope) ([]Ru
 			return result, nil
 		}
 	}
+	log.Printf("github: runner listing for %s stopped at the %d-page cap; later runners were skipped", base, MaxRunnerPages)
+	return result, fmt.Errorf("list runners for %s: %w (%d pages)", base, ErrPageCapReached, MaxRunnerPages)
 }
 func (c *Client) AddRunnerLabels(ctx context.Context, scope model.GitHubScope, id int64, labels []string) error {
 	base, err := scopePath(scope)
