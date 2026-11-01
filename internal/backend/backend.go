@@ -80,6 +80,25 @@ type InventoryBackend interface {
 	LiveRunners(ctx context.Context) ([]LiveRunner, error)
 }
 
+// FinishedRunner is a provider runner whose process has exited (for a
+// Kubernetes pod: phase Succeeded or Failed) while still identified by the
+// allocation the broker recorded when provisioning it.
+type FinishedRunner struct {
+	AllocationID string
+	Pool         model.PoolName
+	Repository   string
+	// Failed reports a runner that exited unsuccessfully.
+	Failed   bool
+	Metadata map[string]string
+}
+
+// FinishedRunnerBackend lists runners that have already exited, so the broker
+// can release their allocations without waiting for a workflow_job completion
+// event (which never arrives when a runner exits before or without a job).
+type FinishedRunnerBackend interface {
+	FinishedRunners(ctx context.Context) ([]FinishedRunner, error)
+}
+
 // FreeSlots returns non-negative free runner slots from a capacity snapshot.
 func FreeSlots(status CapacityStatus) int {
 	used := status.ActiveRunners + status.PendingRunners + status.WarmRunners

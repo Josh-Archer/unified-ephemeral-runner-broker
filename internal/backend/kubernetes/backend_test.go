@@ -358,3 +358,37 @@ func TestProvisionAnnotatesPodWithAllocationIdentity(t *testing.T) {
 		t.Fatalf("annotations = %+v", annotations)
 	}
 }
+
+func TestFinishedRunnersListsExitedPods(t *testing.T) {
+	cfg := newConfig(t)
+	api := &fakeAPI{responses: map[string]response{
+		"GET /api/v1/namespaces/arc-runners/pods": {status: http.StatusOK, body: `{"items":[
+ {"metadata":{"name":"uecb-runner-alloc-1","labels":{"uecb.josh-archer.dev/pool":"full","uecb.josh-archer.dev/allocation-id":"alloc-1"}},"status":{"phase":"Running"}},
+ {"metadata":{"name":"uecb-runner-alloc-2","labels":{"uecb.josh-archer.dev/pool":"full","uecb.josh-archer.dev/allocation-id":"alloc-2"},
+  "annotations":{"uecb.josh-archer.dev/allocation-id":"alloc-2","uecb.josh-archer.dev/github-runner-id":"12","uecb.josh-archer.dev/repository":"example/project"}},"status":{"phase":"Succeeded"}},
+ {"metadata":{"name":"uecb-runner-alloc-3","labels":{"uecb.josh-archer.dev/pool":"full","uecb.josh-archer.dev/allocation-id":"alloc-3"}},"status":{"phase":"Failed"}},
+ {"metadata":{"name":"uecb-runner-alloc-4","deletionTimestamp":"2026-10-31T00:00:00Z","labels":{"uecb.josh-archer.dev/allocation-id":"alloc-4"}},"status":{"phase":"Succeeded"}},
+ {"metadata":{"name":"something-else","labels":{"uecb.josh-archer.dev/allocation-id":"alloc-5"}},"status":{"phase":"Succeeded"}}
+]}`},
+	}}
+	runners, err := New(cfg, api, &fakeRegistrar{}).FinishedRunners(context.Background())
+	if err != nil {
+		t.Fatalf("FinishedRunners: %v", err)
+	}
+	if len(runners) != 2 {
+		t.Fatalf("expected the succeeded and failed pods, got %+v", runners)
+	}
+	byID := map[string]bool{}
+	for _, r := range runners {
+		byID[r.AllocationID] = r.Failed
+		if r.AllocationID == "alloc-2" && (r.Repository != "example/project" || r.Metadata[metadataRunnerID] != "12" || r.Metadata["namespace"] != "arc-runners") {
+			t.Fatalf("unexpected identity: %+v", r)
+		}
+	}
+	if failed, ok := byID["alloc-2"]; !ok || failed {
+		t.Fatalf("alloc-2 should be a succeeded runner: %+v", runners)
+	}
+	if failed, ok := byID["alloc-3"]; !ok || !failed {
+		t.Fatalf("alloc-3 should be a failed runner: %+v", runners)
+	}
+}

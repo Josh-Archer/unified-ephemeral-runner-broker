@@ -565,3 +565,61 @@ func (b *Backend) LiveRunners(ctx context.Context) ([]backend.LiveRunner, error)
 	}
 	return result, nil
 }
+
+// FinishedRunners lists this backend's runner pods that have exited (phase
+// Succeeded or Failed, not already being deleted) and still carry a verifiable
+// allocation id. With dind as a native sidecar a pod reaches these phases as
+// soon as the runner process exits.
+func (b *Backend) FinishedRunners(ctx context.Context) ([]backend.FinishedRunner, error) {
+	if b.api == nil {
+		return nil, fmt.Errorf("backend %s needs the broker to run in Kubernetes", b.name)
+	}
+	namespaces := map[string]struct{}{}
+	for _, pool := range b.cfg.Pools {
+		if cfg, ok := pool.Backends[b.name]; ok && cfg.Enabled {
+			namespaces[b.namespace(cfg)] = struct{}{}
+		}
+	}
+	selector := url.QueryEscape(fmt.Sprintf("%s=%s,%s=%s", labelManagedBy, labelManagedByVal, labelBackend, b.name))
+	var result []backend.FinishedRunner
+	for namespace := range namespaces {
+		code, body, err := b.api.Do(ctx, http.MethodGet, podsPath(namespace, "")+"?labelSelector="+selector, nil)
+		if err != nil {
+			return nil, err
+		}
+		if code < 200 || code >= 300 {
+			return nil, fmt.Errorf("list runner pods in %s: status %d: %s", namespace, code, kubeMessage(body))
+		}
+		var list podList
+		if err := json.Unmarshal(body, &list); err != nil {
+			return nil, fmt.Errorf("decode runner pods in %s: %w", namespace, err)
+		}
+		for _, item := range list.Items {
+			if item.Metadata.DeletionTimestamp != "" || (item.Status.Phase != "Succeeded" && item.Status.Phase != "Failed") {
+				continue
+			}
+			id := strings.TrimSpace(item.Metadata.Annotations[annotationAllocationID])
+			if id == "" {
+				id = strings.TrimSpace(item.Metadata.Labels[labelAllocation])
+			}
+			if id == "" || podName(id) != item.Metadata.Name {
+				continue
+			}
+			runner := backend.FinishedRunner{
+				AllocationID: id,
+				Pool:         model.PoolName(item.Metadata.Labels[labelPool]),
+				Repository:   item.Metadata.Annotations[annotationRepository],
+				Failed:       item.Status.Phase == "Failed",
+				Metadata: map[string]string{
+					"namespace": namespace,
+					"pod_name":  item.Metadata.Name,
+				},
+			}
+			if v := item.Metadata.Annotations[annotationRunnerID]; v != "" {
+				runner.Metadata[metadataRunnerID] = v
+			}
+			result = append(result, runner)
+		}
+	}
+	return result, nil
+}
