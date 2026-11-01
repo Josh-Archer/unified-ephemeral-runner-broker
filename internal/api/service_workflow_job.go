@@ -418,6 +418,19 @@ func (s *Service) ClaimWorkflowJob(ctx context.Context, jobID int64, runnerName 
 	}
 	status, found = s.executionAllocation(jobID, runner)
 	if !found {
+		// Persistent workers can finish a job and accept another before the
+		// prior completion delivery removes routing labels. The signed event
+		// proves this demand is already served; remove only Pending demand,
+		// never a reservation or another allocation's runner resource.
+		if runner.ID > 0 && runner.Name != "" && s.managedPersistentRunner(runner.Name, runner.Repository) {
+			origin, ok := s.findByWorkflowJobID(jobID)
+			if ok && origin.State == model.StatePending && s.allocationServesRepository(origin, runner.Repository) {
+				updated, canceled := s.cancelPendingWorkflowDemand(origin)
+				if canceled {
+					return updated, true, nil
+				}
+			}
+		}
 		// ARC has no provider resource to delete and retains its static-label
 		// accounting. Never apply this fallback to broker-created runner pods.
 		origin, ok := s.findByWorkflowJobID(jobID)
@@ -457,4 +470,19 @@ func (s *Service) ClaimWorkflowJob(ctx context.Context, jobID int64, runnerName 
 		}
 	}
 	return claimed, true, nil
+}
+
+func (s *Service) managedPersistentRunner(name, repository string) bool {
+	for _, pool := range s.cfg.Pools {
+		target := pool.Backends[model.BackendAzureVM].AzureVM
+		if target == nil || !strings.EqualFold(target.Repository, repository) {
+			continue
+		}
+		for _, allowed := range target.RunnerNames {
+			if strings.EqualFold(allowed, name) {
+				return true
+			}
+		}
+	}
+	return false
 }

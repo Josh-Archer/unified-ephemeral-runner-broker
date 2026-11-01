@@ -391,3 +391,10 @@ a late completion cannot release a newer lease. The actual runner name is also
 added as a lease-owned label so API allocations can route to that worker.
 
 Label mutation uses GitHub's [self-hosted runner REST API](https://docs.github.com/en/rest/actions/self-hosted-runners).
+
+A persistent worker may take another compatible job before GitHub delivers the
+prior completion. A signed in-progress event from an explicitly managed worker
+can suppress only that job's still-Pending demand; it never cancels a Reserved
+resource or releases a different lease. This closes the asynchronous fast-job
+window without deleting persistent services or treating shared labels as proof
+of resource ownership.

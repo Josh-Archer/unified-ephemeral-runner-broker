@@ -326,3 +326,31 @@ func TestPersistentRunnerReuseSelectsCurrentLeaseAndRejectsOldEvents(t *testing.
 		t.Fatal("replacement identity accepted old lease")
 	}
 }
+
+func TestPersistentWorkerFastReuseOnlySuppressesPendingDemand(t *testing.T) {
+	s, cleanup := ownershipService(t)
+	s.cfg.Pools[0].Backends[model.BackendAzureVM] = model.BackendConfig{AzureVM: &model.AzureVMBackendConfig{Repository: "example/project", RunnerNames: []string{"worker-1"}}}
+	origin := model.AllocationStatus{ID: "pending", Pool: model.PoolFull, State: model.StatePending, Request: &model.AllocationRequest{WorkflowJobID: 3002, TargetRepository: "example/project"}}
+	if err := s.store.Save(origin); err != nil {
+		t.Fatal(err)
+	}
+	runner := WorkflowJobRunner{Name: "worker-1", ID: 10, Repository: "example/project", StartedAt: time.Now().UTC()}
+	got, found, err := s.ClaimWorkflowJob(context.Background(), 3002, runner.Name, nil, runner)
+	if err != nil || !found || got.State != model.StateCanceled || *cleanup.cleanupCount != 0 {
+		t.Fatalf("pending demand not safely satisfied: %+v %v %v", got, found, err)
+	}
+	// An already created resource is never released by this external observation.
+	origin.ID = "reserved"
+	origin.State = model.StateReserved
+	origin.Request.WorkflowJobID = 3003
+	if err := s.store.Save(origin); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := s.ClaimWorkflowJob(context.Background(), 3003, runner.Name, nil, runner); err != nil || found {
+		t.Fatalf("reserved supply was touched: %v %v", found, err)
+	}
+	current, _ := s.Get("reserved")
+	if current.State != model.StateReserved || *cleanup.cleanupCount != 0 {
+		t.Fatal("reserved runner was released")
+	}
+}
