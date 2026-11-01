@@ -54,12 +54,16 @@ type fakeWorkflowJobLister struct {
 	runs  map[string][]int64
 	jobs  map[string][]github.WorkflowJob
 	err   error
+	since *time.Time
 }
 
 func (f fakeWorkflowJobLister) ListRepositories(context.Context, model.GitHubScope) ([]string, error) {
 	return f.repos, f.err
 }
-func (f fakeWorkflowJobLister) ListQueuedWorkflowRuns(_ context.Context, repository string, _ time.Time) ([]int64, error) {
+func (f fakeWorkflowJobLister) ListQueuedWorkflowRuns(_ context.Context, repository string, since time.Time) ([]int64, error) {
+	if f.since != nil {
+		*f.since = since
+	}
 	return f.runs[repository], f.err
 }
 func (f fakeWorkflowJobLister) ListWorkflowJobs(_ context.Context, _ string, runID int64) ([]github.WorkflowJob, error) {
@@ -788,5 +792,35 @@ func TestGitHubWebhookOnlyAllowedActorsGetRunners(t *testing.T) {
 		if !allowed && !strings.Contains(rec.Body.String(), "actor_not_allowed") {
 			t.Errorf("run %d: want actor_not_allowed, got %s", runID, rec.Body)
 		}
+	}
+}
+
+func TestReconcileQueuedGitHubJobsScansAWeekAcrossReposAndSharedPool(t *testing.T) {
+	service := newServiceWithConfig(func(pool *model.PoolConfig) {
+		if pool.Name == model.PoolFull {
+			pool.WebhookLabels = []string{"self-hosted", "uecb-shared", "home-gh-runner-linux-quest"}
+		}
+	})
+	server := newTestServer(t, service)
+	var since time.Time
+	server.SetGitHubWebhook(GitHubWebhookOptions{
+		WorkflowJobs: fakeWorkflowJobLister{
+			repos: []string{"my-org/home", "my-org/questkit"},
+			runs:  map[string][]int64{"my-org/questkit": {41158879898}},
+			jobs: map[string][]github.WorkflowJob{"41158879898": {
+				{ID: 7, Status: "queued", Labels: []string{"home-gh-runner-linux-quest"}},
+			}},
+			since: &since,
+		},
+		WorkflowRun: func(context.Context, string, int64) (github.WorkflowRun, error) {
+			return github.WorkflowRun{HeadRepository: "my-org/questkit"}, nil
+		},
+	})
+	count, err := server.ReconcileQueuedGitHubJobs(context.Background())
+	if err != nil || count != 1 {
+		t.Fatalf("count=%d err=%v; a 2-day-old queued job in a non-home repo must be reconciled", count, err)
+	}
+	if age := service.now().Sub(since); age < 7*24*time.Hour-time.Minute {
+		t.Fatalf("reconcile window = %v, want >= 7d", age)
 	}
 }

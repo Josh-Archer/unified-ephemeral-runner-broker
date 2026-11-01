@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -211,5 +213,24 @@ func TestManagedRunnerLabelAPI(t *testing.T) {
 		if err := client.RemoveRunnerLabel(context.Background(), scope, 10, label); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func TestListQueuedWorkflowRunsCapsPages(t *testing.T) {
+	pages := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pages++
+		page := r.URL.Query().Get("page")
+		runs := make([]string, 100)
+		for i := range runs {
+			runs[i] = fmt.Sprintf(`{"id":%s%03d}`, page, i+1)
+		}
+		_, _ = w.Write([]byte(`{"workflow_runs":[` + strings.Join(runs, ",") + `]}`))
+	}))
+	defer server.Close()
+	client := NewClient(func(context.Context) (string, error) { return "tok", nil }, nil).WithBaseURL(server.URL)
+	runs, err := client.ListQueuedWorkflowRuns(context.Background(), "o/r", time.Time{})
+	if err != nil || pages != MaxQueuedRunPages || len(runs) != MaxQueuedRunPages*100 {
+		t.Fatalf("pages=%d runs=%d err=%v", pages, len(runs), err)
 	}
 }

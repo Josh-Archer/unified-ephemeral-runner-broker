@@ -235,6 +235,10 @@ func (c *Client) ListRepositories(ctx context.Context, scope model.GitHubScope) 
 	}
 }
 
+// MaxQueuedRunPages caps the queued-run pages read per repository per
+// reconcile pass so a deep backlog cannot exhaust the API budget.
+const MaxQueuedRunPages = 10
+
 // ListQueuedWorkflowRuns returns ids of queued workflow runs in one repository
 // created at or after since (zero means no bound). In-progress runs are not
 // scanned: their queued jobs are rare and scanning them dominates API usage.
@@ -250,7 +254,7 @@ func (c *Client) ListQueuedWorkflowRuns(ctx context.Context, repository string, 
 		created = "&created=" + url.QueryEscape(">="+since.UTC().Format(time.RFC3339))
 	}
 	for _, status := range []string{"queued"} {
-		for page := 1; ; page++ {
+		for page := 1; page <= MaxQueuedRunPages; page++ {
 			var out struct {
 				WorkflowRuns []struct {
 					ID int64 `json:"id"`
