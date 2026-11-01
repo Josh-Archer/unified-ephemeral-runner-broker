@@ -73,6 +73,7 @@ type githubWebhookMetrics struct {
 	expired  prometheus.Counter
 	pageCap  *prometheus.CounterVec
 	budget   prometheus.Counter
+	skipped  prometheus.Counter
 }
 
 func newGitHubWebhookMetrics() *githubWebhookMetrics {
@@ -105,11 +106,15 @@ func newGitHubWebhookMetrics() *githubWebhookMetrics {
 			Name: "uecb_github_reconcile_budget_exhausted_total",
 			Help: "Queued-job reconcile cycles stopped at the per-cycle GitHub API call budget; the next cycle resumes at the next repository.",
 		}),
+		skipped: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "uecb_reconcile_run_skipped_total",
+			Help: "Queued workflow runs skipped by a reconcile scan after reconcileRunMaxCutoffs consecutive deadline cutoffs.",
+		}),
 	}
 }
 
 func (m *githubWebhookMetrics) register() {
-	for _, c := range []prometheus.Collector{m.received, m.matched, m.ignored, m.enqueued, m.expired, m.pageCap, m.budget} {
+	for _, c := range []prometheus.Collector{m.received, m.matched, m.ignored, m.enqueued, m.expired, m.pageCap, m.budget, m.skipped} {
 		if err := prometheus.Register(c); err != nil {
 			if _, ok := err.(prometheus.AlreadyRegisteredError); !ok {
 				panic(err)
@@ -195,9 +200,12 @@ type reconcileState struct {
 	deepOpen bool      // a deep pass started and has not covered every repo yet
 	// lastDeepSpent is the deep scan's call count in the last cycle.
 	lastDeepSpent int64
-	repos         []string
-	reposAt       time.Time
-	reposTTL      time.Duration // reconcileReposTTL, or reconcileTruncatedReposTTL for a capped listing
+	// cutoffs counts consecutive deadline cutoffs per "repo#runID@window"
+	// (one count per scan); reset when that run's check finishes.
+	cutoffs  map[string]int
+	repos    []string
+	reposAt  time.Time
+	reposTTL time.Duration // reconcileReposTTL, or reconcileTruncatedReposTTL for a capped listing
 }
 
 // SetGitHubWebhook enables POST /webhooks/github. Without it the route
@@ -444,6 +452,10 @@ const (
 	// default 1m worker interval.
 	reconcileRecentTimeout = 25 * time.Second
 	reconcileDeepTimeout   = 25 * time.Second
+	// reconcileRunMaxCutoffs is how many consecutive deadline cutoffs a run
+	// gets before a scan skips past it, so a run that hangs every time
+	// cannot park a scan cursor forever.
+	reconcileRunMaxCutoffs = 3
 	reconcileReposTTL      = 5 * time.Minute
 	// reconcileTruncatedReposTTL is how long a repository list cut at its page
 	// cap is reused, so a truncated listing is retried soon.
@@ -676,6 +688,23 @@ type reconcileRun struct {
 	firstErr  error
 }
 
+// cutoff records a deadline cutoff for key and reports whether the run hit
+// reconcileRunMaxCutoffs in a row and should be skipped.
+func (r *reconcileRun) cutoff(key string) bool {
+	state := &r.h.reconcile
+	if state.cutoffs == nil {
+		state.cutoffs = map[string]int{}
+	}
+	state.cutoffs[key]++
+	if state.cutoffs[key] < reconcileRunMaxCutoffs {
+		return false
+	}
+	delete(state.cutoffs, key)
+	r.h.metrics.skipped.Inc()
+	log.Printf("github reconcile WARNING: run %s hit the scan deadline %d times in a row; skipping it this pass", key, reconcileRunMaxCutoffs)
+	return true
+}
+
 func (r *reconcileRun) keepErr(err error) {
 	if r.firstErr == nil {
 		r.firstErr = err
@@ -721,10 +750,19 @@ func (r *reconcileRun) scan(ctx context.Context, sc *repoScanner, repos []string
 			if err := r.budget.take(ctx, limit); err != nil {
 				return err
 			}
-			r.processRun(ctx, sc.repo, sc.runs[sc.pos])
+			runID := sc.runs[sc.pos]
+			// Counted per scan window: the two scans interleave their
+			// cutoffs of a shared run, and one scan skipping it must not
+			// reset the other's count.
+			key := fmt.Sprintf("%s#%d@%s", sc.repo, runID, window)
+			r.processRun(ctx, sc.repo, runID)
 			if ctxErr := ctx.Err(); ctxErr != nil {
-				return ctxErr // retry this run next cycle; allocation is idempotent
+				if r.cutoff(key) {
+					sc.pos++ // skip a run that keeps hanging
+				}
+				return ctxErr // otherwise retry this run next cycle; allocation is idempotent
 			}
+			delete(h.reconcile.cutoffs, key)
 			sc.pos++
 		}
 		sc.repo, sc.runs, sc.pos = "", nil, 0
