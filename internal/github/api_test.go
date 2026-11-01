@@ -383,3 +383,45 @@ func TestListInstallationRepositoriesCapsPages(t *testing.T) {
 		t.Fatalf("pages=%d repos=%d err=%v", pages, len(repos), err)
 	}
 }
+
+func TestListInstallationRepositoriesSkipsArchivedAndPaginates(t *testing.T) {
+	var pages []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/installation/repositories" {
+			t.Errorf("unexpected path %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		page := r.URL.Query().Get("page")
+		pages = append(pages, page)
+		var repos []string
+		switch page {
+		case "1":
+			for i := 0; i < 100; i++ {
+				repos = append(repos, fmt.Sprintf(`{"full_name":"o/r%d","archived":%t}`, i, i == 7))
+			}
+		case "2":
+			repos = []string{`{"full_name":"o/last","archived":false}`, `{"full_name":"o/old","archived":true}`}
+		default:
+			t.Errorf("unexpected page %s", page)
+		}
+		_, _ = w.Write([]byte(`{"total_count":102,"repositories":[` + strings.Join(repos, ",") + `]}`))
+	}))
+	defer server.Close()
+	client := NewClient(func(context.Context) (string, error) { return "tok", nil }, nil).WithBaseURL(server.URL)
+	repos, err := client.ListRepositories(context.Background(), model.GitHubScope{Type: model.GitHubScopeOrganization, Organization: "o"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(pages, ",") != "1,2" {
+		t.Fatalf("pages=%v, want 1,2", pages)
+	}
+	if len(repos) != 100 || repos[len(repos)-1] != "o/last" {
+		t.Fatalf("len=%d last=%q, want 100 ending o/last", len(repos), repos[len(repos)-1])
+	}
+	for _, repo := range repos {
+		if repo == "o/r7" || repo == "o/old" {
+			t.Fatalf("archived repo %s listed", repo)
+		}
+	}
+}

@@ -257,6 +257,7 @@ func (c *Client) listInstallationRepositories(ctx context.Context, owner string)
 		var out struct {
 			Repositories []struct {
 				FullName string `json:"full_name"`
+				Archived bool   `json:"archived"`
 			} `json:"repositories"`
 		}
 		err := c.do(ctx, http.MethodGet, fmt.Sprintf("/installation/repositories?per_page=100&page=%d", page), nil, &out, http.StatusOK)
@@ -268,6 +269,10 @@ func (c *Client) listInstallationRepositories(ctx context.Context, owner string)
 			return nil, true, fmt.Errorf("list installation repositories for %s: %w", owner, err)
 		}
 		for _, repo := range out.Repositories {
+			if repo.Archived {
+				// Archived repositories cannot have queued workflow runs.
+				continue
+			}
 			name := strings.TrimSpace(repo.FullName)
 			if repoOwner, _, found := strings.Cut(name, "/"); found && strings.EqualFold(repoOwner, owner) {
 				repos = append(repos, name)
