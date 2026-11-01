@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -822,5 +823,277 @@ func TestReconcileQueuedGitHubJobsScansAWeekAcrossReposAndSharedPool(t *testing.
 	}
 	if age := service.now().Sub(since); age < 7*24*time.Hour-time.Minute {
 		t.Fatalf("reconcile window = %v, want >= 7d", age)
+	}
+}
+
+// countingLister records every list call and charges one API call per call,
+// mimicking github.Client.APICalls. Runs come from runsRecent for the 1h
+// window and runsDeep for the 7-day window.
+type countingLister struct {
+	*listerLog
+	repos      []string
+	runsRecent map[string][]int64
+	runsDeep   map[string][]int64
+	runErr     map[string]error
+	jobs       map[string][]github.WorkflowJob
+	jobErr     map[int64]error
+	now        func() time.Time
+	// rateFloorAfter, when > 0, reports remaining=999 once that many calls were made.
+	rateFloorAfter int64
+}
+
+type listerLog struct {
+	calls     int64
+	repoLists int
+	runLists  []runListCall
+	jobLists  map[int64]int
+}
+
+type runListCall struct {
+	repo   string
+	window time.Duration
+}
+
+func newCountingLister(now func() time.Time) countingLister {
+	return countingLister{listerLog: &listerLog{jobLists: map[int64]int{}}, now: now}
+}
+
+func (l countingLister) APICalls() int64 { return l.calls }
+func (l countingLister) RateLimit() (int, time.Time, bool) {
+	if l.rateFloorAfter > 0 && l.calls >= l.rateFloorAfter {
+		return 999, l.now().Add(time.Hour), true
+	}
+	return 5000, time.Time{}, true
+}
+func (l countingLister) ListRepositories(context.Context, model.GitHubScope) ([]string, error) {
+	l.calls++
+	l.repoLists++
+	return l.repos, nil
+}
+func (l countingLister) ListQueuedWorkflowRuns(_ context.Context, repository string, since time.Time) ([]int64, error) {
+	l.calls++
+	window := l.now().Sub(since).Round(time.Hour)
+	l.runLists = append(l.runLists, runListCall{repository, window})
+	if window > reconcileRecentWindow {
+		return l.runsDeep[repository], l.runErr[repository]
+	}
+	return l.runsRecent[repository], l.runErr[repository]
+}
+func (l countingLister) ListWorkflowJobs(_ context.Context, _ string, runID int64) ([]github.WorkflowJob, error) {
+	l.calls++
+	l.jobLists[runID]++
+	return l.jobs[fmt.Sprint(runID)], l.jobErr[runID]
+}
+
+func manyRuns(base, n int) []int64 {
+	out := make([]int64, n)
+	for i := range out {
+		out[i] = int64(base + i)
+	}
+	return out
+}
+
+func reconcileCycle(t *testing.T, server *Server, l countingLister) int64 {
+	t.Helper()
+	before := l.calls
+	if _, err := server.ReconcileQueuedGitHubJobs(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	spent := l.calls - before
+	if spent > reconcileCallBudget {
+		t.Fatalf("cycle spent %d calls, budget %d", spent, reconcileCallBudget)
+	}
+	return spent
+}
+
+func TestReconcileQueuedGitHubJobsSingleRepoOverBudgetResumesMidRepo(t *testing.T) {
+	service := newServiceWithConfig(nil)
+	server := newTestServer(t, service)
+	l := newCountingLister(service.now)
+	l.repos = []string{"my-org/big"}
+	l.runsDeep = map[string][]int64{"my-org/big": manyRuns(1000, 500)}
+	server.SetGitHubWebhook(GitHubWebhookOptions{WorkflowJobs: l})
+	budgetBefore := testutil.ToFloat64(server.githubWebhook.metrics.budget)
+	for cycle := 0; cycle < 6; cycle++ {
+		spent := reconcileCycle(t, server, l)
+		t.Logf("cycle %d spent %d jobs=%d", cycle, spent, len(l.jobLists))
+		if spent < reconcileCallBudget-2 && len(l.jobLists) < 500 {
+			t.Fatalf("cycle %d spent only %d calls with work pending", cycle, spent)
+		}
+	}
+	if len(l.jobLists) != 500 {
+		t.Fatalf("listed jobs for %d/500 runs after 6 cycles", len(l.jobLists))
+	}
+	for runID, n := range l.jobLists {
+		if n != 1 {
+			t.Fatalf("run %d listed %d times; mid-repo resume must not restart the repo", runID, n)
+		}
+	}
+	deepLists := 0
+	for _, c := range l.runLists {
+		if c.window == reconcileRunWindow {
+			deepLists++
+		}
+	}
+	if deepLists != 1 {
+		t.Fatalf("deep run listing for the big repo ran %d times, want 1 (cursor resumes at run position)", deepLists)
+	}
+	if got := testutil.ToFloat64(server.githubWebhook.metrics.budget) - budgetBefore; got < 5 {
+		t.Fatalf("budget-exhausted metric delta=%v, want >= 5", got)
+	}
+}
+
+func TestReconcileQueuedGitHubJobsBigRepoDoesNotStarveLaterRepos(t *testing.T) {
+	service := newServiceWithConfig(nil)
+	now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+	service.now = func() time.Time { return now }
+	server := newTestServer(t, service)
+	l := newCountingLister(service.now)
+	l.repos = []string{"my-org/big", "my-org/a", "my-org/b", "my-org/c", "my-org/d", "my-org/e"}
+	l.runsDeep = map[string][]int64{"my-org/big": manyRuns(1000, 300)}
+	for i, r := range l.repos[1:] {
+		l.runsDeep[r] = []int64{int64(10 + i)}
+	}
+	server.SetGitHubWebhook(GitHubWebhookOptions{WorkflowJobs: l})
+	for cycle := 0; cycle < 6 && server.githubWebhook.reconcile.deepOpen || cycle == 0; cycle++ {
+		reconcileCycle(t, server, l)
+		now = now.Add(time.Minute)
+	}
+	if server.githubWebhook.reconcile.deepOpen {
+		t.Fatal("deep pass never completed: repos after the big one starved")
+	}
+	for i := range l.repos[1:] {
+		if l.jobLists[int64(10+i)] == 0 {
+			t.Fatalf("repo %s run never scanned", l.repos[1+i])
+		}
+	}
+}
+
+func TestReconcileQueuedGitHubJobsRecentScanCoversReposAheadOfDeepCursor(t *testing.T) {
+	service := newServiceWithConfig(func(pool *model.PoolConfig) {
+		if pool.Name == model.PoolFull {
+			pool.WebhookLabels = []string{"self-hosted", "uecb-full"}
+		}
+	})
+	server := newTestServer(t, service)
+	l := newCountingLister(service.now)
+	l.repos = []string{"my-org/big", "my-org/a", "my-org/b", "my-org/late"}
+	l.runsDeep = map[string][]int64{"my-org/big": manyRuns(1000, 400)}
+	l.runsRecent = map[string][]int64{"my-org/late": {77}}
+	l.jobs = map[string][]github.WorkflowJob{"77": {
+		{ID: 501, RunID: 77, Status: "queued", Labels: []string{"self-hosted", "uecb-full"}},
+	}}
+	server.SetGitHubWebhook(GitHubWebhookOptions{WorkflowJobs: l})
+	got, err := server.ReconcileQueuedGitHubJobs(context.Background())
+	if err != nil || got != 1 {
+		t.Fatalf("allocated=%d err=%v; the 1h scan must reach repos the deep cursor has not", got, err)
+	}
+	if !server.githubWebhook.reconcile.deepOpen || server.githubWebhook.reconcile.deep.repo != "my-org/big" {
+		t.Fatalf("deep cursor = %+v, want still inside my-org/big", server.githubWebhook.reconcile.deep)
+	}
+}
+
+func TestReconcileQueuedGitHubJobsChecksRateLimitInsideRepo(t *testing.T) {
+	service := newServiceWithConfig(nil)
+	server := newTestServer(t, service)
+	l := newCountingLister(service.now)
+	l.repos = []string{"my-org/big"}
+	l.runsDeep = map[string][]int64{"my-org/big": manyRuns(1000, 50)}
+	l.rateFloorAfter = 10
+	server.SetGitHubWebhook(GitHubWebhookOptions{WorkflowJobs: l})
+	if _, err := server.ReconcileQueuedGitHubJobs(context.Background()); !errors.Is(err, ErrReconcileRateLimited) {
+		t.Fatalf("err=%v, want rate-limit backoff mid-repo", err)
+	}
+	if l.calls != 10 {
+		t.Fatalf("calls=%d, want the scan to stop as soon as remaining fell below the floor", l.calls)
+	}
+}
+
+func TestReconcileQueuedGitHubJobsCachesRepositoryList(t *testing.T) {
+	service := newServiceWithConfig(nil)
+	now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+	service.now = func() time.Time { return now }
+	server := newTestServer(t, service)
+	l := newCountingLister(service.now)
+	l.repos = []string{"my-org/home"}
+	server.SetGitHubWebhook(GitHubWebhookOptions{WorkflowJobs: l})
+	for i := 0; i < 4; i++ {
+		reconcileCycle(t, server, l)
+		now = now.Add(time.Minute)
+	}
+	if l.repoLists != 1 {
+		t.Fatalf("repository list fetched %d times in 4 minutes, want 1", l.repoLists)
+	}
+	now = now.Add(reconcileReposTTL)
+	reconcileCycle(t, server, l)
+	if l.repoLists != 2 {
+		t.Fatalf("repository list fetched %d times after TTL, want 2", l.repoLists)
+	}
+}
+
+func TestReconcileQueuedGitHubJobsRunsDeepScanOnSlowerInterval(t *testing.T) {
+	service := newServiceWithConfig(nil)
+	now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+	service.now = func() time.Time { return now }
+	server := newTestServer(t, service)
+	l := newCountingLister(service.now)
+	l.repos = []string{"my-org/home"}
+	server.SetGitHubWebhook(GitHubWebhookOptions{WorkflowJobs: l})
+	step := func() (deep bool) {
+		t.Helper()
+		l.runLists = nil
+		reconcileCycle(t, server, l)
+		now = now.Add(time.Minute)
+		recent := false
+		for _, c := range l.runLists {
+			deep = deep || c.window == reconcileRunWindow
+			recent = recent || c.window == reconcileRecentWindow
+		}
+		if !recent {
+			t.Fatalf("cycle without a 1h scan: %+v", l.runLists)
+		}
+		return deep
+	}
+	if !step() {
+		t.Fatal("first cycle must run the deep scan")
+	}
+	for i := 1; i < 10; i++ {
+		if step() {
+			t.Fatalf("minute %d ran the deep scan before %v", i, reconcileDeepInterval)
+		}
+	}
+	if !step() {
+		t.Fatalf("no deep scan after %v", reconcileDeepInterval)
+	}
+}
+
+func TestReconcileQueuedGitHubJobsReportsPageCapAndKeepsTruncatedResults(t *testing.T) {
+	service := newServiceWithConfig(func(pool *model.PoolConfig) {
+		if pool.Name == model.PoolFull {
+			pool.WebhookLabels = []string{"self-hosted", "uecb-full"}
+		}
+	})
+	server := newTestServer(t, service)
+	capped := fmt.Errorf("list: %w", github.ErrPageCapReached)
+	l := newCountingLister(service.now)
+	l.repos = []string{"my-org/home"}
+	l.runsRecent = map[string][]int64{"my-org/home": {12}}
+	l.runErr = map[string]error{"my-org/home": capped}
+	l.jobs = map[string][]github.WorkflowJob{"12": {
+		{ID: 99, RunID: 12, Status: "queued", Labels: []string{"self-hosted", "uecb-full"}},
+	}}
+	l.jobErr = map[int64]error{12: capped}
+	server.SetGitHubWebhook(GitHubWebhookOptions{WorkflowJobs: l})
+	m := server.githubWebhook.metrics.pageCap
+	runsBefore, jobsBefore := testutil.ToFloat64(m.WithLabelValues("runs")), testutil.ToFloat64(m.WithLabelValues("jobs"))
+	got, err := server.ReconcileQueuedGitHubJobs(context.Background())
+	if err != nil || got != 1 {
+		t.Fatalf("allocated=%d err=%v; truncated listings must still be acted on", got, err)
+	}
+	if d := testutil.ToFloat64(m.WithLabelValues("runs")) - runsBefore; d < 1 {
+		t.Fatalf("runs page-cap metric delta=%v", d)
+	}
+	if d := testutil.ToFloat64(m.WithLabelValues("jobs")) - jobsBefore; d < 1 {
+		t.Fatalf("jobs page-cap metric delta=%v", d)
 	}
 }

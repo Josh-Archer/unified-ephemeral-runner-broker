@@ -230,7 +230,83 @@ func TestListQueuedWorkflowRunsCapsPages(t *testing.T) {
 	defer server.Close()
 	client := NewClient(func(context.Context) (string, error) { return "tok", nil }, nil).WithBaseURL(server.URL)
 	runs, err := client.ListQueuedWorkflowRuns(context.Background(), "o/r", time.Time{})
-	if err != nil || pages != MaxQueuedRunPages || len(runs) != MaxQueuedRunPages*100 {
-		t.Fatalf("pages=%d runs=%d err=%v", pages, len(runs), err)
+	if !errors.Is(err, ErrPageCapReached) || pages != MaxQueuedRunPages || len(runs) != MaxQueuedRunPages*100 {
+		t.Fatalf("pages=%d runs=%d err=%v, want truncated results with ErrPageCapReached", pages, len(runs), err)
+	}
+	if got := client.APICalls(); got != int64(MaxQueuedRunPages) {
+		t.Fatalf("APICalls=%d, want %d", got, MaxQueuedRunPages)
+	}
+}
+
+func TestListWorkflowJobsCapsPages(t *testing.T) {
+	pages := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pages++
+		page := r.URL.Query().Get("page")
+		jobs := make([]string, 100)
+		for i := range jobs {
+			jobs[i] = fmt.Sprintf(`{"id":%s%03d,"status":"queued"}`, page, i+1)
+		}
+		_, _ = w.Write([]byte(`{"jobs":[` + strings.Join(jobs, ",") + `]}`))
+	}))
+	defer server.Close()
+	client := NewClient(func(context.Context) (string, error) { return "tok", nil }, nil).WithBaseURL(server.URL)
+	jobs, err := client.ListWorkflowJobs(context.Background(), "o/r", 7)
+	if !errors.Is(err, ErrPageCapReached) || pages != MaxWorkflowJobPages || len(jobs) != MaxWorkflowJobPages*100 {
+		t.Fatalf("pages=%d jobs=%d err=%v, want truncated results with ErrPageCapReached", pages, len(jobs), err)
+	}
+	if jobs[0].RunID != 7 {
+		t.Fatalf("run id not backfilled: %+v", jobs[0])
+	}
+}
+
+func TestListWorkflowJobsShortRunIsNotTruncated(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"jobs":[{"id":1,"status":"queued"}]}`))
+	}))
+	defer server.Close()
+	client := NewClient(func(context.Context) (string, error) { return "tok", nil }, nil).WithBaseURL(server.URL)
+	jobs, err := client.ListWorkflowJobs(context.Background(), "o/r", 7)
+	if err != nil || len(jobs) != 1 {
+		t.Fatalf("jobs=%d err=%v", len(jobs), err)
+	}
+}
+
+func fullPageServer(t *testing.T, key string, pages *int) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		*pages++
+		page := r.URL.Query().Get("page")
+		items := make([]string, 100)
+		for i := range items {
+			items[i] = fmt.Sprintf(`{"id":%s%03d,"full_name":"o/r%s-%d","name":"n%s-%d"}`, page, i+1, page, i, page, i)
+		}
+		body := "[" + strings.Join(items, ",") + "]"
+		if key != "" {
+			body = `{"` + key + `":` + body + `}`
+		}
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+func TestListRepositoriesCapsPages(t *testing.T) {
+	pages := 0
+	server := fullPageServer(t, "", &pages)
+	client := NewClient(func(context.Context) (string, error) { return "tok", nil }, nil).WithBaseURL(server.URL)
+	repos, err := client.ListRepositories(context.Background(), model.GitHubScope{Type: model.GitHubScopeOrganization, Organization: "o"})
+	if !errors.Is(err, ErrPageCapReached) || pages != MaxRepositoryPages || len(repos) != MaxRepositoryPages*100 {
+		t.Fatalf("pages=%d repos=%d err=%v", pages, len(repos), err)
+	}
+}
+
+func TestListRunnersCapsPages(t *testing.T) {
+	pages := 0
+	server := fullPageServer(t, "runners", &pages)
+	client := NewClient(func(context.Context) (string, error) { return "tok", nil }, nil).WithBaseURL(server.URL)
+	runners, err := client.ListRunners(context.Background(), model.GitHubScope{Type: model.GitHubScopeOrganization, Organization: "o"})
+	if !errors.Is(err, ErrPageCapReached) || pages != MaxRunnerPages || len(runners) != MaxRunnerPages*100 {
+		t.Fatalf("pages=%d runners=%d err=%v", pages, len(runners), err)
 	}
 }
