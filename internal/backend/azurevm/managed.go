@@ -3,7 +3,9 @@ package azurevm
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
+	"log"
 	"sort"
 	"strconv"
 	"strings"
@@ -13,7 +15,37 @@ import (
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend"
 	gh "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/github"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
+	"github.com/prometheus/client_golang/prometheus"
 )
+
+// runnerPageCap counts ListRunners calls cut at gh.MaxRunnerPages. Runners
+// past the cap are invisible to provisioning, cleanup and capacity.
+var runnerPageCap = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "uecb_github_list_runners_page_cap_total",
+	Help: "Managed azure-vm ListRunners calls truncated at their page cap, by operation (provision, cleanup or capacity); runners past the cap were not seen.",
+}, []string{"operation"})
+
+func init() {
+	if err := prometheus.Register(runnerPageCap); err != nil {
+		if _, ok := err.(prometheus.AlreadyRegisteredError); !ok {
+			panic(err)
+		}
+	}
+}
+
+// listRunners accepts a listing truncated at its page cap: it counts and logs
+// the truncation and returns the partial list instead of failing.
+func (b *managedBackend) listRunners(ctx context.Context, scope model.GitHubScope, operation string) ([]gh.Runner, error) {
+	runners, err := b.client.ListRunners(ctx, scope)
+	if err != nil {
+		if !errors.Is(err, gh.ErrPageCapReached) {
+			return nil, err
+		}
+		runnerPageCap.WithLabelValues(operation).Inc()
+		log.Printf("managed azure-vm WARNING: %s runner listing hit its page cap (%d pages); using the %d runners returned: %v", operation, gh.MaxRunnerPages, len(runners), err)
+	}
+	return runners, nil
+}
 
 // RunnerClient mutates only routing labels, never the persistent runner itself.
 type RunnerClient interface {
@@ -76,7 +108,7 @@ func (b *managedBackend) Provision(ctx context.Context, request model.Allocation
 	if err != nil {
 		return backend.ProvisionedRunner{}, err
 	}
-	runners, err := b.client.ListRunners(ctx, scope)
+	runners, err := b.listRunners(ctx, scope, "provision")
 	if err != nil {
 		return backend.ProvisionedRunner{}, err
 	}
@@ -133,7 +165,7 @@ func (b *managedBackend) Cleanup(ctx context.Context, allocation model.Allocatio
 	return b.cleanupLocked(ctx, allocation, scope, target)
 }
 func (b *managedBackend) cleanupLocked(ctx context.Context, allocation model.AllocationStatus, scope model.GitHubScope, target *model.AzureVMBackendConfig) error {
-	runners, err := b.client.ListRunners(ctx, scope)
+	runners, err := b.listRunners(ctx, scope, "cleanup")
 	if err != nil {
 		return err
 	}
@@ -182,7 +214,7 @@ func (b *managedBackend) Capacity(ctx context.Context) (backend.CapacityStatus, 
 		if err != nil {
 			return backend.CapacityStatus{}, err
 		}
-		rs, err := b.client.ListRunners(ctx, scope)
+		rs, err := b.listRunners(ctx, scope, "capacity")
 		if err != nil {
 			return backend.CapacityStatus{}, err
 		}

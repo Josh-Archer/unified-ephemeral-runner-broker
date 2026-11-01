@@ -3,6 +3,7 @@ package azurevm
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -10,6 +11,7 @@ import (
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend"
 	gh "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/github"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 type fakeRunners struct {
@@ -17,6 +19,7 @@ type fakeRunners struct {
 	runners    []gh.Runner
 	failAdd    bool
 	failRemove bool
+	listErr    error
 }
 
 func (f *fakeRunners) ListRunners(context.Context, model.GitHubScope) ([]gh.Runner, error) {
@@ -26,7 +29,7 @@ func (f *fakeRunners) ListRunners(context.Context, model.GitHubScope) ([]gh.Runn
 	for i := range r {
 		r[i].Labels = append([]gh.RunnerLabel{}, r[i].Labels...)
 	}
-	return r, nil
+	return r, f.listErr
 }
 func (f *fakeRunners) AddRunnerLabels(_ context.Context, _ model.GitHubScope, id int64, labels []string) error {
 	f.mu.Lock()
@@ -190,5 +193,35 @@ func TestLegacyStaticRunnerStillAvailable(t *testing.T) {
 	r, err := New(c).Provision(context.Background(), model.AllocationRequest{}, allocate("one"))
 	if err != nil || r.RunnerLabel != "legacy" {
 		t.Fatalf("legacy: %+v %v", r, err)
+	}
+}
+
+func TestManagedAcceptsTruncatedRunnerList(t *testing.T) {
+	c, f := fixture()
+	f.listErr = fmt.Errorf("list runners: %w", gh.ErrPageCapReached)
+	b := New(c, f)
+	before := testutil.ToFloat64(runnerPageCap.WithLabelValues("provision"))
+	a := allocate("one")
+	r, err := b.Provision(context.Background(), model.AllocationRequest{}, a)
+	if err != nil || r.RunnerLabel != "worker-1" {
+		t.Fatalf("truncated list must still provision: %+v %v", r, err)
+	}
+	if d := testutil.ToFloat64(runnerPageCap.WithLabelValues("provision")) - before; d != 1 {
+		t.Fatalf("provision page-cap metric delta=%v, want 1", d)
+	}
+	cap, err := b.(backend.CapacityBackend).Capacity(context.Background())
+	if err != nil || cap.MaxRunners != 2 || cap.ActiveRunners != 1 {
+		t.Fatalf("capacity from truncated list: %+v %v", cap, err)
+	}
+	if err := b.(backend.CleanupBackend).Cleanup(context.Background(), a); err != nil {
+		t.Fatalf("cleanup with truncated list: %v", err)
+	}
+	rs, _ := f.ListRunners(context.Background(), model.GitHubScope{})
+	if leased(rs[0]) {
+		t.Fatal("cleanup with truncated list left the lease marker")
+	}
+	f.listErr = errors.New("unavailable")
+	if _, err := b.Provision(context.Background(), model.AllocationRequest{}, allocate("two")); err == nil || backend.IsCapacityExhausted(err) {
+		t.Fatalf("other list errors must stay fatal: %v", err)
 	}
 }

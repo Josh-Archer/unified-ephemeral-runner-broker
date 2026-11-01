@@ -191,6 +191,7 @@ type reconcileState struct {
 	deepOpen bool      // a deep pass started and has not covered every repo yet
 	repos    []string
 	reposAt  time.Time
+	reposTTL time.Duration // reconcileReposTTL, or reconcileTruncatedReposTTL for a capped listing
 }
 
 // SetGitHubWebhook enables POST /webhooks/github. Without it the route
@@ -422,10 +423,13 @@ const (
 	// reconcileRecentReserve is the share of the budget held for the 1h scan
 	// while a deep pass is open, so repositories the deep cursor has not
 	// reached yet still get their recent queued runs checked every cycle.
-	reconcileRecentReserve   = 30
-	reconcileReposTTL        = 5 * time.Minute
-	reconcileRateLimitFloor  = 1000
-	reconcileRateLimitBackof = 5 * time.Minute
+	reconcileRecentReserve = 30
+	reconcileReposTTL      = 5 * time.Minute
+	// reconcileTruncatedReposTTL is how long a repository list cut at its page
+	// cap is reused, so a truncated listing is retried soon.
+	reconcileTruncatedReposTTL = time.Minute
+	reconcileRateLimitFloor    = 1000
+	reconcileRateLimitBackof   = 5 * time.Minute
 )
 
 // ErrReconcileRateLimited reports a reconcile pass skipped or cut short because
@@ -572,27 +576,30 @@ func (b *cycleBudget) take(ctx context.Context, limit int64) error {
 }
 
 // reconcileRepositories returns the cached repository list, refreshing it
-// every reconcileReposTTL. A listing cut at its page cap is used as is.
+// every reconcileReposTTL. A listing cut at its page cap is used as is but
+// only cached for reconcileTruncatedReposTTL.
 func (h *githubWebhookHandler) reconcileRepositories(ctx context.Context, budget *cycleBudget, now time.Time) ([]string, error) {
 	state := &h.reconcile
-	if state.repos != nil && now.Sub(state.reposAt) < reconcileReposTTL {
+	if state.repos != nil && now.Sub(state.reposAt) < state.reposTTL {
 		return state.repos, nil
 	}
 	if err := budget.take(ctx, reconcileCallBudget); err != nil {
 		return nil, err
 	}
+	ttl := reconcileReposTTL
 	repos, err := h.opts.WorkflowJobs.ListRepositories(ctx, h.service.cfg.GitHub.Scope)
 	if err != nil {
 		if !errors.Is(err, github.ErrPageCapReached) {
 			return nil, err
 		}
 		h.metrics.pageCap.WithLabelValues("repositories").Inc()
+		ttl = reconcileTruncatedReposTTL
 		log.Printf("github reconcile WARNING: repository listing hit its page cap; repositories past it are not reconciled: %v", err)
 	}
 	if repos == nil {
 		repos = []string{}
 	}
-	state.repos, state.reposAt = repos, now
+	state.repos, state.reposAt, state.reposTTL = repos, now, ttl
 	return repos, nil
 }
 
