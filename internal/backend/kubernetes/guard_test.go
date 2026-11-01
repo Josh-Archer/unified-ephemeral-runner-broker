@@ -85,7 +85,7 @@ func TestNamedTargetSharesCapAndKeepsIndependentIdentity(t *testing.T) {
 	}
 	b := NewNamed(cfg, api, reg, desktopName)
 	status, err := b.Capacity(context.Background())
-	if err != nil || status.MaxRunners != 5 || status.ActiveRunners != 1 || status.PendingRunners != 1 {
+	if err != nil || status.MaxRunners != 5 || status.ActiveRunners != 1 || status.PendingRunners != 0 {
 		t.Fatalf("status=%+v err=%v", status, err)
 	}
 	selector, _ := url.QueryUnescape(api.calls[1].path)

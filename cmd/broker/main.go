@@ -193,6 +193,9 @@ func main() {
 	startBackground("reconcile-finished-runners", 30*time.Second, func(time.Time) {
 		service.ReconcileFinishedRunners(context.Background())
 	})
+	startBackground("reconcile-orphaned-allocations", 30*time.Second, func(now time.Time) {
+		service.ReconcileOrphanedAllocations(context.Background(), now)
+	})
 
 	if webhookPoolsConfigured(cfg) {
 		startBackground("github-webhook-inbox", 5*time.Second, func(time.Time) {

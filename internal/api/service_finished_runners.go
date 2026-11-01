@@ -94,3 +94,86 @@ func (s *Service) releaseFinishedRunner(ctx context.Context, backendName model.B
 	})
 	return false
 }
+
+// orphanedAllocationGrace is how long a ready allocation may go without a
+// visible runner pod before it is reaped, covering list/create races.
+const orphanedAllocationGrace = 3 * time.Minute
+
+// ReconcileOrphanedAllocations releases ready allocations whose runner pod no
+// longer holds a slot: the pod was deleted (including force-deleted), is
+// Terminating, or sits on a NotReady node. Without this, such allocations stay
+// counted against maxRunners in the persisted store until their job timeout,
+// even across broker restarts. Only allocations a pod-backed provider created
+// (metadata pod_name) are considered, and an inventory error releases nothing.
+// It returns the number of allocations released.
+func (s *Service) ReconcileOrphanedAllocations(ctx context.Context, now time.Time) int {
+	if s.registry == nil {
+		return 0
+	}
+	live := map[model.BackendName]map[string]struct{}{}
+	for _, pool := range s.cfg.Pools {
+		for backendName, cfg := range pool.Backends {
+			if !cfg.Enabled {
+				continue
+			}
+			if _, ok := live[backendName]; ok {
+				continue
+			}
+			impl, ok := s.registry.Get(backendName)
+			if !ok {
+				continue
+			}
+			inventory, ok := impl.(backend.InventoryBackend)
+			if !ok {
+				continue
+			}
+			probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			runners, err := inventory.LiveRunners(probeCtx)
+			cancel()
+			if err != nil {
+				logAllocationEvent(ctx, "orphaned_allocation_inventory_failed", map[string]string{
+					"backend": string(backendName),
+					"error":   err.Error(),
+				})
+				continue
+			}
+			ids := make(map[string]struct{}, len(runners))
+			for _, runner := range runners {
+				ids[runner.AllocationID] = struct{}{}
+			}
+			live[backendName] = ids
+		}
+	}
+	released := 0
+	for _, status := range s.store.List() {
+		if status.State != model.StateReady || status.Metadata["pod_name"] == "" {
+			continue
+		}
+		ids, ok := live[status.SelectedBackend]
+		if !ok {
+			continue
+		}
+		if _, alive := ids[status.ID]; alive {
+			continue
+		}
+		if now.Sub(status.CreatedAt) < orphanedAllocationGrace {
+			continue
+		}
+		request := completionRequest{State: "failed", Error: "runner pod gone, terminating, or on a NotReady node"}
+		if _, _, err := s.Complete(ctx, status.ID, request); err != nil && !errors.Is(err, ErrAllocationAlreadyCompleted) {
+			logAllocationEvent(ctx, "orphaned_allocation_release_failed", map[string]string{
+				"allocation_id": allocationIDLabel(status.ID),
+				"backend":       string(status.SelectedBackend),
+				"error":         err.Error(),
+			})
+			continue
+		}
+		logAllocationEvent(ctx, "orphaned_allocation_released", map[string]string{
+			"allocation_id": allocationIDLabel(status.ID),
+			"pool":          string(status.Pool),
+			"backend":       string(status.SelectedBackend),
+		})
+		released++
+	}
+	return released
+}

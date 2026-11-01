@@ -132,3 +132,59 @@ func enforceNodeGuard(spec map[string]any, guard *model.KubernetesNodeGuardConfi
 	required["nodeSelectorTerms"] = terms
 	return nil
 }
+
+// nodeReadiness caches per-node Ready lookups for one inventory pass.
+type nodeReadiness struct {
+	b     *Backend
+	cache map[string]bool
+}
+
+func (b *Backend) newNodeReadiness() *nodeReadiness {
+	return &nodeReadiness{b: b, cache: map[string]bool{}}
+}
+
+// ready reports whether a pod bound to nodeName can still be running a job.
+// Unscheduled pods (empty nodeName) are ready (pending). A node that is gone
+// or whose Ready condition is not True is not ready. Lookup errors other than
+// NotFound are treated as ready so an API blip never frees occupied slots.
+func (n *nodeReadiness) ready(ctx context.Context, nodeName string) bool {
+	if nodeName == "" || n.b.api == nil {
+		return true
+	}
+	if v, ok := n.cache[nodeName]; ok {
+		return v
+	}
+	v := n.lookup(ctx, nodeName)
+	n.cache[nodeName] = v
+	return v
+}
+
+func (n *nodeReadiness) lookup(ctx context.Context, nodeName string) bool {
+	code, body, err := n.b.api.Do(ctx, http.MethodGet, "/api/v1/nodes/"+url.PathEscape(nodeName), nil)
+	if err != nil {
+		return true
+	}
+	if code == http.StatusNotFound {
+		return false
+	}
+	if code != http.StatusOK {
+		return true
+	}
+	var node struct {
+		Status struct {
+			Conditions []struct {
+				Type   string `json:"type"`
+				Status string `json:"status"`
+			} `json:"conditions"`
+		} `json:"status"`
+	}
+	if err := json.Unmarshal(body, &node); err != nil {
+		return true
+	}
+	for _, condition := range node.Status.Conditions {
+		if condition.Type == "Ready" {
+			return condition.Status == "True"
+		}
+	}
+	return false
+}
