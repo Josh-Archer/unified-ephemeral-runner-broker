@@ -291,12 +291,52 @@ func (f *File) persistLocked() error {
 	if err != nil {
 		return fmt.Errorf("encode state store: %w", err)
 	}
-	tmp := f.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	return writeFileAtomic(f.path, data, 0o600)
+}
+
+// writeFileAtomic replaces path with data so a crash leaves either the old or
+// the new contents, never a truncated or zero-filled file (home#4206): write
+// a temp file in the same directory, fsync it, rename it over path, then fsync
+// the directory so the rename itself is durable.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmpName := path + ".tmp"
+	tmp, err := os.OpenFile(tmpName, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	if err != nil {
+		return fmt.Errorf("create state store temp file: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
 		return fmt.Errorf("write state store: %w", err)
 	}
-	if err := os.Rename(tmp, f.path); err != nil {
+	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("chmod state store: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("fsync state store: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close state store: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
 		return fmt.Errorf("replace state store: %w", err)
+	}
+	committed = true
+	d, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("open state store directory: %w", err)
+	}
+	defer d.Close()
+	if err := d.Sync(); err != nil {
+		return fmt.Errorf("fsync state store directory: %w", err)
 	}
 	return nil
 }

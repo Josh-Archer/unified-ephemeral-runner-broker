@@ -204,6 +204,16 @@ type reconcileState struct {
 	deep     repoScanner
 	lastDeep time.Time // when the last full deep pass completed
 	deepOpen bool      // a deep pass started and has not covered every repo yet
+	// deepOpenedAt is when the open deep pass started; a pass open longer
+	// than reconcileDeepMaxOpen is restarted from a fresh repository count.
+	deepOpenedAt time.Time
+	// deepAllAges marks a deep pass opened while the allocation store was
+	// empty (after a state reset): it lists every queued run regardless of
+	// age instead of only reconcileRunWindow.
+	deepAllAges bool
+	// sawAllocations is true once a cycle saw a non-empty store, so a later
+	// empty store (state reset) reopens the deep scan immediately.
+	sawAllocations bool
 	// lastDeepSpent is the deep scan's call count in the last cycle.
 	lastDeepSpent int64
 	// cutoffs counts consecutive deadline cutoffs per scan unit, keyed
@@ -440,7 +450,11 @@ const (
 	reconcileRunWindow    = 7 * 24 * time.Hour
 	reconcileRecentWindow = time.Hour
 	reconcileDeepInterval = 10 * time.Minute
-	reconcileCallBudget   = 100
+	// reconcileDeepMaxOpen bounds how long one deep pass may stay open before
+	// it is restarted, so a pass whose cursor stalls cannot keep the deep
+	// scan from ever reopening (home#4206).
+	reconcileDeepMaxOpen = time.Hour
+	reconcileCallBudget  = 100
 	// reconcileRecentReserve is the share of the budget held for the 1h scan
 	// while a deep pass is open, so repositories the deep cursor has not
 	// reached yet still get their recent queued runs checked every cycle.
@@ -537,9 +551,31 @@ func (s *Server) ReconcileQueuedGitHubJobs(ctx context.Context) (int, error) {
 		state.deepOpen, state.lastDeep = false, now
 		return 0, nil
 	}
-	if !state.deepOpen && (state.lastDeep.IsZero() || now.Sub(state.lastDeep) >= reconcileDeepInterval) {
+	// An empty allocation store means the broker has no record of any
+	// runner (fresh start or state reset, home#4206): every queued run may
+	// be unserved, so the deep pass covers all ages and opens immediately
+	// on the transition to empty.
+	stateEmpty := len(h.service.store.List()) == 0
+	stateReset := stateEmpty && state.sawAllocations
+	if !stateEmpty {
+		state.sawAllocations = true
+	} else if stateReset {
+		state.sawAllocations = false
+	}
+	forceDeep := stateReset
+	if state.deepOpen && (stateReset || now.Sub(state.deepOpenedAt) >= reconcileDeepMaxOpen) {
+		forceDeep = true
+		log.Printf("github reconcile: restarting deep scan (open since %s, state reset=%v)", state.deepOpenedAt.UTC().Format(time.RFC3339), stateReset)
+		state.deepOpen = false
+		state.deep = repoScanner{}
+	}
+	if !state.deepOpen && (forceDeep || state.lastDeep.IsZero() || now.Sub(state.lastDeep) >= reconcileDeepInterval) {
 		state.deepOpen = true
+		state.deepOpenedAt = now
+		state.deepAllAges = stateEmpty
+		state.deep.repo, state.deep.runs, state.deep.pos = "", nil, 0
 		state.deep.remaining = len(repos)
+		log.Printf("github reconcile: deep scan reopened over %d repos (all ages=%v)", len(repos), state.deepAllAges)
 	}
 
 	run := &reconcileRun{h: h, budget: budget}
@@ -562,7 +598,11 @@ func (s *Server) ReconcileQueuedGitHubJobs(ctx context.Context) (int, error) {
 	deepSpent := int64(0)
 	if state.deepOpen && ctx.Err() == nil && !errors.Is(recentErr, ErrReconcileRateLimited) {
 		deepCtx, cancelDeep := context.WithTimeout(ctx, h.timeout(h.deepTimeout, reconcileDeepTimeout))
-		deepErr = run.scan(deepCtx, &state.deep, repos, now.Add(-reconcileRunWindow), reconcileRunWindow, deepScanLimit(recentSpent))
+		deepSince := now.Add(-reconcileRunWindow)
+		if state.deepAllAges {
+			deepSince = time.Time{} // every queued run, regardless of age
+		}
+		deepErr = run.scan(deepCtx, &state.deep, repos, deepSince, reconcileRunWindow, deepScanLimit(recentSpent))
 		cancelDeep()
 		deepSpent = budget.spent() - recentSpent
 		if deepErr == nil && state.deep.remaining <= 0 {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
@@ -146,12 +147,35 @@ func NewFromConfig(cfg model.StateStoreConfig) (Store, error) {
 	case "", TypeMemory:
 		return NewMemory(), nil
 	case TypeFile:
-		return NewFile(cfg.Path)
+		// Return an untyped nil on error: returning NewFile's (*File)(nil)
+		// directly yields a non-nil Store interface holding a nil pointer.
+		s, err := NewFile(cfg.Path)
+		if err != nil {
+			return nil, err
+		}
+		return s, nil
 	case TypePostgres:
-		return NewPostgres(cfg)
+		s, err := NewPostgres(cfg)
+		if err != nil {
+			return nil, err
+		}
+		return s, nil
 	default:
 		return nil, fmt.Errorf("unsupported broker.stateStore.type %q", cfg.Type)
 	}
+}
+
+// IsNil reports whether s is nil or an interface holding a nil pointer.
+func IsNil(s Store) bool {
+	if s == nil {
+		return true
+	}
+	v := reflect.ValueOf(s)
+	switch v.Kind() {
+	case reflect.Ptr, reflect.Map, reflect.Slice, reflect.Interface, reflect.Func, reflect.Chan:
+		return v.IsNil()
+	}
+	return false
 }
 
 // AsLeaderElector returns a LeaderElector when the store supports it.
