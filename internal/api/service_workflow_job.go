@@ -136,11 +136,18 @@ func (s *Service) AllocateForWorkflowJob(ctx context.Context, pool model.PoolCon
 	s.workflowJobMu.Lock()
 	defer s.workflowJobMu.Unlock()
 	if existing, ok := s.findByWorkflowJobID(jobID); ok {
-		// Reconcile only runs for jobs GitHub still reports as queued, so a
-		// failed earlier attempt is stale and the job deserves a new runner.
-		if !(existing.State == model.StateFailed && retryFailedWorkflowJob(ctx)) {
+		// Reconcile only runs for jobs GitHub still reports as queued, so any
+		// terminal earlier attempt (failed, expired/unregistered/unclaimed,
+		// canceled, or completed by a runner that took another job) is stale
+		// and the job deserves a new runner, within bounded retries.
+		if !isTerminalAllocationState(existing.State) || !retryFailedWorkflowJob(ctx) || !s.mayReallocateWorkflowJob(jobID, s.now()) {
 			return existing, false, nil
 		}
+		defer func() {
+			if created {
+				s.noteWorkflowJobReallocated(jobID, s.now())
+			}
+		}()
 	}
 	tenant := ""
 	if s.cfg.GitHub.Scope.IsPerRepository() {
@@ -464,6 +471,7 @@ func (s *Service) ClaimWorkflowJob(ctx context.Context, jobID int64, runnerName 
 	if !saved {
 		return status, true, ErrAllocationAlreadyCompleted
 	}
+	s.recordRegistrationSuccess(status.Pool, status.SelectedBackend)
 	claimed := status
 	s.suppressSurplusDemand(jobID, runner.Repository, claimed)
 	// If completion arrived without runner identity before in_progress, it is
