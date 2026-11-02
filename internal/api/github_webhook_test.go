@@ -869,8 +869,9 @@ func (l *listerLog) hangs(ctx context.Context, key string) bool {
 }
 
 type runListCall struct {
-	repo   string
-	window time.Duration
+	repo    string
+	window  time.Duration
+	allAges bool // listed with no created cutoff (empty-state deep pass)
 }
 
 func newCountingLister(now func() time.Time) countingLister {
@@ -892,7 +893,11 @@ func (l countingLister) ListRepositories(context.Context, model.GitHubScope) ([]
 func (l countingLister) ListQueuedWorkflowRuns(ctx context.Context, repository string, since time.Time) ([]int64, error) {
 	l.calls++
 	window := l.now().Sub(since).Round(time.Hour)
-	l.runLists = append(l.runLists, runListCall{repository, window})
+	allAges := since.IsZero()
+	if allAges {
+		window = reconcileRunWindow // an all-ages deep listing
+	}
+	l.runLists = append(l.runLists, runListCall{repo: repository, window: window, allAges: allAges})
 	if l.hangs(ctx, fmt.Sprintf("runs:%s:%s", repository, window)) {
 		return nil, ctx.Err()
 	}

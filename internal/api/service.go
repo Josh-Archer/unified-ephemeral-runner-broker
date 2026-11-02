@@ -76,7 +76,12 @@ type Service struct {
 
 func NewService(cfg model.BrokerConfig, registry *backend.Registry, health func(context.Context) error) *Service {
 	stateStore, storeErr := store.NewFromConfig(cfg.Broker.StateStore)
-	if stateStore == nil {
+	if store.IsNil(stateStore) {
+		// Never run on a typed-nil store (home#4206): fall back to memory and
+		// surface the error through initErr and health instead of panicking.
+		if storeErr == nil {
+			storeErr = fmt.Errorf("state store %q returned a nil store", cfg.Broker.StateStore.Type)
+		}
 		stateStore = store.NewMemory()
 	}
 	return newServiceWithStore(cfg, registry, health, stateStore, storeErr)
@@ -85,10 +90,14 @@ func NewService(cfg model.BrokerConfig, registry *backend.Registry, health func(
 // NewServiceWithStore builds a service against an injected store. Used by HA
 // concurrency tests that share one store across simulated replicas.
 func NewServiceWithStore(cfg model.BrokerConfig, registry *backend.Registry, health func(context.Context) error, stateStore store.Store) *Service {
-	if stateStore == nil {
+	var storeErr error
+	if store.IsNil(stateStore) {
+		if stateStore != nil {
+			storeErr = fmt.Errorf("state store is a typed nil %T", stateStore)
+		}
 		stateStore = store.NewMemory()
 	}
-	return newServiceWithStore(cfg, registry, health, stateStore, nil)
+	return newServiceWithStore(cfg, registry, health, stateStore, storeErr)
 }
 
 func newServiceWithStore(cfg model.BrokerConfig, registry *backend.Registry, health func(context.Context) error, stateStore store.Store, storeErr error) *Service {
