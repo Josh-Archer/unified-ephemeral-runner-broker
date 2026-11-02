@@ -226,8 +226,14 @@ func (c *Client) ListRepositories(ctx context.Context, scope model.GitHubScope) 
 		if page == 1 && scope.Type == model.GitHubScopeOwner {
 			var status *StatusError
 			if errors.As(err, &status) && status.Code == http.StatusNotFound {
-				// Owner scope also supports a personal account; GitHub exposes
-				// those repositories through /users/{username}/repos.
+				// Owner scope also supports a personal account. A user token
+				// sees that account's private repositories only through
+				// /user/repos; /users/{username}/repos lists public ones alone,
+				// which silently dropped a private home-lab repository from the
+				// queued-job reconcile.
+				if own, ok := c.listAuthenticatedUserRepositories(ctx, owner); ok {
+					return own, nil
+				}
 				path = "/users/" + url.PathEscape(owner) + "/repos"
 				query = "type=owner"
 				err = c.do(ctx, http.MethodGet, fmt.Sprintf("%s?%s&per_page=100&page=%d", path, query, page), nil, &out, http.StatusOK)
@@ -247,6 +253,36 @@ func (c *Client) ListRepositories(ctx context.Context, scope model.GitHubScope) 
 	}
 	log.Printf("github: repository listing for %s stopped at the %d-page cap; later repositories were skipped", owner, MaxRepositoryPages)
 	return repos, fmt.Errorf("list repositories for %s: %w (%d pages)", owner, ErrPageCapReached, MaxRepositoryPages)
+}
+
+// listAuthenticatedUserRepositories lists the non-archived repositories of
+// the token's own user account when that account is owner. ok is false when
+// the listing fails or the token belongs to another account, so the caller
+// falls back to the public owner listing.
+func (c *Client) listAuthenticatedUserRepositories(ctx context.Context, owner string) ([]string, bool) {
+	var repos []string
+	for page := 1; page <= MaxRepositoryPages; page++ {
+		var out []struct {
+			FullName string `json:"full_name"`
+			Archived bool   `json:"archived"`
+		}
+		if err := c.do(ctx, http.MethodGet, fmt.Sprintf("/user/repos?affiliation=owner&visibility=all&per_page=100&page=%d", page), nil, &out, http.StatusOK); err != nil {
+			return nil, false
+		}
+		for _, repo := range out {
+			name := strings.TrimSpace(repo.FullName)
+			if repoOwner, _, found := strings.Cut(name, "/"); found && strings.EqualFold(repoOwner, owner) && !repo.Archived {
+				repos = append(repos, name)
+			}
+		}
+		if len(out) < 100 {
+			break
+		}
+	}
+	if len(repos) == 0 {
+		return nil, false
+	}
+	return repos, true
 }
 
 // listInstallationRepositories lists the repositories of the token's GitHub
