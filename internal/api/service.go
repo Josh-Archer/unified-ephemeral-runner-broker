@@ -69,6 +69,8 @@ type Service struct {
 	// workflowJobMu serializes webhook-driven allocation so one job id never
 	// yields two allocations.
 	workflowJobMu sync.Mutex
+	jobRetries    workflowJobRetries
+	regPenalties  registrationPenalties
 	initErr       error
 	health        func(context.Context) error
 	now           func() time.Time
@@ -802,6 +804,7 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 		}
 		return model.AllocationStatus{}, err
 	}
+	pool = s.filterRegistrationPenalized(pool, request)
 	pool, err = s.filterBackendsByTierState(pool, request)
 	if err != nil {
 		if queued, ok := s.queueAllocation(ctx, request, resultPool, "", err, existing); ok {
@@ -1660,6 +1663,7 @@ func (s *Service) SweepExpired(now time.Time) int {
 							s.reclaimStaleRunnerLabel(context.Background(), status)
 						}
 						s.observer.ObserveAllocationExpired(status.Pool, status.SelectedBackend, reason)
+						s.recordRegistrationExpiry(status.Pool, status.SelectedBackend, now)
 						logAllocationEvent(context.Background(), "allocation_expired", map[string]string{
 							"allocation_id": allocationIDLabel(status.ID),
 							"pool":          string(status.Pool),
@@ -3435,6 +3439,7 @@ func (s *Service) Claim(ctx context.Context, id string) (model.AllocationStatus,
 	if err := s.store.Save(status); err != nil {
 		return model.AllocationStatus{}, false, err
 	}
+	s.recordRegistrationSuccess(status.Pool, status.SelectedBackend)
 	logAllocationEvent(ctx, "allocation_claimed", map[string]string{
 		"allocation_id": allocationIDLabel(status.ID),
 		"pool":          string(status.Pool),
@@ -3462,6 +3467,7 @@ func (s *Service) Register(ctx context.Context, id string) (model.AllocationStat
 	if err := s.store.Save(status); err != nil {
 		return model.AllocationStatus{}, false, err
 	}
+	s.recordRegistrationSuccess(status.Pool, status.SelectedBackend)
 	logAllocationEvent(ctx, "allocation_registered", map[string]string{
 		"allocation_id": allocationIDLabel(status.ID),
 		"pool":          string(status.Pool),
