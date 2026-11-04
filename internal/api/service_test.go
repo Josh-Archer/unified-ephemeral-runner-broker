@@ -4681,3 +4681,39 @@ func TestServiceCrossPoolBackendCapacityLimits(t *testing.T) {
 
 	_ = allocB1
 }
+
+func TestAllocatePrefersNamedLocalBackendWithoutARC(t *testing.T) {
+	cfg := config.Default()
+	local := model.BackendName("kubernetes-shared")
+	for index := range cfg.Pools {
+		if cfg.Pools[index].Name != model.PoolLite {
+			continue
+		}
+		arcCfg := cfg.Pools[index].Backends[model.BackendARC]
+		delete(cfg.Pools[index].Backends, model.BackendARC)
+		arcCfg.MaxRunners = 4
+		cfg.Pools[index].Backends[local] = arcCfg
+		cloudCfg := cfg.Pools[index].Backends[model.BackendCodeBuild]
+		cloudCfg.Enabled = true
+		cloudCfg.Healthy = true
+		cloudCfg.MaxRunners = 4
+		cfg.Pools[index].Backends[model.BackendCodeBuild] = cloudCfg
+	}
+	service := NewService(cfg, backend.NewRegistry(testBackend{name: local}, testBackend{name: model.BackendCodeBuild}), nil)
+	var output strings.Builder
+	previousOutput := log.Writer()
+	log.SetOutput(&output)
+	t.Cleanup(func() { log.SetOutput(previousOutput) })
+	for i := 0; i < 4; i++ {
+		allocation, err := service.Allocate(context.Background(), model.AllocationRequest{Pool: model.PoolLite})
+		if err != nil {
+			t.Fatalf("allocate %d: %v", i, err)
+		}
+		if allocation.SelectedBackend != local {
+			t.Fatalf("allocation %d selected %s, want %s", i, allocation.SelectedBackend, local)
+		}
+	}
+	if strings.Contains(output.String(), "fallback_reason=not-configured") {
+		t.Fatalf("logged not-configured ARC fallback for a pool without ARC: %s", output.String())
+	}
+}
