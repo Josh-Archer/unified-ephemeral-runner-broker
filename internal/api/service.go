@@ -839,7 +839,26 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 	var preReserved bool
 	if request.Backend == nil && hasFallbackBackend(pool) {
 		arcCfg, arcConfigured := pool.Backends[model.BackendARC]
-		if !arcConfigured || !arcCfg.Enabled || !arcCfg.Healthy || arcCfg.MaxRunners <= 0 {
+		localPool := localBackends(pool)
+		if !arcConfigured && !arcWasConfigured && len(localPool.Backends) > 0 {
+			// Pools whose in-cluster lane is not named "arc" (for example
+			// kubernetes-shared) still prefer local capacity before cloud.
+			candidate, reserveErr := s.reserve(localPool, request)
+			switch {
+			case reserveErr == nil:
+				selected = candidate
+				reservePool, preReserved = localPool, true
+			case errors.Is(reserveErr, scheduler.ErrNoCapacity):
+				reservePool = fallbackBackends(pool)
+				logAllocationEvent(ctx, "local_fallback", map[string]string{
+					"pool":            string(pool.Name),
+					"fallback_to":     "cloud",
+					"fallback_reason": "saturated",
+				})
+			default:
+				return model.AllocationStatus{}, reserveErr
+			}
+		} else if !arcConfigured || !arcCfg.Enabled || !arcCfg.Healthy || arcCfg.MaxRunners <= 0 {
 			if !arcConfigured && arcWasConfigured {
 				arcCfg, arcConfigured = configuredARCCfg, true
 				if configuredARCCfg.Enabled && configuredARCCfg.Healthy && configuredARCCfg.MaxRunners > 0 {
@@ -2824,6 +2843,18 @@ func fallbackBackends(pool model.PoolConfig) model.PoolConfig {
 	}
 	for name, cfg := range pool.Backends {
 		if name != model.BackendARC && !isCloudFallback(name) {
+			filtered.Backends[name] = cfg
+		}
+	}
+	return filtered
+}
+
+// localBackends keeps enabled, healthy non-cloud backends other than ARC.
+func localBackends(pool model.PoolConfig) model.PoolConfig {
+	filtered := pool
+	filtered.Backends = make(map[model.BackendName]model.BackendConfig)
+	for name, cfg := range pool.Backends {
+		if name != model.BackendARC && !isCloudFallback(name) && cfg.Enabled && cfg.Healthy && cfg.MaxRunners > 0 {
 			filtered.Backends[name] = cfg
 		}
 	}
