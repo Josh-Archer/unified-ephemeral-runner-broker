@@ -158,6 +158,21 @@ jobs:
             -run "Test.*Tier" \
             -count=1
 
+  e2e-failure-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+
+      - name: End-to-end backend outage fallback, expiry, and quarantine webhook tests
+        run: |
+          go test ./internal/api \
+            -run "^TestE2EFailureBackendOutageToFallbackExpiryAndQuarantineWebhook$" \
+            -count=1 -v
+
   action-queue-regression:
     runs-on: ubuntu-latest
     steps:
