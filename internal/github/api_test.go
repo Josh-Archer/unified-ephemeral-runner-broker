@@ -460,3 +460,20 @@ func TestListRepositoriesPersonalTokenIncludesPrivateRepos(t *testing.T) {
 		t.Fatalf("repos=%v err=%v", repos, err)
 	}
 }
+
+func TestGetWorkflowJob(t *testing.T) {
+	var path string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path = r.URL.Path
+		_, _ = w.Write([]byte(`{"id":99,"run_id":7,"status":"queued","labels":["self-hosted"]}`))
+	}))
+	defer server.Close()
+	client := NewClient(func(context.Context) (string, error) { return "t", nil }, nil).WithBaseURL(server.URL)
+	job, err := client.GetWorkflowJob(context.Background(), "o/r", 99)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if path != "/repos/o/r/actions/jobs/99" || job.ID != 99 || job.Status != "queued" {
+		t.Fatalf("path=%s job=%+v", path, job)
+	}
+}

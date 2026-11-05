@@ -81,7 +81,7 @@ func TestWorkflowLiveCapacityQueuesButAPIStillFailsFast(t *testing.T) {
 	}
 	server := newTestServer(t, service)
 	server.SetGitHubWebhook(GitHubWebhookOptions{Secret: func(context.Context) (string, error) { return testWebhookSecret, nil }})
-	harness := webhookHarness{t: t, service: service, handler: server.Handler()}
+	harness := webhookHarness{t: t, service: service, handler: server.Handler(), server: server}
 	body := `{"action":"queued","workflow_job":{"id":2001,"labels":["shared-runner"]},"repository":{"full_name":"example/project"}}`
 	rec := harness.send("workflow_job", "capacity-event", body)
 	if rec.Code != http.StatusAccepted {

@@ -1771,9 +1771,32 @@ func (s *Service) SweepExpired(now time.Time) int {
 			updated++
 		}
 	}
+	if pruned, err := s.pruneFinishedAllocations(now); err != nil {
+		log.Printf("prune finished allocations: %v", err)
+	} else {
+		updated += pruned
+	}
 	s.observeState()
 	return updated
 }
+
+// pruneFinishedAllocations drops terminal allocation records older than the
+// configured stateStore.retention window so file-backed state stays bounded.
+func (s *Service) pruneFinishedAllocations(now time.Time) (int, error) {
+	retention := store.EffectiveRetention(s.cfg.Broker.StateStore)
+	if retention <= 0 {
+		return 0, nil
+	}
+	n, err := s.store.PruneTerminal(now, retention)
+	if err != nil {
+		return 0, err
+	}
+	if n > 0 {
+		log.Printf("pruned %d finished allocations older than %s", n, retention)
+	}
+	return n, nil
+}
+
 
 func (s *Service) ReconcileBackendHealth() {
 	if s.admission == nil {

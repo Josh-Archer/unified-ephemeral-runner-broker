@@ -29,6 +29,8 @@ type SecretReader interface {
 	ReadSecret(ctx context.Context, name string) (map[string]string, error)
 }
 
+var errSecretReaderUnavailable = errors.New("secret reader is not configured")
+
 type noopChecker struct{}
 
 func (noopChecker) Check(context.Context) error {
@@ -61,12 +63,13 @@ func NewSecretReaderFromEnv() (SecretReader, error) {
 	if api == nil {
 		return noopSecretReader{}, nil
 	}
-	return &kubernetesSecretClient{
+	inner := &kubernetesSecretClient{
 		namespace: api.namespace,
 		baseURL:   api.baseURL,
 		client:    api.client,
 		token:     api.token,
-	}, nil
+	}
+	return NewCachingSecretReader(inner, defaultSecretCacheTTL, defaultSecretReadTimeout), nil
 }
 
 func NewSecretRefCheckerFromEnv(cfg model.BrokerConfig) (HealthChecker, error) {

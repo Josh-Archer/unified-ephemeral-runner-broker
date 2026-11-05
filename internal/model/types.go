@@ -116,6 +116,12 @@ type StateStoreConfig struct {
 	// DSNEnv names the environment variable that holds the PostgreSQL DSN when
 	// type is postgres and DSN is empty. Defaults to UECB_STATE_STORE_DSN.
 	DSNEnv string `yaml:"dsnEnv,omitempty" json:"dsnEnv,omitempty"`
+	// Retention is how long finished (terminal) allocations are kept before
+	// PruneTerminal deletes them. File stores default to 24h when Retention is
+	// zero/unset so allocations.json stays bounded; set a negative duration to
+	// disable pruning. Non-file stores leave pruning off unless Retention > 0
+	// (uecb#201).
+	Retention time.Duration `yaml:"retention,omitempty" json:"retention,omitempty"`
 }
 
 // HAConfig controls multi-replica coordination. When empty, HA is implied by

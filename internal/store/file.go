@@ -190,6 +190,30 @@ func (f *File) CountTenantActive(pool model.PoolName, tenant string) int {
 	return countTenantActiveLocked(f.allocations, pool, tenant, "")
 }
 
+func (f *File) PruneTerminal(now time.Time, retention time.Duration) (int, error) {
+	if retention <= 0 {
+		return 0, nil
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ids := collectPrunableIDs(f.allocations, now, retention)
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	prev := make(map[string]model.AllocationStatus, len(ids))
+	for _, id := range ids {
+		prev[id] = f.allocations[id]
+		delete(f.allocations, id)
+	}
+	if err := f.persistLocked(); err != nil {
+		for id, status := range prev {
+			f.allocations[id] = status
+		}
+		return 0, err
+	}
+	return len(ids), nil
+}
+
 func (f *File) Ping(context.Context) error { return nil }
 
 func (f *File) Close() error { return nil }

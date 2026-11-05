@@ -131,6 +131,19 @@ func (m *Memory) CountTenantActive(pool model.PoolName, tenant string) int {
 	return countTenantActiveLocked(m.allocations, pool, tenant, "")
 }
 
+func (m *Memory) PruneTerminal(now time.Time, retention time.Duration) (int, error) {
+	if retention <= 0 {
+		return 0, nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ids := collectPrunableIDs(m.allocations, now, retention)
+	for _, id := range ids {
+		delete(m.allocations, id)
+	}
+	return len(ids), nil
+}
+
 func (m *Memory) Ping(context.Context) error { return nil }
 
 func (m *Memory) Close() error { return nil }

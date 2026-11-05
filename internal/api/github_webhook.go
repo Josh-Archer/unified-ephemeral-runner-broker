@@ -13,6 +13,7 @@ import (
 	"log"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -173,6 +174,11 @@ func (t *deliveryTracker) release(guid string) {
 	delete(t.seen, guid)
 }
 
+type githubWebhookWork struct {
+	payload workflowJobPayload
+	guid    string
+}
+
 type githubWebhookHandler struct {
 	opts       GitHubWebhookOptions
 	service    *Service
@@ -183,6 +189,12 @@ type githubWebhookHandler struct {
 	// reconcileDeepTimeout when > 0 (tests).
 	recentTimeout time.Duration
 	deepTimeout   time.Duration
+
+	// Async ack path (uecb#201): GitHub's delivery timeout is 10s. Validate
+	// and claim synchronously, then process on a single worker so queued and
+	// completed events for the same job stay ordered.
+	workCh   chan githubWebhookWork
+	inflight sync.WaitGroup
 }
 
 // repoScanner walks the repository list round-robin. It keeps the repository
@@ -228,11 +240,50 @@ type reconcileState struct {
 // SetGitHubWebhook enables POST /webhooks/github. Without it the route
 // answers 404 so pools that do not opt in are unaffected.
 func (s *Server) SetGitHubWebhook(opts GitHubWebhookOptions) {
-	s.githubWebhook = &githubWebhookHandler{
+	h := &githubWebhookHandler{
 		opts:       opts,
 		service:    s.service,
 		metrics:    newGitHubWebhookMetrics(),
 		deliveries: newDeliveryTracker(),
+		workCh:     make(chan githubWebhookWork, 256),
+	}
+	go h.runWebhookWorker()
+	s.githubWebhook = h
+}
+
+// WaitGitHubWebhookIdle blocks until every accepted delivery has finished
+// processing. Tests use it after send() so assertions see store side effects.
+func (s *Server) WaitGitHubWebhookIdle() {
+	if s == nil || s.githubWebhook == nil {
+		return
+	}
+	s.githubWebhook.inflight.Wait()
+}
+
+func (h *githubWebhookHandler) runWebhookWorker() {
+	for work := range h.workCh {
+		func() {
+			defer h.inflight.Done()
+			ctx := context.Background()
+			// Drain any non-leader inbox first so a completed event cannot
+			// overtake the queued event it belongs to.
+			if h.opts.IsLeader != nil {
+				if _, err := h.drainInbox(ctx); err != nil {
+					log.Printf("github webhook inbox drain failed: %v", err)
+				}
+			}
+			_, _, err := h.process(ctx, work.payload)
+			if err != nil {
+				if work.guid != "" {
+					h.deliveries.release(work.guid)
+				}
+				log.Printf("github webhook %s job=%d failed: %v", work.payload.Action, work.payload.WorkflowJob.ID, err)
+				return
+			}
+			if work.guid != "" {
+				h.deliveries.done(work.guid)
+			}
+		}()
 	}
 }
 
@@ -330,11 +381,7 @@ func (h *githubWebhookHandler) serve(s *Server, w http.ResponseWriter, r *http.R
 			h.enqueueForLeader(ctx, s, w, r, payload)
 			return
 		}
-		// Process anything queued earlier first so a completed event cannot
-		// overtake the queued event it belongs to.
-		if _, err := h.drainInbox(ctx); err != nil {
-			log.Printf("github webhook inbox drain failed: %v", err)
-		}
+		// Inbox drain runs on the webhook worker so this handler returns fast.
 	}
 
 	guid := strings.TrimSpace(r.Header.Get("X-GitHub-Delivery"))
@@ -344,19 +391,22 @@ func (h *githubWebhookHandler) serve(s *Server, w http.ResponseWriter, r *http.R
 			return
 		}
 	}
-	status, code, err := h.process(ctx, payload)
-	if err != nil {
+
+	// Ack within GitHub's 10s delivery window; allocation / finalize run on
+	// the webhook worker afterward (uecb#201). Inbox drain moved into the
+	// worker so a large backlog cannot stall this response.
+	h.inflight.Add(1)
+	select {
+	case h.workCh <- githubWebhookWork{payload: payload, guid: guid}:
+		s.writeJSON(w, http.StatusAccepted, map[string]string{"status": "accepted"})
+	default:
+		h.inflight.Done()
 		if guid != "" {
 			h.deliveries.release(guid)
 		}
-		log.Printf("github webhook %s job=%d failed: %v", action, payload.WorkflowJob.ID, err)
-		s.writeError(w, http.StatusInternalServerError, err)
-		return
+		h.metrics.ignored.WithLabelValues("queue_full").Inc()
+		s.writeError(w, http.StatusServiceUnavailable, errors.New("webhook processing queue full"))
 	}
-	if guid != "" {
-		h.deliveries.done(guid)
-	}
-	s.writeJSON(w, code, status)
 }
 
 func (h *githubWebhookHandler) enqueueForLeader(ctx context.Context, s *Server, w http.ResponseWriter, r *http.Request, payload workflowJobPayload) {
@@ -542,6 +592,15 @@ func (s *Server) ReconcileQueuedGitHubJobs(ctx context.Context) (int, error) {
 	ctx = withRetryFailedWorkflowJob(ctx)
 	budget := newCycleBudget(lister, func() time.Time { return h.service.now() })
 
+	run := &reconcileRun{h: h, budget: budget}
+	if rescued, err := run.rescueTerminalQueuedJobs(ctx, reconcileCallBudget/4); err != nil {
+		if !errors.Is(err, errReconcileBudgetSpent) && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, ErrReconcileRateLimited) {
+			return run.allocated, err
+		}
+	} else if rescued > 0 {
+		log.Printf("github reconcile: rescued %d still-queued jobs with terminal allocations", rescued)
+	}
+
 	repos, err := h.reconcileRepositories(ctx, budget, now)
 	if err != nil {
 		return 0, err
@@ -578,7 +637,6 @@ func (s *Server) ReconcileQueuedGitHubJobs(ctx context.Context) (int, error) {
 		log.Printf("github reconcile: deep scan reopened over %d repos (all ages=%v)", len(repos), state.deepAllAges)
 	}
 
-	run := &reconcileRun{h: h, budget: budget}
 	recentLimit := int64(reconcileCallBudget)
 	if state.deepOpen {
 		recentLimit = reconcileCallBudget - reconcileDeepReserve
@@ -839,6 +897,12 @@ func (r *reconcileRun) processRun(ctx context.Context, repository string, runID 
 		h.metrics.pageCap.WithLabelValues("jobs").Inc()
 		log.Printf("github reconcile WARNING: %s run %d hit the job page cap (%d pages); its remaining jobs were skipped", repository, runID, github.MaxWorkflowJobPages)
 	}
+	// Prefer jobs whose prior allocation already ended: shared labels like
+	// home-gh-runner let other queued jobs steal the runner, and those
+	// stranded jobs must be re-served before fresh ones (uecb#201).
+	sort.SliceStable(jobs, func(i, j int) bool {
+		return r.terminalPriority(jobs[i].ID) > r.terminalPriority(jobs[j].ID)
+	})
 	for _, job := range jobs {
 		if job.ID <= 0 || job.Status != "queued" {
 			continue
@@ -863,6 +927,115 @@ func (r *reconcileRun) processRun(ctx context.Context, repository string, runID 
 			r.allocated++
 		}
 	}
+}
+
+
+// terminalPriority ranks jobs for reconcile: 1 when the store only has a
+// terminal allocation for the job (needs re-serve), else 0.
+func (r *reconcileRun) terminalPriority(jobID int64) int {
+	existing, ok := r.h.service.findByWorkflowJobID(jobID)
+	if ok && isTerminalAllocationState(existing.State) {
+		return 1
+	}
+	return 0
+}
+
+// workflowJobGetter is optional on WorkflowJobs; when present the rescue pass
+// verifies GitHub still shows the job as queued before reallocating.
+type workflowJobGetter interface {
+	GetWorkflowJob(context.Context, string, int64) (github.WorkflowJob, error)
+}
+
+// rescueTerminalQueuedJobs re-serves jobs whose allocation ended while GitHub
+// still has them queued. This is preferred over per-job-only runner labels:
+// workflows request shared labels (home-gh-runner), so unique labels alone
+// cannot stop GitHub assigning a runner to a different queued job.
+func (r *reconcileRun) rescueTerminalQueuedJobs(ctx context.Context, callLimit int64) (int, error) {
+	getter, ok := r.h.opts.WorkflowJobs.(workflowJobGetter)
+	if !ok || getter == nil {
+		return 0, nil
+	}
+	type candidate struct {
+		jobID int64
+		repo  string
+		labels []string
+		created time.Time
+	}
+	seen := map[int64]struct{}{}
+	var candidates []candidate
+	for _, status := range r.h.service.store.List() {
+		if status.Request == nil || status.Request.WorkflowJobID <= 0 {
+			continue
+		}
+		if !isTerminalAllocationState(status.State) {
+			continue
+		}
+		jobID := status.Request.WorkflowJobID
+		if _, dup := seen[jobID]; dup {
+			continue
+		}
+		// Skip when a non-terminal allocation already covers the job.
+		if live, found := r.h.service.findByWorkflowJobID(jobID); found && !isTerminalAllocationState(live.State) {
+			continue
+		}
+		repo := strings.TrimSpace(status.Request.TargetRepository)
+		if repo == "" {
+			repo = strings.TrimSpace(status.Repository)
+		}
+		if repo == "" {
+			continue
+		}
+		seen[jobID] = struct{}{}
+		candidates = append(candidates, candidate{
+			jobID: jobID,
+			repo:  repo,
+			labels: append([]string(nil), status.Request.Labels...),
+			created: status.CreatedAt,
+		})
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return candidates[i].created.Before(candidates[j].created)
+	})
+	rescued := 0
+	limit := callLimit
+	if limit <= 0 {
+		limit = 10
+	}
+	for _, c := range candidates {
+		if err := r.budget.take(ctx, limit); err != nil {
+			return rescued, err
+		}
+		job, err := getter.GetWorkflowJob(ctx, c.repo, c.jobID)
+		if err != nil {
+			r.keepErr(fmt.Errorf("rescue get job %s#%d: %w", c.repo, c.jobID, err))
+			continue
+		}
+		if job.Status != "queued" {
+			continue
+		}
+		labels := job.Labels
+		if len(labels) == 0 {
+			labels = c.labels
+		}
+		if _, ok := r.h.service.MatchWebhookPoolForRepository(labels, c.repo); !ok {
+			continue
+		}
+		payload := workflowJobPayload{Action: "queued"}
+		payload.WorkflowJob.ID = c.jobID
+		payload.WorkflowJob.RunID = job.RunID
+		payload.WorkflowJob.Labels = labels
+		payload.Repository.FullName = c.repo
+		result, _, err := r.h.process(ctx, payload)
+		if err != nil {
+			r.keepErr(fmt.Errorf("rescue %s job %d: %w", c.repo, c.jobID, err))
+			continue
+		}
+		if result["status"] == "allocated" {
+			rescued++
+			r.allocated++
+		}
+	}
+	return rescued, nil
 }
 
 // process handles an authenticated, leader-owned queued/completed delivery.
