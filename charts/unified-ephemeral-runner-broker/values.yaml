@@ -88,6 +88,9 @@ config:
       # secretRef/secretKey inject the DSN when type=postgres (key defaults to dsn).
       secretRef: ""
       secretKey: dsn
+      # retention deletes terminal allocations older than this (file default 24h).
+      # Set "0s" to disable. Keeps allocations.json bounded (uecb#201).
+      retention: ""
     ha:
       # When null/omitted, HA leader election enables automatically for postgres.
       # enabled: true

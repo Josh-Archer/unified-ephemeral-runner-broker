@@ -30,6 +30,9 @@ data:
         {{- if .Values.config.broker.stateStore.dsnEnv }}
         dsnEnv: {{ .Values.config.broker.stateStore.dsnEnv }}
         {{- end }}
+        {{- if .Values.config.broker.stateStore.retention }}
+        retention: {{ .Values.config.broker.stateStore.retention }}
+        {{- end }}
       {{- if .Values.config.broker.ha }}
       ha:
 {{ toYaml .Values.config.broker.ha | indent 8 }}

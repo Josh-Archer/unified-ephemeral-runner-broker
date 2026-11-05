@@ -168,12 +168,16 @@ func TestWorkflowJobSignedHandlerUsesActualRunnerAndRepository(t *testing.T) {
 		}
 		return body
 	}
+	beforeForeign := counterValue(t, "uecb_github_webhook_events_ignored_total", map[string]string{"reason": "foreign_repository"})
 	rec := h.send("workflow_job", "foreign-execution", event("in_progress", "example/other", second.RunnerLabel, ""))
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "foreign_repository") {
+	if rec.Code != http.StatusAccepted {
 		t.Fatalf("foreign claim: %d %s", rec.Code, rec.Body)
 	}
+	if got := counterValue(t, "uecb_github_webhook_events_ignored_total", map[string]string{"reason": "foreign_repository"}); got != beforeForeign+1 {
+		t.Fatalf("foreign_repository metric = %v, want %v", got, beforeForeign+1)
+	}
 	rec = h.send("workflow_job", "actual-execution", event("in_progress", "example/project", second.RunnerLabel, ""))
-	if rec.Code != http.StatusOK {
+	if rec.Code != http.StatusAccepted {
 		t.Fatalf("actual claim: %d %s", rec.Code, rec.Body)
 	}
 	claimed, _ := service.Get(second.ID)
@@ -181,7 +185,7 @@ func TestWorkflowJobSignedHandlerUsesActualRunnerAndRepository(t *testing.T) {
 		t.Fatalf("wrong execution ownership: %+v", claimed)
 	}
 	rec = h.send("workflow_job", "actual-complete", event("completed", "example/project", second.RunnerLabel, "success"))
-	if rec.Code != http.StatusOK || *cleanup.cleanupCount != 1 {
+	if rec.Code != http.StatusAccepted || *cleanup.cleanupCount != 1 {
 		t.Fatalf("actual complete: %d %s cleanups=%d", rec.Code, rec.Body, *cleanup.cleanupCount)
 	}
 	untouched, _ := service.Get(first.ID)

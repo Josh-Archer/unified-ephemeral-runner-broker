@@ -68,6 +68,10 @@ type Store interface {
 
 	// Close releases resources. Safe to call multiple times.
 	Close() error
+
+	// PruneTerminal deletes terminal allocations older than retention.
+	// retention <= 0 is a no-op. Returns the number of deleted records.
+	PruneTerminal(now time.Time, retention time.Duration) (int, error)
 }
 
 // LeaderElector coordinates single-writer background work across replicas.
@@ -299,4 +303,70 @@ func capacityAllowed(allocations map[string]model.AllocationStatus, status model
 		}
 	}
 	return nil
+}
+
+
+// isTerminalState reports whether an allocation no longer consumes scheduler
+// capacity and is safe to prune after retention.
+func isTerminalState(state model.AllocationState) bool {
+	switch state {
+	case model.StateCompleted, model.StateFailed, model.StateCanceled, model.StateExpired, model.StateQuarantined:
+		return true
+	default:
+		return false
+	}
+}
+
+// allocationAgeAnchor is the timestamp used for retention pruning. Prefer
+// CreatedAt; fall back to ExpiresAt when CreatedAt was never recorded.
+func allocationAgeAnchor(status model.AllocationStatus) time.Time {
+	if !status.CreatedAt.IsZero() {
+		return status.CreatedAt
+	}
+	return status.ExpiresAt
+}
+
+// collectPrunableIDs returns terminal allocation IDs older than retention.
+func collectPrunableIDs(allocations map[string]model.AllocationStatus, now time.Time, retention time.Duration) []string {
+	if retention <= 0 {
+		return nil
+	}
+	cutoff := now.Add(-retention)
+	var ids []string
+	for id, status := range allocations {
+		if !isTerminalState(status.State) {
+			continue
+		}
+		anchor := allocationAgeAnchor(status)
+		if anchor.IsZero() || !anchor.After(cutoff) {
+			// Zero anchor: treat as immediately prunable once terminal so a
+			// corrupt/legacy record cannot pin the file forever.
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+
+// DefaultFileRetention bounds allocations.json growth when operators omit
+// stateStore.retention (uecb#201).
+const DefaultFileRetention = 24 * time.Hour
+
+// EffectiveRetention returns the prune window for cfg. An explicit Retention
+// (including 0) wins; otherwise file stores default to DefaultFileRetention
+// and other store types leave pruning disabled.
+func EffectiveRetention(cfg model.StateStoreConfig) time.Duration {
+	// Negative retention disables pruning (YAML cannot distinguish unset 0 from
+	// explicit 0s on a Duration field; file stores therefore default to 24h
+	// when Retention is zero).
+	if cfg.Retention < 0 {
+		return 0
+	}
+	if cfg.Retention > 0 {
+		return cfg.Retention
+	}
+	if normalizeType(cfg.Type) == TypeFile {
+		return DefaultFileRetention
+	}
+	return 0
 }

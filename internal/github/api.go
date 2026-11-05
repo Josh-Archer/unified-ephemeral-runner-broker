@@ -438,6 +438,25 @@ func repositoryPath(repository string) (string, error) {
 	return fmt.Sprintf("/repos/%s/%s", url.PathEscape(owner), url.PathEscape(repo)), nil
 }
 
+// GetWorkflowJob reads one workflow job by id. Used by the queued-job rescue
+// pass to re-serve jobs whose prior allocation ended while GitHub still shows
+// them as queued (uecb#201).
+func (c *Client) GetWorkflowJob(ctx context.Context, repository string, jobID int64) (WorkflowJob, error) {
+	base, err := repositoryPath(repository)
+	if err != nil {
+		return WorkflowJob{}, err
+	}
+	if jobID <= 0 {
+		return WorkflowJob{}, errors.New("workflow job id must be positive")
+	}
+	var out WorkflowJob
+	path := fmt.Sprintf("%s/actions/jobs/%d", base, jobID)
+	if err := c.do(ctx, http.MethodGet, path, nil, &out, http.StatusOK); err != nil {
+		return WorkflowJob{}, fmt.Errorf("get workflow job %s#%d: %w", repository, jobID, err)
+	}
+	return out, nil
+}
+
 // GetWorkflowRun reads the run that a workflow job belongs to.
 func (c *Client) GetWorkflowRun(ctx context.Context, repository string, runID int64) (WorkflowRun, error) {
 	owner, repo, ok := strings.Cut(strings.TrimSpace(repository), "/")

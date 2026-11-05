@@ -232,7 +232,10 @@ func (h *webhookHarness) post(event, delivery, body, signature string) *httptest
 }
 
 func (h *webhookHarness) send(event, delivery, body string) *httptest.ResponseRecorder {
-	return h.post(event, delivery, body, sign(testWebhookSecret, body))
+	rec := h.post(event, delivery, body, sign(testWebhookSecret, body))
+	// Async webhook processing (uecb#201): wait so store assertions see results.
+	h.server.WaitGitHubWebhookIdle()
+	return rec
 }
 
 func (h *webhookHarness) activeCount() int {
@@ -343,12 +346,16 @@ func TestGitHubWebhookLabelMatching(t *testing.T) {
 			t.Errorf("case %d labels=%v: match=%v want %v", i, tc.labels, ok, tc.match)
 		}
 	}
+	before := counterValue(t, "uecb_github_webhook_events_ignored_total", map[string]string{"reason": "no_matching_pool"})
 	rec := h.send("workflow_job", "d-nomatch", jobBody("queued", 5, "", "ubuntu-latest"))
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "no_matching_pool") {
+	if rec.Code != http.StatusAccepted {
 		t.Fatalf("got %d %s", rec.Code, rec.Body)
 	}
 	if h.activeCount() != 0 {
 		t.Fatal("non-matching job must not allocate")
+	}
+	if got := counterValue(t, "uecb_github_webhook_events_ignored_total", map[string]string{"reason": "no_matching_pool"}); got != before+1 {
+		t.Fatalf("no_matching_pool metric = %v, want %v", got, before+1)
 	}
 }
 
@@ -370,7 +377,7 @@ func TestGitHubWebhookQueuedAllocatesAndCompletedFinalizes(t *testing.T) {
 	}
 
 	rec = h.send("workflow_job", "c1", jobBody("completed", 42, "success", "self-hosted", "uecb-full"))
-	if rec.Code != http.StatusOK {
+	if rec.Code != http.StatusAccepted {
 		t.Fatalf("completed: got %d %s", rec.Code, rec.Body)
 	}
 	final, _ := h.service.Get(allocation.ID)
@@ -397,7 +404,7 @@ func TestGitHubWebhookInProgressClaimsAllocation(t *testing.T) {
 	}
 
 	rec = h.send("workflow_job", "ip1", jobBody("in_progress", 42, "", "self-hosted", "uecb-full"))
-	if rec.Code != http.StatusOK {
+	if rec.Code != http.StatusAccepted {
 		t.Fatalf("in_progress: got %d %s", rec.Code, rec.Body)
 	}
 
@@ -411,7 +418,7 @@ func TestGitHubWebhookCancelledFinalizesAsCanceled(t *testing.T) {
 	h := newWebhookHarness(t, true)
 	h.send("workflow_job", "q1", jobBody("queued", 7, "", "self-hosted", "uecb-full"))
 	rec := h.send("workflow_job", "c1", jobBody("completed", 7, "cancelled", "self-hosted", "uecb-full"))
-	if rec.Code != http.StatusOK {
+	if rec.Code != http.StatusAccepted {
 		t.Fatalf("got %d %s", rec.Code, rec.Body)
 	}
 	allocation, _ := h.service.findByWorkflowJobID(7)
@@ -425,9 +432,13 @@ func TestGitHubWebhookCancelledFinalizesAsCanceled(t *testing.T) {
 
 func TestGitHubWebhookCompletedUnknownJobIgnored(t *testing.T) {
 	h := newWebhookHarness(t, true)
+	before := counterValue(t, "uecb_github_webhook_events_ignored_total", map[string]string{"reason": "unknown_job"})
 	rec := h.send("workflow_job", "c1", jobBody("completed", 999, "success", "self-hosted", "uecb-full"))
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "unknown_job") {
+	if rec.Code != http.StatusAccepted {
 		t.Fatalf("got %d %s", rec.Code, rec.Body)
+	}
+	if got := counterValue(t, "uecb_github_webhook_events_ignored_total", map[string]string{"reason": "unknown_job"}); got != before+1 {
+		t.Fatalf("unknown_job metric = %v, want %v", got, before+1)
 	}
 }
 
@@ -443,9 +454,13 @@ func TestGitHubWebhookDuplicateDeliveryIdempotent(t *testing.T) {
 	}
 	// A different delivery for the same job (e.g. manual redelivery) must also
 	// not allocate again.
+	beforeDup := counterValue(t, "uecb_github_webhook_events_ignored_total", map[string]string{"reason": "duplicate_job"})
 	rec = h.send("workflow_job", "other-guid", body)
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "duplicate_job") {
+	if rec.Code != http.StatusAccepted {
 		t.Fatalf("same job new guid: %d %s", rec.Code, rec.Body)
+	}
+	if got := counterValue(t, "uecb_github_webhook_events_ignored_total", map[string]string{"reason": "duplicate_job"}); got != beforeDup+1 {
+		t.Fatalf("duplicate_job metric = %v, want %v", got, beforeDup+1)
 	}
 	if n := h.activeCount(); n != 1 {
 		t.Fatalf("active allocations = %d, want 1", n)
@@ -529,23 +544,34 @@ func TestGitHubWebhookInboxFailureRetried(t *testing.T) {
 
 func TestGitHubWebhookFailedAllocationAllowsRedelivery(t *testing.T) {
 	h := newWebhookHarness(t, true)
-	// A failing allocation releases the delivery claim so GitHub can redeliver.
+	// Async ack returns 202 even when process fails; the worker releases the
+	// delivery claim so GitHub (or a manual redelivery) can retry.
 	h.service.initErr = errors.New("boom")
 	body := jobBody("queued", 31, "", "self-hosted", "uecb-full")
-	if rec := h.send("workflow_job", "f1", body); rec.Code != http.StatusInternalServerError {
+	if rec := h.send("workflow_job", "f1", body); rec.Code != http.StatusAccepted {
 		t.Fatalf("got %d %s", rec.Code, rec.Body)
+	}
+	if _, ok := h.service.findByWorkflowJobID(31); ok {
+		t.Fatal("failed process must not leave an allocation")
 	}
 	h.service.initErr = nil
 	if rec := h.send("workflow_job", "f1", body); rec.Code != http.StatusAccepted {
 		t.Fatalf("redelivery after failure: %d %s", rec.Code, rec.Body)
 	}
+	if _, ok := h.service.findByWorkflowJobID(31); !ok {
+		t.Fatal("redelivery after fault cleared must allocate")
+	}
 }
 
 func TestGitHubWebhookPoolsWithoutLabelsUnaffected(t *testing.T) {
 	h := newWebhookHarness(t, false)
+	before := counterValue(t, "uecb_github_webhook_events_ignored_total", map[string]string{"reason": "no_matching_pool"})
 	rec := h.send("workflow_job", "q1", jobBody("queued", 50, "", "self-hosted", "uecb-full"))
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "no_matching_pool") {
+	if rec.Code != http.StatusAccepted {
 		t.Fatalf("got %d %s", rec.Code, rec.Body)
+	}
+	if got := counterValue(t, "uecb_github_webhook_events_ignored_total", map[string]string{"reason": "no_matching_pool"}); got != before+1 {
+		t.Fatalf("no_matching_pool metric = %v, want %v", got, before+1)
 	}
 	if h.activeCount() != 0 {
 		t.Fatal("pool without webhookLabels must not allocate from webhooks")
@@ -632,7 +658,7 @@ func TestGitHubWebhookOwnerScopeRecordsRepositoryAndRejectsOthers(t *testing.T) 
 	before := counterValue(t, "uecb_github_webhook_events_ignored_total", map[string]string{"reason": "foreign_repository"})
 	for i, repo := range []string{"someone-else/repo", ""} {
 		rec = h.send("workflow_job", fmt.Sprintf("o-foreign-%d", i), repoJobBody("queued", int64(600+i), repo, "self-hosted", "uecb-full"))
-		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "foreign_repository") {
+		if rec.Code != http.StatusAccepted {
 			t.Fatalf("repository %q: got %d %s", repo, rec.Code, rec.Body)
 		}
 		if _, ok := h.service.findByWorkflowJobID(int64(600 + i)); ok {
@@ -695,21 +721,27 @@ func TestGitHubWebhookRejectsForkPullRequestJobs(t *testing.T) {
 	if rec := h.send("workflow_job", "f1", body(701, 1)); rec.Code != http.StatusAccepted {
 		t.Fatalf("same-repository job: got %d %s", rec.Code, rec.Body)
 	}
+	beforeFork := counterValue(t, "uecb_github_webhook_events_ignored_total", map[string]string{"reason": "fork_pull_request"})
 	rec := h.send("workflow_job", "f2", body(702, 2))
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "fork_pull_request") {
+	if rec.Code != http.StatusAccepted {
 		t.Fatalf("fork job: got %d %s", rec.Code, rec.Body)
+	}
+	if got := counterValue(t, "uecb_github_webhook_events_ignored_total", map[string]string{"reason": "fork_pull_request"}); got != beforeFork+1 {
+		t.Fatalf("fork_pull_request metric = %v, want %v", got, beforeFork+1)
 	}
 	if _, ok := h.service.findByWorkflowJobID(702); ok {
 		t.Fatal("a fork pull request job must not get a runner")
 	}
-	if rec := h.send("workflow_job", "f3", body(703, 3)); rec.Code < 500 {
-		t.Fatalf("a failed lookup must fail the delivery, got %d %s", rec.Code, rec.Body)
+	// Async ack: lookup errors no longer surface as HTTP 5xx; the worker
+	// releases the delivery claim so a redelivery can retry the lookup.
+	if rec := h.send("workflow_job", "f3", body(703, 3)); rec.Code != http.StatusAccepted {
+		t.Fatalf("a failed lookup still acks fast, got %d %s", rec.Code, rec.Body)
 	}
 	if _, ok := h.service.findByWorkflowJobID(703); ok {
 		t.Fatal("a failed lookup must not allocate")
 	}
 	before := lookups
-	if rec := h.send("workflow_job", "f1-dup", body(701, 1)); rec.Code != http.StatusOK {
+	if rec := h.send("workflow_job", "f1-dup", body(701, 1)); rec.Code != http.StatusAccepted {
 		t.Fatalf("duplicate: got %d", rec.Code)
 	}
 	if lookups != before {
@@ -730,9 +762,13 @@ func TestGitHubWebhookPoolRepositoryAllowlist(t *testing.T) {
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("allowed repository: got %d %s", rec.Code, rec.Body)
 	}
+	beforeDenied := counterValue(t, "uecb_github_webhook_events_ignored_total", map[string]string{"reason": "repository_not_allowed"})
 	rec = h.send("workflow_job", "r2", repoJobBody("queued", 802, "example-owner/public-repo", "self-hosted", "uecb-full"))
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "repository_not_allowed") {
+	if rec.Code != http.StatusAccepted {
 		t.Fatalf("other repository: got %d %s", rec.Code, rec.Body)
+	}
+	if got := counterValue(t, "uecb_github_webhook_events_ignored_total", map[string]string{"reason": "repository_not_allowed"}); got != beforeDenied+1 {
+		t.Fatalf("repository_not_allowed metric = %v, want %v", got, beforeDenied+1)
 	}
 	if _, ok := h.service.findByWorkflowJobID(802); ok {
 		t.Fatal("a repository outside webhookRepositories must not get a runner from the pool")
@@ -783,6 +819,8 @@ func TestGitHubWebhookOnlyAllowedActorsGetRunners(t *testing.T) {
 		b := repoJobBody("queued", jobID, "example-owner/questkit", "self-hosted", "uecb-full")
 		return strings.Replace(b, fmt.Sprintf(`"id":%d,`, jobID), fmt.Sprintf(`"id":%d,"run_id":%d,`, jobID, runID), 1)
 	}
+	beforeActor := counterValue(t, "uecb_github_webhook_events_ignored_total", map[string]string{"reason": "actor_not_allowed"})
+	denied := 0
 	for runID, allowed := range map[int64]bool{1: true, 2: false, 3: false, 4: true, 5: true, 6: false} {
 		jobID := 900 + runID
 		rec := h.send("workflow_job", fmt.Sprintf("a%d", runID), body(jobID, runID))
@@ -790,9 +828,12 @@ func TestGitHubWebhookOnlyAllowedActorsGetRunners(t *testing.T) {
 		if got != allowed {
 			t.Errorf("run %d (%+v): allocated=%v want %v (%d %s)", runID, runs[runID], got, allowed, rec.Code, rec.Body)
 		}
-		if !allowed && !strings.Contains(rec.Body.String(), "actor_not_allowed") {
-			t.Errorf("run %d: want actor_not_allowed, got %s", runID, rec.Body)
+		if !allowed {
+			denied++
 		}
+	}
+	if after := counterValue(t, "uecb_github_webhook_events_ignored_total", map[string]string{"reason": "actor_not_allowed"}); after-beforeActor != float64(denied) {
+		t.Fatalf("actor_not_allowed metric delta = %v, want %d", after-beforeActor, denied)
 	}
 }
 

@@ -336,6 +336,48 @@ WHERE pool = $1 AND tenant = $2 AND state IN ('reserved', 'ready', 'warm')
 	return active
 }
 
+func (p *Postgres) PruneTerminal(now time.Time, retention time.Duration) (int, error) {
+	if retention <= 0 {
+		return 0, nil
+	}
+	cutoff := now.Add(-retention)
+	rows, err := p.db.Query(`SELECT id, payload FROM uecb_allocations`)
+	if err != nil {
+		return 0, fmt.Errorf("list allocations for prune: %w", err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		var payload []byte
+		if err := rows.Scan(&id, &payload); err != nil {
+			return 0, err
+		}
+		var status model.AllocationStatus
+		if err := json.Unmarshal(payload, &status); err != nil {
+			continue
+		}
+		if !isTerminalState(status.State) {
+			continue
+		}
+		anchor := allocationAgeAnchor(status)
+		if anchor.IsZero() || !anchor.After(cutoff) {
+			ids = append(ids, id)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	deleted := 0
+	for _, id := range ids {
+		if err := p.Delete(id); err != nil {
+			return deleted, err
+		}
+		deleted++
+	}
+	return deleted, nil
+}
+
 func (p *Postgres) Ping(ctx context.Context) error {
 	return p.db.PingContext(ctx)
 }
