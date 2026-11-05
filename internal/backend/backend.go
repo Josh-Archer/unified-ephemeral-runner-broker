@@ -77,6 +77,10 @@ type LiveRunner struct {
 	WorkflowJobID int64
 	CreatedAt     time.Time
 	Metadata      map[string]string
+	// RunnerRunning reports that the runner process itself has started (its
+	// container is running). A JIT runner registers with GitHub as soon as it
+	// starts, so this proves registration even when no webhook recorded it.
+	RunnerRunning bool
 }
 
 // InventoryBackend lists live runners so a restarted broker can rebuild
