@@ -446,3 +446,25 @@ func TestLiveRunnersExcludesPodsOnNotReadyNode(t *testing.T) {
 		t.Fatalf("pod on NotReady node must not be live: %+v", runners)
 	}
 }
+
+// home#4340: a running runner container marks the live runner as started;
+// a pod still in init (dind sidecar running, runner waiting) does not.
+func TestLiveRunnersReportsRunnerRunning(t *testing.T) {
+	api := &fakeAPI{responses: map[string]response{
+		"GET /api/v1/namespaces/arc-runners/pods": {status: http.StatusOK, body: `{"items":[
+ {"metadata":{"name":"uecb-runner-alloc-1","labels":{"uecb.josh-archer.dev/allocation-id":"alloc-1"}},"status":{"phase":"Running","containerStatuses":[{"name":"runner","state":{"running":{"startedAt":"2026-11-05T10:15:00Z"}}}]}},
+ {"metadata":{"name":"uecb-runner-alloc-2","labels":{"uecb.josh-archer.dev/allocation-id":"alloc-2"}},"status":{"phase":"Pending","initContainerStatuses":[{"name":"dind","state":{"running":{}}}],"containerStatuses":[{"name":"runner","state":{"waiting":{"reason":"PodInitializing"}}}]}}
+]}`},
+	}}
+	runners, err := New(newConfig(t), api, &fakeRegistrar{}).LiveRunners(context.Background())
+	if err != nil {
+		t.Fatalf("LiveRunners: %v", err)
+	}
+	got := map[string]bool{}
+	for _, r := range runners {
+		got[r.AllocationID] = r.RunnerRunning
+	}
+	if len(got) != 2 || !got["alloc-1"] || got["alloc-2"] {
+		t.Fatalf("RunnerRunning = %+v", got)
+	}
+}

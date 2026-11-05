@@ -93,3 +93,35 @@ func TestReconcileOrphanedAllocationsIgnoresInventoryErrors(t *testing.T) {
 		t.Fatalf("inventory error must not release: %s", st.State)
 	}
 }
+
+// Regression (home#4340): a runner already running its job must not be expired
+// at registrationTimeout just because the in_progress webhook was lost.
+func TestReconcileOrphanedAllocationsRegistersRunningRunners(t *testing.T) {
+	cfg := inventoryConfig(t)
+	var live []backend.LiveRunner
+	impl := podInventoryBackend{testBackend: testBackend{name: model.BackendARC}, mu: &sync.Mutex{}, live: &live}
+	svc := NewService(cfg, backend.NewRegistry(impl), nil)
+	running, err := svc.Allocate(context.Background(), model.AllocationRequest{Pool: model.PoolFull, JobTimeout: 6 * time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := svc.Allocate(context.Background(), model.AllocationRequest{Pool: model.PoolFull, JobTimeout: 6 * time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	impl.mu.Lock()
+	live = []backend.LiveRunner{
+		{AllocationID: running.ID, Pool: model.PoolFull, RunnerRunning: true},
+		{AllocationID: pending.ID, Pool: model.PoolFull},
+	}
+	impl.mu.Unlock()
+	svc.ReconcileOrphanedAllocations(context.Background(), time.Now())
+
+	svc.SweepExpired(time.Now().Add(defaultRegistrationTimeout + time.Minute))
+	if st, _ := svc.Get(running.ID); st.State != model.StateReady {
+		t.Fatalf("running runner expired: %s", st.State)
+	}
+	if st, _ := svc.Get(pending.ID); st.State != model.StateExpired {
+		t.Fatalf("never-started runner should still expire, got %s", st.State)
+	}
+}

@@ -451,6 +451,14 @@ type podList struct {
 		} `json:"spec"`
 		Status struct {
 			Phase string `json:"phase"`
+			// Main containers only; native sidecars (dind) report under
+			// initContainerStatuses.
+			ContainerStatuses []struct {
+				Name  string `json:"name"`
+				State struct {
+					Running *struct{} `json:"running"`
+				} `json:"state"`
+			} `json:"containerStatuses"`
 		} `json:"status"`
 	} `json:"items"`
 }
@@ -589,6 +597,12 @@ func (b *Backend) LiveRunners(ctx context.Context) ([]backend.LiveRunner, error)
 			}
 			if v, err := strconv.ParseInt(item.Metadata.Annotations[annotationWorkflowJob], 10, 64); err == nil && v > 0 {
 				runner.WorkflowJobID = v
+			}
+			for _, cs := range item.Status.ContainerStatuses {
+				if cs.State.Running != nil {
+					runner.RunnerRunning = true
+					break
+				}
 			}
 			result = append(result, runner)
 		}

@@ -140,6 +140,9 @@ func (s *Service) ReconcileOrphanedAllocations(ctx context.Context, now time.Tim
 			ids := make(map[string]struct{}, len(runners))
 			for _, runner := range runners {
 				ids[runner.AllocationID] = struct{}{}
+				if runner.RunnerRunning {
+					s.markRunningRunnerRegistered(ctx, backendName, runner.AllocationID)
+				}
 			}
 			live[backendName] = ids
 		}
@@ -176,4 +179,33 @@ func (s *Service) ReconcileOrphanedAllocations(ctx context.Context, now time.Tim
 		released++
 	}
 	return released
+}
+
+// markRunningRunnerRegistered records registration for an allocation whose
+// runner process is already running. Registration is otherwise only recorded
+// by the workflow_job in_progress webhook; when that delivery is lost (for
+// example while the broker restarts) SweepExpired would expire the allocation
+// at registrationTimeout and delete a pod that is mid-job, which GitHub reports
+// as "The runner has received a shutdown signal" (home#4340).
+func (s *Service) markRunningRunnerRegistered(ctx context.Context, backendName model.BackendName, id string) {
+	status, ok := s.store.Get(id)
+	if !ok || status.SelectedBackend != backendName || !isActiveAllocationState(status.State) {
+		return
+	}
+	if (status.RegisteredAt != nil && !status.RegisteredAt.IsZero()) || (status.ClaimedAt != nil && !status.ClaimedAt.IsZero()) {
+		return
+	}
+	if _, _, err := s.Register(ctx, id); err != nil {
+		logAllocationEvent(ctx, "running_runner_register_failed", map[string]string{
+			"allocation_id": allocationIDLabel(id),
+			"backend":       string(backendName),
+			"error":         err.Error(),
+		})
+		return
+	}
+	logAllocationEvent(ctx, "running_runner_registered", map[string]string{
+		"allocation_id": allocationIDLabel(id),
+		"pool":          string(status.Pool),
+		"backend":       string(backendName),
+	})
 }
