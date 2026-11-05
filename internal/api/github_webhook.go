@@ -898,7 +898,7 @@ func (r *reconcileRun) processRun(ctx context.Context, repository string, runID 
 		log.Printf("github reconcile WARNING: %s run %d hit the job page cap (%d pages); its remaining jobs were skipped", repository, runID, github.MaxWorkflowJobPages)
 	}
 	// Prefer jobs whose prior allocation already ended: shared labels like
-	// home-gh-runner let other queued jobs steal the runner, and those
+	// shared pool labels let other queued jobs steal the runner, and those
 	// stranded jobs must be re-served before fresh ones (uecb#201).
 	sort.SliceStable(jobs, func(i, j int) bool {
 		return r.terminalPriority(jobs[i].ID) > r.terminalPriority(jobs[j].ID)
@@ -948,7 +948,7 @@ type workflowJobGetter interface {
 
 // rescueTerminalQueuedJobs re-serves jobs whose allocation ended while GitHub
 // still has them queued. This is preferred over per-job-only runner labels:
-// workflows request shared labels (home-gh-runner), so unique labels alone
+// workflows request shared labels (shared pool labels), so unique labels alone
 // cannot stop GitHub assigning a runner to a different queued job.
 func (r *reconcileRun) rescueTerminalQueuedJobs(ctx context.Context, callLimit int64) (int, error) {
 	getter, ok := r.h.opts.WorkflowJobs.(workflowJobGetter)
