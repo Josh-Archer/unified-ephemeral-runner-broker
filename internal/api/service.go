@@ -1374,6 +1374,8 @@ func (s *Service) noCapacityCaps(poolName model.PoolName) string {
 			limit = "pressure-auto-off"
 		case s.liveCapacityLimit(name, cfg, active) != "":
 			limit = s.liveCapacityLimit(name, cfg, active)
+		case s.registrationPenalized(pool.Name, name, s.now()):
+			limit = "registration-penalized"
 		default:
 			limit = fmt.Sprintf("free(%d/%d)", active, cfg.MaxRunners)
 		}
