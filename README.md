@@ -469,7 +469,10 @@ capacity, the broker can use the configured cloud backends (`azure-vm`,
 `azure-functions`, `ec2`, `gce`, `cloud-run`, `lambda`, and `codebuild`). When ARC is saturated,
 the broker waits briefly for capacity before falling back. The wait defaults to
 2 seconds with a 100 millisecond polling interval; fallback events are logged
-with an `arc_fallback` reason. Other configured non-ARC backends are also eligible
+with an `arc_fallback` reason. `fallback_reason=unhealthy` means ARC itself is marked
+unhealthy; `filtered-by-policy` means ARC is healthy but an admission, tier,
+live-capacity or budget filter removed it. `fallback_to` is `cloud` only when a
+cloud backend is in the fallback set, otherwise `local`. Other configured non-ARC backends are also eligible
 after the listed cloud backends.
 
 ```yaml
