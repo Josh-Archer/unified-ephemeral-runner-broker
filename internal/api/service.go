@@ -859,15 +859,20 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 				return model.AllocationStatus{}, reserveErr
 			}
 		} else if !arcConfigured || !arcCfg.Enabled || !arcCfg.Healthy || arcCfg.MaxRunners <= 0 {
+			policyFiltered := false
 			if !arcConfigured && arcWasConfigured {
 				arcCfg, arcConfigured = configuredARCCfg, true
-				if configuredARCCfg.Enabled && configuredARCCfg.Healthy && configuredARCCfg.MaxRunners > 0 {
-					arcCfg.Healthy = false // filtered by an availability/admission policy
-				}
+				// ARC is configured, enabled and healthy but was dropped by an
+				// admission, tier, live-capacity or budget filter. That is not a
+				// health failure, so report it separately.
+				policyFiltered = configuredARCCfg.Enabled && configuredARCCfg.Healthy && configuredARCCfg.MaxRunners > 0
 			}
 			reason := arcUnavailableReason(arcCfg, arcConfigured)
+			if policyFiltered {
+				reason = "filtered-by-policy"
+			}
 			reservePool = fallbackBackends(pool)
-			logARCFallback(ctx, pool.Name, reason)
+			logARCFallback(ctx, pool.Name, reason, fallbackTarget(reservePool))
 		} else {
 			arcPool := pool
 			arcPool.Backends = map[model.BackendName]model.BackendConfig{model.BackendARC: arcCfg}
@@ -887,7 +892,7 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 				}
 				if wait <= 0 || !time.Now().Before(deadline) {
 					reservePool = fallbackBackends(fallbackPool)
-					logARCFallback(ctx, pool.Name, "saturated")
+					logARCFallback(ctx, pool.Name, "saturated", fallbackTarget(fallbackBackends(fallbackPool)))
 					break
 				}
 				delay := poll
@@ -957,7 +962,7 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 				switch decision.Reason {
 				case "circuit-open":
 					if selected == model.BackendARC && pinnedBackend == nil && hasFallbackBackend(withoutBackend(fallbackPool, selected)) {
-						logARCFallback(ctx, pool.Name, "circuit-open")
+						logARCFallback(ctx, pool.Name, "circuit-open", fallbackTarget(fallbackBackends(withoutBackend(fallbackPool, selected))))
 						reservePool = fallbackBackends(withoutBackend(fallbackPool, selected))
 						reserveRequest.Backend = nil
 						continue
@@ -971,7 +976,7 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 				case "rate-limited":
 					rateLimitedFallback = selected
 					if selected == model.BackendARC && pinnedBackend == nil && hasFallbackBackend(withoutBackend(fallbackPool, selected)) {
-						logARCFallback(ctx, pool.Name, "rate-limited")
+						logARCFallback(ctx, pool.Name, "rate-limited", fallbackTarget(fallbackBackends(withoutBackend(fallbackPool, selected))))
 						reservePool = fallbackBackends(withoutBackend(fallbackPool, selected))
 					} else {
 						reservePool = withoutBackend(reservePool, selected)
@@ -1119,7 +1124,7 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 					"error":         err.Error(),
 				})
 				if selected == model.BackendARC && pinnedBackend == nil && hasFallbackBackend(withoutBackend(fallbackPool, selected)) {
-					logARCFallback(ctx, pool.Name, "provider-capacity-rejected")
+					logARCFallback(ctx, pool.Name, "provider-capacity-rejected", fallbackTarget(fallbackBackends(withoutBackend(fallbackPool, selected))))
 				}
 				if pinnedBackend != nil && *pinnedBackend == selected && !fallbackFromRateLimit {
 					// Pinned requests are not silently rerouted on live-capacity rejection.
@@ -1148,7 +1153,7 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 				return model.AllocationStatus{}, fmt.Errorf("selected backend %q capacity exhausted and no fallback backend is available: %w", selected, ErrBackendLiveCapacity)
 			}
 			if selected == model.BackendARC && pinnedBackend == nil && isARCUnavailableFailure(err) && hasFallbackBackend(withoutBackend(fallbackPool, selected)) {
-				logARCFallback(ctx, pool.Name, arcFailureReason(err))
+				logARCFallback(ctx, pool.Name, arcFailureReason(err), fallbackTarget(fallbackBackends(withoutBackend(fallbackPool, selected))))
 				reservePool = fallbackBackends(withoutBackend(fallbackPool, selected))
 				reserveRequest.Backend = nil
 				if existing.ID == "" {
@@ -2912,11 +2917,23 @@ func arcUnavailableReason(cfg model.BackendConfig, configured bool) string {
 	return "unavailable"
 }
 
-func logARCFallback(ctx context.Context, pool model.PoolName, reason string) {
+// fallbackTarget names the lane an ARC fallback will actually use: "cloud" only
+// when a cloud backend is in the fallback set, otherwise "local" (for example
+// kubernetes-desktop on pools whose cloud backends are disabled).
+func fallbackTarget(fallback model.PoolConfig) string {
+	for name, cfg := range fallback.Backends {
+		if isCloudFallback(name) && cfg.Enabled && cfg.Healthy && cfg.MaxRunners > 0 {
+			return "cloud"
+		}
+	}
+	return "local"
+}
+
+func logARCFallback(ctx context.Context, pool model.PoolName, reason, target string) {
 	logAllocationEvent(ctx, "arc_fallback", map[string]string{
 		"pool":            string(pool),
 		"backend":         string(model.BackendARC),
-		"fallback_to":     "cloud",
+		"fallback_to":     target,
 		"fallback_reason": reason,
 	})
 }

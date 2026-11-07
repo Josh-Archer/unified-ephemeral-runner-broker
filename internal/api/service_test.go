@@ -789,6 +789,25 @@ func TestAllocateARCFirstFallbackWhenARCDown(t *testing.T) {
 	if !strings.Contains(output.String(), "event=arc_fallback") || !strings.Contains(output.String(), "fallback_reason=unhealthy") {
 		t.Fatalf("missing unhealthy fallback reason in logs: %s", output.String())
 	}
+	if !strings.Contains(output.String(), "fallback_to=cloud") {
+		t.Fatalf("want fallback_to=cloud for a cloud fallback: %s", output.String())
+	}
+}
+
+func TestFallbackTargetReportsLocalWhenNoCloudBackend(t *testing.T) {
+	local := model.PoolConfig{Backends: map[model.BackendName]model.BackendConfig{
+		model.BackendName("kubernetes-desktop"): {Enabled: true, Healthy: true, MaxRunners: 4},
+		model.BackendLambda:            {Enabled: false, Healthy: true, MaxRunners: 2},
+	}}
+	if got := fallbackTarget(local); got != "local" {
+		t.Fatalf("fallbackTarget = %q, want local", got)
+	}
+	cloud := model.PoolConfig{Backends: map[model.BackendName]model.BackendConfig{
+		model.BackendCodeBuild: {Enabled: true, Healthy: true, MaxRunners: 1},
+	}}
+	if got := fallbackTarget(cloud); got != "cloud" {
+		t.Fatalf("fallbackTarget = %q, want cloud", got)
+	}
 }
 
 func TestAllocateSkipsTierExceededBackend(t *testing.T) {
