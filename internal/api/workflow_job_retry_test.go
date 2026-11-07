@@ -102,11 +102,12 @@ func TestWorkflowJobRetryBackoff(t *testing.T) {
 }
 
 func TestRegistrationExpiriesSkipBackendWhileOthersRemain(t *testing.T) {
+	usable := model.BackendConfig{Enabled: true, Healthy: true, MaxRunners: 1}
 	service := newServiceWithConfig(nil)
 	now := time.Now()
 	service.now = func() time.Time { return now }
 	pool := model.PoolConfig{Name: "shared", Backends: map[model.BackendName]model.BackendConfig{
-		model.BackendGCE: {}, model.BackendAzureVM: {}, "kubernetes-shared": {},
+		model.BackendGCE: usable, model.BackendAzureVM: usable, "kubernetes-shared": usable,
 	}}
 	service.recordRegistrationExpiry(pool.Name, model.BackendGCE, now)
 	if got := service.filterRegistrationPenalized(pool, model.AllocationRequest{}); len(got.Backends) != 3 {
@@ -123,7 +124,7 @@ func TestRegistrationExpiriesSkipBackendWhileOthersRemain(t *testing.T) {
 	if got := service.filterRegistrationPenalized(pool, model.AllocationRequest{Backend: &pinned}); len(got.Backends) != 3 {
 		t.Fatal("pinned request must not be filtered")
 	}
-	only := model.PoolConfig{Name: "shared", Backends: map[model.BackendName]model.BackendConfig{model.BackendGCE: {}, model.BackendAzureVM: {}}}
+	only := model.PoolConfig{Name: "shared", Backends: map[model.BackendName]model.BackendConfig{model.BackendGCE: usable, model.BackendAzureVM: usable}}
 	if got := service.filterRegistrationPenalized(only, model.AllocationRequest{}); len(got.Backends) != 2 {
 		t.Fatal("must not filter every backend away")
 	}

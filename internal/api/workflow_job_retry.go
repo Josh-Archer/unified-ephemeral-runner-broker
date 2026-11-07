@@ -137,12 +137,20 @@ func (s *Service) filterRegistrationPenalized(pool model.PoolConfig, request mod
 	}
 	now := s.now()
 	kept := make(map[model.BackendName]model.BackendConfig, len(pool.Backends))
+	usableKept := 0
 	for name, cfg := range pool.Backends {
 		if !s.registrationPenalized(pool.Name, name, now) {
 			kept[name] = cfg
+			// Disabled, unhealthy or zero-capacity entries cannot take the job, so
+			// they must not count as the alternative that justifies skipping the
+			// penalized backend. Otherwise a pool with one real backend plus
+			// disabled cloud entries strands every job until the cooldown ends.
+			if cfg.Enabled && cfg.Healthy && cfg.MaxRunners > 0 {
+				usableKept++
+			}
 		}
 	}
-	if len(kept) == 0 || len(kept) == len(pool.Backends) {
+	if usableKept == 0 || len(kept) == len(pool.Backends) {
 		return pool
 	}
 	filtered := pool
