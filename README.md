@@ -81,7 +81,7 @@ Built-in schedulers:
 
 - A Kubernetes broker service with a small REST API
 - Reusable GitHub Actions, `allocate-runner` and `finalize-allocation`
-- A public backend adapter SDK with a conformance test harness
+- A frozen public backend adapter SDK v1, with an in-process and HTTP conformance kit ([guide](docs/third-party-backend.md))
 - An OCI Helm chart for installation
 - Generic provider runner images for `launcher`, `lambda`, `cloud-run`, and `azure-functions`
 - A generic Kustomize-facing GitOps consumption path
@@ -442,7 +442,8 @@ HTTP-dispatch backends publish capacity via optional secret key `capacity_url`.
 Built-in `arc` implements first-class `Capacity()` (optional `capacity_url` or
 configured runner-scale `maxRunners`); `desktop` reports `maxRunners` plus an
 optional host probe. SDK adapters implement `Adapter.Capacity`. See
-[docs/adapter-sdk.md](docs/adapter-sdk.md#publishing-capacity) and
+[docs/adapter-sdk.md](docs/adapter-sdk.md#publishing-capacity),
+[docs/third-party-backend.md](docs/third-party-backend.md), and
 [docs/architecture.md](docs/architecture.md#live-backend-capacity).
 
 ### Quality-Aware Auto Backend Selection
@@ -527,9 +528,9 @@ the allocation until it becomes `ready` or `queue_wait_timeout` expires.
 - `actions/allocate-runner`: public allocate workflow integration surface
 - `actions/finalize-allocation`: public complete/finalize workflow integration surface
 - `examples/`: generic Terraform and GitOps consumption examples
-- `docs/`: architecture notes, security boundary, and [OpenAPI](docs/openapi.yaml) for the allocation API
+- `docs/`: architecture notes, security boundary, [adapter SDK v1](docs/adapter-sdk.md), [third-party backend guide](docs/third-party-backend.md), and [OpenAPI](docs/openapi.yaml) for the allocation API
 - `observability/`: reusable Prometheus alert rules and Grafana dashboard artifacts
-- `pkg/adapter`: public backend adapter SDK and conformance test helpers
+- `pkg/adapter`: public backend adapter SDK v1, external-dispatch HTTP bridge, and conformance test kit
 
 ## Public CI and Trusted Release Boundary
 
