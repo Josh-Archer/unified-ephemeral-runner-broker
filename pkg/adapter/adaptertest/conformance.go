@@ -111,6 +111,12 @@ func RunConformance(t *testing.T, factory Factory, options Options) {
 			t.Fatal(err)
 		}
 	})
+	t.Run("idempotent-launch", func(t *testing.T) {
+		t.Helper()
+		if err := checkIdempotentLaunch(context.Background(), factory(t), options); err != nil {
+			t.Fatal(err)
+		}
+	})
 	t.Run("cleanup-unknown", func(t *testing.T) {
 		t.Helper()
 		if err := checkCleanupUnknown(context.Background(), factory(t)); err != nil {
@@ -286,6 +292,46 @@ func checkIdempotentReserve(ctx context.Context, impl adapter.Adapter, opts Opti
 		return fmt.Errorf("repeat Reserve consumed %d slots, want 1", got-usedSlots(before))
 	}
 	return impl.Cleanup(ctx, adapter.CleanupRequest{Reservation: first, State: adapter.StateCanceled, Reason: "conformance release"})
+}
+
+func checkIdempotentLaunch(ctx context.Context, impl adapter.Adapter, opts Options) error {
+	if impl == nil {
+		return errors.New("factory returned a nil adapter")
+	}
+	before, err := impl.Capacity(ctx)
+	if err != nil {
+		return fmt.Errorf("Capacity: %w", err)
+	}
+	request := reservationRequest(opts, "launch-idem-1")
+	reservation, err := impl.Reserve(ctx, request)
+	if err != nil {
+		return fmt.Errorf("Reserve: %w", err)
+	}
+	first, err := impl.Launch(ctx, adapter.LaunchRequest{Reservation: reservation, Warm: opts.Warm})
+	if err != nil {
+		return fmt.Errorf("first Launch: %w", err)
+	}
+	if strings.TrimSpace(first.RunnerLabel) == "" {
+		return fmt.Errorf("first Launch must return a runner label: %+v", first)
+	}
+	second, err := impl.Launch(ctx, adapter.LaunchRequest{Reservation: reservation, Warm: opts.Warm})
+	if err != nil {
+		return fmt.Errorf("second Launch (start or attach) of %q: %w", reservation.AllocationID, err)
+	}
+	if strings.TrimSpace(second.RunnerLabel) == "" {
+		return fmt.Errorf("second Launch must return a runner label: %+v", second)
+	}
+	if second.RunnerLabel != first.RunnerLabel {
+		return fmt.Errorf("second Launch returned label %q, want %q", second.RunnerLabel, first.RunnerLabel)
+	}
+	mid, err := impl.Capacity(ctx)
+	if err != nil {
+		return fmt.Errorf("Capacity after repeat Launch: %w", err)
+	}
+	if got, want := usedSlots(mid), usedSlots(before)+1; got != want {
+		return fmt.Errorf("repeat Launch consumed %d slots, want 1", got-usedSlots(before))
+	}
+	return impl.Cleanup(ctx, adapter.CleanupRequest{Reservation: reservation, State: adapter.StateCanceled, Reason: "conformance release"})
 }
 
 func checkCleanupUnknown(ctx context.Context, impl adapter.Adapter) error {

@@ -19,7 +19,7 @@ Implement the lifecycle in [adapter-sdk.md](adapter-sdk.md#lifecycle):
 | `Capacity` | `MaxRunners > 0`. Counters are never negative. Every reserved, launching, warm, and running slot is visible before the mutating call returns. |
 | `Reserve` | Keep a non-empty allocation id. Return a non-empty runner label and a zero or future `ExpiresAt`. Reserving an id you already hold returns that reservation and does not take a second slot. |
 | `Reserve` when full | Return `ErrCapacityExhausted` (`adapter.IsCapacityExhausted`). Do not keep a slot for the rejected call. |
-| `Launch` | Return a non-empty runner label. `Warm: true` is a warm start. |
+| `Launch` | Return a non-empty runner label once the runner is started. Do not wait for GitHub registration. `Warm: true` is a warm start. |
 | `Cleanup` | Succeed for `canceled`, `expired`, `failed`, and `completed`. A repeat call, including an unknown allocation, returns nil and releases nothing extra. |
 | Context | A context that is already canceled returns `context.Canceled` and does not change capacity. |
 
@@ -139,6 +139,8 @@ Start one ephemeral runner registered at `github.target_url` with `runner_labels
 }
 ```
 
+The broker's HTTP client budget for `POST /dispatch` covers **Reserve plus Launch only** (20s by default, 90s for the `azure-functions` backend name). Launch must return once the runner process or cloud job is started. Do **not** wait for GitHub registration inside Launch. Registration happens afterward under `registrationTimeout` (default 10m on the broker, overridable per backend). Slow boots that still finish starting within the dispatch budget should raise `registrationTimeout` rather than blocking Launch.
+
 A second dispatch with the same `allocation_id` returns the same `runner_label` and does not take another slot. `launch_mode` `warm` is a warm start. When the controller is full, return HTTP 409 and an `{"error":"..."}` body. Include the word `capacity` in that error. Do not return `2xx` for a rejected reservation.
 
 `job_timeout_seconds` wins when it is positive. The Go bridge also accepts Go duration strings in `job_timeout` (`15m0s`).
@@ -188,12 +190,12 @@ kubectl create secret generic uecb-my-backend \
 
 Enable one existing external backend on the `lite` pool and set `secretRef` to that secret. The URLs decide which controller runs. The name decides broker defaults:
 
-| Backend name | Dispatch timeout | Warm pool |
+| Backend name | Dispatch timeout (Reserve + Launch) | Warm pool |
 | --- | --- | --- |
 | `codebuild`, `lambda`, `cloud-run`, `ec2`, `gce` | 20s | supported |
 | `azure-functions` | 90s | supported |
 
-Use `azure-functions` when cold start can exceed 20 seconds. The controller behind the secret does not have to be that cloud product.
+These dispatch budgets come from the broker's external-dispatch client (`internal/backend/externaldispatch`: 20s default, 90s for `azure-functions`). They apply only to the `POST dispatch_url` round trip. After a successful dispatch, the broker waits up to `registrationTimeout` (default 10m from `broker.registrationTimeout`, overridable per backend) for the runner to appear in GitHub. Use the `azure-functions` backend name when cold start can exceed 20 seconds; the controller behind the secret does not have to be that cloud product. Raise `registrationTimeout` when the runner needs a long time to register after Launch returns.
 
 ```yaml
 pools:
@@ -203,6 +205,7 @@ pools:
         enabled: true
         healthy: true
         maxRunners: 4
+        registrationTimeout: 10m
         secretRef: uecb-my-backend
 ```
 

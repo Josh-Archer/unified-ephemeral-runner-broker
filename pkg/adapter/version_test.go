@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -17,23 +18,52 @@ func TestAPIVersionIsV1(t *testing.T) {
 
 func TestAdapterV1MethodSet(t *testing.T) {
 	typ := reflect.TypeOf((*Adapter)(nil)).Elem()
-	want := map[string][2]int{
-		"Health":   {1, 2},
-		"Capacity": {1, 2},
-		"Reserve":  {2, 2},
-		"Launch":   {2, 2},
-		"Cleanup":  {2, 1},
+	ctxType := reflect.TypeOf((*context.Context)(nil)).Elem()
+	want := map[string]struct {
+		in  []reflect.Type
+		out []reflect.Type
+	}{
+		"Health": {
+			in:  []reflect.Type{ctxType},
+			out: []reflect.Type{reflect.TypeOf(HealthStatus{}), reflect.TypeOf((*error)(nil)).Elem()},
+		},
+		"Capacity": {
+			in:  []reflect.Type{ctxType},
+			out: []reflect.Type{reflect.TypeOf(CapacityStatus{}), reflect.TypeOf((*error)(nil)).Elem()},
+		},
+		"Reserve": {
+			in:  []reflect.Type{ctxType, reflect.TypeOf(ReservationRequest{})},
+			out: []reflect.Type{reflect.TypeOf(Reservation{}), reflect.TypeOf((*error)(nil)).Elem()},
+		},
+		"Launch": {
+			in:  []reflect.Type{ctxType, reflect.TypeOf(LaunchRequest{})},
+			out: []reflect.Type{reflect.TypeOf(LaunchResult{}), reflect.TypeOf((*error)(nil)).Elem()},
+		},
+		"Cleanup": {
+			in:  []reflect.Type{ctxType, reflect.TypeOf(CleanupRequest{})},
+			out: []reflect.Type{reflect.TypeOf((*error)(nil)).Elem()},
+		},
 	}
 	if typ.NumMethod() != len(want) {
 		t.Fatalf("Adapter method count = %d, want %d", typ.NumMethod(), len(want))
 	}
-	for name, counts := range want {
+	for name, sig := range want {
 		method, ok := typ.MethodByName(name)
 		if !ok {
 			t.Fatalf("Adapter is missing %s", name)
 		}
-		if method.Type.NumIn() != counts[0] || method.Type.NumOut() != counts[1] {
-			t.Fatalf("%s signature in=%d out=%d, want in=%d out=%d", name, method.Type.NumIn(), method.Type.NumOut(), counts[0], counts[1])
+		if method.Type.NumIn() != len(sig.in) || method.Type.NumOut() != len(sig.out) {
+			t.Fatalf("%s signature in=%d out=%d, want in=%d out=%d", name, method.Type.NumIn(), method.Type.NumOut(), len(sig.in), len(sig.out))
+		}
+		for i, wantType := range sig.in {
+			if got := method.Type.In(i); got != wantType {
+				t.Fatalf("%s In(%d) = %s, want %s", name, i, got, wantType)
+			}
+		}
+		for i, wantType := range sig.out {
+			if got := method.Type.Out(i); got != wantType {
+				t.Fatalf("%s Out(%d) = %s, want %s", name, i, got, wantType)
+			}
 		}
 	}
 }
@@ -93,6 +123,9 @@ func TestV1GuidePublished(t *testing.T) {
 		"cleanup_url",
 		"capacity_url",
 		"health_url",
+		"registrationTimeout",
+		"20s",
+		"90s",
 	} {
 		if !strings.Contains(string(guide), needle) {
 			t.Errorf("docs/third-party-backend.md missing %q", needle)

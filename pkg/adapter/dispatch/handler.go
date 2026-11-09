@@ -1,9 +1,11 @@
 package dispatch
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -11,6 +13,11 @@ import (
 
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/pkg/adapter"
 )
+
+// cleanupTimeout bounds post-Launch cleanup when the request context is
+// already canceled (broker client timeout). Cleanup must still release the
+// reserved slot; Adapter methods return ctx.Err() for a canceled context.
+const cleanupTimeout = 5 * time.Second
 
 // HandlerOptions configures NewHandler. Empty paths use PathDispatch,
 // PathCleanup, PathHealth, and PathCapacity. Token, when set, requires
@@ -105,6 +112,10 @@ func (h *Handler) handleDispatch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, errors.New("unsupported action"))
 		return
 	}
+	if strings.TrimSpace(body.AllocationID) == "" {
+		writeError(w, http.StatusBadRequest, errors.New("allocation_id is required"))
+		return
+	}
 	request := reservationRequest(r, body)
 	reservation, err := h.adapter.Reserve(r.Context(), request)
 	if err != nil {
@@ -117,25 +128,36 @@ func (h *Handler) handleDispatch(w http.ResponseWriter, r *http.Request) {
 		Metadata:    cloneMetadata(request.Metadata),
 	})
 	if err != nil {
-		_ = h.adapter.Cleanup(r.Context(), adapter.CleanupRequest{
-			Reservation: reservation,
-			State:       adapter.StateFailed,
-			Reason:      "launch failed",
-		})
+		if cleanupErr := h.releaseReservation(r.Context(), reservation, "launch failed"); cleanupErr != nil {
+			writeError(w, http.StatusBadGateway, fmt.Errorf("launch failed: %w; cleanup failed: %v", err, cleanupErr))
+			return
+		}
 		writeAdapterError(w, err)
 		return
 	}
 	response := responseFrom(body, reservation, launch)
 	if strings.TrimSpace(response.RunnerLabel) == "" {
-		_ = h.adapter.Cleanup(r.Context(), adapter.CleanupRequest{
-			Reservation: reservation,
-			State:       adapter.StateFailed,
-			Reason:      "launch returned an empty runner label",
-		})
-		writeError(w, http.StatusBadGateway, errors.New("launch returned an empty runner label"))
+		emptyLabel := errors.New("launch returned an empty runner label")
+		if cleanupErr := h.releaseReservation(r.Context(), reservation, emptyLabel.Error()); cleanupErr != nil {
+			writeError(w, http.StatusBadGateway, fmt.Errorf("%w; cleanup failed: %v", emptyLabel, cleanupErr))
+			return
+		}
+		writeError(w, http.StatusBadGateway, emptyLabel)
 		return
 	}
 	writeJSON(w, http.StatusOK, response)
+}
+
+// releaseReservation runs Cleanup on a context that outlives a canceled
+// request so a broker client timeout cannot strand the reserved slot.
+func (h *Handler) releaseReservation(parent context.Context, reservation adapter.Reservation, reason string) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), cleanupTimeout)
+	defer cancel()
+	return h.adapter.Cleanup(ctx, adapter.CleanupRequest{
+		Reservation: reservation,
+		State:       adapter.StateFailed,
+		Reason:      reason,
+	})
 }
 
 func (h *Handler) handleCleanup(w http.ResponseWriter, r *http.Request) {
@@ -146,6 +168,10 @@ func (h *Handler) handleCleanup(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.Action != "" && body.Action != "cleanup" {
 		writeError(w, http.StatusBadRequest, errors.New("unsupported action"))
+		return
+	}
+	if strings.TrimSpace(body.AllocationID) == "" {
+		writeError(w, http.StatusBadRequest, errors.New("allocation_id is required"))
 		return
 	}
 	err := h.adapter.Cleanup(r.Context(), adapter.CleanupRequest{
@@ -189,6 +215,10 @@ func (h *Handler) handleCapacity(w http.ResponseWriter, r *http.Request) {
 	status, err := h.adapter.Capacity(r.Context())
 	if err != nil {
 		writeAdapterError(w, err)
+		return
+	}
+	if status.MaxRunners < 0 || status.ActiveRunners < 0 || status.PendingRunners < 0 || status.WarmRunners < 0 {
+		writeError(w, http.StatusBadGateway, errors.New("capacity counters must not be negative"))
 		return
 	}
 	writeJSON(w, http.StatusOK, CapacityBody{
