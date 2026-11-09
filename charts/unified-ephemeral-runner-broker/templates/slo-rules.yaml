@@ -1,0 +1,30 @@
+{{- if .Values.observability.slo.enabled }}
+{{- if .Values.observability.slo.prometheusOperator }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "uecb.fullname" . }}-slo
+  labels:
+    app.kubernetes.io/name: {{ include "uecb.name" . }}
+    app.kubernetes.io/component: slo-rules
+{{- with .Values.observability.slo.labels }}
+{{ toYaml . | indent 4 }}
+{{- end }}
+spec:
+{{ include "uecb.sloRules" . | indent 2 }}
+{{- else }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "uecb.fullname" . }}-slo-rules
+  labels:
+    app.kubernetes.io/name: {{ include "uecb.name" . }}
+    app.kubernetes.io/component: slo-rules
+{{- with .Values.observability.slo.labels }}
+{{ toYaml . | indent 4 }}
+{{- end }}
+data:
+  slo-rules.yaml: |
+{{ include "uecb.sloRules" . | indent 4 }}
+{{- end }}
+{{- end }}

@@ -178,6 +178,152 @@
       ],
       "title": "Stale Runner Labels",
       "type": "timeseries"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "description": "p95 end-to-end latency of successful allocations, grouped by pool and backend. SLO example is 60 seconds.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 24
+      },
+      "id": 8,
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, pool, backend) (rate(uecb_allocation_latency_seconds_bucket{result=\"success\"}[5m])))",
+          "legendFormat": "p95 {{pool}}/{{backend}}"
+        }
+      ],
+      "title": "Allocation Latency by Backend",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "description": "Share of allocation attempts with result=failure, by pool and backend. Queued attempts are not failures. SLO example is 5 percent.",
+      "fieldConfig": {
+        "defaults": {
+          "max": 1,
+          "min": 0,
+          "unit": "percentunit"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 24
+      },
+      "id": 9,
+      "targets": [
+        {
+          "expr": "sum by (pool, backend) (rate(uecb_allocations_total{result=\"failure\"}[5m])) / clamp_min(sum by (pool, backend) (rate(uecb_allocations_total[5m])), 0.001)",
+          "legendFormat": "{{pool}}/{{backend}}"
+        }
+      ],
+      "title": "Allocation Failure Ratio by Backend",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "description": "Per-second estimated cost of successful allocations. Uses estimatedCostPerAllocation when set; otherwise the effective cost class. Not a cloud bill.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 32
+      },
+      "id": 10,
+      "targets": [
+        {
+          "expr": "sum by (pool, backend) (rate(uecb_backend_estimated_cost_total[5m]))",
+          "legendFormat": "{{pool}}/{{backend}}"
+        }
+      ],
+      "title": "Estimated Cost Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "description": "Cumulative estimated cost of successful allocations since process start.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 32
+      },
+      "id": 11,
+      "targets": [
+        {
+          "expr": "sum by (pool, backend) (uecb_backend_estimated_cost_total)",
+          "legendFormat": "{{pool}}/{{backend}}"
+        }
+      ],
+      "title": "Estimated Cost Total",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "description": "Effective scheduler cost class. Lower is cheaper.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 40
+      },
+      "id": 12,
+      "targets": [
+        {
+          "expr": "uecb_backend_cost_class",
+          "legendFormat": "{{pool}}/{{backend}}"
+        }
+      ],
+      "title": "Backend Cost Class",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "description": "Cost added for one successful allocation on this backend.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 40
+      },
+      "id": 13,
+      "targets": [
+        {
+          "expr": "uecb_backend_estimated_unit_cost",
+          "legendFormat": "{{pool}}/{{backend}}"
+        }
+      ],
+      "title": "Estimated Unit Cost",
+      "type": "timeseries"
     }
   ],
   "refresh": "30s",
@@ -204,7 +350,8 @@
     "to": "now"
   },
   "timezone": "browser",
+  "description": "Per-backend allocation latency, failure ratio, and estimated cost for the unified ephemeral runner broker.",
   "title": "Unified Ephemeral Runner Broker",
   "uid": "uecb-observability-pack",
-  "version": 1
+  "version": 2
 }

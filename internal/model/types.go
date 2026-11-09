@@ -389,19 +389,24 @@ type BackendConfig struct {
 	// CostClass ranks relative expense for scheduler tie-breaking when free
 	// capacity is equal. Lower is cheaper. Zero means use the built-in default
 	// for the backend name (cluster-local first, then free-tier cloud, then VMs).
-	CostClass      int                      `yaml:"costClass,omitempty" json:"costClass,omitempty"`
-	MaxJobDuration time.Duration            `yaml:"maxJobDuration,omitempty" json:"maxJobDuration,omitempty"`
-	Capabilities   []string                 `yaml:"capabilities,omitempty" json:"capabilities,omitempty"`
-	RunnerLabel    string                   `yaml:"runnerLabel,omitempty" json:"runnerLabel,omitempty"`
-	AzureVM        *AzureVMBackendConfig    `yaml:"azureVM,omitempty" json:"azureVM,omitempty"`
-	Template       string                   `yaml:"template,omitempty" json:"template,omitempty"`
-	SecretRef      string                   `yaml:"secretRef,omitempty" json:"secretRef,omitempty"`
-	CircuitBreaker CircuitBreakerConfig     `yaml:"circuitBreaker,omitempty" json:"circuitBreaker,omitempty"`
-	RateLimit      RateLimitConfig          `yaml:"rateLimit,omitempty" json:"rateLimit,omitempty"`
-	Budget         BudgetConfig             `yaml:"budget,omitempty" json:"budget,omitempty"`
-	TierRules      []TierRuleConfig         `yaml:"tierRules,omitempty" json:"tierRules,omitempty"`
-	Desktop        *DesktopConfig           `yaml:"desktop,omitempty" json:"desktop,omitempty"`
-	Kubernetes     *KubernetesBackendConfig `yaml:"kubernetes,omitempty" json:"kubernetes,omitempty"`
+	CostClass int `yaml:"costClass,omitempty" json:"costClass,omitempty"`
+	// EstimatedCostPerAllocation is the operator's estimated cost, in currency
+	// units, of one successful allocation. Zero uses the effective cost class
+	// as a relative unit so every backend still exports a comparable series.
+	// The value is an operator estimate for dashboards, not a cloud bill.
+	EstimatedCostPerAllocation float64                  `yaml:"estimatedCostPerAllocation,omitempty" json:"estimatedCostPerAllocation,omitempty"`
+	MaxJobDuration             time.Duration            `yaml:"maxJobDuration,omitempty" json:"maxJobDuration,omitempty"`
+	Capabilities               []string                 `yaml:"capabilities,omitempty" json:"capabilities,omitempty"`
+	RunnerLabel                string                   `yaml:"runnerLabel,omitempty" json:"runnerLabel,omitempty"`
+	AzureVM                    *AzureVMBackendConfig    `yaml:"azureVM,omitempty" json:"azureVM,omitempty"`
+	Template                   string                   `yaml:"template,omitempty" json:"template,omitempty"`
+	SecretRef                  string                   `yaml:"secretRef,omitempty" json:"secretRef,omitempty"`
+	CircuitBreaker             CircuitBreakerConfig     `yaml:"circuitBreaker,omitempty" json:"circuitBreaker,omitempty"`
+	RateLimit                  RateLimitConfig          `yaml:"rateLimit,omitempty" json:"rateLimit,omitempty"`
+	Budget                     BudgetConfig             `yaml:"budget,omitempty" json:"budget,omitempty"`
+	TierRules                  []TierRuleConfig         `yaml:"tierRules,omitempty" json:"tierRules,omitempty"`
+	Desktop                    *DesktopConfig           `yaml:"desktop,omitempty" json:"desktop,omitempty"`
+	Kubernetes                 *KubernetesBackendConfig `yaml:"kubernetes,omitempty" json:"kubernetes,omitempty"`
 }
 
 // AzureVMBackendConfig opts persistent repository runners into managed leases.

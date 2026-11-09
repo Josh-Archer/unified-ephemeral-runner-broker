@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"reflect"
 	"regexp"
 	"sort"
@@ -172,6 +173,10 @@ func validateBackendBudgets(cfg model.BrokerConfig) error {
 			}
 			if backendCfg.CostClass < 0 {
 				return fmt.Errorf("pools[%s].backends[%s].costClass must not be negative", pool.Name, backendName)
+			}
+			estimate := backendCfg.EstimatedCostPerAllocation
+			if estimate < 0 || math.IsNaN(estimate) || math.IsInf(estimate, 0) {
+				return fmt.Errorf("pools[%s].backends[%s].estimatedCostPerAllocation must be a finite number that is not negative", pool.Name, backendName)
 			}
 		}
 	}

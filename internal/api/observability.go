@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"log"
+	"math"
 	"net/http"
 	"sort"
 	"strconv"
@@ -48,6 +49,13 @@ type Observer interface {
 	ObserveLiveCapacityDecision(model.PoolName, model.BackendName, string, int)
 	ObserveBudgetBlocked(model.PoolName, model.BackendName, string)
 	ObserveBudgetUsage(model.PoolName, model.BackendName, int, int, int, int)
+	// ObserveBackendCosts publishes the effective cost class and the per-allocation
+	// estimate for every configured backend. The slice replaces the previous sample.
+	ObserveBackendCosts([]backendCostSnapshot)
+	// ObserveEstimatedCost adds units to the cumulative estimated cost of
+	// successful allocations. units is currency when estimatedCostPerAllocation
+	// is set, otherwise the effective cost class.
+	ObserveEstimatedCost(model.PoolName, model.BackendName, float64)
 	ObserveQualitySelection(model.PoolName, model.BackendName, string, float64)
 	ObserveQualityScore(model.PoolName, model.BackendName, float64, float64, time.Duration, int, int)
 	ObserveAllocationReaped(model.PoolName, model.BackendName, string)
@@ -90,6 +98,8 @@ func (noopObserver) ObserveLiveCapacityDecision(model.PoolName, model.BackendNam
 func (noopObserver) ObserveBudgetBlocked(model.PoolName, model.BackendName, string) {}
 func (noopObserver) ObserveBudgetUsage(model.PoolName, model.BackendName, int, int, int, int) {
 }
+func (noopObserver) ObserveBackendCosts([]backendCostSnapshot)                                  {}
+func (noopObserver) ObserveEstimatedCost(model.PoolName, model.BackendName, float64)            {}
 func (noopObserver) ObserveQualitySelection(model.PoolName, model.BackendName, string, float64) {}
 func (noopObserver) ObserveQualityScore(model.PoolName, model.BackendName, float64, float64, time.Duration, int, int) {
 }
@@ -154,6 +164,9 @@ type PrometheusObserver struct {
 	liveCapacityDecisions *prometheus.CounterVec
 	budgetBlocked         *prometheus.CounterVec
 	budgetUsage           *prometheus.GaugeVec
+	backendCostClass      *prometheus.GaugeVec
+	backendUnitCost       *prometheus.GaugeVec
+	estimatedCost         *prometheus.CounterVec
 	qualitySelections     *prometheus.CounterVec
 	qualityScore          *prometheus.GaugeVec
 	qualitySuccessRate    *prometheus.GaugeVec
@@ -266,6 +279,18 @@ func NewPrometheusObserver(_ prometheus.Registerer) *PrometheusObserver {
 			Name: "uecb_backend_budget_usage",
 			Help: "Current backend budget usage against configured limits (window is daily or monthly).",
 		}, []string{"pool", "backend", "window", "kind"}),
+		backendCostClass: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "uecb_backend_cost_class",
+			Help: "Effective scheduler cost class for a pool and backend. Lower is cheaper.",
+		}, []string{"pool", "backend"}),
+		backendUnitCost: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "uecb_backend_estimated_unit_cost",
+			Help: "Estimated cost added for one successful allocation. Uses estimatedCostPerAllocation when set; otherwise the effective cost class.",
+		}, []string{"pool", "backend"}),
+		estimatedCost: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "uecb_backend_estimated_cost_total",
+			Help: "Cumulative estimated cost of successful allocations by pool and backend. Not a cloud bill.",
+		}, []string{"pool", "backend"}),
 		qualitySelections: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "uecb_quality_selection_total",
 			Help: "Quality-aware backend selection decisions by pool, backend, and reason.",
@@ -352,6 +377,9 @@ func (o *PrometheusObserver) Register(registerer prometheus.Registerer) error {
 		o.liveCapacityDecisions,
 		o.budgetBlocked,
 		o.budgetUsage,
+		o.backendCostClass,
+		o.backendUnitCost,
+		o.estimatedCost,
 		o.qualitySelections,
 		o.qualityScore,
 		o.qualitySuccessRate,
@@ -422,6 +450,45 @@ func (o *PrometheusObserver) ObserveBudgetBlocked(pool model.PoolName, backend m
 		reason = "unknown"
 	}
 	o.budgetBlocked.WithLabelValues(string(pool), string(backend), reason).Inc()
+}
+
+type backendCostSnapshot struct {
+	Pool      model.PoolName
+	Backend   model.BackendName
+	CostClass float64
+	UnitCost  float64
+}
+
+func (o *PrometheusObserver) ObserveBackendCosts(snapshots []backendCostSnapshot) {
+	o.backendCostClass.Reset()
+	o.backendUnitCost.Reset()
+	for _, snapshot := range snapshots {
+		pool := string(snapshot.Pool)
+		backendName := string(snapshot.Backend)
+		if pool == "" {
+			pool = "unknown"
+		}
+		if backendName == "" {
+			backendName = "unknown"
+		}
+		o.backendCostClass.WithLabelValues(pool, backendName).Set(snapshot.CostClass)
+		o.backendUnitCost.WithLabelValues(pool, backendName).Set(snapshot.UnitCost)
+	}
+}
+
+func (o *PrometheusObserver) ObserveEstimatedCost(pool model.PoolName, backend model.BackendName, units float64) {
+	if units <= 0 || math.IsNaN(units) || math.IsInf(units, 0) {
+		return
+	}
+	poolLabel := string(pool)
+	backendLabel := string(backend)
+	if poolLabel == "" {
+		poolLabel = "unknown"
+	}
+	if backendLabel == "" {
+		backendLabel = "unknown"
+	}
+	o.estimatedCost.WithLabelValues(poolLabel, backendLabel).Add(units)
 }
 
 func (o *PrometheusObserver) ObserveBudgetUsage(pool model.PoolName, backend model.BackendName, dailyUsed, dailyLimit, monthlyUsed, monthlyLimit int) {

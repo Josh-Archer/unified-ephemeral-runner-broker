@@ -218,6 +218,17 @@ func utcMonthStart(now time.Time) time.Time {
 	return time.Date(u.Year(), u.Month(), 1, 0, 0, 0, 0, time.UTC)
 }
 
+// EstimatedUnitCost is the amount added to the estimated-cost counter for one
+// successful allocation. An explicit EstimatedCostPerAllocation above zero is
+// currency units chosen by the operator. Otherwise the effective cost class is
+// used as a relative unit. The result is not a cloud bill.
+func EstimatedUnitCost(name model.BackendName, cfg model.BackendConfig) float64 {
+	if cfg.EstimatedCostPerAllocation > 0 {
+		return cfg.EstimatedCostPerAllocation
+	}
+	return float64(CostClass(name, cfg))
+}
+
 // CostClass returns the effective cost class for scheduler tie-breaking.
 // Lower is cheaper. Explicit cfg.CostClass > 0 wins; otherwise built-in defaults
 // prefer cluster-local and free-tier cloud backends over VM backends.

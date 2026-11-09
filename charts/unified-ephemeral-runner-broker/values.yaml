@@ -23,6 +23,28 @@ observability:
   prometheus:
     scrape: false
     path: /metrics
+  # Grafana dashboard ConfigMap (label grafana_dashboard=1) for per-backend
+  # allocation latency, failure ratio, and estimated cost.
+  dashboard:
+    enabled: true
+    folder: UECB
+    labels: {}
+  # Per-backend SLO alerts. Default renders a Prometheus rule-file ConfigMap.
+  # Set prometheusOperator to emit a monitoring.coreos.com PrometheusRule and
+  # add the labels your Prometheus selects (for example release: prometheus).
+  slo:
+    enabled: true
+    prometheusOperator: false
+    labels: {}
+    latency:
+      quantile: 0.95
+      seconds: 60
+      for: 15m
+      window: 10m
+    failure:
+      ratio: 0.05
+      for: 10m
+      window: 10m
   # OpenTelemetry traces (OTLP/HTTP). Empty endpoint keeps the noop provider.
   otel:
     enabled: false
@@ -264,6 +286,7 @@ config:
           #   interval: 1m
           #   burst: 1
           # costClass: 50  # lower is cheaper; used when free slots are equal
+          # estimatedCostPerAllocation: 0.02  # currency units per success; 0 uses cost class
           # budget:
           #   enabled: false
           #   maxAllocationsDaily: 50

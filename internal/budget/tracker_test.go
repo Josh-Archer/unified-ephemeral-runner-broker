@@ -117,6 +117,23 @@ func TestCostClassDefaultsAndOverride(t *testing.T) {
 	}
 }
 
+func TestEstimatedUnitCost(t *testing.T) {
+	if got := EstimatedUnitCost(model.BackendARC, model.BackendConfig{}); got != 10 {
+		t.Fatalf("arc default unit cost = %v, want 10", got)
+	}
+	if got := EstimatedUnitCost(model.BackendEC2, model.BackendConfig{CostClass: 5}); got != 5 {
+		t.Fatalf("cost class unit cost = %v, want 5", got)
+	}
+	cfg := model.BackendConfig{CostClass: 90, EstimatedCostPerAllocation: 0.5}
+	if got := EstimatedUnitCost(model.BackendEC2, cfg); got != 0.5 {
+		t.Fatalf("explicit unit cost = %v, want 0.5", got)
+	}
+	cfg.EstimatedCostPerAllocation = 0
+	if got := EstimatedUnitCost(model.BackendEC2, cfg); got != 90 {
+		t.Fatalf("zero explicit unit cost = %v, want cost class 90", got)
+	}
+}
+
 func TestFreeSlots(t *testing.T) {
 	cfg := model.BackendConfig{Enabled: true, Healthy: true, MaxRunners: 3}
 	if got := FreeSlots(cfg, 1); got != 2 {

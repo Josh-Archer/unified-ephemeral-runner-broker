@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/store"
 	"github.com/prometheus/client_golang/prometheus"
@@ -48,6 +49,13 @@ func TestNoopObserver(t *testing.T) {
 	observer.ObserveLiveCapacityDecision(model.PoolFull, model.BackendARC, "provider-full", 0)
 	observer.ObserveBudgetBlocked(model.PoolFull, model.BackendARC, "daily")
 	observer.ObserveBudgetUsage(model.PoolFull, model.BackendARC, 1, 2, 3, 4)
+	observer.ObserveBackendCosts(nil)
+	observer.ObserveBackendCosts([]backendCostSnapshot{{
+		Pool: model.PoolFull, Backend: model.BackendARC, CostClass: 10, UnitCost: 10,
+	}})
+	observer.ObserveEstimatedCost(model.PoolFull, model.BackendARC, 10)
+	observer.ObserveEstimatedCost(model.PoolFull, model.BackendARC, 0)
+	observer.ObserveEstimatedCost(model.PoolFull, model.BackendARC, math.NaN())
 	observer.ObserveQualitySelection(model.PoolFull, model.BackendARC, "higher-score", 0.5)
 	observer.ObserveQualityScore(model.PoolFull, model.BackendARC, 0.5, 1, time.Second, 0, 1)
 	observer.ObserveAllocationReaped(model.PoolFull, model.BackendARC, "expired")
@@ -452,6 +460,151 @@ func TestPrometheusObserverLiveCapacityMetrics(t *testing.T) {
 		metricSeries{`backend="arc",pool="full",reason="provider-full"`, 2},
 		metricSeries{`backend="arc",pool="full",reason="unknown"`, 1},
 	))
+}
+
+func TestPrometheusObserverEstimatedCost(t *testing.T) {
+	obs, reg := newRegisteredObserver(t)
+	obs.ObserveBackendCosts([]backendCostSnapshot{
+		{Pool: model.PoolFull, Backend: model.BackendARC, CostClass: 10, UnitCost: 10},
+		{Pool: model.PoolLite, Backend: model.BackendLambda, CostClass: 40, UnitCost: 0.5},
+	})
+	requireFloat(t, obs.backendCostClass.WithLabelValues("full", "arc"), 10)
+	requireFloat(t, obs.backendUnitCost.WithLabelValues("lite", "lambda"), 0.5)
+	compareRegistered(t, reg, obs.backendCostClass, "uecb_backend_cost_class", expectFamily(
+		"uecb_backend_cost_class",
+		"Effective scheduler cost class for a pool and backend. Lower is cheaper.",
+		"gauge",
+		metricSeries{`backend="arc",pool="full"`, 10},
+		metricSeries{`backend="lambda",pool="lite"`, 40},
+	))
+	compareRegistered(t, reg, obs.backendUnitCost, "uecb_backend_estimated_unit_cost", expectFamily(
+		"uecb_backend_estimated_unit_cost",
+		"Estimated cost added for one successful allocation. Uses estimatedCostPerAllocation when set; otherwise the effective cost class.",
+		"gauge",
+		metricSeries{`backend="arc",pool="full"`, 10},
+		metricSeries{`backend="lambda",pool="lite"`, 0.5},
+	))
+
+	// A later sample replaces gauges so removed backends do not linger.
+	obs.ObserveBackendCosts([]backendCostSnapshot{
+		{Pool: model.PoolFull, Backend: model.BackendEC2, CostClass: 90, UnitCost: 90},
+	})
+	compareRegistered(t, reg, obs.backendCostClass, "uecb_backend_cost_class", expectFamily(
+		"uecb_backend_cost_class",
+		"Effective scheduler cost class for a pool and backend. Lower is cheaper.",
+		"gauge",
+		metricSeries{`backend="ec2",pool="full"`, 90},
+	))
+
+	obs.ObserveEstimatedCost(model.PoolFull, model.BackendARC, 10)
+	obs.ObserveEstimatedCost(model.PoolFull, model.BackendARC, 10)
+	obs.ObserveEstimatedCost(model.PoolLite, model.BackendLambda, 0.5)
+	obs.ObserveEstimatedCost(model.PoolFull, model.BackendARC, 0)
+	obs.ObserveEstimatedCost(model.PoolFull, model.BackendARC, -1)
+	obs.ObserveEstimatedCost(model.PoolFull, model.BackendARC, math.NaN())
+	obs.ObserveEstimatedCost("", "", 2)
+	requireFloat(t, obs.estimatedCost.WithLabelValues("full", "arc"), 20)
+	requireFloat(t, obs.estimatedCost.WithLabelValues("lite", "lambda"), 0.5)
+	requireFloat(t, obs.estimatedCost.WithLabelValues("unknown", "unknown"), 2)
+	compareRegistered(t, reg, obs.estimatedCost, "uecb_backend_estimated_cost_total", expectFamily(
+		"uecb_backend_estimated_cost_total",
+		"Cumulative estimated cost of successful allocations by pool and backend. Not a cloud bill.",
+		"counter",
+		metricSeries{`backend="arc",pool="full"`, 20},
+		metricSeries{`backend="lambda",pool="lite"`, 0.5},
+		metricSeries{`backend="unknown",pool="unknown"`, 2},
+	))
+}
+
+func TestAllocateRecordsEstimatedCostForColdAndWarm(t *testing.T) {
+	now := time.Unix(1000, 0)
+	counting := &countingBackend{testBackend: testBackend{name: model.BackendCodeBuild}}
+	service := newServiceWithCountingBackend(func(pool *model.PoolConfig) {
+		if pool.Name != model.PoolLite {
+			return
+		}
+		for name, backendCfg := range pool.Backends {
+			backendCfg.Enabled = false
+			pool.Backends[name] = backendCfg
+		}
+		codebuildCfg := pool.Backends[model.BackendCodeBuild]
+		codebuildCfg.Enabled = true
+		codebuildCfg.Healthy = true
+		codebuildCfg.MaxRunners = 2
+		codebuildCfg.WarmMin = 1
+		codebuildCfg.WarmMax = 1
+		codebuildCfg.EstimatedCostPerAllocation = 1.5
+		pool.Backends[model.BackendCodeBuild] = codebuildCfg
+	}, counting)
+	service.now = func() time.Time { return now }
+
+	reg := prometheus.NewRegistry()
+	obs := NewPrometheusObserver(reg)
+	if err := obs.Register(reg); err != nil {
+		t.Fatalf("register observer: %v", err)
+	}
+	service.SetObserver(obs)
+
+	service.ReconcileWarmPools()
+	warmAllocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolLite,
+		JobTimeout: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("warm allocation: %v", err)
+	}
+	if warmAllocation.Metadata[backend.MetadataLaunchModeKey] != launchModeWarm {
+		t.Fatalf("launch mode = %q, want warm", warmAllocation.Metadata[backend.MetadataLaunchModeKey])
+	}
+	requireFloat(t, obs.estimatedCost.WithLabelValues("lite", "codebuild"), 1.5)
+
+	coldAllocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolLite,
+		JobTimeout: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("cold allocation: %v", err)
+	}
+	if coldAllocation.Metadata[backend.MetadataLaunchModeKey] != launchModeCold {
+		t.Fatalf("launch mode = %q, want cold", coldAllocation.Metadata[backend.MetadataLaunchModeKey])
+	}
+	requireFloat(t, obs.estimatedCost.WithLabelValues("lite", "codebuild"), 3)
+	requireFloat(t, obs.backendCostClass.WithLabelValues("lite", "codebuild"), 50)
+	requireFloat(t, obs.backendUnitCost.WithLabelValues("lite", "codebuild"), 1.5)
+	requireFloat(t, obs.allocations.WithLabelValues("lite", "codebuild", "success"), 2)
+
+	_, err = service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolLite,
+		JobTimeout: 30 * time.Minute,
+	})
+	if err == nil {
+		t.Fatal("expected timeout limit to fail the allocation")
+	}
+	requireFloat(t, obs.estimatedCost.WithLabelValues("lite", "codebuild"), 3)
+	if got := testutil.ToFloat64(obs.allocations.WithLabelValues("lite", "codebuild", "failure")); got != 0 {
+		// Timeout rejection happens before a backend is selected, so the failure
+		// series is unlabeled by the selected backend.
+		t.Fatalf("selected-backend failure series = %v, want 0", got)
+	}
+	requireFloat(t, obs.allocations.WithLabelValues("lite", "", "failure"), 1)
+}
+
+func TestAllocateUsesCostClassWhenEstimateUnset(t *testing.T) {
+	service := newService()
+	reg := prometheus.NewRegistry()
+	obs := NewPrometheusObserver(reg)
+	if err := obs.Register(reg); err != nil {
+		t.Fatalf("register observer: %v", err)
+	}
+	service.SetObserver(obs)
+
+	if _, err := service.Allocate(context.Background(), model.AllocationRequest{Pool: model.PoolFull}); err != nil {
+		t.Fatalf("allocate: %v", err)
+	}
+	requireFloat(t, obs.estimatedCost.WithLabelValues("full", "arc"), 10)
+	requireFloat(t, obs.backendCostClass.WithLabelValues("full", "arc"), 10)
+	requireFloat(t, obs.backendUnitCost.WithLabelValues("full", "arc"), 10)
+	requireFloat(t, obs.allocations.WithLabelValues("full", "arc", "success"), 1)
 }
 
 func TestPrometheusObserverBudgetAndQuality(t *testing.T) {

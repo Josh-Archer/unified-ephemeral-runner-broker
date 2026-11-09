@@ -111,8 +111,22 @@ func TestValidateBackendBudgets(t *testing.T) {
 			continue
 		}
 		backendCfg := cfg.Pools[i].Backends[model.BackendLambda]
+		backendCfg.CostClass = 40
+		backendCfg.EstimatedCostPerAllocation = -0.01
+		cfg.Pools[i].Backends[model.BackendLambda] = backendCfg
+	}
+	if err := Validate(cfg); err == nil {
+		t.Fatal("negative estimatedCostPerAllocation should fail")
+	}
+
+	for i := range cfg.Pools {
+		if cfg.Pools[i].Name != model.PoolLite {
+			continue
+		}
+		backendCfg := cfg.Pools[i].Backends[model.BackendLambda]
 		backendCfg.Budget = model.BudgetConfig{Enabled: true, MaxAllocationsDaily: 10, MaxAllocationsMonthly: 100}
 		backendCfg.CostClass = 40
+		backendCfg.EstimatedCostPerAllocation = 0.02
 		cfg.Pools[i].Backends[model.BackendLambda] = backendCfg
 	}
 	if err := Validate(cfg); err != nil {

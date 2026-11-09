@@ -59,18 +59,55 @@ Core metrics:
 - `uecb_live_capacity_decisions_total{pool,backend,reason}`: live capacity routing decisions (`live`, `provider-full`, `stale-pass-through`, `provider-reject`, …).
 - `uecb_backend_budget_blocked_total{pool,backend,reason}`: allocations skipped because a daily/monthly backend budget was exceeded.
 - `uecb_backend_budget_usage{pool,backend,window,kind}`: current budget counters (`window=daily|monthly`, `kind=used|limit`).
+- `uecb_backend_cost_class{pool,backend}`: effective scheduler cost class (lower is cheaper).
+- `uecb_backend_estimated_unit_cost{pool,backend}`: estimated cost of one successful allocation. Uses `estimatedCostPerAllocation` when set; otherwise the effective cost class.
+- `uecb_backend_estimated_cost_total{pool,backend}`: cumulative estimated cost of successful allocations. This is an operator estimate for comparison, not a cloud bill.
+
+Per-backend SLO series:
+
+- Allocation latency: `uecb_allocation_latency_seconds{pool,backend,result}`. Successful dispatch uses `result="success"`.
+- Allocation failure: `uecb_allocations_total{pool,backend,result="failure"}`. `queued` is not a failure.
+- Estimated cost: `uecb_backend_estimated_cost_total{pool,backend}`, with `uecb_backend_cost_class` and `uecb_backend_estimated_unit_cost` showing the rate used.
 
 Runtime admission metrics change only when a backend has opted into circuit breaking or rate limiting.
 Tier-routing metrics appear when cached decisions are present or tier policies affect allocation.
 Live-capacity metrics appear when `broker.liveCapacity.enabled` is true and backends publish capacity.
 Budget metrics appear when a backend enables `budget` and allocations are recorded or blocked.
+Cost-class and estimated-cost series appear for every configured backend. Successful cold and warm allocations add the unit cost. Set `estimatedCostPerAllocation` to currency units (for example USD per allocation). Leave it at `0` to accumulate the effective cost class instead.
 
 ## Artifacts
 
-- `observability/grafana-dashboard.json`: importable Grafana dashboard for latency, allocation rate, queue depth, and capacity utilization.
-- `observability/prometheus-rules.yaml`: Prometheus alert rules for dispatch latency, failure rate, saturated capacity, and stuck allocations.
+- `observability/grafana-dashboard.json`: importable Grafana dashboard for per-backend latency, failure ratio, estimated cost, queue depth, and capacity utilization. The same document is shipped in the chart at `charts/unified-ephemeral-runner-broker/dashboards/uecb-slo.json`.
+- `observability/prometheus-rules.yaml`: Prometheus alert rules for per-backend allocation latency and failure SLOs, plus dispatch latency, saturated capacity, and stuck allocations.
 - `observability/prometheus-scrape-example.yaml`: example Prometheus scrape config.
 - `observability/otel-collector-config.yaml`: example OTLP collector pipeline for broker traces.
+
+## Chart
+
+The Helm chart publishes the dashboard and the per-backend SLO alerts. Both are on by default:
+
+```yaml
+observability:
+  dashboard:
+    enabled: true
+    folder: UECB
+  slo:
+    enabled: true
+    prometheusOperator: false
+    latency:
+      quantile: 0.95
+      seconds: 60
+      for: 15m
+      window: 10m
+    failure:
+      ratio: 0.05
+      for: 10m
+      window: 10m
+```
+
+- Dashboard ConfigMap `<release>-slo-dashboard` carries `grafana_dashboard: "1"` and `uecb-slo.json` for a Grafana sidecar.
+- Rule ConfigMap `<release>-slo-rules` contains Prometheus rule groups. Set `observability.slo.prometheusOperator: true` to emit a `PrometheusRule` instead, and set `observability.slo.labels` to the labels your Prometheus selects.
+- Installing that chart output and `observability/prometheus-rules.yaml` together duplicates `UECBBackendAllocationLatencyHigh` and `UECBBackendAllocationFailureRateHigh`. Use one source for those two alerts.
 
 ## Failure Modes
 
@@ -90,6 +127,8 @@ Tier fallback activity means all eligible cloud backends were unavailable under 
 
 Rising `uecb_backend_budget_blocked_total` means operator-set daily/monthly allocation quotas are exhausted for one or more backends. Check `uecb_backend_budget_usage` against configured `maxAllocationsDaily` / `maxAllocationsMonthly`, then either raise the quota, enable a cheaper fallback backend, or wait for the UTC day/month window to reset.
 
+A rising `uecb_backend_estimated_cost_total` for a cloud backend, next to a flat ARC series, means fallback traffic is accumulating the higher estimate. Compare `uecb_backend_estimated_unit_cost` and `uecb_backend_cost_class` before treating the counter as spend. It does not read a cloud billing API.
+
 Saturated capacity means the scheduler has few or no healthy slots available for a pool/backend. Check `maxRunners`, runner cleanup, and whether completed jobs are leaving allocations in `ready` or `reserved`.
 
 Stuck queue depth means allocations are not moving to terminal states. Check the stuck-allocation reaper (`SweepExpired` / `uecb_allocations_reaped_total`), backend cancellation behavior, explicit completion callbacks, and quarantine transitions (`quarantined` -> `expired`). A rising reaped rate usually means finalize callbacks are missing or jobs outlive `job_timeout` + `orphanCleanup.gracePeriod`.
@@ -102,10 +141,14 @@ Dispatch latency SLO:
 
 - Objective: 99 percent of successful allocations complete within 60 seconds over 30 days.
 - Indicator: `histogram_quantile(0.99, sum by (le) (rate(uecb_allocation_latency_seconds_bucket{result="success"}[30d])))`.
-- Initial alert: p95 over 60 seconds for 15 minutes.
+- Per backend: `histogram_quantile(0.95, sum by (le, pool, backend) (rate(uecb_allocation_latency_seconds_bucket{result="success"}[10m])))`.
+- Initial alert: `UECBBackendAllocationLatencyHigh`, p95 over 60 seconds for 15 minutes, grouped by pool and backend.
 
 Successful runner completion SLO:
 
 - Objective: 99 percent of allocation attempts reach a usable runner label without broker-side failure over 30 days.
 - Indicator: `sum(rate(uecb_allocations_total{result="success"}[30d])) / sum(rate(uecb_allocations_total[30d]))`.
-- Initial alert: failure ratio above 5 percent for 10 minutes.
+- Per-backend failure ratio: `sum by (pool, backend) (rate(uecb_allocations_total{result="failure"}[10m])) / clamp_min(sum by (pool, backend) (rate(uecb_allocations_total[10m])), 0.001)`.
+- Initial alert: `UECBBackendAllocationFailureRateHigh`, failure ratio above 5 percent for 10 minutes, grouped by pool and backend.
+
+Estimated cost is a comparison series, not an SLO. Chart the rate of `uecb_backend_estimated_cost_total` beside the latency and failure panels when ARC-first routing falls back to a cloud backend.

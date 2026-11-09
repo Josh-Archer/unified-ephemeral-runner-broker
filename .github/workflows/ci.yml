@@ -67,6 +67,29 @@ jobs:
       - name: Manifest render sanity
         run: |
           helm template uecb charts/unified-ephemeral-runner-broker >/tmp/uecb-helm.yaml
+          grep -q 'uecb-slo.json' /tmp/uecb-helm.yaml
+          grep -q 'UECBBackendAllocationLatencyHigh' /tmp/uecb-helm.yaml
+          grep -q 'UECBBackendAllocationFailureRateHigh' /tmp/uecb-helm.yaml
+          grep -q 'uecb_allocation_latency_seconds_bucket{result="success"}' /tmp/uecb-helm.yaml
+          grep -q 'uecb_allocations_total{result="failure"}' /tmp/uecb-helm.yaml
+          helm template uecb charts/unified-ephemeral-runner-broker \
+            --set observability.slo.prometheusOperator=true >/tmp/uecb-helm-prom.yaml
+          grep -q 'kind: PrometheusRule' /tmp/uecb-helm-prom.yaml
+          if grep -q 'slo-rules.yaml:' /tmp/uecb-helm-prom.yaml; then
+            echo "PrometheusRule mode also rendered the rules ConfigMap" >&2
+            exit 1
+          fi
+          helm template uecb charts/unified-ephemeral-runner-broker \
+            --set observability.dashboard.enabled=false \
+            --set observability.slo.enabled=false >/tmp/uecb-helm-off.yaml
+          if grep -q 'UECBBackendAllocationLatencyHigh' /tmp/uecb-helm-off.yaml; then
+            echo "SLO rules rendered while disabled" >&2
+            exit 1
+          fi
+          if grep -q 'uecb-slo.json' /tmp/uecb-helm-off.yaml; then
+            echo "SLO dashboard rendered while disabled" >&2
+            exit 1
+          fi
           kubectl kustomize examples/gitops/kustomize/base >/tmp/uecb-kustomize.yaml
 
       - name: Render GitOps pack variants
