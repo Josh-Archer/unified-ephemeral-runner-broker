@@ -710,7 +710,7 @@ pools:
 - Jobs from different repositories share the namespace and nodes. Give the pods a service account with no RBAC bindings and `automountServiceAccountToken: false`, and limit privileges to the dind sidecar.
 - The broker needs pod `create`, `delete`, `get` and `list` there (`runnerPods.enabled` in the Helm chart).
 - Pods are named `uecb-runner-<allocation-id>` and deleted when the allocation finishes or is reaped.
-- `Capacity()` counts live pods. Unschedulable pods count as pending, so a full cluster shows no free slots.
+- `Capacity()` counts live pods that can run. Terminating pods, pods on a NotReady node, and Pending pods rejected as Unschedulable do not occupy slots.
 - A ResourceQuota rejection is reported as capacity exhaustion, which lets the scheduler fall back to other backends.
 
 Independent Kubernetes targets can share a pool while keeping their capacity and pod ownership separate. Use a non-builtin backend name and `driver: kubernetes`:
