@@ -1067,6 +1067,7 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 			)
 			_ = s.store.Save(warmAllocation)
 			s.recordBudgetUsage(pool, selected)
+			s.recordEstimatedCost(pool, selected)
 			launchLatency := time.Duration(0)
 			s.observer.ObserveLaunchLatency(pool.Name, selected, launchMode, launchLatency)
 			s.observer.ObserveRegistrationLatency(pool.Name, selected, launchLatency)
@@ -1211,6 +1212,7 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 		s.notifyReady(allocation)
 		s.recordBackendSuccess(pool, selected, s.now())
 		s.recordBudgetUsage(pool, selected)
+		s.recordEstimatedCost(pool, selected)
 		s.recordQualitySuccess(pool.Name, selected, launchLatency)
 		result = "success"
 		allocationID = allocation.ID
@@ -1804,7 +1806,6 @@ func (s *Service) pruneFinishedAllocations(now time.Time) (int, error) {
 	return n, nil
 }
 
-
 func (s *Service) ReconcileBackendHealth() {
 	if s.admission == nil {
 		return
@@ -1847,10 +1848,40 @@ func (s *Service) observeState() {
 	statuses := s.store.List()
 	s.observer.ObserveActiveAllocations(statuses)
 	s.observer.ObserveCapacity(s.cfg, statuses)
+	s.observer.ObserveBackendCosts(backendCostSnapshots(s.cfg))
 	s.observer.ObserveStaleRunnerLabels(staleRunnerLabelSnapshots(statuses, s.now()))
 	s.observeCircuitState()
 	s.observeTierState()
 	s.observeLiveCapacityState()
+}
+
+func backendCostSnapshots(cfg model.BrokerConfig) []backendCostSnapshot {
+	out := make([]backendCostSnapshot, 0)
+	for _, pool := range cfg.Pools {
+		names := make([]model.BackendName, 0, len(pool.Backends))
+		for name := range pool.Backends {
+			names = append(names, name)
+		}
+		sort.Slice(names, func(i, j int) bool { return names[i] < names[j] })
+		for _, name := range names {
+			backendCfg := pool.Backends[name]
+			out = append(out, backendCostSnapshot{
+				Pool:      pool.Name,
+				Backend:   name,
+				CostClass: float64(budget.CostClass(name, backendCfg)),
+				UnitCost:  budget.EstimatedUnitCost(name, backendCfg),
+			})
+		}
+	}
+	return out
+}
+
+func (s *Service) recordEstimatedCost(pool model.PoolConfig, backendName model.BackendName) {
+	cfg, ok := pool.Backends[backendName]
+	if !ok {
+		cfg = model.BackendConfig{}
+	}
+	s.observer.ObserveEstimatedCost(pool.Name, backendName, budget.EstimatedUnitCost(backendName, cfg))
 }
 
 // staleRunnerLabelSnapshots reports allocations that still hold a runner label

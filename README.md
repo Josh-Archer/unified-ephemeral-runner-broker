@@ -870,6 +870,7 @@ Behavior:
 - Over-budget backends are skipped for unpinned requests; pinned over-budget requests fail with a clear error.
 - When only over-budget backends remain, allocation fails fast (not queued).
 - Schedulers order candidates by lower `costClass` first so cheaper backends win when free capacity is otherwise equal; RR/WRR still rotate over that order.
+- `estimatedCostPerAllocation` is an optional currency-unit estimate of one successful allocation. `0` exports the effective cost class instead. The broker adds that unit to `uecb_backend_estimated_cost_total` on cold and warm success. It is not a cloud bill. See [docs/observability.md](docs/observability.md).
 - Counters share the admission-state document (memory/file/postgres) so multi-replica brokers stay aligned. External metrics/cloud sources can be plugged into the budget tracker for reported usage overrides.
 
 This is complementary to [tier-aware routing](#tier-aware-routing) (provider billing APIs) and per-backend `rateLimit` (short cold-launch windows).
@@ -1203,18 +1204,24 @@ The reusable pack includes:
 - `observability/otel-collector-config.yaml`
 - [docs/observability.md](docs/observability.md)
 
-Enable Prometheus scrape annotations and OTLP export from Helm:
+Enable Prometheus scrape annotations, the per-backend SLO dashboard, and OTLP export from Helm:
 
 ```yaml
 observability:
   prometheus:
     scrape: true
+  dashboard:
+    enabled: true
+  slo:
+    enabled: true
   otel:
     enabled: true
     endpoint: otel-collector.observability.svc.cluster.local:4318
 ```
 
-The pack observes allocate, backend dispatch, finalize, and cancel lifecycle events without changing scheduling behavior.
+The chart publishes ConfigMap `<release>-slo-dashboard` (`grafana_dashboard: "1"`) and ConfigMap `<release>-slo-rules` with per-backend allocation latency and failure alerts. Set `observability.slo.prometheusOperator: true` to emit a `PrometheusRule` instead. The same dashboard JSON is `observability/grafana-dashboard.json`.
+
+The pack observes allocate, backend dispatch, finalize, cancel, and estimated cost without changing scheduling behavior. Estimated cost uses `estimatedCostPerAllocation` when set and the effective cost class otherwise.
 
 ## License
 
