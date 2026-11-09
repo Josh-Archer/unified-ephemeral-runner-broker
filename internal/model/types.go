@@ -501,6 +501,49 @@ type PoolConfig struct {
 	WebhookRepositories []string                      `yaml:"webhookRepositories,omitempty" json:"webhookRepositories,omitempty"`
 	CapabilityProfile   CapabilityProfile             `yaml:"capabilityProfile" json:"capabilityProfile"`
 	Backends            map[BackendName]BackendConfig `yaml:"backends" json:"backends"`
+	// HostedOverflow sends this pool's jobs to GitHub-hosted runners while
+	// the pool is backed up, by flipping a repository Actions variable that
+	// the workflows read in runs-on.
+	HostedOverflow *HostedOverflowConfig `yaml:"hostedOverflow,omitempty" json:"hostedOverflow,omitempty"`
+}
+
+// HostedOverflowBudgetBackend is the tier-routing key that hostedOverflow
+// budget rules are evaluated under. It is not a real backend.
+const HostedOverflowBudgetBackend BackendName = "github-hosted"
+
+// HostedOverflowConfig lets jobs that would wait for this pool run on
+// GitHub-hosted runners instead. GitHub cannot move a queued job to another
+// runner, so the broker decides before jobs are queued: it sets a repository
+// Actions variable that the workflows use in runs-on, for example
+//
+//	runs-on: ${{ vars.UECB_SHARED_RUNS_ON || 'uecb-shared' }}
+//
+// The variable holds HostedValue while the pool is backed up and SelfHostedValue
+// otherwise. Private repositories only switch while every BudgetRule is under
+// its limit (GitHub bills their minutes); public repositories run on standard
+// GitHub-hosted runners at no charge and switch regardless.
+type HostedOverflowConfig struct {
+	Enabled bool `yaml:"enabled" json:"enabled"`
+	// Variable is the repository Actions variable name, e.g. UECB_SHARED_RUNS_ON.
+	Variable string `yaml:"variable" json:"variable"`
+	// SelfHostedValue is the runs-on label used while the pool keeps up.
+	SelfHostedValue string `yaml:"selfHostedValue" json:"selfHostedValue"`
+	// HostedValue is the runs-on label used while the pool is backed up.
+	HostedValue string `yaml:"hostedValue" json:"hostedValue"`
+	// Repositories ("owner/repo") whose variable the broker manages.
+	Repositories []string `yaml:"repositories" json:"repositories"`
+	// SaturateAfter is how long an allocation must wait (queued for capacity,
+	// or reserved with no registered runner yet) before the pool counts as
+	// backed up. Defaults to 2m.
+	SaturateAfter time.Duration `yaml:"saturateAfter,omitempty" json:"saturateAfter,omitempty"`
+	// RecoverAfter is how long the pool must have no waiting allocations
+	// before jobs return to self-hosted runners. Defaults to 5m.
+	RecoverAfter time.Duration `yaml:"recoverAfter,omitempty" json:"recoverAfter,omitempty"`
+	// BudgetRules gate private repositories, evaluated through
+	// broker.tierRouting under backend "github-hosted". With no rules private
+	// repositories never switch. A stale or unknown decision counts as over
+	// budget, so a missing billing feed never spends minutes.
+	BudgetRules []TierRuleConfig `yaml:"budgetRules,omitempty" json:"budgetRules,omitempty"`
 }
 
 type BrokerConfig struct {

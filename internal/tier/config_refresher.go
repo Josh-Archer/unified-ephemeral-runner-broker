@@ -56,6 +56,15 @@ func (r *ConfigRefresher) Refresh(ctx context.Context) ([]Decision, error) {
 				mergeDecision(decisions, decision)
 			}
 		}
+		if pool.HostedOverflow != nil && pool.HostedOverflow.Enabled {
+			for _, ruleCfg := range pool.HostedOverflow.BudgetRules {
+				decision, err := r.refreshRule(ctx, pool.Name, model.HostedOverflowBudgetBackend, ruleCfg, now)
+				if err != nil && firstErr == nil {
+					firstErr = err
+				}
+				mergeDecision(decisions, decision)
+			}
+		}
 	}
 	return sortedDecisions(decisions), firstErr
 }

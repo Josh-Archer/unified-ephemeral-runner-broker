@@ -72,6 +72,9 @@ func Validate(cfg model.BrokerConfig) error {
 	if err := validateRegistrationTimeoutAndBackendLimits(cfg); err != nil {
 		return err
 	}
+	if err := validateHostedOverflow(cfg); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -593,6 +596,13 @@ func validateTierRouting(cfg model.BrokerConfig) error {
 				}
 			}
 		}
+		if pool.HostedOverflow != nil {
+			for index, rule := range pool.HostedOverflow.BudgetRules {
+				if err := validateTierRule(tierCfg, pool.Name, model.HostedOverflowBudgetBackend, index, rule); err != nil {
+					return err
+				}
+			}
+		}
 	}
 	return nil
 }
@@ -674,6 +684,9 @@ func hasTierRules(cfg model.BrokerConfig) bool {
 		return true
 	}
 	for _, pool := range cfg.Pools {
+		if pool.HostedOverflow != nil && len(pool.HostedOverflow.BudgetRules) > 0 {
+			return true
+		}
 		for _, backend := range pool.Backends {
 			if len(backend.TierRules) > 0 {
 				return true

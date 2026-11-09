@@ -208,3 +208,53 @@ func decisionsByBackend(decisions []Decision) map[model.BackendName]Decision {
 	}
 	return result
 }
+
+func TestConfigRefresherEvaluatesHostedOverflowBudgetRules(t *testing.T) {
+	now := time.Date(2026, 11, 9, 12, 0, 0, 0, time.UTC)
+	used := "0.4"
+	prometheusServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"scalar","result":[1715097600,"` + used + `"]}}`))
+	}))
+	defer prometheusServer.Close()
+
+	overflow := &model.HostedOverflowConfig{
+		Enabled: true,
+		BudgetRules: []model.TierRuleConfig{{
+			Name:           "github-actions-minutes",
+			UsageQuery:     "github_minutes_ratio",
+			HardLimitRatio: 0.95,
+			Action:         ActionDisable,
+		}},
+	}
+	refresher := NewConfigRefresher(model.BrokerConfig{
+		Broker: model.BrokerRuntimeConfig{TierRouting: model.TierRoutingConfig{
+			Enabled:    true,
+			Prometheus: model.TierPrometheusConfig{URL: prometheusServer.URL},
+		}},
+		Pools: []model.PoolConfig{{Name: "shared", HostedOverflow: overflow}},
+	}, staticSecretReader{})
+	refresher.now = func() time.Time { return now }
+
+	decisions, err := refresher.Refresh(context.Background())
+	if err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	if len(decisions) != 1 || decisions[0].Pool != "shared" || decisions[0].Backend != model.HostedOverflowBudgetBackend {
+		t.Fatalf("decisions = %+v", decisions)
+	}
+	if decisions[0].State != StateHealthy {
+		t.Fatalf("40%% used should be healthy: %+v", decisions[0])
+	}
+
+	used = "0.97"
+	decisions, _ = refresher.Refresh(context.Background())
+	if decisions[0].State != StateExceeded {
+		t.Fatalf("97%% used should be exceeded: %+v", decisions[0])
+	}
+
+	overflow.Enabled = false
+	decisions, _ = refresher.Refresh(context.Background())
+	if len(decisions) != 0 {
+		t.Fatalf("disabled overflow still evaluated: %+v", decisions)
+	}
+}
