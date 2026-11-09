@@ -62,6 +62,8 @@ Core metrics:
 - `uecb_backend_cost_class{pool,backend}`: effective scheduler cost class (lower is cheaper).
 - `uecb_backend_estimated_unit_cost{pool,backend}`: estimated cost of one successful allocation. Uses `estimatedCostPerAllocation` when set; otherwise the effective cost class.
 - `uecb_backend_estimated_cost_total{pool,backend}`: cumulative estimated cost of successful allocations. This is an operator estimate for comparison, not a cloud bill.
+- `uecb_scaleset_decisions_total{pool,mode,outcome}`: Runner Scale Set demand decisions (`match`, `disagree`, `allocated`, `capacity`) when `broker.scaleSetListener.enabled` is true. `disagree` is observe mode seeing assigned jobs the broker has not covered.
+- `uecb_scaleset_runners_allocated_total{pool}`: runners placed from scale-set statistics. This path does not list queued workflow runs.
 
 Per-backend SLO series:
 

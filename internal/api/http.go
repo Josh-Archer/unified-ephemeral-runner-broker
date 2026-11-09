@@ -40,6 +40,7 @@ func NewServerWithPolicy(service *Service, allowedIssuers []string, expectedAud 
 		panic(err)
 	}
 	service.SetObserver(observer)
+	registerScaleSetMetrics(prometheus.DefaultRegisterer)
 
 	return &Server{
 		service:        service,

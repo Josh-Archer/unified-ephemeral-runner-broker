@@ -49,31 +49,22 @@ func (s *Service) MatchWebhookPool(jobLabels []string) (model.PoolConfig, bool) 
 func (s *Service) matchWebhookPool(jobLabels []string, allow func(model.PoolConfig) bool) (model.PoolConfig, bool) {
 	// size-* selects a resource shape. It is not part of the pool's identity,
 	// so a job can add size-large without a matching webhookLabels entry.
-	wanted := normalizeLabelSet(model.WithoutSizeLabels(jobLabels))
-	specific := false
-	for label := range wanted {
-		if label != "self-hosted" {
-			specific = true
-		}
-	}
-	if !specific {
+	if !webhookJobLabelsSpecific(jobLabels) {
 		return model.PoolConfig{}, false
 	}
 	for _, pool := range s.cfg.Pools {
-		if len(pool.WebhookLabels) == 0 || (allow != nil && !allow(pool)) {
+		if !jobLabelsMatchPool(pool, jobLabels) {
 			continue
 		}
-		have := normalizeLabelSet(pool.WebhookLabels)
-		covered := true
-		for label := range wanted {
-			if _, ok := have[label]; !ok {
-				covered = false
-				break
-			}
+		if allow != nil && !allow(pool) {
+			continue
 		}
-		if covered {
-			return pool, true
+		// Allocate mode is the demand source for this pool. A later pool whose
+		// labels also cover the job can still take it.
+		if s.scaleSetOwnsDemand(pool) {
+			continue
 		}
+		return pool, true
 	}
 	return model.PoolConfig{}, false
 }
@@ -89,6 +80,30 @@ func webhookRegistrationLabels(pool model.PoolConfig, jobLabels []string) []stri
 		}
 	}
 	return labels
+}
+
+func webhookJobLabelsSpecific(jobLabels []string) bool {
+	wanted := normalizeLabelSet(model.WithoutSizeLabels(jobLabels))
+	for label := range wanted {
+		if label != "self-hosted" {
+			return true
+		}
+	}
+	return false
+}
+
+func jobLabelsMatchPool(pool model.PoolConfig, jobLabels []string) bool {
+	if len(pool.WebhookLabels) == 0 || !webhookJobLabelsSpecific(jobLabels) {
+		return false
+	}
+	wanted := normalizeLabelSet(model.WithoutSizeLabels(jobLabels))
+	have := normalizeLabelSet(pool.WebhookLabels)
+	for label := range wanted {
+		if _, ok := have[label]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func normalizeLabelSet(labels []string) map[string]struct{} {

@@ -246,6 +246,16 @@ func main() {
 		startBackground("reconcile-github-queued-jobs", reconcileInterval, func(time.Time) { reconcileQueuedJobs() })
 	}
 
+	if cfg.Broker.ScaleSetListener.Enabled {
+		var isLeader func(context.Context) (bool, error)
+		if useLeaderElection {
+			isLeader = func(ctx context.Context) (bool, error) {
+				return elector.TryAcquireLeadership(ctx, store.LeaderLeaseName, identity, leaseTTL)
+			}
+		}
+		startScaleSetListener(ctx, cfg, service, secretReader, isLeader)
+	}
+
 	if tierManager != nil {
 		go func() {
 			ticker := time.NewTicker(30 * time.Second)

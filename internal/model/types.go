@@ -181,6 +181,9 @@ type BrokerRuntimeConfig struct {
 	// with a runs-on label size-<name>. No size label selects default. When
 	// default is omitted, the pod template's resources are left unchanged.
 	SizeClasses map[string]SizeClassConfig `yaml:"sizeClasses,omitempty" json:"sizeClasses,omitempty"`
+	// ScaleSetListener receives Runner Scale Set messages for pools that set
+	// scaleSet. Disabled by default; see docs/scaleset-listener.md.
+	ScaleSetListener ScaleSetListenerConfig `yaml:"scaleSetListener,omitempty" json:"scaleSetListener,omitempty"`
 }
 
 // ARCFirstConfig controls how long automatic allocations wait for local ARC
@@ -211,6 +214,46 @@ type GitHubWebhookConfig struct {
 	// ReconcileInterval polls GitHub for queued jobs that arrived before a
 	// webhook was delivered. The runtime defaults this to one minute.
 	ReconcileInterval time.Duration `yaml:"reconcileInterval,omitempty" json:"reconcileInterval,omitempty"`
+}
+
+const (
+	// ScaleSetModeObserve logs assigned-job demand and leaves webhook delivery
+	// and queued-run reconcile in place.
+	ScaleSetModeObserve = "observe"
+	// ScaleSetModeAllocate places runners from scale-set statistics and stops
+	// webhook allocation and queued-run reconcile for those pools.
+	ScaleSetModeAllocate = "allocate"
+)
+
+// ScaleSetListenerConfig turns on the Runner Scale Set message listener.
+// The listener long-polls a message session per pool. It does not list queued
+// workflow runs. Mode defaults to observe.
+type ScaleSetListenerConfig struct {
+	Enabled bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	// Mode is observe (default) or allocate.
+	Mode string `yaml:"mode,omitempty" json:"mode,omitempty"`
+	// SessionSecretRef is a Kubernetes secret whose keys are scale set names.
+	// Each value is the message-session JSON (sessionId, messageQueueUrl,
+	// messageQueueAccessToken, statistics). Required when Enabled is true.
+	SessionSecretRef string `yaml:"sessionSecretRef,omitempty" json:"sessionSecretRef,omitempty"`
+}
+
+// EffectiveMode returns observe when Mode is empty.
+func (c ScaleSetListenerConfig) EffectiveMode() string {
+	switch strings.TrimSpace(c.Mode) {
+	case "", ScaleSetModeObserve:
+		return ScaleSetModeObserve
+	case ScaleSetModeAllocate:
+		return ScaleSetModeAllocate
+	default:
+		return strings.TrimSpace(c.Mode)
+	}
+}
+
+// Allocates reports whether this listener should place runners and suppress
+// webhook plus queued-run demand for the pools it owns.
+func (c ScaleSetListenerConfig) Allocates() bool {
+	return c.Enabled && c.EffectiveMode() == ScaleSetModeAllocate
 }
 
 // WebhooksConfig controls outbound allocation lifecycle event delivery.
@@ -510,6 +553,11 @@ type PoolConfig struct {
 	// serves every repository the GitHub scope accepts. Use it under owner
 	// scope to keep privileged pools to the repositories they were built for.
 	WebhookRepositories []string                      `yaml:"webhookRepositories,omitempty" json:"webhookRepositories,omitempty"`
+	// ScaleSet registers this pool as one Runner Scale Set. Name is the
+	// runs-on label. ID is the scale set id from the admin API. Both are
+	// required together. The listener ignores the pool until
+	// broker.scaleSetListener.enabled is true.
+	ScaleSet            PoolScaleSetConfig            `yaml:"scaleSet,omitempty" json:"scaleSet,omitempty"`
 	CapabilityProfile   CapabilityProfile             `yaml:"capabilityProfile" json:"capabilityProfile"`
 	Backends            map[BackendName]BackendConfig `yaml:"backends" json:"backends"`
 	// HostedOverflow sends this pool's jobs to GitHub-hosted runners while
@@ -555,6 +603,12 @@ type HostedOverflowConfig struct {
 	// repositories never switch. A stale or unknown decision counts as over
 	// budget, so a missing billing feed never spends minutes.
 	BudgetRules []TierRuleConfig `yaml:"budgetRules,omitempty" json:"budgetRules,omitempty"`
+}
+
+// PoolScaleSetConfig names the Runner Scale Set that feeds one pool.
+type PoolScaleSetConfig struct {
+	Name string `yaml:"name,omitempty" json:"name,omitempty"`
+	ID   int    `yaml:"id,omitempty" json:"id,omitempty"`
 }
 
 type BrokerConfig struct {

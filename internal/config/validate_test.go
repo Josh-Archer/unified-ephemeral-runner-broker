@@ -283,6 +283,51 @@ func TestValidateSizeClasses(t *testing.T) {
 	}
 }
 
+func TestValidateScaleSetListener(t *testing.T) {
+	cfg := Default()
+	if err := Validate(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Broker.ScaleSetListener.Enabled || cfg.Broker.ScaleSetListener.EffectiveMode() != model.ScaleSetModeObserve {
+		t.Fatalf("default listener = %+v", cfg.Broker.ScaleSetListener)
+	}
+
+	cfg.Broker.ScaleSetListener.Enabled = true
+	cfg.Broker.ScaleSetListener.SessionSecretRef = "uecb-scaleset-sessions"
+	if err := Validate(cfg); err == nil {
+		t.Fatal("enabled listener without a scale set should fail")
+	}
+
+	cfg.Pools[0].ScaleSet = model.PoolScaleSetConfig{Name: "uecb-shared", ID: 4}
+	if err := Validate(cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg.Broker.ScaleSetListener.Mode = "watch"
+	if err := Validate(cfg); err == nil {
+		t.Fatal("unknown mode should fail")
+	}
+	cfg.Broker.ScaleSetListener.Mode = model.ScaleSetModeAllocate
+	cfg.Broker.ScaleSetListener.SessionSecretRef = " "
+	if err := Validate(cfg); err == nil {
+		t.Fatal("missing session secret should fail")
+	}
+	cfg.Broker.ScaleSetListener.SessionSecretRef = "uecb-scaleset-sessions"
+
+	cfg.Pools[1].ScaleSet = model.PoolScaleSetConfig{Name: "uecb-shared", ID: 5}
+	if err := Validate(cfg); err == nil {
+		t.Fatal("duplicate scale set name should fail")
+	}
+	cfg.Pools[1].ScaleSet = model.PoolScaleSetConfig{Name: "uecb-lite", ID: 4}
+	if err := Validate(cfg); err == nil {
+		t.Fatal("duplicate scale set id should fail")
+	}
+	cfg.Pools[1].ScaleSet = model.PoolScaleSetConfig{Name: "uecb-lite"}
+	if err := Validate(cfg); err == nil {
+		t.Fatal("name without id should fail")
+	}
+}
+
 func TestValidateRegistrationTimeoutAndBackendLimits(t *testing.T) {
 	cfg := Default()
 	if err := Validate(cfg); err != nil {

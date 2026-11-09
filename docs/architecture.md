@@ -209,6 +209,20 @@ Deliveries are asynchronous and best-effort. Transient failures (network,
 client errors (4xx other than 408/429) are not retried. Webhook failures never
 block allocation state transitions.
 
+## Runner Scale Set listener
+
+Optional, off by default. Pools that set `scaleSet` can take demand from a
+GitHub Runner Scale Set message session instead of the queued-run scan. The
+listener long-polls `statistics.totalAssignedJobs` and acknowledges a message
+only after the scale step succeeds. `mode: observe` only logs disagreements
+with local runners. `mode: allocate` places the deficit through the same tier,
+quota, and fallback path as any other allocation, and stops webhook plus
+queued-run demand for that pool.
+
+The message-queue client does not list workflow runs. Session creation, JIT
+runner config, and removing the scan are still ahead. See
+[scaleset-listener.md](scaleset-listener.md).
+
 ## Queued Admission
 
 Queued admission is optional and disabled by default.

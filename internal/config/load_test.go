@@ -389,6 +389,30 @@ broker:
 	}
 }
 
+func TestScaleSetListenerDefaultsAndLoads(t *testing.T) {
+	if got := Default().Broker.ScaleSetListener.EffectiveMode(); got != model.ScaleSetModeObserve {
+		t.Fatalf("default mode=%s", got)
+	}
+	path := filepath.Join(t.TempDir(), "broker.yaml")
+	body := "broker:\n  scaleSetListener:\n    mode: allocate\n    sessionSecretRef: uecb-scaleset-sessions\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Broker.ScaleSetListener.Enabled {
+		t.Fatal("omitted enabled should stay off")
+	}
+	if cfg.Broker.ScaleSetListener.EffectiveMode() != model.ScaleSetModeAllocate {
+		t.Fatalf("mode=%s", cfg.Broker.ScaleSetListener.Mode)
+	}
+	if cfg.Broker.ScaleSetListener.SessionSecretRef != "uecb-scaleset-sessions" {
+		t.Fatalf("secret ref=%q", cfg.Broker.ScaleSetListener.SessionSecretRef)
+	}
+}
+
 func TestGitHubWebhookReconcileIntervalDefaultsAndLoads(t *testing.T) {
 	if got := Default().Broker.GitHubWebhook.ReconcileInterval; got != time.Minute {
 		t.Fatalf("default reconcile interval=%s, want 1m", got)

@@ -52,6 +52,9 @@ func Validate(cfg model.BrokerConfig) error {
 	if err := validateWebhookLabels(cfg); err != nil {
 		return err
 	}
+	if err := validateScaleSetListener(cfg); err != nil {
+		return err
+	}
 	if err := validateBackendBudgets(cfg); err != nil {
 		return err
 	}
@@ -868,6 +871,47 @@ func validateContainerResources(prefix string, resources model.ContainerResource
 		if !model.ValidQuantity(quantity.value) {
 			return fmt.Errorf("%s: invalid quantity %q", quantity.field, strings.TrimSpace(quantity.value))
 		}
+	}
+	return nil
+}
+
+func validateScaleSetListener(cfg model.BrokerConfig) error {
+	listener := cfg.Broker.ScaleSetListener
+	switch listener.EffectiveMode() {
+	case model.ScaleSetModeObserve, model.ScaleSetModeAllocate:
+	default:
+		return fmt.Errorf("broker.scaleSetListener.mode %q must be %q or %q", listener.Mode, model.ScaleSetModeObserve, model.ScaleSetModeAllocate)
+	}
+	names := map[string]model.PoolName{}
+	ids := map[int]model.PoolName{}
+	configured := 0
+	for _, pool := range cfg.Pools {
+		name := strings.TrimSpace(pool.ScaleSet.Name)
+		id := pool.ScaleSet.ID
+		if name == "" && id == 0 {
+			continue
+		}
+		if name == "" || id <= 0 {
+			return fmt.Errorf("pools[%s].scaleSet requires name and a positive id", pool.Name)
+		}
+		if other, ok := names[name]; ok {
+			return fmt.Errorf("pools[%s].scaleSet.name %q duplicates pools[%s]", pool.Name, name, other)
+		}
+		if other, ok := ids[id]; ok {
+			return fmt.Errorf("pools[%s].scaleSet.id %d duplicates pools[%s]", pool.Name, id, other)
+		}
+		names[name] = pool.Name
+		ids[id] = pool.Name
+		configured++
+	}
+	if !listener.Enabled {
+		return nil
+	}
+	if configured == 0 {
+		return fmt.Errorf("broker.scaleSetListener.enabled requires pools[].scaleSet.name and id")
+	}
+	if strings.TrimSpace(listener.SessionSecretRef) == "" {
+		return fmt.Errorf("broker.scaleSetListener.sessionSecretRef is required when the listener is enabled")
 	}
 	return nil
 }
