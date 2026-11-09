@@ -1,8 +1,8 @@
 name: Auto release
 
-# Every merge to main whose CI passes is released: this tags the commit with
-# the next version (scripts/next-release-version.sh) and starts release.yml on
-# that tag. A tag pushed with GITHUB_TOKEN does not trigger other workflows,
+# Every merge to main whose CI passes is released: this sets Chart.yaml to the
+# next version (scripts/next-release-version.sh) in a commit on main, tags it
+# and starts release.yml on that tag. A tag pushed with GITHUB_TOKEN does not trigger other workflows,
 # so release.yml is started explicitly. Docs, CI, test and chart-version-only
 # merges are not released.
 
@@ -52,26 +52,45 @@ jobs:
             echo "No release needed for ${SHA}." >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - name: Tag the commit
+      - name: Bump the chart and tag
         if: steps.version.outputs.version != ''
+        id: tag
         env:
           VERSION: ${{ steps.version.outputs.version }}
           SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
+          # release.yml's drift check needs Chart.yaml at the tagged commit to
+          # carry the release version, so the bump lands on main first. Only
+          # the tip of main is released: if main moved on, the newer commit's
+          # run releases this change too.
+          git fetch --quiet origin main
+          if [[ "$(git rev-parse origin/main)" != "${SHA}" ]]; then
+            echo "main moved past ${SHA}; its newer commit will be released." >> "$GITHUB_STEP_SUMMARY"
+            echo "tagged=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           base="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n 1)"
           summary="$(git log --format='%s' "${base}..${SHA}" | head -n 20)"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "${VERSION}" "${SHA}" -m "${VERSION}" -m "${summary}"
+          chart=charts/unified-ephemeral-runner-broker/Chart.yaml
+          sed -i -E "s/^version:.*/version: ${VERSION#v}/; s/^appVersion:.*/appVersion: ${VERSION#v}/" "${chart}"
+          if ! git diff --quiet -- "${chart}"; then
+            git commit --quiet -m "chore(release): chart ${VERSION#v}" -- "${chart}"
+            # Fast-forward only: fails cleanly if main moved meanwhile.
+            git push origin HEAD:refs/heads/main
+          fi
+          git tag -a "${VERSION}" HEAD -m "${VERSION}" -m "${summary}"
           git push origin "refs/tags/${VERSION}"
-          echo "Tagged ${SHA} as ${VERSION}." >> "$GITHUB_STEP_SUMMARY"
+          echo "tagged=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Tagged $(git rev-parse --short HEAD) as ${VERSION}." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Start the release
-        if: steps.version.outputs.version != ''
+        if: steps.tag.outputs.tagged != ''
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.version.outputs.version }}
+          VERSION: ${{ steps.tag.outputs.tagged }}
         run: |
           set -euo pipefail
           gh workflow run release.yml --repo "${GITHUB_REPOSITORY}" --ref "${VERSION}" \

@@ -527,7 +527,7 @@ This repository is designed for a split trust model:
 
 - Public CI runs on GitHub-hosted runners only
 - The trusted `release.yml` workflow publishes immutable releases from GitHub-hosted runners through the `release` environment
-- `auto-release.yml` releases every merge to `main` once CI passes: it tags the next version (patch, or minor for a breaking change) and starts `release.yml` on that tag. Docs, CI, test and chart-version-only merges are skipped; see `scripts/next-release-version.sh`
+- `auto-release.yml` releases every merge to `main` once CI passes: it sets `Chart.yaml` to the next version (patch, or minor for a breaking change) in a commit on `main`, tags it, and starts `release.yml` on that tag, which ends by publishing the GitHub release. Docs, CI, test and chart-version-only merges are skipped; see `scripts/next-release-version.sh`
 - The former private release repository is archived and must stay retired
 - Public forks and PRs must never reach self-hosted runners or publish credentials
 

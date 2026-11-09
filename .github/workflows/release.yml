@@ -346,3 +346,24 @@ jobs:
           bash scripts/check-release-drift.sh \
             --version "${VERSION_NO_V}" \
             --source-ref "${SOURCE_REF}"
+
+  github-release:
+    name: Publish GitHub release
+    needs: [validate, verify-drift]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create the release with generated notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          if gh release view "${VERSION}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Release ${VERSION} already exists." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          gh release create "${VERSION}" --repo "${GITHUB_REPOSITORY}" --verify-tag \
+            --title "${VERSION}" --generate-notes
+          echo "Published release ${VERSION}." >> "$GITHUB_STEP_SUMMARY"
