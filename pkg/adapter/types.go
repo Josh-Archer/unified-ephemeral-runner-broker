@@ -8,6 +8,8 @@ import (
 type BackendName string
 type PoolName string
 
+// AllocationState is the lifecycle state a caller passes to Cleanup.
+// The string values are part of adapter API v1.
 type AllocationState string
 
 const (
@@ -73,6 +75,23 @@ type CleanupRequest struct {
 	Metadata    map[string]string
 }
 
+// Adapter is the v1 runner-controller lifecycle.
+//
+// The method set is frozen while APIVersion is "v1". Every method honors
+// context cancellation: a context that is already canceled or whose deadline
+// has already passed returns that context error and leaves provider state
+// unchanged.
+//
+// Reserve preserves a non-empty AllocationID, returns a non-empty RunnerLabel,
+// and returns a zero or future ExpiresAt. Reserving an AllocationID that is
+// already held returns the original reservation and does not consume another
+// slot. When no free slot remains, Reserve returns an error for which
+// IsCapacityExhausted is true.
+//
+// Capacity counts every reserved, launching, warm, and running slot before
+// the corresponding call returns. Cleanup releases the slot, succeeds for the
+// terminal states canceled, expired, failed, and completed, and succeeds
+// again when the allocation is already gone.
 type Adapter interface {
 	Health(context.Context) (HealthStatus, error)
 	Capacity(context.Context) (CapacityStatus, error)
