@@ -839,6 +839,41 @@ Supported fallback modes:
 
 Use `observe-only` first, then move a provider or backend rule to `deprioritize` or `disable` after validating Prometheus queries and provider snapshots. Pinned requests fail clearly when the requested backend is tier-blocked.
 
+## GitHub-Hosted Overflow
+
+A pool with `webhookLabels` can send jobs to GitHub-hosted runners while it is backed up. GitHub cannot move a job that is already queued for self-hosted labels, so the broker decides before jobs are queued: it sets a repository Actions variable that the workflows read in `runs-on`.
+
+```yaml
+pools:
+  - name: shared
+    webhookLabels: [self-hosted, uecb-shared]
+    hostedOverflow:
+      enabled: true
+      variable: UECB_SHARED_RUNS_ON
+      selfHostedValue: uecb-shared
+      hostedValue: ubuntu-latest
+      repositories: [Josh-Archer/DeskQuest]
+      saturateAfter: 2m   # an allocation waiting this long means the pool is backed up
+      recoverAfter: 5m    # no long waits for this long switches back
+      budgetRules:        # private repositories switch only while these are under limit
+        - name: github-actions-minutes
+          usageQuery: max(cloud_budget_actual{cloud="github"} / cloud_budget_limit{cloud="github"})
+          hardLimitRatio: 0.95
+          action: disable
+```
+
+```yaml
+jobs:
+  build:
+    runs-on: ${{ vars.UECB_SHARED_RUNS_ON || 'uecb-shared' }}
+```
+
+- **Backed up** means an allocation in the pool has waited `saturateAfter` without a runner picking up its job: queued for capacity, or given a backend whose runner has not registered yet (for example a Pending pod).
+- **Public repositories** switch whenever the pool is backed up; standard GitHub-hosted runners are free for them.
+- **Private repositories** use the account's included minutes, so they switch only while every `budgetRules` entry is under its limit. The rules are evaluated through `broker.tierRouting` under backend `github-hosted`. A missing, stale or unknown reading counts as over budget, and with no rules private repositories never switch.
+- The broker writes a variable only when its value changes. It needs the GitHub App **Variables: write** repository permission, and it reads repository visibility once an hour.
+- Jobs that need cluster access or self-hosted-only tools should keep a fixed self-hosted `runs-on`.
+
 ## Per-Backend Budget and Cost Guardrails
 
 Optional daily/monthly allocation budgets protect free-tier and student backends from retries and stuck runners. Configure per backend; disabled by default.

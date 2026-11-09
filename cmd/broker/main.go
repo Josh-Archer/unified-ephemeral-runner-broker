@@ -27,6 +27,7 @@ import (
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/config"
 	githubapi "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/github"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
+	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/overflow"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/runtime"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/store"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/telemetry"
@@ -196,6 +197,20 @@ func main() {
 	startBackground("reconcile-orphaned-allocations", 30*time.Second, func(now time.Time) {
 		service.ReconcileOrphanedAllocations(context.Background(), now)
 	})
+
+	// Hosted overflow steers backed-up pools' jobs to GitHub-hosted runners
+	// through a repository variable the workflows read in runs-on.
+	var overflowBudget overflow.Budget
+	if tierManager != nil {
+		overflowBudget = tierManager
+	}
+	if hostedOverflow := overflow.New(cfg, githubClient, service.Store(), overflowBudget); hostedOverflow != nil {
+		startBackground("hosted-overflow", 30*time.Second, func(now time.Time) {
+			if err := hostedOverflow.Reconcile(ctx, now.UTC()); err != nil {
+				log.Printf("hosted overflow: %v", err)
+			}
+		})
+	}
 
 	if webhookPoolsConfigured(cfg) {
 		startBackground("github-webhook-inbox", 5*time.Second, func(time.Time) {
