@@ -110,16 +110,21 @@ func (m *Memory) Launch(ctx context.Context, request adapter.LaunchRequest) (ada
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	id := request.Reservation.AllocationID
-	if slot, ok := m.reservations[id]; ok {
-		if request.Warm {
-			slot.phase = memoryWarm
-		} else {
-			slot.phase = memoryActive
-		}
-		m.reservations[id] = slot
+	id := strings.TrimSpace(request.Reservation.AllocationID)
+	slot, ok := m.reservations[id]
+	if !ok {
+		return adapter.LaunchResult{}, fmt.Errorf("memory adapter: unknown allocation %q", id)
 	}
+	if request.Warm {
+		slot.phase = memoryWarm
+	} else {
+		slot.phase = memoryActive
+	}
+	m.reservations[id] = slot
 	label := strings.TrimSpace(request.Reservation.RunnerLabel)
+	if label == "" {
+		label = strings.TrimSpace(slot.reservation.RunnerLabel)
+	}
 	if label == "" {
 		label = "uecb-mem-" + id
 	}

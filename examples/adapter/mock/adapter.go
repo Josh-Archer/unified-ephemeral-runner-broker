@@ -110,17 +110,23 @@ func (a *Adapter) Launch(ctx context.Context, request adapter.LaunchRequest) (ad
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	if slot, ok := a.reservations[request.Reservation.AllocationID]; ok {
-		if request.Warm {
-			slot.phase = phaseWarm
-		} else {
-			slot.phase = phaseActive
-		}
-		a.reservations[request.Reservation.AllocationID] = slot
+	id := strings.TrimSpace(request.Reservation.AllocationID)
+	current, ok := a.reservations[id]
+	if !ok {
+		return adapter.LaunchResult{}, fmt.Errorf("mock adapter: unknown allocation %q", id)
 	}
+	if request.Warm {
+		current.phase = phaseWarm
+	} else {
+		current.phase = phaseActive
+	}
+	a.reservations[id] = current
 	label := strings.TrimSpace(request.Reservation.RunnerLabel)
 	if label == "" {
-		label = "uecb-mock-" + request.Reservation.AllocationID
+		label = strings.TrimSpace(current.reservation.RunnerLabel)
+	}
+	if label == "" {
+		label = "uecb-mock-" + id
 	}
 	mode := "cold"
 	if request.Warm {
