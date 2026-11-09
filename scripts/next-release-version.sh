@@ -12,8 +12,8 @@
 #   chart is packaged with the tag version, so its version fields do not
 #   matter). Merge titles are not
 #   always conventional, so the decision uses changed files, not prefixes.
-# - Bump: minor for a breaking change ("type!:" subject or "BREAKING CHANGE"
-#   in a body), otherwise patch. This keeps the existing v0.1.x scheme.
+# - Bump: minor for a breaking change (a "type!:" line or a "BREAKING CHANGE:"
+#   footer at the start of a line, per Conventional Commits), otherwise patch. This keeps the existing v0.1.x scheme.
 set -euo pipefail
 
 commit="$(git rev-parse --verify "${1:-HEAD}^{commit}")"
@@ -43,7 +43,7 @@ fi
 
 IFS=. read -r major minor patch <<<"${base_tag#v}"
 if git log --format='%s%n%b' "${base_commit}..${commit}" \
-  | grep -qE '^[a-z]+(\([^)]*\))?!:|BREAKING[ -]CHANGE'; then
+  | grep -qE '^[a-z]+(\([^)]*\))?!:|^BREAKING[ -]CHANGE:'; then
   if [[ "${major}" == 0 ]]; then
     minor=$((minor + 1)); patch=0
   else
