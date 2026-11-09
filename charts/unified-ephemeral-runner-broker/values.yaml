@@ -196,6 +196,13 @@ config:
     #       limits: {cpu: "2", memory: "4Gi", ephemeral-storage: "16Gi"}
     #     backends: [kubernetes-desktop]
     sizeClasses: {}
+    # Runner Scale Set listener. Off by default. See docs/scaleset-listener.md.
+    # observe logs demand beside webhooks and queued-run reconcile.
+    # allocate places runners from statistics and skips that scan for the pool.
+    scaleSetListener:
+      enabled: false
+      mode: observe
+      sessionSecretRef: ""
   pools:
     - name: full
       labels:

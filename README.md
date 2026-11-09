@@ -305,7 +305,17 @@ deliveries), `uecb_github_webhook_events_matched_total{pool,action}` and
 `uecb_github_webhook_events_enqueued_total{action}` (queued by a non-leader for the leader), and `uecb_github_webhook_events_ignored_total{reason}` (`unsupported_event`,
 `unsupported_action`, `no_matching_pool`, `duplicate_delivery`,
 `duplicate_job`, `unknown_job`, `not_leader` (no shared inbox), `enqueue_failed`, `invalid_signature`,
-`missing_signature`, and others).
+`missing_signature`, `scale_set_listener` (allocate mode owns the pool), and others).
+
+### Runner Scale Set listener (preview)
+
+`broker.scaleSetListener` can take demand from a Runner Scale Set message
+session instead of the queued-run scan. It is off by default. `mode: observe`
+logs `totalAssignedJobs` against local runners and leaves webhooks and
+reconcile in place. `mode: allocate` places the deficit through the normal
+tier, quota, and fallback path and, for those pools, stops webhook allocation
+and the queued-run scan. Session creation and JIT runner registration are not
+in this slice. See [docs/scaleset-listener.md](docs/scaleset-listener.md).
 
 ### Stuck-allocation reaper (orphan cleanup)
 

@@ -578,6 +578,11 @@ func (s *Server) ReconcileQueuedGitHubJobs(ctx context.Context) (int, error) {
 		ctx = context.Background()
 	}
 	h := s.githubWebhook
+	// Pools in scale-set allocate mode take demand from message statistics.
+	// When every webhook pool is one of those, do not list queued runs at all.
+	if !h.service.queuedReconcileNeeded() {
+		return 0, nil
+	}
 	lister := h.opts.WorkflowJobs
 	now := h.service.now()
 	if reconcileRateLimited(lister, now) {
@@ -1053,6 +1058,9 @@ func (h *githubWebhookHandler) process(ctx context.Context, payload workflowJobP
 	case "queued":
 		pool, ok := h.service.MatchWebhookPoolForRepository(payload.WorkflowJob.Labels, repository)
 		if !ok {
+			if h.service.scaleSetCovers(payload.WorkflowJob.Labels, repository) {
+				return ignored("scale_set_listener")
+			}
 			if _, labelsMatch := h.service.MatchWebhookPool(payload.WorkflowJob.Labels); labelsMatch {
 				return ignored("repository_not_allowed")
 			}
