@@ -52,6 +52,37 @@ jobs:
             echo "No release needed for ${SHA}." >> "$GITHUB_STEP_SUMMARY"
           fi
 
+      - name: Recover a tag whose release never started
+        # A rerun after a failed dispatch finds the commit already tagged, so
+        # the version step above prints nothing. If the tip of main carries a
+        # version tag with no GitHub release and no release.yml run at all,
+        # start that release instead of dropping it. A release that ran and
+        # failed is left for a person to look at.
+        if: steps.version.outputs.version == ''
+        id: recover
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git fetch --quiet --tags origin main
+          tag="$(git tag --points-at origin/main --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n 1)"
+          if [[ -z "${tag}" ]]; then
+            echo "tagged=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "tagged=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          runs="$(gh run list --repo "${GITHUB_REPOSITORY}" --workflow release.yml --branch "${tag}" --limit 1 --json databaseId --jq 'length')"
+          if [[ "${runs}" != "0" ]]; then
+            echo "${tag} already has a release.yml run; not starting another." >> "$GITHUB_STEP_SUMMARY"
+            echo "tagged=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "${tag} was tagged but its release never started; starting it." >> "$GITHUB_STEP_SUMMARY"
+          echo "tagged=${tag}" >> "$GITHUB_OUTPUT"
+
       - name: Bump the chart and tag
         if: steps.version.outputs.version != ''
         id: tag
@@ -87,10 +118,10 @@ jobs:
           echo "Tagged $(git rev-parse --short HEAD) as ${VERSION}." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Start the release
-        if: steps.tag.outputs.tagged != ''
+        if: steps.tag.outputs.tagged != '' || steps.recover.outputs.tagged != ''
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.tag.outputs.tagged }}
+          VERSION: ${{ steps.tag.outputs.tagged || steps.recover.outputs.tagged }}
         run: |
           set -euo pipefail
           gh workflow run release.yml --repo "${GITHUB_REPOSITORY}" --ref "${VERSION}" \
