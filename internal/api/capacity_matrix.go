@@ -199,6 +199,9 @@ func (s *Service) wrapAllocationError(rawPool model.PoolConfig, request model.Al
 
 	errorCode := "allocation_failed"
 	switch {
+	case errors.Is(err, model.ErrUnknownSizeClass):
+		errorCode = "unknown_size_class"
+		suggestedAction = "Use a size class defined in broker.sizeClasses, or omit the size-* label to keep the default pod shape."
 	case errors.Is(err, ErrBackendLiveCapacity), errors.Is(err, scheduler.ErrNoCapacity):
 		errorCode = "capacity_exhausted"
 	case errors.Is(err, ErrBackendRateLimited):

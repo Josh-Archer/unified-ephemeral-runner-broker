@@ -767,6 +767,16 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 		return model.AllocationStatus{}, err
 	}
 	resultPool = pool.Name
+	// Size is a per-job request. Resolve it before the ARC snapshot so a class
+	// that excludes ARC is treated as a pool that has no ARC lane.
+	request, err = applySizeClass(s.cfg.Broker.SizeClasses, request)
+	if err != nil {
+		return model.AllocationStatus{}, err
+	}
+	pool, err = filterBackendsBySizeClass(pool, request, s.cfg.Broker.SizeClasses)
+	if err != nil {
+		return model.AllocationStatus{}, err
+	}
 	configuredARCCfg, arcWasConfigured := pool.Backends[model.BackendARC]
 
 	explicitTimeout := request.JobTimeout > 0
@@ -1061,10 +1071,10 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 			warmAllocation.Subject = allocation.Subject
 			warmAllocation.Repository = allocation.Repository
 			warmAllocation.Owner = allocation.Owner
-			warmAllocation.Metadata = withLaunchModeMetadata(
+			warmAllocation.Metadata = annotateSizeClass(s.cfg.Broker.SizeClasses, withLaunchModeMetadata(
 				backend.WithCapabilitiesMetadata(pool.Backends[selected], warmAllocation.Metadata),
 				launchMode,
-			)
+			), request.Labels)
 			_ = s.store.Save(warmAllocation)
 			s.recordBudgetUsage(pool, selected)
 			launchLatency := time.Duration(0)
@@ -1188,10 +1198,10 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 		endSpan(provisionSpan, nil)
 
 		allocation.RunnerLabel = provisioned.RunnerLabel
-		allocation.Metadata = withLaunchModeMetadata(
+		allocation.Metadata = annotateSizeClass(s.cfg.Broker.SizeClasses, withLaunchModeMetadata(
 			backend.WithCapabilitiesMetadata(pool.Backends[selected], provisioned.Metadata),
 			launchMode,
-		)
+		), request.Labels)
 		allocation.State = model.StateReady
 		if s.isStaticLabelBackend(pool.Name, selected) {
 			nowStatic := s.now()
@@ -1804,7 +1814,6 @@ func (s *Service) pruneFinishedAllocations(now time.Time) (int, error) {
 	return n, nil
 }
 
-
 func (s *Service) ReconcileBackendHealth() {
 	if s.admission == nil {
 		return
@@ -1983,6 +1992,9 @@ func (s *Service) consumeWarmAllocation(ctx context.Context, pool model.PoolConf
 	for _, candidate := range warm {
 		if isWarmExpired(candidate, now, ttl) {
 			s.recycleWarmAllocation(ctx, pool, candidate, "warm allocation expired")
+			continue
+		}
+		if !warmCandidateServesSize(request.RequestedLabels, candidate.RequestedLabels) {
 			continue
 		}
 		// Claim under warmMu before returning so concurrent consumers cannot

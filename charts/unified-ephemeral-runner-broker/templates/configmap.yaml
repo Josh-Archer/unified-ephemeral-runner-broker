@@ -54,5 +54,9 @@ data:
 {{ toYaml (.Values.config.broker.qualityAware | default dict) | indent 8 }}
       arcFirst:
 {{ toYaml (.Values.config.broker.arcFirst | default dict) | indent 8 }}
+      {{- if .Values.config.broker.sizeClasses }}
+      sizeClasses:
+{{ toYaml .Values.config.broker.sizeClasses | indent 8 }}
+      {{- end }}
     pools:
 {{ toYaml .Values.config.pools | indent 6 }}

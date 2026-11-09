@@ -384,7 +384,13 @@ components:
           type: array
           items:
             type: string
-          description: Optional labels attached to the allocation request
+          description: |
+            Optional labels attached to the allocation request. A label
+            `size-<class>` (for example `size-large`) selects
+            `broker.sizeClasses.<class>` and shapes the runner pod. With no
+            size label the request uses class `default`, which keeps the
+            configured pod template when `default` is not configured. An
+            unknown class is rejected with `unknown_size_class`.
         required_capabilities:
           type: array
           items:

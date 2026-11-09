@@ -47,7 +47,9 @@ func (s *Service) MatchWebhookPool(jobLabels []string) (model.PoolConfig, bool) 
 }
 
 func (s *Service) matchWebhookPool(jobLabels []string, allow func(model.PoolConfig) bool) (model.PoolConfig, bool) {
-	wanted := normalizeLabelSet(jobLabels)
+	// size-* selects a resource shape. It is not part of the pool's identity,
+	// so a job can add size-large without a matching webhookLabels entry.
+	wanted := normalizeLabelSet(model.WithoutSizeLabels(jobLabels))
 	specific := false
 	for label := range wanted {
 		if label != "self-hosted" {
@@ -74,6 +76,19 @@ func (s *Service) matchWebhookPool(jobLabels []string, allow func(model.PoolConf
 		}
 	}
 	return model.PoolConfig{}, false
+}
+
+// webhookRegistrationLabels are the pool's static labels plus the job's size
+// label, when it asked for one. The size label has to be on the runner or
+// GitHub will not assign the job to it.
+func webhookRegistrationLabels(pool model.PoolConfig, jobLabels []string) []string {
+	labels := append([]string(nil), pool.WebhookLabels...)
+	for _, label := range jobLabels {
+		if model.IsSizeLabel(label) {
+			labels = append(labels, strings.TrimSpace(label))
+		}
+	}
+	return labels
 }
 
 func normalizeLabelSet(labels []string) map[string]struct{} {
@@ -132,7 +147,7 @@ func (s *Service) AcceptsWebhookRepository(repository string) bool {
 // pool's static webhook labels and the job id is recorded on the allocation,
 // along with the repository that queued it. It is idempotent per job id: a
 // second call returns the existing allocation with created=false.
-func (s *Service) AllocateForWorkflowJob(ctx context.Context, pool model.PoolConfig, jobID int64, repository string) (status model.AllocationStatus, created bool, err error) {
+func (s *Service) AllocateForWorkflowJob(ctx context.Context, pool model.PoolConfig, jobID int64, repository string, jobLabels []string) (status model.AllocationStatus, created bool, err error) {
 	s.workflowJobMu.Lock()
 	defer s.workflowJobMu.Unlock()
 	if existing, ok := s.findByWorkflowJobID(jobID); ok {
@@ -158,7 +173,7 @@ func (s *Service) AllocateForWorkflowJob(ctx context.Context, pool model.PoolCon
 		Pool:             pool.Name,
 		JobTimeout:       pool.WebhookJobTimeout,
 		Tenant:           tenant,
-		Labels:           append([]string(nil), pool.WebhookLabels...),
+		Labels:           webhookRegistrationLabels(pool, jobLabels),
 		WorkflowJobID:    jobID,
 		TargetRepository: strings.TrimSpace(repository),
 	}

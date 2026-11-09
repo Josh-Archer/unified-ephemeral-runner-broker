@@ -929,7 +929,6 @@ func (r *reconcileRun) processRun(ctx context.Context, repository string, runID 
 	}
 }
 
-
 // terminalPriority ranks jobs for reconcile: 1 when the store only has a
 // terminal allocation for the job (needs re-serve), else 0.
 func (r *reconcileRun) terminalPriority(jobID int64) int {
@@ -956,9 +955,9 @@ func (r *reconcileRun) rescueTerminalQueuedJobs(ctx context.Context, callLimit i
 		return 0, nil
 	}
 	type candidate struct {
-		jobID int64
-		repo  string
-		labels []string
+		jobID   int64
+		repo    string
+		labels  []string
 		created time.Time
 	}
 	seen := map[int64]struct{}{}
@@ -987,9 +986,9 @@ func (r *reconcileRun) rescueTerminalQueuedJobs(ctx context.Context, callLimit i
 		}
 		seen[jobID] = struct{}{}
 		candidates = append(candidates, candidate{
-			jobID: jobID,
-			repo:  repo,
-			labels: append([]string(nil), status.Request.Labels...),
+			jobID:   jobID,
+			repo:    repo,
+			labels:  append([]string(nil), status.Request.Labels...),
 			created: status.CreatedAt,
 		})
 	}
@@ -1064,8 +1063,16 @@ func (h *githubWebhookHandler) process(ctx context.Context, payload workflowJobP
 		} else if reason != "" {
 			return ignored(reason)
 		}
-		allocation, created, err := h.service.AllocateForWorkflowJob(ctx, pool, jobID, repository)
+		allocation, created, err := h.service.AllocateForWorkflowJob(ctx, pool, jobID, repository, payload.WorkflowJob.Labels)
 		if err != nil {
+			if errors.Is(err, model.ErrUnknownSizeClass) {
+				// A bad size label cannot be fixed by retrying the delivery.
+				// Ack it and record the message; GitHub does not retry HTTP 500,
+				// and a 500 would look like a broker outage.
+				log.Printf("github webhook job=%d rejected: %v", jobID, err)
+				h.metrics.ignored.WithLabelValues("unknown_size_class").Inc()
+				return map[string]string{"status": "ignored", "reason": "unknown_size_class", "error": err.Error()}, http.StatusOK, nil
+			}
 			return nil, 0, err
 		}
 		if !created {

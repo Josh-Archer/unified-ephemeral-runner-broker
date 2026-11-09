@@ -43,6 +43,13 @@ const (
 	annotationAllocationID = "uecb.josh-archer.dev/allocation-id"
 	annotationRunnerID     = "uecb.josh-archer.dev/github-runner-id"
 	annotationWorkflowJob  = "uecb.josh-archer.dev/workflow-job-id"
+	annotationSizeClass    = "uecb.josh-archer.dev/size-class"
+
+	labelSizeClass = "uecb.josh-archer.dev/size-class"
+
+	// dindContainerName is the sidecar the size class's dind resources apply to,
+	// whether it is a regular container or a native sidecar init container.
+	dindContainerName = "dind"
 )
 
 // API is the subset of runtime.KubernetesAPI the backend uses.
@@ -105,6 +112,11 @@ func (b *Backend) Provision(ctx context.Context, request model.AllocationRequest
 		}
 	}
 
+	selection, err := model.ResolveSizeClass(sizeClassLabels(request, allocation), b.cfg.Broker.SizeClasses)
+	if err != nil {
+		return backend.ProvisionedRunner{}, err
+	}
+
 	scope, err := b.cfg.GitHub.Scope.ForRepository(allocation.TargetRepository())
 	if err != nil {
 		return backend.ProvisionedRunner{}, err
@@ -136,7 +148,7 @@ func (b *Backend) Provision(ctx context.Context, request model.AllocationRequest
 		}
 	}()
 
-	pod, err := b.buildPod(pool, backendCfg, allocation, jit.Encoded, timeout)
+	pod, err := b.buildPod(pool, backendCfg, allocation, jit.Encoded, timeout, selection)
 	if err != nil {
 		return backend.ProvisionedRunner{}, err
 	}
@@ -343,7 +355,7 @@ func (b *Backend) namespace(cfg model.BackendConfig) string {
 	return ""
 }
 
-func (b *Backend) buildPod(pool model.PoolConfig, cfg model.BackendConfig, allocation model.AllocationStatus, jitConfig string, timeout time.Duration) (map[string]any, error) {
+func (b *Backend) buildPod(pool model.PoolConfig, cfg model.BackendConfig, allocation model.AllocationStatus, jitConfig string, timeout time.Duration, selection model.SizeClassSelection) (map[string]any, error) {
 	kcfg := model.KubernetesBackendConfig{}
 	if cfg.Kubernetes != nil {
 		kcfg = *cfg.Kubernetes
@@ -408,6 +420,9 @@ func (b *Backend) buildPod(pool model.PoolConfig, cfg model.BackendConfig, alloc
 	runner["env"] = append(filtered, map[string]any{"name": envJITConfig, "value": jitConfig})
 	containers[runnerIndex] = runner
 	spec["containers"] = containers
+	if selection.OverlaysResources() {
+		applySizeClassResources(spec, containerName, selection.Class)
+	}
 
 	labels := map[string]any{}
 	for key, value := range kcfg.PodLabels {
@@ -420,6 +435,10 @@ func (b *Backend) buildPod(pool model.PoolConfig, cfg model.BackendConfig, alloc
 	annotations := map[string]any{}
 	for key, value := range kcfg.PodAnnotations {
 		annotations[key] = value
+	}
+	if selection.AnnotatesPod() {
+		labels[labelSizeClass] = selection.Name
+		annotations[annotationSizeClass] = selection.Name
 	}
 	if repo := allocation.TargetRepository(); repo != "" {
 		annotations[annotationRepository] = repo
