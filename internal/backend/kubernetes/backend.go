@@ -223,9 +223,9 @@ func (b *Backend) Cleanup(ctx context.Context, status model.AllocationStatus) er
 }
 
 // Capacity counts this backend's live runner pods against the summed
-// maxRunners of its enabled pools. Pods that cannot be scheduled count as
-// pending, so a full cluster reports no free slots and allocations fall back
-// to other backends.
+// maxRunners of its enabled pools. Terminating pods, pods on a NotReady
+// node, and Pending pods the scheduler rejected as Unschedulable do not
+// occupy slots (home#4443, home#4202).
 func (b *Backend) Capacity(ctx context.Context) (result backend.CapacityStatus, resultErr error) {
 	maxRunners := 0
 	sharedMax := 0
@@ -301,9 +301,10 @@ func (b *Backend) Capacity(ctx context.Context) (result backend.CapacityStatus, 
 			return backend.CapacityStatus{}, fmt.Errorf("runner inventory did not contain items")
 		}
 		for _, item := range list.Items {
-			// Terminating pods and pods on a NotReady node no longer run a job;
-			// counting them would hold slots the cluster cannot use.
-			if item.Metadata.DeletionTimestamp != "" || !nodes.ready(ctx, item.Spec.NodeName) {
+			// Terminating pods, pods on a NotReady node, and unschedulable
+			// Pending pods no longer run a job; counting them would hold slots
+			// the cluster cannot use (home#4443, home#4202).
+			if item.Metadata.DeletionTimestamp != "" || !nodes.ready(ctx, item.Spec.NodeName) || podUnschedulable(item.Status.Phase, item.Status.Conditions) {
 				continue
 			}
 			switch item.Status.Phase {
@@ -459,6 +460,7 @@ type podList struct {
 					Running *struct{} `json:"running"`
 				} `json:"state"`
 			} `json:"containerStatuses"`
+			Conditions []podCondition `json:"conditions"`
 		} `json:"status"`
 	} `json:"items"`
 }
@@ -500,6 +502,26 @@ func labelValue(value string) string {
 		value = value[:63]
 	}
 	return strings.Trim(value, "-._")
+}
+
+type podCondition struct {
+	Type   string `json:"type"`
+	Status string `json:"status"`
+	Reason string `json:"reason"`
+}
+
+// podUnschedulable reports a Pending pod the scheduler has rejected. Those
+// pods cannot run a job, so they must not consume backend caps.
+func podUnschedulable(phase string, conditions []podCondition) bool {
+	if phase != "Pending" {
+		return false
+	}
+	for _, condition := range conditions {
+		if condition.Type == "PodScheduled" && condition.Status == "False" && condition.Reason == "Unschedulable" {
+			return true
+		}
+	}
+	return false
 }
 
 func podsPath(namespace, name string) string {
@@ -568,7 +590,7 @@ func (b *Backend) LiveRunners(ctx context.Context) ([]backend.LiveRunner, error)
 			return nil, fmt.Errorf("decode runner pods in %s: %w", namespace, err)
 		}
 		for _, item := range list.Items {
-			if item.Status.Phase == "Succeeded" || item.Status.Phase == "Failed" || item.Metadata.DeletionTimestamp != "" || !nodes.ready(ctx, item.Spec.NodeName) {
+			if item.Status.Phase == "Succeeded" || item.Status.Phase == "Failed" || item.Metadata.DeletionTimestamp != "" || !nodes.ready(ctx, item.Spec.NodeName) || podUnschedulable(item.Status.Phase, item.Status.Conditions) {
 				continue
 			}
 			id := strings.TrimSpace(item.Metadata.Annotations[annotationAllocationID])

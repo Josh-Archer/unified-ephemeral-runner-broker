@@ -401,8 +401,8 @@ const readyNode = `{"kind":"Node","metadata":{"name":"worker-node"},"status":{"c
 func TestCapacityExcludesTerminatingAndNotReadyNodePods(t *testing.T) {
 	api := &fakeAPI{responses: map[string]response{
 		"GET /api/v1/nodes/desktop-node": {http.StatusOK, notReadyNode},
-		"GET /api/v1/nodes/worker-node":      {http.StatusOK, readyNode},
-		"GET /api/v1/nodes/gone":           {http.StatusNotFound, `{}`},
+		"GET /api/v1/nodes/worker-node":  {http.StatusOK, readyNode},
+		"GET /api/v1/nodes/gone":         {http.StatusNotFound, `{}`},
 		"GET /api/v1/namespaces/arc-runners/pods": {http.StatusOK, `{"items":[
 			{"spec":{"nodeName":"worker-node"},"status":{"phase":"Running"}},
 			{"spec":{"nodeName":"worker-node"},"status":{"phase":"Pending"}},
@@ -431,7 +431,44 @@ func TestCapacityExcludesTerminatingAndNotReadyNodePods(t *testing.T) {
 	}
 }
 
+func TestCapacityExcludesUnschedulablePendingPods(t *testing.T) {
+	// Regression home#4443: Pending pods the scheduler rejected must not
+	// fill maxRunners. Starting pods (Pending with PodScheduled=True) still count.
+	api := &fakeAPI{responses: map[string]response{
+		"GET /api/v1/namespaces/arc-runners/pods": {http.StatusOK, `{"items":[
+			{"status":{"phase":"Running"}},
+			{"status":{"phase":"Pending","conditions":[{"type":"PodScheduled","status":"False","reason":"Unschedulable","message":"0/6 nodes are available: 1 node(s) didn't satisfy existing pods anti-affinity rules"}]}},
+			{"status":{"phase":"Pending","conditions":[{"type":"PodScheduled","status":"True"}]}},
+			{"status":{"phase":"Pending"}}
+		]}`},
+	}}
+	status, err := New(newConfig(t), api, &fakeRegistrar{}).Capacity(context.Background())
+	if err != nil {
+		t.Fatalf("Capacity: %v", err)
+	}
+	if status.ActiveRunners != 1 || status.PendingRunners != 2 {
+		t.Fatalf("status = %+v", status)
+	}
+}
+
+func TestLiveRunnersExcludesUnschedulablePendingPods(t *testing.T) {
+	api := &fakeAPI{responses: map[string]response{
+		"GET /api/v1/namespaces/arc-runners/pods": {http.StatusOK, `{"items":[
+ {"metadata":{"name":"uecb-runner-alloc-1","labels":{"uecb.josh-archer.dev/pool":"full","uecb.josh-archer.dev/allocation-id":"alloc-1"}},"status":{"phase":"Pending","conditions":[{"type":"PodScheduled","status":"False","reason":"Unschedulable"}]}},
+ {"metadata":{"name":"uecb-runner-alloc-2","labels":{"uecb.josh-archer.dev/pool":"full","uecb.josh-archer.dev/allocation-id":"alloc-2"}},"status":{"phase":"Pending","conditions":[{"type":"PodScheduled","status":"True"}]}}
+]}`},
+	}}
+	runners, err := New(newConfig(t), api, &fakeRegistrar{}).LiveRunners(context.Background())
+	if err != nil {
+		t.Fatalf("LiveRunners: %v", err)
+	}
+	if len(runners) != 1 || runners[0].AllocationID != "alloc-2" {
+		t.Fatalf("expected only the schedulable pending runner, got %+v", runners)
+	}
+}
+
 func TestLiveRunnersExcludesPodsOnNotReadyNode(t *testing.T) {
+
 	api := &fakeAPI{responses: map[string]response{
 		"GET /api/v1/nodes/desktop-node": {http.StatusOK, notReadyNode},
 		"GET /api/v1/namespaces/arc-runners/pods": {http.StatusOK, `{"items":[
