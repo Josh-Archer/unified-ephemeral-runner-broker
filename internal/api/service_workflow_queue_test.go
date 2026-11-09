@@ -39,7 +39,7 @@ func TestWorkflowCapacityQueueSurvivesRestartAndDrains(t *testing.T) {
 	if pending.State != model.StatePending {
 		t.Fatalf("full capacity should persist pending demand: %+v", pending)
 	}
-	duplicate, created, err := service.AllocateForWorkflowJob(context.Background(), cfg.Pools[0], 1002, "example/project")
+	duplicate, created, err := service.AllocateForWorkflowJob(context.Background(), cfg.Pools[0], 1002, "example/project", nil)
 	if err != nil || created || duplicate.ID != pending.ID {
 		t.Fatalf("duplicate: %+v created=%v err=%v", duplicate, created, err)
 	}

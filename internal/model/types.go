@@ -175,6 +175,12 @@ type BrokerRuntimeConfig struct {
 	// GitHubWebhook configures the inbound POST /webhooks/github endpoint used
 	// by pools that set webhookLabels.
 	GitHubWebhook GitHubWebhookConfig `yaml:"githubWebhook,omitempty" json:"githubWebhook,omitempty"`
+	// SizeClasses maps a runner size class (small, default, large, build) to
+	// the CPU, memory, and ephemeral-storage shape of the runner and dind
+	// containers, and optionally the backends allowed to serve it. Jobs opt in
+	// with a runs-on label size-<name>. No size label selects default. When
+	// default is omitted, the pod template's resources are left unchanged.
+	SizeClasses map[string]SizeClassConfig `yaml:"sizeClasses,omitempty" json:"sizeClasses,omitempty"`
 }
 
 // ARCFirstConfig controls how long automatic allocations wait for local ARC

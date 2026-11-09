@@ -27,7 +27,7 @@ func ownershipService(t *testing.T) (*Service, *testCleanupBackend) {
 
 func ownershipAllocate(t *testing.T, service *Service, jobID int64) model.AllocationStatus {
 	t.Helper()
-	status, created, err := service.AllocateForWorkflowJob(context.Background(), service.cfg.Pools[0], jobID, "example/project")
+	status, created, err := service.AllocateForWorkflowJob(context.Background(), service.cfg.Pools[0], jobID, "example/project", nil)
 	if err != nil || !created {
 		t.Fatalf("allocate job %d: status=%+v created=%v err=%v", jobID, status, created, err)
 	}
@@ -231,7 +231,7 @@ func TestWorkflowJobAndAPIShareNamedBackendCrossPoolLimit(t *testing.T) {
 	var completed model.AllocationStatus
 	for i := 0; i < 2; i++ {
 		var err error
-		completed, _, err = service.AllocateForWorkflowJob(ctx, service.cfg.Pools[1], int64(700+i), "example/project")
+		completed, _, err = service.AllocateForWorkflowJob(ctx, service.cfg.Pools[1], int64(700+i), "example/project", nil)
 		if err != nil {
 			t.Fatalf("webhook allocation %d: %v", i, err)
 		}
@@ -239,7 +239,7 @@ func TestWorkflowJobAndAPIShareNamedBackendCrossPoolLimit(t *testing.T) {
 	if _, err := service.Allocate(ctx, model.AllocationRequest{Pool: model.PoolLite}); err == nil {
 		t.Fatal("API exceeded shared five-runner limit")
 	}
-	if _, _, err := service.AllocateForWorkflowJob(ctx, service.cfg.Pools[1], 703, "example/project"); err == nil {
+	if _, _, err := service.AllocateForWorkflowJob(ctx, service.cfg.Pools[1], 703, "example/project", nil); err == nil {
 		t.Fatal("webhook exceeded shared five-runner limit")
 	}
 	if _, _, err := service.FinalizeWorkflowJob(ctx, 701, "success", ownedRunner(completed)); err != nil {

@@ -9,6 +9,57 @@ import (
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 )
 
+func TestLoadParsesSizeClasses(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "broker.yaml")
+	if err := os.WriteFile(path, []byte(`
+broker:
+  sizeClasses:
+    small:
+      runner:
+        requests:
+          cpu: 500m
+          memory: 1Gi
+          ephemeral-storage: 8Gi
+        limits:
+          cpu: "1"
+          memory: 2Gi
+          ephemeral-storage: 8Gi
+      dind:
+        requests:
+          cpu: 250m
+          memory: 512Mi
+          ephemeral-storage: 8Gi
+        limits:
+          cpu: "1"
+          memory: 1Gi
+          ephemeral-storage: 8Gi
+    large:
+      runner:
+        requests: {cpu: "2", memory: 4Gi, ephemeral-storage: 16Gi}
+        limits: {cpu: "2", memory: 4Gi, ephemeral-storage: 16Gi}
+      dind:
+        limits: {cpu: "2", memory: 4Gi, ephemeral-storage: 16Gi}
+      backends: [arc]
+`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	small := cfg.Broker.SizeClasses["small"]
+	if small.Runner.Requests.CPU != "500m" || small.Runner.Requests.Memory != "1Gi" || small.Runner.Requests.EphemeralStorage != "8Gi" {
+		t.Fatalf("small runner requests = %+v", small.Runner.Requests)
+	}
+	if small.Dind.Limits.Memory != "1Gi" || small.Dind.Requests.CPU != "250m" {
+		t.Fatalf("small dind = %+v", small.Dind)
+	}
+	large := cfg.Broker.SizeClasses["large"]
+	if large.Runner.Limits.EphemeralStorage != "16Gi" || len(large.Backends) != 1 || large.Backends[0] != model.BackendARC {
+		t.Fatalf("large = %+v", large)
+	}
+}
+
 func TestLoadParsesOIDCPolicy(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "broker.yaml")
 	if err := os.WriteFile(path, []byte(`

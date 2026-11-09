@@ -714,6 +714,43 @@ pools:
 - `Capacity()` counts live pods that can run. Terminating pods, pods on a NotReady node, and Pending pods rejected as Unschedulable do not occupy slots.
 - A ResourceQuota rejection is reported as capacity exhaustion, which lets the scheduler fall back to other backends.
 
+#### Runner size classes
+
+Every runner pod from a Kubernetes backend otherwise uses that backend's one `podSpec`. A job can ask for a different CPU, memory, and ephemeral-storage shape with a `runs-on` label:
+
+```yaml
+runs-on: [self-hosted, uecb-full, size-large]
+```
+
+`size-<name>` selects `broker.sizeClasses.<name>` (`size-large` selects `large`). Matching ignores case. A job may name only one size. With no size label, the class is `default`.
+
+```yaml
+broker:
+  sizeClasses:
+    small:
+      runner:
+        requests: {cpu: "500m", memory: "1Gi", ephemeral-storage: "8Gi"}
+        limits: {cpu: "1", memory: "2Gi", ephemeral-storage: "8Gi"}
+      dind:
+        requests: {cpu: "250m", memory: "512Mi", ephemeral-storage: "8Gi"}
+        limits: {cpu: "1", memory: "1Gi", ephemeral-storage: "8Gi"}
+    large:
+      runner:
+        requests: {cpu: "2", memory: "4Gi", ephemeral-storage: "16Gi"}
+        limits: {cpu: "2", memory: "4Gi", ephemeral-storage: "16Gi"}
+      dind:
+        requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "16Gi"}
+        limits: {cpu: "2", memory: "4Gi", ephemeral-storage: "16Gi"}
+      backends: [kubernetes-desktop]
+```
+
+- Fields that a class sets replace those requests or limits on the actions runner container and on a container named `dind` (a regular container or a native sidecar in `initContainers`). Unset fields stay as the pod template defined them. Other containers are unchanged. The class does not create a dind container that the template omitted.
+- `default` is optional. When it is omitted, a job with no size label keeps the pod template exactly, including its resources and pod labels. Configuring `default` applies that shape to unlabeled jobs.
+- `backends`, when set, is the only set of backends that may run the class. A pinned backend outside that set fails the allocation. An empty list means every backend in the pool.
+- An unknown class, a malformed `size-*` label, or more than one size label fails the allocation before a runner is registered. The API returns `error: unknown_size_class` and the message `unknown runner size class "<name>"`. A `workflow_job` webhook is acknowledged and ignored with reason `unknown_size_class`; the broker log carries the same message. A bad label is not treated as a broker outage, because GitHub does not retry HTTP 500.
+- The runner registers with the size label the job asked for, so GitHub will not assign that job to a runner of another class. Unlabeled jobs do not gain a size label. Their registration labels stay the pool labels. A warm runner is reused only when it was registered with the same size label; otherwise the sized job cold-starts. `size-*` is not a pool identity: it is removed before `webhookLabels` matching, and it is rejected in `pools[].labels` and `pools[].webhookLabels`.
+- Each pod still counts as one slot against `maxRunners`. Kubernetes packs the sized requests onto the node. A pod that cannot fit stays Pending and holds its slot. Set `maxRunners` for the largest class the node should run at once, or point a class at a backend with its own limit via `backends`.
+
 Independent Kubernetes targets can share a pool while keeping their capacity and pod ownership separate. Use a non-builtin backend name and `driver: kubernetes`:
 
 ```yaml
@@ -748,7 +785,7 @@ Optional `podLabels` and `podAnnotations` carry operator metadata such as evicti
 
 A pool can set `webhookJobTimeout` (for example `6h`) for jobs received through workflow-job webhooks, since those events do not include the workflow timeout. Zero preserves `broker.defaultJobTimeout`. This setting does not change timeouts on explicit allocation API requests.
 
-Workflows then use `runs-on: [self-hosted, uecb-full]` in every repository, with the webhook set on each repository (or a GitHub App) for **Workflow jobs**.
+Workflows then use `runs-on: [self-hosted, uecb-full]` in every repository, with the webhook set on each repository (or a GitHub App) for **Workflow jobs**. Add a size label to ask for a different pod shape, for example `runs-on: [self-hosted, uecb-full, size-large]`.
 
 ## Scheduler Configuration
 

@@ -184,7 +184,7 @@ func TestReconcileQueuedGitHubJobsRetriesFailedAllocation(t *testing.T) {
 		t.Fatalf("retried allocation = %+v ok=%v", retried, ok)
 	}
 	// A webhook redelivery (no reconcile context) must not replace a failed allocation.
-	if _, created, err := service.AllocateForWorkflowJob(context.Background(), service.cfg.Pools[0], 99, "my-org/home"); err != nil || created {
+	if _, created, err := service.AllocateForWorkflowJob(context.Background(), service.cfg.Pools[0], 99, "my-org/home", nil); err != nil || created {
 		t.Fatalf("webhook path created=%v err=%v, want existing allocation returned", created, err)
 	}
 }

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -215,6 +216,70 @@ func TestValidateWebhookLabels(t *testing.T) {
 	off := Default()
 	if err := Validate(off); err != nil {
 		t.Fatalf("pools without webhookLabels need no secret: %v", err)
+	}
+
+	sized := valid()
+	sized.Pools[0].WebhookLabels = []string{"self-hosted", "size-large"}
+	if err := Validate(sized); err == nil || !strings.Contains(err.Error(), "reserved for runner size classes") {
+		t.Fatalf("size label in webhookLabels = %v", err)
+	}
+}
+
+func TestValidateSizeClasses(t *testing.T) {
+	cfg := Default()
+	cfg.Broker.SizeClasses = map[string]model.SizeClassConfig{
+		"small": {
+			Runner: model.ContainerResources{Requests: model.ResourceQuantity{CPU: "500m", Memory: "1Gi", EphemeralStorage: "8Gi"}},
+			Dind:   model.ContainerResources{Limits: model.ResourceQuantity{CPU: "1", Memory: "1Gi", EphemeralStorage: "8Gi"}},
+		},
+		"large": {
+			Runner:   model.ContainerResources{Requests: model.ResourceQuantity{CPU: "2", Memory: "4Gi", EphemeralStorage: "16Gi"}},
+			Dind:     model.ContainerResources{Requests: model.ResourceQuantity{CPU: "1", Memory: "2Gi", EphemeralStorage: "16Gi"}},
+			Backends: []model.BackendName{model.BackendARC},
+		},
+		"default": {},
+	}
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("valid size classes: %v", err)
+	}
+
+	unknown := cfg
+	unknown.Broker.SizeClasses = map[string]model.SizeClassConfig{
+		"large": {
+			Runner:   model.ContainerResources{Requests: model.ResourceQuantity{CPU: "2"}},
+			Backends: []model.BackendName{"missing"},
+		},
+	}
+	if err := Validate(unknown); err == nil || !strings.Contains(err.Error(), "unknown backend") {
+		t.Fatalf("unknown backend = %v", err)
+	}
+
+	emptyShape := cfg
+	emptyShape.Broker.SizeClasses = map[string]model.SizeClassConfig{"build": {}}
+	if err := Validate(emptyShape); err == nil || !strings.Contains(err.Error(), "must set runner or dind") {
+		t.Fatalf("empty shape = %v", err)
+	}
+
+	badQty := cfg
+	badQty.Broker.SizeClasses = map[string]model.SizeClassConfig{
+		"small": {Runner: model.ContainerResources{Requests: model.ResourceQuantity{Memory: "2 GB"}}},
+	}
+	if err := Validate(badQty); err == nil || !strings.Contains(err.Error(), "invalid quantity") {
+		t.Fatalf("bad quantity = %v", err)
+	}
+
+	badName := cfg
+	badName.Broker.SizeClasses = map[string]model.SizeClassConfig{
+		"Size-Large": {Runner: model.ContainerResources{Requests: model.ResourceQuantity{CPU: "1"}}},
+	}
+	if err := Validate(badName); err == nil {
+		t.Fatal("uppercase class name should be rejected")
+	}
+
+	reserved := Default()
+	reserved.Pools[0].Labels = append(reserved.Pools[0].Labels, "size-small")
+	if err := Validate(reserved); err == nil || !strings.Contains(err.Error(), "reserved for runner size classes") {
+		t.Fatalf("pool label = %v", err)
 	}
 }
 

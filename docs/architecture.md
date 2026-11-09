@@ -30,6 +30,10 @@
 - The public Azure Functions launcher uses an HTTP dispatch endpoint only for admission and status. Actual runner execution happens on a queue-triggered function inside the same container so the HTTP trigger does not have to stay open for the whole job.
 - Each runner handles one job and exits.
 
+## Runner size classes
+
+Kubernetes runner pods start from the backend `podSpec`. A workflow job may add one `runs-on` label `size-<class>` (`size-small`, `size-large`). The broker resolves that label to `broker.sizeClasses` and overlays CPU, memory, and ephemeral-storage on the runner container and on a container named `dind` before the pod is created. No size label uses class `default`, which leaves the pod template unchanged when `default` is not configured. Unknown classes fail before a runner is registered. The runner still counts as one `maxRunners` slot; the Kubernetes scheduler packs the sized requests onto the node. See the README for the config shape and backend allow-lists.
+
 ## Warm Capacity
 
 Each pool backend may define a warm policy for cold-start cloud backends:

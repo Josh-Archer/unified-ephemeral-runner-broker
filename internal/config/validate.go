@@ -67,6 +67,9 @@ func Validate(cfg model.BrokerConfig) error {
 	if err := validateKubernetesBackends(cfg); err != nil {
 		return err
 	}
+	if err := validateSizeClasses(cfg); err != nil {
+		return err
+	}
 	if err := validateFairShare(cfg); err != nil {
 		return err
 	}
@@ -768,6 +771,9 @@ func validateWebhookLabels(cfg model.BrokerConfig) error {
 			if label == "" {
 				return fmt.Errorf("pools[%s].webhookLabels[%d] must not be empty", pool.Name, i)
 			}
+			if model.IsSizeLabel(label) {
+				return fmt.Errorf("pools[%s].webhookLabels[%d] %q is reserved for runner size classes; configure broker.sizeClasses", pool.Name, i, label)
+			}
 			normalized = append(normalized, label)
 		}
 		sort.Strings(normalized)
@@ -783,6 +789,85 @@ func validateWebhookLabels(cfg model.BrokerConfig) error {
 	gh := cfg.Broker.GitHubWebhook
 	if strings.TrimSpace(gh.Secret) == "" && strings.TrimSpace(gh.SecretRef) == "" {
 		return fmt.Errorf("broker.githubWebhook requires secret or secretRef when pools[].webhookLabels is set")
+	}
+	return nil
+}
+
+// validateSizeClasses checks broker.sizeClasses and keeps the size-* prefix
+// out of pool identity labels. Size is a per-job request, not a pool.
+func validateSizeClasses(cfg model.BrokerConfig) error {
+	for _, pool := range cfg.Pools {
+		for i, label := range pool.Labels {
+			if model.IsSizeLabel(label) {
+				return fmt.Errorf("pools[%s].labels[%d] %q is reserved for runner size classes; configure broker.sizeClasses", pool.Name, i, strings.TrimSpace(label))
+			}
+		}
+	}
+	if len(cfg.Broker.SizeClasses) == 0 {
+		return nil
+	}
+	knownBackends := map[string]struct{}{}
+	for _, pool := range cfg.Pools {
+		for name := range pool.Backends {
+			knownBackends[string(name)] = struct{}{}
+		}
+	}
+	seen := map[string]string{}
+	for rawName, class := range cfg.Broker.SizeClasses {
+		name := strings.ToLower(strings.TrimSpace(rawName))
+		if name != strings.TrimSpace(rawName) || !model.ValidSizeClassName(name) {
+			return fmt.Errorf("broker.sizeClasses[%q]: name must be a lowercase DNS label such as small, default, or large", rawName)
+		}
+		if prev, ok := seen[name]; ok {
+			return fmt.Errorf("broker.sizeClasses[%q] duplicates %q", rawName, prev)
+		}
+		seen[name] = rawName
+		if name != model.DefaultSizeClass && class.EmptyShape() {
+			return fmt.Errorf("broker.sizeClasses[%s] must set runner or dind resources", name)
+		}
+		if err := validateContainerResources(fmt.Sprintf("broker.sizeClasses[%s].runner", name), class.Runner); err != nil {
+			return err
+		}
+		if err := validateContainerResources(fmt.Sprintf("broker.sizeClasses[%s].dind", name), class.Dind); err != nil {
+			return err
+		}
+		backendSeen := map[string]struct{}{}
+		for i, backendName := range class.Backends {
+			key := strings.TrimSpace(string(backendName))
+			if key == "" {
+				return fmt.Errorf("broker.sizeClasses[%s].backends[%d] must not be empty", name, i)
+			}
+			if key != string(backendName) {
+				return fmt.Errorf("broker.sizeClasses[%s].backends[%d] %q must not have surrounding space", name, i, backendName)
+			}
+			if _, ok := backendSeen[key]; ok {
+				return fmt.Errorf("broker.sizeClasses[%s].backends duplicates %q", name, key)
+			}
+			backendSeen[key] = struct{}{}
+			if _, ok := knownBackends[key]; !ok {
+				return fmt.Errorf("broker.sizeClasses[%s].backends: unknown backend %q", name, key)
+			}
+		}
+	}
+	return nil
+}
+
+func validateContainerResources(prefix string, resources model.ContainerResources) error {
+	quantities := []struct {
+		field string
+		value string
+	}{
+		{prefix + ".requests.cpu", resources.Requests.CPU},
+		{prefix + ".requests.memory", resources.Requests.Memory},
+		{prefix + ".requests.ephemeral-storage", resources.Requests.EphemeralStorage},
+		{prefix + ".limits.cpu", resources.Limits.CPU},
+		{prefix + ".limits.memory", resources.Limits.Memory},
+		{prefix + ".limits.ephemeral-storage", resources.Limits.EphemeralStorage},
+	}
+	for _, quantity := range quantities {
+		if !model.ValidQuantity(quantity.value) {
+			return fmt.Errorf("%s: invalid quantity %q", quantity.field, strings.TrimSpace(quantity.value))
+		}
 	}
 	return nil
 }
