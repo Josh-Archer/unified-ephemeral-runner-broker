@@ -197,6 +197,9 @@ func main() {
 	startBackground("reconcile-orphaned-allocations", 30*time.Second, func(now time.Time) {
 		service.ReconcileOrphanedAllocations(context.Background(), now)
 	})
+	startBackground("reconcile-unschedulable-pods", 30*time.Second, func(now time.Time) {
+		service.ReconcileUnschedulablePods(context.Background(), now)
+	})
 
 	// Hosted overflow steers backed-up pools' jobs to GitHub-hosted runners
 	// through a repository variable the workflows read in runs-on.

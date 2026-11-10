@@ -215,6 +215,29 @@ func TestMemorySaveIfCapacityCrossPoolBackendLimit(t *testing.T) {
 	}
 }
 
+func TestMemorySaveIfCapacityGroupSharedAcrossBackends(t *testing.T) {
+	s := NewMemory()
+	members := []model.BackendName{model.BackendARC, "arc-small-nodes"}
+	a1 := model.AllocationStatus{
+		ID:              "alloc-arc",
+		Pool:            model.PoolFull,
+		SelectedBackend: model.BackendARC,
+		State:           model.StateReady,
+	}
+	if err := s.SaveIfCapacityGroup(a1, 5, 0, 0, members, 1); err != nil {
+		t.Fatalf("save a1: %v", err)
+	}
+	a2 := model.AllocationStatus{
+		ID:              "alloc-small",
+		Pool:            model.PoolFull,
+		SelectedBackend: "arc-small-nodes",
+		State:           model.StateReserved,
+	}
+	if err := s.SaveIfCapacityGroup(a2, 5, 0, 0, members, 1); err != ErrNoCapacity {
+		t.Fatalf("expected shared group cap to reject sibling backend, got %v", err)
+	}
+}
+
 func TestIsSharedAndProcessLocal(t *testing.T) {
 	if !IsShared("postgres") || IsProcessLocal("postgres") {
 		t.Fatal("postgres should be shared")

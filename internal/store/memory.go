@@ -104,9 +104,13 @@ func (m *Memory) SaveIfState(status model.AllocationStatus, expectedFrom model.A
 }
 
 func (m *Memory) SaveIfCapacity(status model.AllocationStatus, maxRunners int, tenantQuota int, backendLimit int) error {
+	return m.SaveIfCapacityGroup(status, maxRunners, tenantQuota, backendLimit, nil, 0)
+}
+
+func (m *Memory) SaveIfCapacityGroup(status model.AllocationStatus, maxRunners int, tenantQuota int, backendLimit int, groupMembers []model.BackendName, groupCap int) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := capacityAllowed(m.allocations, status, maxRunners, tenantQuota, backendLimit); err != nil {
+	if err := capacityAllowedGroup(m.allocations, status, maxRunners, tenantQuota, backendLimit, groupMembers, groupCap); err != nil {
 		return err
 	}
 	m.allocations[status.ID] = status

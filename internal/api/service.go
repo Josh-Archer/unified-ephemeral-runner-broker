@@ -831,6 +831,14 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 		}
 		return model.AllocationStatus{}, err
 	}
+	pool, err = s.filterBackendsByCapacityGroup(pool, request)
+	if err != nil {
+		if queued, ok := s.queueAllocation(ctx, request, resultPool, "", err, existing); ok {
+			result = "queued"
+			return queued, nil
+		}
+		return model.AllocationStatus{}, err
+	}
 	pool, err = s.filterBackendsByBudget(pool, request)
 	if err != nil {
 		if queued, ok := s.queueAllocation(ctx, request, resultPool, "", err, existing); ok {
@@ -1296,7 +1304,8 @@ func (s *Service) saveReservedAllocation(allocation model.AllocationStatus, pool
 			backendLimit = limit
 		}
 	}
-	if err := s.store.SaveIfCapacity(allocation, maxRunners, tenantQuota, backendLimit); err != nil {
+	group := model.ResolveCapacityGroup(s.cfg, allocation.SelectedBackend)
+	if err := s.store.SaveIfCapacityGroup(allocation, maxRunners, tenantQuota, backendLimit, group.Members, group.Cap); err != nil {
 		return err
 	}
 	return nil
@@ -1379,6 +1388,11 @@ func (s *Service) noCapacityCaps(poolName model.PoolName) string {
 		cfg := pool.Backends[name]
 		active := s.store.CountActive(pool.Name, name)
 		shared := s.store.CountBackendActive(name)
+		group := model.ResolveCapacityGroup(s.cfg, name)
+		groupUsed := 0
+		if group.Cap > 0 {
+			groupUsed = s.capacityGroupOccupancy(group.Members)
+		}
 		var limit string
 		switch {
 		case !cfg.Enabled || !cfg.Healthy:
@@ -1387,6 +1401,8 @@ func (s *Service) noCapacityCaps(poolName model.PoolName) string {
 			limit = fmt.Sprintf("crossPoolMaxRunners(%d/%d)", shared, cfg.CrossPoolMaxRunners)
 		case active >= cfg.MaxRunners:
 			limit = fmt.Sprintf("maxRunners(%d/%d)", active, cfg.MaxRunners)
+		case group.Cap > 0 && groupUsed >= group.Cap:
+			limit = fmt.Sprintf("capacityGroup(%d/%d)", groupUsed, group.Cap)
 		case s.cfg.Broker.TierRouting.Enabled && s.tierMgr != nil && !s.pinnedBackendAllowedByTier(pool.Name, name):
 			limit = "pressure-auto-off"
 		case s.liveCapacityLimit(name, cfg, active) != "":

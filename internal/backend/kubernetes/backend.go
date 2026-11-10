@@ -264,6 +264,21 @@ func (b *Backend) Capacity(ctx context.Context) (result backend.CapacityStatus, 
 	if sharedMax > 0 && sharedMax < maxRunners {
 		maxRunners = sharedMax
 	}
+	group := model.ResolveCapacityGroup(b.cfg, b.name)
+	if group.Cap > 0 && group.Cap < maxRunners {
+		maxRunners = group.Cap
+	}
+	if group.Key != "" {
+		for _, pool := range b.cfg.Pools {
+			for _, member := range group.Members {
+				cfg, ok := pool.Backends[member]
+				if !ok || !cfg.Enabled {
+					continue
+				}
+				namespaces[b.namespace(cfg)] = struct{}{}
+			}
+		}
+	}
 	defer func() {
 		if guard != nil && resultErr != nil {
 			result = backend.CapacityStatus{MaxRunners: maxRunners, ActiveRunners: maxRunners}
@@ -296,6 +311,15 @@ func (b *Backend) Capacity(ctx context.Context) (result backend.CapacityStatus, 
 		}
 	}
 	selector := url.QueryEscape(fmt.Sprintf("%s=%s,%s=%s", labelManagedBy, labelManagedByVal, labelBackend, b.name))
+	countGroup := group.Key != "" && len(group.Members) > 1
+	memberSet := map[string]struct{}{string(b.name): {}}
+	if countGroup {
+		selector = url.QueryEscape(fmt.Sprintf("%s=%s", labelManagedBy, labelManagedByVal))
+		memberSet = make(map[string]struct{}, len(group.Members))
+		for _, member := range group.Members {
+			memberSet[string(member)] = struct{}{}
+		}
+	}
 	nodes := b.newNodeReadiness()
 	for namespace := range namespaces {
 		code, body, err := b.api.Do(ctx, http.MethodGet, podsPath(namespace, "")+"?labelSelector="+selector, nil)
@@ -313,6 +337,11 @@ func (b *Backend) Capacity(ctx context.Context) (result backend.CapacityStatus, 
 			return backend.CapacityStatus{}, fmt.Errorf("runner inventory did not contain items")
 		}
 		for _, item := range list.Items {
+			if countGroup {
+				if _, ok := memberSet[item.Metadata.Labels[labelBackend]]; !ok {
+					continue
+				}
+			}
 			// Terminating pods, pods on a NotReady node, and unschedulable
 			// Pending pods no longer run a job; counting them would hold slots
 			// the cluster cannot use (home#4443, home#4202).
@@ -524,9 +553,10 @@ func labelValue(value string) string {
 }
 
 type podCondition struct {
-	Type   string `json:"type"`
-	Status string `json:"status"`
-	Reason string `json:"reason"`
+	Type               string    `json:"type"`
+	Status             string    `json:"status"`
+	Reason             string    `json:"reason"`
+	LastTransitionTime time.Time `json:"lastTransitionTime"`
 }
 
 // podUnschedulable reports a Pending pod the scheduler has rejected. Those

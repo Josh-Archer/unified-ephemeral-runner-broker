@@ -723,6 +723,8 @@ pools:
 - The broker needs pod `create`, `delete`, `get` and `list` there (`runnerPods.enabled` in the Helm chart).
 - Pods are named `uecb-runner-<allocation-id>` and deleted when the allocation finishes or is reaped.
 - `Capacity()` counts live pods that can run. Terminating pods, pods on a NotReady node, and Pending pods rejected as Unschedulable do not occupy slots.
+- A broker-owned pod that stays `PodScheduled=False` / `Unschedulable` longer than `broker.unschedulableTimeout` (default 2 minutes, measured from the condition's last transition time or the pod's creation) is deleted. Its allocation is released and the workflow job is retried so it can overflow to another backend. Set the timeout to a negative duration to disable the reaper. Only pods with the broker's ownership labels are touched.
+- Backends that share required node placement and a required pod anti-affinity topology key count against one shared cap (one runner per pinned hostname when the topology key is `kubernetes.io/hostname`). Set `capacityGroup` and optional `capacityGroupMax` to name a group explicitly. Desktop-style backends without that anti-affinity are not grouped.
 - A ResourceQuota rejection is reported as capacity exhaustion, which lets the scheduler fall back to other backends.
 
 #### Runner size classes
@@ -760,7 +762,7 @@ broker:
 - `backends`, when set, is the only set of backends that may run the class. A pinned backend outside that set fails the allocation. An empty list means every backend in the pool.
 - An unknown class, a malformed `size-*` label, or more than one size label fails the allocation before a runner is registered. The API returns `error: unknown_size_class` and the message `unknown runner size class "<name>"`. A `workflow_job` webhook is acknowledged and ignored with reason `unknown_size_class`; the broker log carries the same message. A bad label is not treated as a broker outage, because GitHub does not retry HTTP 500.
 - The runner registers with the size label the job asked for, so GitHub will not assign that job to a runner of another class. Unlabeled jobs do not gain a size label. Their registration labels stay the pool labels. A warm runner is reused only when it was registered with the same size label; otherwise the sized job cold-starts. `size-*` is not a pool identity: it is removed before `webhookLabels` matching, and it is rejected in `pools[].labels` and `pools[].webhookLabels`.
-- Each pod still counts as one slot against `maxRunners`. Kubernetes packs the sized requests onto the node. A pod that cannot fit stays Pending and holds its slot. Set `maxRunners` for the largest class the node should run at once, or point a class at a backend with its own limit via `backends`.
+- Each pod still counts as one slot against `maxRunners`. Kubernetes packs the sized requests onto the node. A pod that cannot schedule (`Unschedulable`) does not keep that slot past `broker.unschedulableTimeout`. Set `maxRunners` for the largest class the node should run at once, or point a class at a backend with its own limit via `backends`.
 
 Independent Kubernetes targets can share a pool while keeping their capacity and pod ownership separate. Use a non-builtin backend name and `driver: kubernetes`:
 
@@ -788,7 +790,7 @@ backends:
               limits: {cpu: "1", memory: 2Gi}
 ```
 
-A named target requires positive `maxRunners` and `crossPoolMaxRunners`. When the same target appears in multiple pools, its `driver`, `kubernetes` settings and cross-pool limit must match. The shared limit bounds concurrent allocations across those pools; capacity counts pods with that target's backend label, including pending and terminating runners, and clamps its ceiling to the shared limit. Explicit `costClass` still wins; named Kubernetes targets otherwise have the same local cost as the built-in adapter.
+A named target requires positive `maxRunners` and `crossPoolMaxRunners`. When the same target appears in multiple pools, its `driver`, `kubernetes` settings and cross-pool limit must match. The shared limit bounds concurrent allocations across those pools; capacity counts live pods with that target's backend label (not terminating, not Unschedulable) and clamps its ceiling to the shared limit. Named targets that share required anti-affinity on the same nodes also share a group cap, as described above. Explicit `costClass` still wins; named Kubernetes targets otherwise have the same local cost as the built-in adapter.
 
 `nodeGuard` reads the named Node immediately before registration and during capacity collection. The Node must be Ready, uncordoned, match every required label, and have no `NoSchedule` or `NoExecute` taints. Unknown node or inventory state reports no free slots, and provisioning returns capacity exhaustion before requesting a JIT registration so another eligible backend can be selected. Grant the broker `get` on just that Node with a `resourceNames`-restricted ClusterRole. The broker adds required labels to the pod's node selector and pins the exact node through required affinity, preserving existing affinity constraints. A guarded template cannot set `nodeName`, which would bypass scheduler admission. Labels revoked before scheduling therefore keep the pod pending; eviction of already running pods remains the operator's responsibility.
 

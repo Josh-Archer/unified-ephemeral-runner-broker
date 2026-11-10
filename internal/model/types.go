@@ -152,6 +152,11 @@ type BrokerRuntimeConfig struct {
 	RegistrationTimeout time.Duration `yaml:"registrationTimeout,omitempty" json:"registrationTimeout,omitempty"`
 	// BackendLimits sets cross-pool capacity limits per backend name across all pools.
 	BackendLimits map[BackendName]int `yaml:"backendLimits,omitempty" json:"backendLimits,omitempty"`
+	// UnschedulableTimeout is how long a broker-owned runner pod may stay
+	// Pending with PodScheduled=False/Unschedulable before the broker deletes
+	// it, releases its allocation, and lets the job retry on another backend.
+	// Zero uses the default (2 minutes). A negative value disables the reaper.
+	UnschedulableTimeout time.Duration `yaml:"unschedulableTimeout,omitempty" json:"unschedulableTimeout,omitempty"`
 	// OrphanCleanup is the broker-side stuck-allocation reaper. Active
 	// reserved/ready allocations past expires_at (+ optional gracePeriod) are
 	// marked terminal so maxRunners capacity is released when finalize never runs.
@@ -425,7 +430,16 @@ type BackendConfig struct {
 	Healthy    bool   `yaml:"healthy" json:"healthy"`
 	MaxRunners int    `yaml:"maxRunners" json:"maxRunners"`
 	// CrossPoolMaxRunners limits concurrent active allocations for this backend across all pools.
-	CrossPoolMaxRunners int           `yaml:"crossPoolMaxRunners,omitempty" json:"crossPoolMaxRunners,omitempty"`
+	CrossPoolMaxRunners int `yaml:"crossPoolMaxRunners,omitempty" json:"crossPoolMaxRunners,omitempty"`
+	// CapacityGroup names backends that share one scheduling cap, typically
+	// because required pod anti-affinity pins them to the same nodes. Empty
+	// means the broker derives a group from matching node placement and
+	// required anti-affinity topology keys when it can.
+	CapacityGroup string `yaml:"capacityGroup,omitempty" json:"capacityGroup,omitempty"`
+	// CapacityGroupMax is the shared cap for CapacityGroup. Zero means use a
+	// derived cap (the number of pinned hostnames when anti-affinity is
+	// per-hostname) or no extra cap when nothing can be derived.
+	CapacityGroupMax    int           `yaml:"capacityGroupMax,omitempty" json:"capacityGroupMax,omitempty"`
 	RegistrationTimeout time.Duration `yaml:"registrationTimeout,omitempty" json:"registrationTimeout,omitempty"`
 	WarmMin             int           `yaml:"warmMin" json:"warmMin"`
 	WarmMax             int           `yaml:"warmMax" json:"warmMax"`
@@ -552,14 +566,14 @@ type PoolConfig struct {
 	// this pool serves ("owner/repo" or "owner/*", case-insensitive). Empty
 	// serves every repository the GitHub scope accepts. Use it under owner
 	// scope to keep privileged pools to the repositories they were built for.
-	WebhookRepositories []string                      `yaml:"webhookRepositories,omitempty" json:"webhookRepositories,omitempty"`
+	WebhookRepositories []string `yaml:"webhookRepositories,omitempty" json:"webhookRepositories,omitempty"`
 	// ScaleSet registers this pool as one Runner Scale Set. Name is the
 	// runs-on label. ID is the scale set id from the admin API. Both are
 	// required together. The listener ignores the pool until
 	// broker.scaleSetListener.enabled is true.
-	ScaleSet            PoolScaleSetConfig            `yaml:"scaleSet,omitempty" json:"scaleSet,omitempty"`
-	CapabilityProfile   CapabilityProfile             `yaml:"capabilityProfile" json:"capabilityProfile"`
-	Backends            map[BackendName]BackendConfig `yaml:"backends" json:"backends"`
+	ScaleSet          PoolScaleSetConfig            `yaml:"scaleSet,omitempty" json:"scaleSet,omitempty"`
+	CapabilityProfile CapabilityProfile             `yaml:"capabilityProfile" json:"capabilityProfile"`
+	Backends          map[BackendName]BackendConfig `yaml:"backends" json:"backends"`
 	// HostedOverflow sends this pool's jobs to GitHub-hosted runners while
 	// the pool is backed up, by flipping a repository Actions variable that
 	// the workflows read in runs-on.
