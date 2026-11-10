@@ -40,7 +40,7 @@ Ephemeral runner pod    Ephemeral runner
 | `full` | arc | round-robin | ARC full-capacity, no external overflow |
 | `lite` | arc (weight 3), codebuild (weight 1) | weighted-round-robin | ARC preferred; CodeBuild absorbs overflow |
 
-CodeBuild warm capacity is configured with `warmMin: 1, warmMax: 2` to reduce cold-start latency on burst.
+CodeBuild stays cold. Always-on warm (`warmMin` / `warmMax` above 0) is refused for CodeBuild; use it on ARC, Kubernetes, or a VM backend.
 
 ## Files in This Pack
 

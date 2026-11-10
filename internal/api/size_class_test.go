@@ -277,7 +277,7 @@ func TestWarmCandidateServesSize(t *testing.T) {
 
 func TestAllocateSizeClassDoesNotConsumeUnlabeledWarmRunner(t *testing.T) {
 	now := time.Unix(1000, 0)
-	counting := &countingBackend{testBackend: testBackend{name: model.BackendCodeBuild}}
+	counting := &countingBackend{testBackend: testBackend{name: model.BackendEC2}}
 	service := newServiceWithCountingBackend(func(pool *model.PoolConfig) {
 		if pool.Name != model.PoolLite {
 			return
@@ -286,13 +286,13 @@ func TestAllocateSizeClassDoesNotConsumeUnlabeledWarmRunner(t *testing.T) {
 			backendCfg.Enabled = false
 			pool.Backends[name] = backendCfg
 		}
-		codebuildCfg := pool.Backends[model.BackendCodeBuild]
+		codebuildCfg := pool.Backends[model.BackendEC2]
 		codebuildCfg.Enabled = true
 		codebuildCfg.Healthy = true
 		codebuildCfg.MaxRunners = 2
 		codebuildCfg.WarmMin = 1
 		codebuildCfg.WarmMax = 1
-		pool.Backends[model.BackendCodeBuild] = codebuildCfg
+		pool.Backends[model.BackendEC2] = codebuildCfg
 	}, counting)
 	service.cfg.Broker.SizeClasses = map[string]model.SizeClassConfig{
 		"large": {

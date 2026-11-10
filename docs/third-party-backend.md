@@ -2,7 +2,7 @@
 
 This guide is for a runner controller the broker does not ship. The contract is Adapter SDK v1: `adapter.APIVersion` is `"v1"`. The normative field rules live in [adapter-sdk.md](adapter-sdk.md). This page is the path from that interface to a broker that can call your controller.
 
-The broker does not load out-of-tree Go plugins. You run your own controller and point a built-in external backend's secret at it. The backend name selects broker behavior (dispatch timeout, warm pool eligibility, cost class). The secret URLs select your controller.
+The broker does not load out-of-tree Go plugins. You run your own controller and point a built-in external backend's secret at it. The backend name selects broker behavior (dispatch timeout, warm pool eligibility, cost class). The secret URLs select your controller. Always-on warm pools are allowed for `ec2`, `gce`, and ephemeral `azure-vm`, and refused for `codebuild`, `lambda`, `cloud-run`, and `azure-functions`.
 
 Two extension points are different from this guide:
 
@@ -190,10 +190,11 @@ kubectl create secret generic uecb-my-backend \
 
 Enable one existing external backend on the `lite` pool and set `secretRef` to that secret. The URLs decide which controller runs. The name decides broker defaults:
 
-| Backend name | Dispatch timeout (Reserve + Launch) | Warm pool |
+| Backend name | Dispatch timeout (Reserve + Launch) | Always-on warm pool |
 | --- | --- | --- |
-| `codebuild`, `lambda`, `cloud-run`, `ec2`, `gce` | 20s | supported |
-| `azure-functions` | 90s | supported |
+| `ec2`, `gce` | 20s | supported |
+| `codebuild`, `lambda`, `cloud-run` | 20s | refused |
+| `azure-functions` | 90s | refused |
 
 These dispatch budgets come from the broker's external-dispatch client (`internal/backend/externaldispatch`: 20s default, 90s for `azure-functions`). They apply only to the `POST dispatch_url` round trip. After a successful dispatch, the broker waits up to `registrationTimeout` (default 10m from `broker.registrationTimeout`, overridable per backend) for the runner to appear in GitHub. Use the `azure-functions` backend name when cold start can exceed 20 seconds; the controller behind the secret does not have to be that cloud product. Raise `registrationTimeout` when the runner needs a long time to register after Launch returns.
 

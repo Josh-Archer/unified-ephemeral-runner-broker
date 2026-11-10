@@ -34,15 +34,15 @@ func TestQAWarmTransferNeverBypassesQuota(t *testing.T) {
 				b.Enabled = false
 				pool.Backends[name] = b
 			}
-			cb := pool.Backends[model.BackendCodeBuild]
+			cb := pool.Backends[model.BackendEC2]
 			cb.Enabled, cb.Healthy = true, true
 			cb.MaxRunners = workers + 2
 			cb.WarmMin, cb.WarmMax = 1, 1
-			pool.Backends[model.BackendCodeBuild] = cb
+			pool.Backends[model.BackendEC2] = cb
 		}
 		service := NewService(cfg, backend.NewRegistry(
 			testBackend{name: model.BackendARC},
-			testBackend{name: model.BackendCodeBuild},
+			testBackend{name: model.BackendEC2},
 		), nil)
 		service.ReconcileWarmPools()
 
@@ -82,8 +82,8 @@ func TestQAWarmTransferNeverBypassesQuota(t *testing.T) {
 			}
 		}
 		// Only the remaining (if any) warm runner may hold capacity: no leaked "default".
-		warm := len(filterWarmAllocations(service.store.List(), model.PoolLite, model.BackendCodeBuild))
-		if active := service.fairShare.Active(model.PoolLite, model.BackendCodeBuild); active != warm {
+		warm := len(filterWarmAllocations(service.store.List(), model.PoolLite, model.BackendEC2))
+		if active := service.fairShare.Active(model.PoolLite, model.BackendEC2); active != warm {
 			t.Fatalf("iteration %d: fair-share active=%d after cancel, want %d (warm runners)", iter, active, warm)
 		}
 	}

@@ -518,7 +518,7 @@ func TestPrometheusObserverEstimatedCost(t *testing.T) {
 
 func TestAllocateRecordsEstimatedCostForColdAndWarm(t *testing.T) {
 	now := time.Unix(1000, 0)
-	counting := &countingBackend{testBackend: testBackend{name: model.BackendCodeBuild}}
+	counting := &countingBackend{testBackend: testBackend{name: model.BackendEC2}}
 	service := newServiceWithCountingBackend(func(pool *model.PoolConfig) {
 		if pool.Name != model.PoolLite {
 			return
@@ -527,14 +527,14 @@ func TestAllocateRecordsEstimatedCostForColdAndWarm(t *testing.T) {
 			backendCfg.Enabled = false
 			pool.Backends[name] = backendCfg
 		}
-		codebuildCfg := pool.Backends[model.BackendCodeBuild]
+		codebuildCfg := pool.Backends[model.BackendEC2]
 		codebuildCfg.Enabled = true
 		codebuildCfg.Healthy = true
 		codebuildCfg.MaxRunners = 2
 		codebuildCfg.WarmMin = 1
 		codebuildCfg.WarmMax = 1
 		codebuildCfg.EstimatedCostPerAllocation = 1.5
-		pool.Backends[model.BackendCodeBuild] = codebuildCfg
+		pool.Backends[model.BackendEC2] = codebuildCfg
 	}, counting)
 	service.now = func() time.Time { return now }
 
@@ -556,7 +556,7 @@ func TestAllocateRecordsEstimatedCostForColdAndWarm(t *testing.T) {
 	if warmAllocation.Metadata[backend.MetadataLaunchModeKey] != launchModeWarm {
 		t.Fatalf("launch mode = %q, want warm", warmAllocation.Metadata[backend.MetadataLaunchModeKey])
 	}
-	requireFloat(t, obs.estimatedCost.WithLabelValues("lite", "codebuild"), 1.5)
+	requireFloat(t, obs.estimatedCost.WithLabelValues("lite", "ec2"), 1.5)
 
 	coldAllocation, err := service.Allocate(context.Background(), model.AllocationRequest{
 		Pool:       model.PoolLite,
@@ -568,10 +568,10 @@ func TestAllocateRecordsEstimatedCostForColdAndWarm(t *testing.T) {
 	if coldAllocation.Metadata[backend.MetadataLaunchModeKey] != launchModeCold {
 		t.Fatalf("launch mode = %q, want cold", coldAllocation.Metadata[backend.MetadataLaunchModeKey])
 	}
-	requireFloat(t, obs.estimatedCost.WithLabelValues("lite", "codebuild"), 3)
-	requireFloat(t, obs.backendCostClass.WithLabelValues("lite", "codebuild"), 50)
-	requireFloat(t, obs.backendUnitCost.WithLabelValues("lite", "codebuild"), 1.5)
-	requireFloat(t, obs.allocations.WithLabelValues("lite", "codebuild", "success"), 2)
+	requireFloat(t, obs.estimatedCost.WithLabelValues("lite", "ec2"), 3)
+	requireFloat(t, obs.backendCostClass.WithLabelValues("lite", "ec2"), 90)
+	requireFloat(t, obs.backendUnitCost.WithLabelValues("lite", "ec2"), 1.5)
+	requireFloat(t, obs.allocations.WithLabelValues("lite", "ec2", "success"), 2)
 
 	_, err = service.Allocate(context.Background(), model.AllocationRequest{
 		Pool:       model.PoolLite,
@@ -580,8 +580,8 @@ func TestAllocateRecordsEstimatedCostForColdAndWarm(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected timeout limit to fail the allocation")
 	}
-	requireFloat(t, obs.estimatedCost.WithLabelValues("lite", "codebuild"), 3)
-	if got := testutil.ToFloat64(obs.allocations.WithLabelValues("lite", "codebuild", "failure")); got != 0 {
+	requireFloat(t, obs.estimatedCost.WithLabelValues("lite", "ec2"), 3)
+	if got := testutil.ToFloat64(obs.allocations.WithLabelValues("lite", "ec2", "failure")); got != 0 {
 		// Timeout rejection happens before a backend is selected, so the failure
 		// series is unlabeled by the selected backend.
 		t.Fatalf("selected-backend failure series = %v, want 0", got)

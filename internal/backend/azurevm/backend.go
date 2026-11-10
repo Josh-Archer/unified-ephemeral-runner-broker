@@ -6,7 +6,9 @@ import (
 	"strings"
 
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend"
+	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend/externaldispatch"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
+	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/runtime"
 )
 
 type Backend struct {
@@ -25,6 +27,37 @@ func New(cfg model.BrokerConfig, clients ...RunnerClient) backend.Backend {
 		}
 	}
 	return b
+}
+
+// UsesEphemeralDispatch reports an unmanaged azure-vm pool that points at an
+// external launcher (secretRef), the same contract as ec2 and gce. Managed
+// named-runner pools stay on the lease adapter even if a secret is also set.
+func UsesEphemeralDispatch(cfg model.BrokerConfig) bool {
+	sawManaged := false
+	sawSecret := false
+	for _, pool := range cfg.Pools {
+		target, ok := pool.Backends[model.BackendAzureVM]
+		if !ok {
+			continue
+		}
+		if target.AzureVM != nil {
+			sawManaged = true
+		}
+		if strings.TrimSpace(target.SecretRef) != "" {
+			sawSecret = true
+		}
+	}
+	return sawSecret && !sawManaged
+}
+
+// NewFromRuntime selects the azure-vm adapter. Ephemeral pools dispatch a VM
+// and can be held warm. Managed pools lease named machines. Static-label pools
+// return the configured runner label and are not warm-provisionable.
+func NewFromRuntime(cfg model.BrokerConfig, secrets runtime.SecretReader, clients ...RunnerClient) backend.Backend {
+	if UsesEphemeralDispatch(cfg) {
+		return externaldispatch.New(model.BackendAzureVM, cfg, secrets)
+	}
+	return New(cfg, clients...)
 }
 
 func (b *Backend) Name() model.BackendName {

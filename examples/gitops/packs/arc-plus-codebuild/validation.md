@@ -49,7 +49,7 @@ After a burst of allocations, the ARC count should be roughly 3× the CodeBuild 
 
 ## 6. Confirm Warm Capacity (Optional)
 
-If warm capacity is configured (`warmMin: 1`), check that a warm slot is maintained:
+CodeBuild warm capacity is not configured (`warmMin: 0`). Always-on warm on CodeBuild is refused. If an ARC or VM backend sets `warmMin: 1`, check that a warm slot is maintained:
 
 ```bash
 curl -s http://localhost:8080/metrics \

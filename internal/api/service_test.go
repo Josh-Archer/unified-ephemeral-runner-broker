@@ -205,13 +205,15 @@ func newServiceWithCountingBackend(mutator func(*model.PoolConfig), counting *co
 		cfg,
 		backend.NewRegistry(
 			testBackend{name: model.BackendARC},
-			counting,
 			testBackend{name: model.BackendLambda},
 			testBackend{name: model.BackendCloudRun},
 			testBackend{name: model.BackendAzureFunctions},
 			testBackend{name: model.BackendAzureVM},
 			testBackend{name: model.BackendEC2},
 			testBackend{name: model.BackendGCE},
+			// Last write wins. Warm tests name the counting backend after a
+			// static entry (ec2, gce); registering it last keeps the counter.
+			counting,
 		),
 		nil,
 	)
@@ -797,7 +799,7 @@ func TestAllocateARCFirstFallbackWhenARCDown(t *testing.T) {
 func TestFallbackTargetReportsLocalWhenNoCloudBackend(t *testing.T) {
 	local := model.PoolConfig{Backends: map[model.BackendName]model.BackendConfig{
 		model.BackendName("kubernetes-desktop"): {Enabled: true, Healthy: true, MaxRunners: 4},
-		model.BackendLambda:            {Enabled: false, Healthy: true, MaxRunners: 2},
+		model.BackendLambda:                     {Enabled: false, Healthy: true, MaxRunners: 2},
 	}}
 	if got := fallbackTarget(local); got != "local" {
 		t.Fatalf("fallbackTarget = %q, want local", got)
@@ -1554,7 +1556,7 @@ func TestAllocateUsesLambdaWhenLambdaBackendIsEnabled(t *testing.T) {
 }
 
 func TestReconcileWarmPoolsCreatesWarmAllocation(t *testing.T) {
-	counting := &countingBackend{testBackend: testBackend{name: model.BackendCodeBuild}}
+	counting := &countingBackend{testBackend: testBackend{name: model.BackendEC2}}
 	service := newServiceWithCountingBackend(func(pool *model.PoolConfig) {
 		if pool.Name != model.PoolLite {
 			return
@@ -1563,13 +1565,13 @@ func TestReconcileWarmPoolsCreatesWarmAllocation(t *testing.T) {
 			backendCfg.Enabled = false
 			pool.Backends[name] = backendCfg
 		}
-		codebuildCfg := pool.Backends[model.BackendCodeBuild]
+		codebuildCfg := pool.Backends[model.BackendEC2]
 		codebuildCfg.Enabled = true
 		codebuildCfg.Healthy = true
 		codebuildCfg.MaxRunners = 2
 		codebuildCfg.WarmMin = 1
 		codebuildCfg.WarmMax = 1
-		pool.Backends[model.BackendCodeBuild] = codebuildCfg
+		pool.Backends[model.BackendEC2] = codebuildCfg
 	}, counting)
 
 	service.ReconcileWarmPools()
@@ -1591,7 +1593,7 @@ func TestReconcileWarmPoolsCreatesWarmAllocation(t *testing.T) {
 }
 
 func TestReconcileWarmPoolsSkipsTierBlockedBackend(t *testing.T) {
-	counting := &countingBackend{testBackend: testBackend{name: model.BackendCodeBuild}}
+	counting := &countingBackend{testBackend: testBackend{name: model.BackendEC2}}
 	service := newServiceWithCountingBackend(func(pool *model.PoolConfig) {
 		if pool.Name != model.PoolLite {
 			return
@@ -1600,17 +1602,17 @@ func TestReconcileWarmPoolsSkipsTierBlockedBackend(t *testing.T) {
 			backendCfg.Enabled = false
 			pool.Backends[name] = backendCfg
 		}
-		codebuildCfg := pool.Backends[model.BackendCodeBuild]
+		codebuildCfg := pool.Backends[model.BackendEC2]
 		codebuildCfg.Enabled = true
 		codebuildCfg.Healthy = true
 		codebuildCfg.MaxRunners = 2
 		codebuildCfg.WarmMin = 1
 		codebuildCfg.WarmMax = 1
-		pool.Backends[model.BackendCodeBuild] = codebuildCfg
+		pool.Backends[model.BackendEC2] = codebuildCfg
 	}, counting)
 	service.cfg.Broker.TierRouting.Enabled = true
 	manager := tier.NewManager()
-	manager.SetDecision(tier.Decision{Pool: model.PoolLite, Backend: model.BackendCodeBuild, State: tier.StateExceeded, Action: tier.ActionDisable, UpdatedAt: time.Now()})
+	manager.SetDecision(tier.Decision{Pool: model.PoolLite, Backend: model.BackendEC2, State: tier.StateExceeded, Action: tier.ActionDisable, UpdatedAt: time.Now()})
 	service.SetTierManager(manager)
 
 	service.ReconcileWarmPools()
@@ -1625,7 +1627,7 @@ func TestReconcileWarmPoolsSkipsTierBlockedBackend(t *testing.T) {
 
 func TestAllocatePrefersWarmAllocationOverColdLaunch(t *testing.T) {
 	now := time.Unix(1000, 0)
-	counting := &countingBackend{testBackend: testBackend{name: model.BackendCodeBuild}}
+	counting := &countingBackend{testBackend: testBackend{name: model.BackendEC2}}
 	service := newServiceWithCountingBackend(func(pool *model.PoolConfig) {
 		if pool.Name != model.PoolLite {
 			return
@@ -1634,13 +1636,13 @@ func TestAllocatePrefersWarmAllocationOverColdLaunch(t *testing.T) {
 			backendCfg.Enabled = false
 			pool.Backends[name] = backendCfg
 		}
-		codebuildCfg := pool.Backends[model.BackendCodeBuild]
+		codebuildCfg := pool.Backends[model.BackendEC2]
 		codebuildCfg.Enabled = true
 		codebuildCfg.Healthy = true
 		codebuildCfg.MaxRunners = 2
 		codebuildCfg.WarmMin = 1
 		codebuildCfg.WarmMax = 1
-		pool.Backends[model.BackendCodeBuild] = codebuildCfg
+		pool.Backends[model.BackendEC2] = codebuildCfg
 	}, counting)
 	service.now = func() time.Time { return now }
 
@@ -1695,7 +1697,7 @@ func TestAllocatePrefersWarmAllocationOverColdLaunch(t *testing.T) {
 
 func TestConcurrentAllocateDoesNotDoubleConsumeWarm(t *testing.T) {
 	now := time.Unix(1000, 0)
-	counting := &countingBackend{testBackend: testBackend{name: model.BackendCodeBuild}}
+	counting := &countingBackend{testBackend: testBackend{name: model.BackendEC2}}
 	service := newServiceWithCountingBackend(func(pool *model.PoolConfig) {
 		if pool.Name != model.PoolLite {
 			return
@@ -1704,7 +1706,7 @@ func TestConcurrentAllocateDoesNotDoubleConsumeWarm(t *testing.T) {
 			backendCfg.Enabled = false
 			pool.Backends[name] = backendCfg
 		}
-		codebuildCfg := pool.Backends[model.BackendCodeBuild]
+		codebuildCfg := pool.Backends[model.BackendEC2]
 		codebuildCfg.Enabled = true
 		codebuildCfg.Healthy = true
 		// Warm prewarm holds 1 slot; concurrent workers each cold-reserve before
@@ -1712,12 +1714,12 @@ func TestConcurrentAllocateDoesNotDoubleConsumeWarm(t *testing.T) {
 		codebuildCfg.MaxRunners = 4
 		codebuildCfg.WarmMin = 1
 		codebuildCfg.WarmMax = 1
-		pool.Backends[model.BackendCodeBuild] = codebuildCfg
+		pool.Backends[model.BackendEC2] = codebuildCfg
 	}, counting)
 	service.now = func() time.Time { return now }
 
 	service.ReconcileWarmPools()
-	warmBefore := filterWarmAllocations(service.store.List(), model.PoolLite, model.BackendCodeBuild)
+	warmBefore := filterWarmAllocations(service.store.List(), model.PoolLite, model.BackendEC2)
 	if len(warmBefore) != 1 {
 		t.Fatalf("expected one warm allocation before concurrent allocate, got %d", len(warmBefore))
 	}
@@ -1784,7 +1786,7 @@ func TestConcurrentAllocateDoesNotDoubleConsumeWarm(t *testing.T) {
 	}
 
 	// The pre-warmed runner must not still be StateWarm after exclusive claim.
-	if remaining := filterWarmAllocations(service.store.List(), model.PoolLite, model.BackendCodeBuild); len(remaining) != 0 {
+	if remaining := filterWarmAllocations(service.store.List(), model.PoolLite, model.BackendEC2); len(remaining) != 0 {
 		t.Fatalf("expected no residual warm allocations, got %+v", remaining)
 	}
 }
@@ -1795,7 +1797,7 @@ func TestAllocateWarmHitDoesNotLeakFairShareCapacity(t *testing.T) {
 	// capacity from the prewarm "default" tenant to the consumer so cancel
 	// correctly frees capacity.
 	now := time.Unix(1000, 0)
-	counting := &countingBackend{testBackend: testBackend{name: model.BackendCodeBuild}}
+	counting := &countingBackend{testBackend: testBackend{name: model.BackendEC2}}
 	service := newServiceWithCountingBackend(func(pool *model.PoolConfig) {
 		if pool.Name != model.PoolLite {
 			return
@@ -1805,18 +1807,18 @@ func TestAllocateWarmHitDoesNotLeakFairShareCapacity(t *testing.T) {
 			backendCfg.Enabled = false
 			pool.Backends[name] = backendCfg
 		}
-		codebuildCfg := pool.Backends[model.BackendCodeBuild]
+		codebuildCfg := pool.Backends[model.BackendEC2]
 		codebuildCfg.Enabled = true
 		codebuildCfg.Healthy = true
 		codebuildCfg.MaxRunners = 2
 		codebuildCfg.WarmMin = 1
 		codebuildCfg.WarmMax = 1
-		pool.Backends[model.BackendCodeBuild] = codebuildCfg
+		pool.Backends[model.BackendEC2] = codebuildCfg
 	}, counting)
 	service.now = func() time.Time { return now }
 
 	service.ReconcileWarmPools()
-	if active := service.fairShare.Active(model.PoolLite, model.BackendCodeBuild); active != 1 {
+	if active := service.fairShare.Active(model.PoolLite, model.BackendEC2); active != 1 {
 		t.Fatalf("expected fair-share active=1 after warm prewarm, got %d", active)
 	}
 
@@ -1834,17 +1836,17 @@ func TestAllocateWarmHitDoesNotLeakFairShareCapacity(t *testing.T) {
 		if allocation.Metadata[backend.MetadataLaunchModeKey] != launchModeWarm {
 			t.Fatalf("allocate #%d: expected warm launch mode, got %q", i+1, allocation.Metadata[backend.MetadataLaunchModeKey])
 		}
-		if active := service.fairShare.Active(model.PoolLite, model.BackendCodeBuild); active != 1 {
+		if active := service.fairShare.Active(model.PoolLite, model.BackendEC2); active != 1 {
 			t.Fatalf("after warm hit #%d: expected fair-share active=1 (no cold leak), got %d", i+1, active)
 		}
 		if _, ok := service.Cancel(context.Background(), allocation.ID); !ok {
 			t.Fatalf("cancel #%d failed", i+1)
 		}
-		if active := service.fairShare.Active(model.PoolLite, model.BackendCodeBuild); active != 0 {
+		if active := service.fairShare.Active(model.PoolLite, model.BackendEC2); active != 0 {
 			t.Fatalf("after cancel #%d: expected fair-share active=0, got %d", i+1, active)
 		}
 		service.ReconcileWarmPools()
-		if active := service.fairShare.Active(model.PoolLite, model.BackendCodeBuild); active != 1 {
+		if active := service.fairShare.Active(model.PoolLite, model.BackendEC2); active != 1 {
 			t.Fatalf("after re-warm #%d: expected fair-share active=1, got %d", i+1, active)
 		}
 	}
@@ -1868,7 +1870,7 @@ func TestAllocateWarmHitDoesNotLeakFairShareCapacity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("capacity probe allocate 2 failed: %v", err)
 	}
-	if active := service.fairShare.Active(model.PoolLite, model.BackendCodeBuild); active != 2 {
+	if active := service.fairShare.Active(model.PoolLite, model.BackendEC2); active != 2 {
 		t.Fatalf("expected fair-share active=2 at capacity, got %d", active)
 	}
 	if _, err := service.Allocate(context.Background(), model.AllocationRequest{
@@ -1878,7 +1880,7 @@ func TestAllocateWarmHitDoesNotLeakFairShareCapacity(t *testing.T) {
 	}
 	service.Cancel(context.Background(), a1.ID)
 	service.Cancel(context.Background(), a2.ID)
-	if active := service.fairShare.Active(model.PoolLite, model.BackendCodeBuild); active != 0 {
+	if active := service.fairShare.Active(model.PoolLite, model.BackendEC2); active != 0 {
 		t.Fatalf("expected fair-share active=0 after draining, got %d", active)
 	}
 }
@@ -1896,16 +1898,16 @@ func TestFileStoreWarmConsumptionRehydratesOnlyRealAllocation(t *testing.T) {
 			backendCfg.Enabled = false
 			cfg.Pools[index].Backends[name] = backendCfg
 		}
-		codebuildCfg := cfg.Pools[index].Backends[model.BackendCodeBuild]
+		codebuildCfg := cfg.Pools[index].Backends[model.BackendEC2]
 		codebuildCfg.Enabled = true
 		codebuildCfg.Healthy = true
 		codebuildCfg.MaxRunners = 2
 		codebuildCfg.WarmMin = 1
 		codebuildCfg.WarmMax = 1
-		cfg.Pools[index].Backends[model.BackendCodeBuild] = codebuildCfg
+		cfg.Pools[index].Backends[model.BackendEC2] = codebuildCfg
 	}
 
-	counting := &countingBackend{testBackend: testBackend{name: model.BackendCodeBuild}}
+	counting := &countingBackend{testBackend: testBackend{name: model.BackendEC2}}
 	first := NewService(cfg, backend.NewRegistry(testBackend{name: model.BackendARC}, counting), nil)
 	first.now = func() time.Time { return now }
 	first.ReconcileWarmPools()
@@ -1937,7 +1939,7 @@ func TestFileStoreWarmConsumptionRehydratesOnlyRealAllocation(t *testing.T) {
 
 func TestReconcileWarmPoolsRecyclesExpiredWarmAllocation(t *testing.T) {
 	now := time.Unix(1000, 0)
-	counting := &countingBackend{testBackend: testBackend{name: model.BackendCodeBuild}}
+	counting := &countingBackend{testBackend: testBackend{name: model.BackendEC2}}
 	service := newServiceWithCountingBackend(func(pool *model.PoolConfig) {
 		if pool.Name != model.PoolLite {
 			return
@@ -1946,14 +1948,14 @@ func TestReconcileWarmPoolsRecyclesExpiredWarmAllocation(t *testing.T) {
 			backendCfg.Enabled = false
 			pool.Backends[name] = backendCfg
 		}
-		codebuildCfg := pool.Backends[model.BackendCodeBuild]
+		codebuildCfg := pool.Backends[model.BackendEC2]
 		codebuildCfg.Enabled = true
 		codebuildCfg.Healthy = true
 		codebuildCfg.MaxRunners = 1
 		codebuildCfg.WarmMin = 1
 		codebuildCfg.WarmMax = 1
 		codebuildCfg.WarmTTL = time.Minute
-		pool.Backends[model.BackendCodeBuild] = codebuildCfg
+		pool.Backends[model.BackendEC2] = codebuildCfg
 	}, counting)
 	service.now = func() time.Time { return now }
 
@@ -1997,7 +1999,7 @@ func TestWarmScheduleGatesColdCloudPrewarm(t *testing.T) {
 	// Sunday 10:00 UTC is outside weekdays.
 	outWindow := time.Date(2026, 7, 26, 10, 0, 0, 0, time.UTC)
 
-	counting := &countingBackend{testBackend: testBackend{name: model.BackendLambda}}
+	counting := &countingBackend{testBackend: testBackend{name: model.BackendEC2}}
 	service := newServiceWithBrokerConfig(func(cfg *model.BrokerConfig) {
 		for index := range cfg.Pools {
 			pool := &cfg.Pools[index]
@@ -2008,7 +2010,7 @@ func TestWarmScheduleGatesColdCloudPrewarm(t *testing.T) {
 				backendCfg.Enabled = false
 				pool.Backends[name] = backendCfg
 			}
-			lambdaCfg := pool.Backends[model.BackendLambda]
+			lambdaCfg := pool.Backends[model.BackendEC2]
 			lambdaCfg.Enabled = true
 			lambdaCfg.Healthy = true
 			lambdaCfg.MaxRunners = 2
@@ -2023,18 +2025,17 @@ func TestWarmScheduleGatesColdCloudPrewarm(t *testing.T) {
 					End:   "18:00",
 				}},
 			}
-			pool.Backends[model.BackendLambda] = lambdaCfg
+			pool.Backends[model.BackendEC2] = lambdaCfg
 		}
 	})
 	service.registry = backend.NewRegistry(
 		testBackend{name: model.BackendARC},
 		testBackend{name: model.BackendCodeBuild},
-		counting,
 		testBackend{name: model.BackendCloudRun},
 		testBackend{name: model.BackendAzureFunctions},
 		testBackend{name: model.BackendAzureVM},
-		testBackend{name: model.BackendEC2},
 		testBackend{name: model.BackendGCE},
+		counting,
 	)
 
 	service.now = func() time.Time { return inWindow }
@@ -2042,19 +2043,19 @@ func TestWarmScheduleGatesColdCloudPrewarm(t *testing.T) {
 	if counting.provisionCount != 1 {
 		t.Fatalf("expected warm provision inside schedule window, got %d", counting.provisionCount)
 	}
-	if got := len(filterWarmAllocations(service.store.List(), model.PoolLite, model.BackendLambda)); got != 1 {
+	if got := len(filterWarmAllocations(service.store.List(), model.PoolLite, model.BackendEC2)); got != 1 {
 		t.Fatalf("expected one warm allocation in window, got %d", got)
 	}
 
 	service.now = func() time.Time { return outWindow }
 	service.ReconcileWarmPools()
-	if got := len(filterWarmAllocations(service.store.List(), model.PoolLite, model.BackendLambda)); got != 0 {
+	if got := len(filterWarmAllocations(service.store.List(), model.PoolLite, model.BackendEC2)); got != 0 {
 		t.Fatalf("expected warm pool drained outside schedule window, got %d", got)
 	}
 }
 
 func TestWarmPoolRespectsLiveCapacityFreeSlots(t *testing.T) {
-	counting := &countingBackend{testBackend: testBackend{name: model.BackendCloudRun}}
+	counting := &countingBackend{testBackend: testBackend{name: model.BackendGCE}}
 	cfg := config.Default()
 	enableLiveCapacity(&cfg)
 	for index := range cfg.Pools {
@@ -2066,27 +2067,26 @@ func TestWarmPoolRespectsLiveCapacityFreeSlots(t *testing.T) {
 			backendCfg.Enabled = false
 			pool.Backends[name] = backendCfg
 		}
-		cloud := pool.Backends[model.BackendCloudRun]
+		cloud := pool.Backends[model.BackendGCE]
 		cloud.Enabled = true
 		cloud.Healthy = true
 		cloud.MaxRunners = 5
 		cloud.WarmMin = 2
 		cloud.WarmMax = 2
-		pool.Backends[model.BackendCloudRun] = cloud
+		pool.Backends[model.BackendGCE] = cloud
 	}
 	service := NewService(cfg, backend.NewRegistry(
 		testBackend{name: model.BackendARC},
 		testBackend{name: model.BackendCodeBuild},
 		testBackend{name: model.BackendLambda},
-		counting,
 		testBackend{name: model.BackendAzureFunctions},
 		testBackend{name: model.BackendAzureVM},
 		testBackend{name: model.BackendEC2},
-		testBackend{name: model.BackendGCE},
+		counting,
 	), nil)
 	manager := capacity.NewManager()
 	manager.Set(capacity.Snapshot{
-		Backend: model.BackendCloudRun,
+		Backend: model.BackendGCE,
 		Status: backend.CapacityStatus{
 			MaxRunners:     5,
 			ActiveRunners:  5,
@@ -2104,7 +2104,7 @@ func TestWarmPoolRespectsLiveCapacityFreeSlots(t *testing.T) {
 	}
 
 	manager.Set(capacity.Snapshot{
-		Backend: model.BackendCloudRun,
+		Backend: model.BackendGCE,
 		Status: backend.CapacityStatus{
 			MaxRunners:     5,
 			ActiveRunners:  4,
@@ -2121,8 +2121,8 @@ func TestWarmPoolRespectsLiveCapacityFreeSlots(t *testing.T) {
 }
 
 func TestAutoAllocatePrefersWarmColdCloudBackend(t *testing.T) {
-	// With ARC disabled, auto selection should still prefer the warm Lambda.
-	lambda := &countingBackend{testBackend: testBackend{name: model.BackendLambda}}
+	// With ARC disabled, auto selection should still prefer the warm EC2 pool.
+	lambda := &countingBackend{testBackend: testBackend{name: model.BackendEC2}}
 	service := newServiceWithCountingBackend(func(pool *model.PoolConfig) {
 		if pool.Name != model.PoolLite {
 			return
@@ -2138,30 +2138,29 @@ func TestAutoAllocatePrefersWarmColdCloudBackend(t *testing.T) {
 		arc.Weight = 100
 		pool.Backends[model.BackendARC] = arc
 
-		cfg := pool.Backends[model.BackendLambda]
+		cfg := pool.Backends[model.BackendEC2]
 		cfg.Enabled = true
 		cfg.Healthy = true
 		cfg.MaxRunners = 2
 		cfg.Weight = 1
 		cfg.WarmMin = 1
 		cfg.WarmMax = 1
-		pool.Backends[model.BackendLambda] = cfg
+		pool.Backends[model.BackendEC2] = cfg
 	}, lambda)
-	// Register ARC as real test backend and replace lambda with counting.
+	// Register ARC as a real test backend and keep the counting EC2 last.
 	service.registry = backend.NewRegistry(
 		testBackend{name: model.BackendARC},
 		testBackend{name: model.BackendCodeBuild},
-		lambda,
 		testBackend{name: model.BackendCloudRun},
 		testBackend{name: model.BackendAzureFunctions},
 		testBackend{name: model.BackendAzureVM},
-		testBackend{name: model.BackendEC2},
 		testBackend{name: model.BackendGCE},
+		lambda,
 	)
 
 	service.ReconcileWarmPools()
 	if lambda.provisionCount != 1 {
-		t.Fatalf("expected lambda warm prewarm, got %d", lambda.provisionCount)
+		t.Fatalf("expected ec2 warm prewarm, got %d", lambda.provisionCount)
 	}
 
 	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
@@ -2171,8 +2170,8 @@ func TestAutoAllocatePrefersWarmColdCloudBackend(t *testing.T) {
 	if err != nil {
 		t.Fatalf("allocate failed: %v", err)
 	}
-	if allocation.SelectedBackend != model.BackendLambda {
-		t.Fatalf("expected auto allocate to prefer warm lambda, got %s", allocation.SelectedBackend)
+	if allocation.SelectedBackend != model.BackendEC2 {
+		t.Fatalf("expected auto allocate to prefer warm ec2, got %s", allocation.SelectedBackend)
 	}
 	if allocation.Metadata[backend.MetadataLaunchModeKey] != launchModeWarm {
 		t.Fatalf("expected warm launch mode, got %q", allocation.Metadata[backend.MetadataLaunchModeKey])
@@ -2204,8 +2203,8 @@ func TestWarmPoolReducesAllocateReadyLatencySmoke(t *testing.T) {
 	const coldDelay = 40 * time.Millisecond
 	const samples = 8
 
-	coldBackend := &delayedBackend{testBackend: testBackend{name: model.BackendAzureFunctions}, delay: coldDelay}
-	warmBackend := &delayedBackend{testBackend: testBackend{name: model.BackendAzureFunctions}, delay: coldDelay}
+	coldBackend := &delayedBackend{testBackend: testBackend{name: model.BackendEC2}, delay: coldDelay}
+	warmBackend := &delayedBackend{testBackend: testBackend{name: model.BackendEC2}, delay: coldDelay}
 
 	measure := func(withWarm bool, impl *delayedBackend) []time.Duration {
 		service := newServiceWithBrokerConfig(func(cfg *model.BrokerConfig) {
@@ -2218,7 +2217,7 @@ func TestWarmPoolReducesAllocateReadyLatencySmoke(t *testing.T) {
 					backendCfg.Enabled = false
 					pool.Backends[name] = backendCfg
 				}
-				cfgBackend := pool.Backends[model.BackendAzureFunctions]
+				cfgBackend := pool.Backends[model.BackendEC2]
 				cfgBackend.Enabled = true
 				cfgBackend.Healthy = true
 				cfgBackend.MaxRunners = samples + 2
@@ -2226,7 +2225,7 @@ func TestWarmPoolReducesAllocateReadyLatencySmoke(t *testing.T) {
 					cfgBackend.WarmMin = 1
 					cfgBackend.WarmMax = 1
 				}
-				pool.Backends[model.BackendAzureFunctions] = cfgBackend
+				pool.Backends[model.BackendEC2] = cfgBackend
 			}
 		})
 		service.registry = backend.NewRegistry(
@@ -2234,10 +2233,9 @@ func TestWarmPoolReducesAllocateReadyLatencySmoke(t *testing.T) {
 			testBackend{name: model.BackendCodeBuild},
 			testBackend{name: model.BackendLambda},
 			testBackend{name: model.BackendCloudRun},
-			impl,
 			testBackend{name: model.BackendAzureVM},
-			testBackend{name: model.BackendEC2},
 			testBackend{name: model.BackendGCE},
+			impl,
 		)
 		latencies := make([]time.Duration, 0, samples)
 		for i := 0; i < samples; i++ {
@@ -2285,15 +2283,42 @@ func TestWarmPoolReducesAllocateReadyLatencySmoke(t *testing.T) {
 	}
 }
 
-func TestAzureVMIsNotWarmProvisionable(t *testing.T) {
-	if isWarmProvisionableBackend(model.BackendAzureVM) {
-		t.Fatal("azure-vm must not participate in warm pools")
+func TestAlwaysOnWarmProvisionableBackends(t *testing.T) {
+	allow := []struct {
+		name model.BackendName
+		cfg  model.BackendConfig
+	}{
+		{model.BackendARC, model.BackendConfig{}},
+		{model.BackendKubernetes, model.BackendConfig{}},
+		{model.BackendName("kubernetes-primary"), model.BackendConfig{Driver: "kubernetes"}},
+		{model.BackendEC2, model.BackendConfig{}},
+		{model.BackendGCE, model.BackendConfig{}},
+		{model.BackendAzureVM, model.BackendConfig{SecretRef: "uecb-azure-vm"}},
+		{model.BackendARC, model.BackendConfig{Driver: "kubernetes"}},
 	}
-	if isWarmProvisionableBackend(model.BackendARC) {
-		t.Fatal("arc must not participate in warm pools")
+	for _, tc := range allow {
+		if !isWarmProvisionableBackend(tc.name, tc.cfg) {
+			t.Fatalf("%s %+v should be warm provisionable", tc.name, tc.cfg)
+		}
 	}
-	if !isWarmProvisionableBackend(model.BackendLambda) {
-		t.Fatal("lambda should be warm provisionable")
+	refuse := []struct {
+		name model.BackendName
+		cfg  model.BackendConfig
+	}{
+		{model.BackendLambda, model.BackendConfig{}},
+		{model.BackendCodeBuild, model.BackendConfig{}},
+		{model.BackendCloudRun, model.BackendConfig{}},
+		{model.BackendAzureFunctions, model.BackendConfig{}},
+		{model.BackendDesktop, model.BackendConfig{}},
+		{model.BackendAzureVM, model.BackendConfig{}},
+		{model.BackendAzureVM, model.BackendConfig{AzureVM: &model.AzureVMBackendConfig{RunnerNames: []string{"worker-1"}}}},
+		{model.BackendAzureVM, model.BackendConfig{SecretRef: "uecb-azure-vm", AzureVM: &model.AzureVMBackendConfig{RunnerNames: []string{"worker-1"}}}},
+		{model.BackendName("kubernetes-primary"), model.BackendConfig{}},
+	}
+	for _, tc := range refuse {
+		if isWarmProvisionableBackend(tc.name, tc.cfg) {
+			t.Fatalf("%s %+v must not be warm provisionable", tc.name, tc.cfg)
+		}
 	}
 }
 
@@ -3934,7 +3959,7 @@ func TestLiveCapacityDoesNotOverrideARCFirstWithFairShare(t *testing.T) {
 }
 
 func TestLiveCapacityWarmPoolStillConsumed(t *testing.T) {
-	counting := &countingBackend{testBackend: testBackend{name: model.BackendCodeBuild}}
+	counting := &countingBackend{testBackend: testBackend{name: model.BackendEC2}}
 	cfg := config.Default()
 	enableLiveCapacity(&cfg)
 	for i := range cfg.Pools {
@@ -3942,7 +3967,7 @@ func TestLiveCapacityWarmPoolStillConsumed(t *testing.T) {
 			continue
 		}
 		for name, backendCfg := range cfg.Pools[i].Backends {
-			if name == model.BackendCodeBuild {
+			if name == model.BackendEC2 {
 				backendCfg.Enabled = true
 				backendCfg.MaxRunners = 4
 				backendCfg.WarmMin = 1
@@ -3957,7 +3982,7 @@ func TestLiveCapacityWarmPoolStillConsumed(t *testing.T) {
 	manager := capacity.NewManager()
 	// Provider free slots available.
 	manager.Set(capacity.Snapshot{
-		Backend:   model.BackendCodeBuild,
+		Backend:   model.BackendEC2,
 		Status:    backend.CapacityStatus{MaxRunners: 4, ActiveRunners: 0, WarmRunners: 0},
 		UpdatedAt: time.Now().UTC(),
 		Source:    "live",

@@ -44,6 +44,7 @@ const (
 	annotationRunnerID     = "uecb.josh-archer.dev/github-runner-id"
 	annotationWorkflowJob  = "uecb.josh-archer.dev/workflow-job-id"
 	annotationSizeClass    = "uecb.josh-archer.dev/size-class"
+	annotationLaunchMode   = "uecb.josh-archer.dev/launch-mode"
 
 	labelSizeClass = "uecb.josh-archer.dev/size-class"
 
@@ -161,6 +162,9 @@ func (b *Backend) Provision(ctx context.Context, request model.AllocationRequest
 			annotations[annotationRunnerID] = strconv.FormatInt(jit.RunnerID, 10)
 			if allocation.Request != nil && allocation.Request.WorkflowJobID > 0 {
 				annotations[annotationWorkflowJob] = strconv.FormatInt(allocation.Request.WorkflowJobID, 10)
+			}
+			if mode := strings.TrimSpace(allocation.Metadata[backend.MetadataLaunchModeKey]); mode != "" {
+				annotations[annotationLaunchMode] = mode
 			}
 		}
 	}
@@ -665,6 +669,9 @@ func (b *Backend) LiveRunners(ctx context.Context) ([]backend.LiveRunner, error)
 			}
 			if v := item.Metadata.Annotations[annotationRunnerID]; v != "" {
 				runner.Metadata[metadataRunnerID] = v
+			}
+			if mode := strings.TrimSpace(item.Metadata.Annotations[annotationLaunchMode]); mode != "" {
+				runner.Metadata[backend.MetadataLaunchModeKey] = mode
 			}
 			if v, err := strconv.ParseInt(item.Metadata.Annotations[annotationWorkflowJob], 10, 64); err == nil && v > 0 {
 				runner.WorkflowJobID = v

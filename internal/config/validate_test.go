@@ -504,3 +504,94 @@ func TestManagedAzureVMReplicaCountCannotBypassGuard(t *testing.T) {
 		t.Fatal("managed physical claims cannot use multiple replicas")
 	}
 }
+
+func TestAlwaysOnWarmPolicy(t *testing.T) {
+	one := 1
+	base := func(name model.BackendName, backend model.BackendConfig) model.BrokerConfig {
+		cfg := Default()
+		cfg.Pools = []model.PoolConfig{{
+			Name:     model.PoolFull,
+			Backends: map[model.BackendName]model.BackendConfig{name: backend},
+		}}
+		return cfg
+	}
+	k8s := model.BackendConfig{
+		Enabled: true, Healthy: true, MaxRunners: 3, WarmMin: 1, WarmMax: 1,
+		Kubernetes: &model.KubernetesBackendConfig{Namespace: "arc-runners"},
+	}
+	alias := k8s
+	alias.Driver = "kubernetes"
+	alias.CrossPoolMaxRunners = 3
+	arc := model.BackendConfig{Enabled: true, Healthy: true, MaxRunners: 2, WarmMin: 1, WarmMax: 1}
+	arcDriver := arc
+	arcDriver.Driver = "kubernetes"
+	arcDriver.CrossPoolMaxRunners = 2
+	arcDriver.Kubernetes = &model.KubernetesBackendConfig{Namespace: "arc-runners"}
+
+	for _, tc := range []struct {
+		label   string
+		name    model.BackendName
+		backend model.BackendConfig
+	}{
+		{"arc", model.BackendARC, arc},
+		{"arc-kubernetes-driver", model.BackendARC, arcDriver},
+		{"kubernetes", model.BackendKubernetes, k8s},
+		{"kubernetes-alias", model.BackendName("kubernetes-primary"), alias},
+		{"ec2", model.BackendEC2, model.BackendConfig{Enabled: true, Healthy: true, MaxRunners: 2, WarmMin: 1, WarmMax: 1, SecretRef: "uecb-ec2"}},
+		{"gce", model.BackendGCE, model.BackendConfig{Enabled: true, Healthy: true, MaxRunners: 2, WarmMin: 1, WarmMax: 1, SecretRef: "uecb-gce"}},
+		{"azure-vm-ephemeral", model.BackendAzureVM, model.BackendConfig{Enabled: true, Healthy: true, MaxRunners: 2, WarmMin: 1, WarmMax: 1, SecretRef: "uecb-azure-vm"}},
+		{"desktop-unused-field", model.BackendDesktop, model.BackendConfig{Enabled: true, Healthy: true, MaxRunners: 1, WarmMin: 1, WarmMax: 1}},
+	} {
+		t.Run("allow-"+tc.label, func(t *testing.T) {
+			if err := Validate(base(tc.name, tc.backend)); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+
+	for _, tc := range []struct {
+		pool    model.PoolName
+		name    model.BackendName
+		backend model.BackendConfig
+		want    string
+	}{
+		{model.PoolFull, model.BackendLambda, model.BackendConfig{Enabled: true, Healthy: true, MaxRunners: 1, WarmMin: 1, WarmMax: 1}, "serverless backend lambda"},
+		{model.PoolLite, model.BackendCodeBuild, model.BackendConfig{Enabled: true, Healthy: true, MaxRunners: 1, WarmMin: 1, WarmMax: 1}, "serverless backend codebuild"},
+		{"ci", model.BackendCloudRun, model.BackendConfig{Enabled: true, Healthy: true, MaxRunners: 1, WarmMin: 1, WarmMax: 1}, "serverless backend cloud-run"},
+		{"jobs", model.BackendAzureFunctions, model.BackendConfig{Enabled: true, Healthy: true, MaxRunners: 1, WarmMin: 1, WarmMax: 1}, "serverless backend azure-functions"},
+		{"vms", model.BackendAzureVM, model.BackendConfig{Enabled: true, Healthy: true, MaxRunners: 1, CrossPoolMaxRunners: 1, WarmMin: 1, WarmMax: 1, AzureVM: &model.AzureVMBackendConfig{Repository: "example/project", RunnerNames: []string{"worker-1"}}}, "managed azure-vm"},
+		{"labels", model.BackendAzureVM, model.BackendConfig{Enabled: true, Healthy: true, MaxRunners: 1, WarmMin: 1, WarmMax: 1, RunnerLabel: "persistent"}, "static-label azure-vm"},
+	} {
+		t.Run("refuse-"+string(tc.pool), func(t *testing.T) {
+			cfg := Default()
+			cfg.Pools = []model.PoolConfig{{
+				Name:     tc.pool,
+				Backends: map[model.BackendName]model.BackendConfig{tc.name: tc.backend},
+			}}
+			err := Validate(cfg)
+			if err == nil {
+				t.Fatal("expected warm policy rejection")
+			}
+			for _, needle := range []string{
+				"pools[" + string(tc.pool) + "].backends[" + string(tc.name) + "]",
+				"warm runners are not supported",
+				tc.want,
+			} {
+				if !strings.Contains(err.Error(), needle) {
+					t.Fatalf("error %q missing %q", err.Error(), needle)
+				}
+			}
+		})
+	}
+
+	scheduled := base(model.BackendLambda, model.BackendConfig{
+		Enabled: true, Healthy: true, MaxRunners: 1,
+		WarmSchedule: &model.WarmScheduleConfig{
+			Timezone: "UTC",
+			Windows:  []model.WarmWindowConfig{{Start: "08:00", End: "18:00", WarmMin: &one, WarmMax: &one}},
+		},
+	})
+	if err := Validate(scheduled); err != nil {
+		t.Fatalf("serverless schedule with warmMin 0 should load: %v", err)
+	}
+}

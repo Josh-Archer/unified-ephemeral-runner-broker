@@ -49,7 +49,7 @@ The fair-share admission layer does not have a dedicated metric, but allocation 
 
 ## 6. Confirm Warm Capacity
 
-All three external backends are configured with `warmMin: 1`. Check that warm slots are initialized:
+Serverless backends stay cold (`warmMin: 0`). Always-on warm is refused for `codebuild`, `lambda`, and `cloud-run`. Warm slots apply to ARC, Kubernetes, and VM backends.
 
 ```bash
 curl -s http://localhost:8080/metrics \
