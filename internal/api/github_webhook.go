@@ -651,7 +651,7 @@ func (s *Server) ReconcileQueuedGitHubJobs(ctx context.Context) (int, error) {
 		recentLimit = reconcileCallBudget - reconcileDeepReserve
 	}
 	// The recent scan always checks priority repositories first (the GitHub
-	// scope repository, typically Josh-Archer/home) so a lost webhook there
+	// scope repository, typically example-owner/home) so a lost webhook there
 	// is recovered within one reconcile interval. It then visits each other
 	// repository at most once per cycle.
 	state.recent.remaining = len(rest)

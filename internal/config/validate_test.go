@@ -420,7 +420,7 @@ func TestValidateWebhookJobTimeout(t *testing.T) {
 
 func TestValidateReconcileRepositories(t *testing.T) {
 	cfg := Default()
-	cfg.Broker.GitHubWebhook.ReconcileRepositories = []string{"Josh-Archer/home", "owner/repo"}
+	cfg.Broker.GitHubWebhook.ReconcileRepositories = []string{"example-owner/home", "owner/repo"}
 	if err := Validate(cfg); err != nil {
 		t.Fatalf("valid allowlist: %v", err)
 	}

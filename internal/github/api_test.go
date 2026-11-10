@@ -490,7 +490,7 @@ func TestListRepositoriesUsesConditionalRequests(t *testing.T) {
 		case "/installation/repositories":
 			w.WriteHeader(http.StatusForbidden)
 			_, _ = w.Write([]byte(`{"message":"Resource not accessible by personal access token"}`))
-		case "/orgs/josh-archer/repos":
+		case "/orgs/example-owner/repos":
 			mu.Lock()
 			requests++
 			match := r.Header.Get("If-None-Match")
@@ -503,7 +503,7 @@ func TestListRepositoriesUsesConditionalRequests(t *testing.T) {
 				return
 			}
 			w.Header().Set("ETag", `"repos-v1"`)
-			_, _ = w.Write([]byte(`[{"full_name":"Josh-Archer/home"},{"full_name":"Josh-Archer/DeskQuest"}]`))
+			_, _ = w.Write([]byte(`[{"full_name":"example-owner/home"},{"full_name":"example-owner/questkit"}]`))
 		default:
 			t.Errorf("unexpected path %s", r.URL.Path)
 			w.WriteHeader(http.StatusNotFound)
@@ -511,13 +511,13 @@ func TestListRepositoriesUsesConditionalRequests(t *testing.T) {
 	}))
 	defer server.Close()
 	client := NewClient(func(context.Context) (string, error) { return "tok", nil }, nil).WithBaseURL(server.URL)
-	scope := model.GitHubScope{Type: model.GitHubScopeOwner, Owner: "josh-archer"}
+	scope := model.GitHubScope{Type: model.GitHubScopeOwner, Owner: "example-owner"}
 	first, err := client.ListRepositories(context.Background(), scope)
-	if err != nil || len(first) != 2 || first[0] != "Josh-Archer/home" {
+	if err != nil || len(first) != 2 || first[0] != "example-owner/home" {
 		t.Fatalf("first list=%v err=%v", first, err)
 	}
 	second, err := client.ListRepositories(context.Background(), scope)
-	if err != nil || len(second) != 2 || second[0] != "Josh-Archer/home" || second[1] != "Josh-Archer/DeskQuest" {
+	if err != nil || len(second) != 2 || second[0] != "example-owner/home" || second[1] != "example-owner/questkit" {
 		t.Fatalf("cached list=%v err=%v", second, err)
 	}
 	mu.Lock()

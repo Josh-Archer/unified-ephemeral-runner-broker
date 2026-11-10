@@ -30,7 +30,7 @@ func queuedJob(runID, jobID int64) []github.WorkflowJob {
 // the per-cycle budget cannot cover every other repository.
 func TestReconcileQueuedGitHubJobsPrioritizesHomeUnderBudget(t *testing.T) {
 	service := newServiceWithConfig(webhookFullPool)
-	service.cfg.GitHub.Scope = model.GitHubScope{Type: model.GitHubScopeOwner, Owner: "Josh-Archer", Repository: "home"}
+	service.cfg.GitHub.Scope = model.GitHubScope{Type: model.GitHubScopeOwner, Owner: "example-owner", Repository: "home"}
 	server := newTestServer(t, service)
 	l := newCountingLister(service.now)
 	l.runsRecent = map[string][]int64{}
@@ -43,7 +43,7 @@ func TestReconcileQueuedGitHubJobsPrioritizesHomeUnderBudget(t *testing.T) {
 		l.repos = append(l.repos, repo)
 		l.runsRecent[repo] = manyRuns(10000+i*10, 5)
 	}
-	const homeRepo = "Josh-Archer/home"
+	const homeRepo = "example-owner/home"
 	l.repos = append(l.repos, homeRepo)
 	l.runsRecent[homeRepo] = []int64{77}
 	l.jobs["77"] = queuedJob(77, 501)
@@ -66,16 +66,16 @@ func TestReconcileQueuedGitHubJobsPrioritizesHomeUnderBudget(t *testing.T) {
 
 func TestReconcileQueuedGitHubJobsAllowlistSkipsRepositoryListing(t *testing.T) {
 	service := newServiceWithConfig(webhookFullPool)
-	service.cfg.GitHub.Scope = model.GitHubScope{Type: model.GitHubScopeOwner, Owner: "Josh-Archer", Repository: "home"}
-	service.cfg.Broker.GitHubWebhook.ReconcileRepositories = []string{"Josh-Archer/tools", "Josh-Archer/docs"}
+	service.cfg.GitHub.Scope = model.GitHubScope{Type: model.GitHubScopeOwner, Owner: "example-owner", Repository: "home"}
+	service.cfg.Broker.GitHubWebhook.ReconcileRepositories = []string{"example-owner/tools", "example-owner/docs"}
 	server := newTestServer(t, service)
 	l := newCountingLister(service.now)
-	l.repos = []string{"other/one", "other/two", "Josh-Archer/tools", "Josh-Archer/docs", "Josh-Archer/home"}
+	l.repos = []string{"other/one", "other/two", "example-owner/tools", "example-owner/docs", "example-owner/home"}
 	l.runsRecent = map[string][]int64{
-		"Josh-Archer/tools":       {11},
-		"Josh-Archer/docs":        {12},
-		"Josh-Archer/home": {13},
-		"other/one":        {14},
+		"example-owner/tools": {11},
+		"example-owner/docs":  {12},
+		"example-owner/home":  {13},
+		"other/one":           {14},
 	}
 	l.jobs = map[string][]github.WorkflowJob{
 		"11": queuedJob(11, 611),
@@ -104,7 +104,7 @@ func TestReconcileQueuedGitHubJobsAllowlistSkipsRepositoryListing(t *testing.T) 
 			seen[strings.ToLower(c.repo)]++
 		}
 	}
-	for _, repo := range []string{"josh-archer/home", "josh-archer/tools", "josh-archer/docs"} {
+	for _, repo := range []string{"example-owner/home", "example-owner/tools", "example-owner/docs"} {
 		if seen[repo] == 0 {
 			t.Fatalf("recent scan missed %s: %+v", repo, l.runLists)
 		}
@@ -112,7 +112,7 @@ func TestReconcileQueuedGitHubJobsAllowlistSkipsRepositoryListing(t *testing.T) 
 	if seen["other/one"] != 0 {
 		t.Fatalf("recent scan visited a repo outside the allowlist: %+v", l.runLists)
 	}
-	if len(l.runLists) == 0 || !strings.EqualFold(l.runLists[0].repo, "Josh-Archer/home") {
+	if len(l.runLists) == 0 || !strings.EqualFold(l.runLists[0].repo, "example-owner/home") {
 		t.Fatalf("home must still be scanned first under an allowlist, got %+v", l.runLists)
 	}
 }
