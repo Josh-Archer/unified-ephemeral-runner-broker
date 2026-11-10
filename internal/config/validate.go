@@ -102,6 +102,9 @@ func validateRegistrationTimeoutAndBackendLimits(cfg model.BrokerConfig) error {
 			if bCfg.CrossPoolMaxRunners < 0 {
 				return fmt.Errorf("pools[%s].backends[%s].crossPoolMaxRunners must not be negative", pool.Name, backendName)
 			}
+			if bCfg.CapacityGroupMax < 0 {
+				return fmt.Errorf("pools[%s].backends[%s].capacityGroupMax must not be negative", pool.Name, backendName)
+			}
 		}
 	}
 	return nil

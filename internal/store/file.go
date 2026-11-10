@@ -154,9 +154,13 @@ func (f *File) SaveIfState(status model.AllocationStatus, expectedFrom model.All
 }
 
 func (f *File) SaveIfCapacity(status model.AllocationStatus, maxRunners int, tenantQuota int, backendLimit int) error {
+	return f.SaveIfCapacityGroup(status, maxRunners, tenantQuota, backendLimit, nil, 0)
+}
+
+func (f *File) SaveIfCapacityGroup(status model.AllocationStatus, maxRunners int, tenantQuota int, backendLimit int, groupMembers []model.BackendName, groupCap int) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := capacityAllowed(f.allocations, status, maxRunners, tenantQuota, backendLimit); err != nil {
+	if err := capacityAllowedGroup(f.allocations, status, maxRunners, tenantQuota, backendLimit, groupMembers, groupCap); err != nil {
 		return err
 	}
 	prev, ok := f.allocations[status.ID]

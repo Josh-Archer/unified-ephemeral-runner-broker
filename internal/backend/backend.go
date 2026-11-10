@@ -108,6 +108,22 @@ type FinishedRunnerBackend interface {
 	FinishedRunners(ctx context.Context) ([]FinishedRunner, error)
 }
 
+// UnschedulablePod is a broker-owned runner pod the scheduler rejected.
+type UnschedulablePod struct {
+	AllocationID  string
+	Pool          model.PoolName
+	Repository    string
+	WorkflowJobID int64
+	Metadata      map[string]string
+}
+
+// UnschedulableReaper deletes broker-owned pods that have stayed
+// Pending/Unschedulable past a timeout so their allocations can be released
+// and the job retried on another backend.
+type UnschedulableReaper interface {
+	ReapUnschedulablePods(ctx context.Context, now time.Time, timeout time.Duration) ([]UnschedulablePod, error)
+}
+
 // FreeSlots returns non-negative free runner slots from a capacity snapshot.
 func FreeSlots(status CapacityStatus) int {
 	used := status.ActiveRunners + status.PendingRunners + status.WarmRunners

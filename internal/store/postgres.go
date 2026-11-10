@@ -249,6 +249,10 @@ func (p *Postgres) SaveIfState(status model.AllocationStatus, expectedFrom model
 }
 
 func (p *Postgres) SaveIfCapacity(status model.AllocationStatus, maxRunners int, tenantQuota int, backendLimit int) error {
+	return p.SaveIfCapacityGroup(status, maxRunners, tenantQuota, backendLimit, nil, 0)
+}
+
+func (p *Postgres) SaveIfCapacityGroup(status model.AllocationStatus, maxRunners int, tenantQuota int, backendLimit int, groupMembers []model.BackendName, groupCap int) error {
 	tx, err := p.db.Begin()
 	if err != nil {
 		return err
@@ -291,6 +295,30 @@ WHERE pool = $1 AND tenant = $2 AND state IN ('reserved', 'ready', 'warm') AND i
 			return fmt.Errorf("count tenant allocations: %w", err)
 		}
 		if tenantActive >= tenantQuota {
+			return ErrNoCapacity
+		}
+	}
+	if groupCap > 0 {
+		members := groupMembers
+		if len(members) == 0 {
+			members = []model.BackendName{status.SelectedBackend}
+		}
+		args := make([]any, 0, len(members)+1)
+		placeholders := make([]string, 0, len(members))
+		for i, member := range members {
+			placeholders = append(placeholders, fmt.Sprintf("$%d", i+1))
+			args = append(args, string(member))
+		}
+		args = append(args, status.ID)
+		var groupActive int
+		err = tx.QueryRow(fmt.Sprintf(`
+SELECT COUNT(*) FROM uecb_allocations
+WHERE backend IN (%s) AND state IN ('reserved', 'ready', 'warm') AND id <> $%d
+`, strings.Join(placeholders, ","), len(args)), args...).Scan(&groupActive)
+		if err != nil {
+			return fmt.Errorf("count capacity group allocations: %w", err)
+		}
+		if groupActive >= groupCap {
 			return ErrNoCapacity
 		}
 	}

@@ -54,6 +54,11 @@ type Store interface {
 	// when any limit would be exceeded.
 	SaveIfCapacity(status model.AllocationStatus, maxRunners int, tenantQuota int, backendLimit int) error
 
+	// SaveIfCapacityGroup is SaveIfCapacity plus a shared cap counted across
+	// groupMembers (reserved|ready|warm, excluding this id). groupCap <= 0
+	// disables the extra check so callers can always use this method.
+	SaveIfCapacityGroup(status model.AllocationStatus, maxRunners int, tenantQuota int, backendLimit int, groupMembers []model.BackendName, groupCap int) error
+
 	// CountActive returns the number of scheduler-accounted allocations for pool/backend.
 	CountActive(pool model.PoolName, backend model.BackendName) int
 
@@ -284,6 +289,10 @@ func countBackendActiveLocked(allocations map[string]model.AllocationStatus, bac
 }
 
 func capacityAllowed(allocations map[string]model.AllocationStatus, status model.AllocationStatus, maxRunners int, tenantQuota int, backendLimit int) error {
+	return capacityAllowedGroup(allocations, status, maxRunners, tenantQuota, backendLimit, nil, 0)
+}
+
+func capacityAllowedGroup(allocations map[string]model.AllocationStatus, status model.AllocationStatus, maxRunners int, tenantQuota int, backendLimit int, groupMembers []model.BackendName, groupCap int) error {
 	if maxRunners > 0 {
 		active := countActiveLocked(allocations, status.Pool, status.SelectedBackend, status.ID)
 		if active >= maxRunners {
@@ -302,9 +311,21 @@ func capacityAllowed(allocations map[string]model.AllocationStatus, status model
 			return ErrNoCapacity
 		}
 	}
+	if groupCap > 0 {
+		members := groupMembers
+		if len(members) == 0 {
+			members = []model.BackendName{status.SelectedBackend}
+		}
+		total := 0
+		for _, member := range members {
+			total += countBackendActiveLocked(allocations, member, status.ID)
+		}
+		if total >= groupCap {
+			return ErrNoCapacity
+		}
+	}
 	return nil
 }
-
 
 // isTerminalState reports whether an allocation no longer consumes scheduler
 // capacity and is safe to prune after retention.
@@ -346,7 +367,6 @@ func collectPrunableIDs(allocations map[string]model.AllocationStatus, now time.
 	}
 	return ids
 }
-
 
 // DefaultFileRetention bounds allocations.json growth when operators omit
 // stateStore.retention (uecb#201).
