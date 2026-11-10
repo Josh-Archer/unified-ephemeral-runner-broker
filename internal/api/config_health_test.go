@@ -31,7 +31,7 @@ pools:
         healthy: true
         maxRunners: 2
         weight: 1
-      kubernetes-homelabai:
+      kubernetes-primary:
         driver: kubernetes
         enabled: true
         healthy: true
@@ -60,7 +60,7 @@ func TestDisabledPoolStartsAndSurfacesHealthAndMetrics(t *testing.T) {
 	if len(cfg.Pools) != 1 || cfg.Pools[0].Name != model.PoolLite {
 		t.Fatalf("serving pools = %+v", cfg.Pools)
 	}
-	if len(disabled) != 1 || disabled[0].Pool != model.PoolFull || disabled[0].Backend != "kubernetes-homelabai" {
+	if len(disabled) != 1 || disabled[0].Pool != model.PoolFull || disabled[0].Backend != "kubernetes-primary" {
 		t.Fatalf("disabled = %+v", disabled)
 	}
 
@@ -89,7 +89,7 @@ func TestDisabledPoolStartsAndSurfacesHealthAndMetrics(t *testing.T) {
 		t.Fatalf("health body = %+v", body)
 	}
 	got := body.DisabledPools[0]
-	if got.Pool != "full" || got.Backend != "kubernetes-homelabai" || !strings.Contains(got.Error, "warm runners are not supported") || !strings.Contains(got.Error, "pools[full].backends[kubernetes-homelabai]") {
+	if got.Pool != "full" || got.Backend != "kubernetes-primary" || !strings.Contains(got.Error, "warm runners are not supported") || !strings.Contains(got.Error, "pools[full].backends[kubernetes-primary]") {
 		t.Fatalf("disabled pool = %+v", got)
 	}
 
@@ -102,9 +102,9 @@ func TestDisabledPoolStartsAndSurfacesHealthAndMetrics(t *testing.T) {
 	for _, needle := range []string{
 		disabledPoolMetricName,
 		`pool="full"`,
-		`backend="kubernetes-homelabai"`,
+		`backend="kubernetes-primary"`,
 		"warm runners are not supported",
-		"pools[full].backends[kubernetes-homelabai]",
+		"pools[full].backends[kubernetes-primary]",
 	} {
 		if !strings.Contains(text, needle) {
 			t.Fatalf("metrics missing %q\n%s", needle, text)

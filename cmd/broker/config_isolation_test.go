@@ -35,7 +35,7 @@ pools:
         healthy: true
         maxRunners: 2
         weight: 1
-      kubernetes-homelabai:
+      kubernetes-primary:
         driver: kubernetes
         enabled: true
         healthy: true
@@ -105,7 +105,7 @@ pools:
 pools:
   - name: full
     backends:
-      kubernetes-homelabai:
+      kubernetes-primary:
         driver: kubernetes
         enabled: true
         healthy: true
@@ -138,7 +138,7 @@ pools:
 		if len(disabled) != 2 || !strings.Contains(err.Error(), "all pools failed validation") {
 			t.Fatalf("err=%v disabled=%v", err, disabled)
 		}
-		if !strings.Contains(err.Error(), "kubernetes-homelabai") || !strings.Contains(err.Error(), "kubernetes-other") {
+		if !strings.Contains(err.Error(), "kubernetes-primary") || !strings.Contains(err.Error(), "kubernetes-other") {
 			t.Fatalf("error = %v", err)
 		}
 	})
@@ -181,16 +181,16 @@ func TestContractBrokerBinaryInvalidPoolStaysUp(t *testing.T) {
 	for _, needle := range []string{
 		`"status":"degraded"`,
 		`"pool":"full"`,
-		`"backend":"kubernetes-homelabai"`,
+		`"backend":"kubernetes-primary"`,
 		"warm runners are not supported",
-		"pools[full].backends[kubernetes-homelabai]",
+		"pools[full].backends[kubernetes-primary]",
 	} {
 		if !strings.Contains(health, needle) {
 			t.Fatalf("health missing %q\n%s\nlogs:\n%s", needle, health, proc.logs.String())
 		}
 	}
 	logs := proc.logs.String()
-	if !strings.Contains(logs, "CONFIG ERROR: disabled pool full backend kubernetes-homelabai") {
+	if !strings.Contains(logs, "CONFIG ERROR: disabled pool full backend kubernetes-primary") {
 		t.Fatalf("logs missing disabled pool line:\n%s", logs)
 	}
 
@@ -198,7 +198,7 @@ func TestContractBrokerBinaryInvalidPoolStaysUp(t *testing.T) {
 	for _, needle := range []string{
 		"uecb_pool_config_disabled",
 		`pool="full"`,
-		`backend="kubernetes-homelabai"`,
+		`backend="kubernetes-primary"`,
 		"warm runners are not supported",
 	} {
 		if !strings.Contains(metrics, needle) {
@@ -266,7 +266,7 @@ pools:
 pools:
   - name: full
     backends:
-      kubernetes-homelabai:
+      kubernetes-primary:
         driver: kubernetes
         enabled: true
         healthy: true
@@ -320,7 +320,7 @@ pools:
 				t.Fatalf("logs missing %q\n%s", tc.want, logs)
 			}
 			if tc.name == "all pools invalid" {
-				for _, needle := range []string{"kubernetes-homelabai", "kubernetes-other", "pools[full]", "pools[lite]"} {
+				for _, needle := range []string{"kubernetes-primary", "kubernetes-other", "pools[full]", "pools[lite]"} {
 					if !strings.Contains(logs, needle) {
 						t.Fatalf("logs missing %q\n%s", needle, logs)
 					}

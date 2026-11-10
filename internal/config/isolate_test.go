@@ -25,7 +25,7 @@ pools:
         healthy: true
         maxRunners: 2
         weight: 1
-      kubernetes-homelabai:
+      kubernetes-primary:
         driver: kubernetes
         enabled: true
         healthy: true
@@ -62,10 +62,10 @@ func TestLoadServingKeepsValidPoolsWhenOnePoolIsInvalid(t *testing.T) {
 		t.Fatalf("disabled = %+v, want one pool", disabled)
 	}
 	fault := disabled[0]
-	if fault.Pool != model.PoolFull || fault.Backend != "kubernetes-homelabai" {
-		t.Fatalf("fault pool=%s backend=%s, want full/kubernetes-homelabai", fault.Pool, fault.Backend)
+	if fault.Pool != model.PoolFull || fault.Backend != "kubernetes-primary" {
+		t.Fatalf("fault pool=%s backend=%s, want full/kubernetes-primary", fault.Pool, fault.Backend)
 	}
-	if !strings.Contains(fault.Error(), "pools[full].backends[kubernetes-homelabai]") || !strings.Contains(fault.Error(), "warm runners are not supported") {
+	if !strings.Contains(fault.Error(), "pools[full].backends[kubernetes-primary]") || !strings.Contains(fault.Error(), "warm runners are not supported") {
 		t.Fatalf("fault error = %q", fault.Error())
 	}
 
@@ -73,14 +73,14 @@ func TestLoadServingKeepsValidPoolsWhenOnePoolIsInvalid(t *testing.T) {
 	if err == nil {
 		t.Fatal("strict Load accepted a config with an invalid pool")
 	}
-	if !strings.Contains(err.Error(), "pools[full].backends[kubernetes-homelabai]") || !strings.Contains(err.Error(), "warm runners are not supported") {
+	if !strings.Contains(err.Error(), "pools[full].backends[kubernetes-primary]") || !strings.Contains(err.Error(), "warm runners are not supported") {
 		t.Fatalf("strict error = %q", err.Error())
 	}
 	if len(strict.Pools) != 0 {
 		t.Fatal("strict Load returned pools with the error")
 	}
 	var parsed PoolBackendErrors
-	if !errors.As(err, &parsed) || len(parsed) != 1 || parsed[0].Pool != model.PoolFull || parsed[0].Backend != "kubernetes-homelabai" {
+	if !errors.As(err, &parsed) || len(parsed) != 1 || parsed[0].Pool != model.PoolFull || parsed[0].Backend != "kubernetes-primary" {
 		t.Fatalf("strict error type = %T %v", err, err)
 	}
 }
@@ -98,13 +98,13 @@ broker:
         requests:
           cpu: "1"
           memory: 1Gi
-      backends: [kubernetes-homelabai, arc]
+      backends: [kubernetes-primary, arc]
     onlybad:
       runner:
         requests:
           cpu: "1"
           memory: 1Gi
-      backends: [kubernetes-homelabai]
+      backends: [kubernetes-primary]
 pools:
   - name: full
     scheduler: round-robin
@@ -114,7 +114,7 @@ pools:
         healthy: true
         maxRunners: 2
         weight: 1
-      kubernetes-homelabai:
+      kubernetes-primary:
         driver: kubernetes
         enabled: true
         healthy: true
@@ -183,7 +183,7 @@ github:
 pools:
   - name: full
     backends:
-      kubernetes-homelabai:
+      kubernetes-primary:
         driver: kubernetes
         enabled: true
         healthy: true
@@ -217,7 +217,7 @@ pools:
 		t.Fatalf("error = %q", err.Error())
 	}
 	for _, needle := range []string{
-		"pools[full].backends[kubernetes-homelabai]",
+		"pools[full].backends[kubernetes-primary]",
 		"pools[lite].backends[kubernetes-other]",
 		"warm runners are not supported",
 	} {
