@@ -72,8 +72,15 @@ func main() {
 	}
 
 	// The broker's own GitHub client: registers kubernetes-backend runners and
-	// checks webhook jobs. Its token never leaves the broker.
-	githubClient := githubapi.NewClient(githubapi.TokenFromSecret(secretReader, cfg.GitHub.Auth.SecretRef, ""), nil)
+	// checks webhook jobs. Its token never leaves the broker. AuthFromSecret
+	// mints a GitHub App installation token when a private key is present
+	// with app/installation IDs from config or the secret; otherwise it uses
+	// github_token.
+	auth := cfg.GitHub.Auth
+	githubClient := githubapi.NewClientWithSource(
+		githubapi.AuthFromSecret(secretReader, auth.SecretRef, auth.Mode, auth.AppID.String(), auth.InstallationID.String()),
+		nil,
+	)
 
 	registry, desktopBackend := buildRegistry(cfg, secretReader, runnerPods, githubClient)
 	healthChecker, err := runtime.NewSecretRefCheckerFromEnv(cfg)

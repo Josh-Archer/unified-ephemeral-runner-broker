@@ -62,7 +62,7 @@ func TokenFromSecret(reader SecretReader, name, key string) TokenFunc {
 // lookups. The token never leaves the broker.
 type Client struct {
 	baseURL string
-	token   TokenFunc
+	token   TokenSource
 	http    *http.Client
 
 	rateMu        sync.Mutex
@@ -110,6 +110,16 @@ func (c *Client) recordRateLimit(header http.Header) {
 }
 
 func NewClient(token TokenFunc, httpClient *http.Client) *Client {
+	var src TokenSource
+	if token != nil {
+		src = tokenFuncSource{fn: token}
+	}
+	return NewClientWithSource(src, httpClient)
+}
+
+// NewClientWithSource is NewClient for a TokenSource, including
+// SecretTokenSource so a 401 can invalidate a cached installation token.
+func NewClientWithSource(token TokenSource, httpClient *http.Client) *Client {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 15 * time.Second}
 	}
@@ -581,10 +591,29 @@ func decodeGitHubJSON(data []byte, out any) error {
 }
 
 func (c *Client) doBytes(ctx context.Context, method, path string, extra http.Header, body any, want ...int) (int, http.Header, []byte, error) {
+	var status int
+	var hdr http.Header
+	var data []byte
+	var err error
+	for attempt := 0; attempt < 2; attempt++ {
+		status, hdr, data, err = c.doBytesOnce(ctx, method, path, extra, body, want...)
+		var apiErr *StatusError
+		if attempt == 0 && errors.As(err, &apiErr) && apiErr.Code == http.StatusUnauthorized {
+			if inv, ok := c.token.(interface{ Invalidate() }); ok {
+				inv.Invalidate()
+			}
+			continue
+		}
+		return status, hdr, data, err
+	}
+	return status, hdr, data, err
+}
+
+func (c *Client) doBytesOnce(ctx context.Context, method, path string, extra http.Header, body any, want ...int) (int, http.Header, []byte, error) {
 	if c == nil || c.token == nil {
 		return 0, nil, nil, errors.New("github client is not configured")
 	}
-	token, err := c.token(ctx)
+	token, err := c.token.Token(ctx)
 	if err != nil {
 		return 0, nil, nil, err
 	}
