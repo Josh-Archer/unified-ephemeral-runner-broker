@@ -6,7 +6,7 @@ import (
 )
 
 func TestResolveCapacityGroupDerivesSharedNodeAntiAffinity(t *testing.T) {
-	spec := homelab2AntiAffinitySpec("amd64")
+	spec := pinnedNodeAntiAffinitySpec("amd64")
 	cfg := BrokerConfig{Pools: []PoolConfig{{
 		Name: PoolFull,
 		Backends: map[BackendName]BackendConfig{
@@ -21,7 +21,7 @@ func TestResolveCapacityGroupDerivesSharedNodeAntiAffinity(t *testing.T) {
 			"kubernetes-desktop": {
 				Enabled: true, MaxRunners: 10,
 				Kubernetes: &KubernetesBackendConfig{PodSpec: map[string]any{
-					"nodeSelector": map[string]any{"kubernetes.io/hostname": "homelabdesktop"},
+					"nodeSelector": map[string]any{"kubernetes.io/hostname": "workstation"},
 				}},
 			},
 		},
@@ -47,13 +47,13 @@ func TestResolveCapacityGroupExplicitName(t *testing.T) {
 	cfg := BrokerConfig{Pools: []PoolConfig{{
 		Name: PoolFull,
 		Backends: map[BackendName]BackendConfig{
-			"arc":                {Enabled: true, MaxRunners: 4, CapacityGroup: "homelab2", CapacityGroupMax: 1},
-			"kubernetes-shared":  {Enabled: true, MaxRunners: 4, CapacityGroup: "homelab2"},
+			"arc":                {Enabled: true, MaxRunners: 4, CapacityGroup: "shared-node", CapacityGroupMax: 1},
+			"kubernetes-shared":  {Enabled: true, MaxRunners: 4, CapacityGroup: "shared-node"},
 			"kubernetes-desktop": {Enabled: true, MaxRunners: 10, CapacityGroup: "desktop", CapacityGroupMax: 10},
 		},
 	}}}
 	group := ResolveCapacityGroup(cfg, "kubernetes-shared")
-	if group.Key != "named:homelab2" || group.Cap != 1 {
+	if group.Key != "named:shared-node" || group.Cap != 1 {
 		t.Fatalf("group = %+v", group)
 	}
 	if !reflect.DeepEqual(group.Members, []BackendName{"arc", "kubernetes-shared"}) {
@@ -67,11 +67,11 @@ func TestResolveCapacityGroupSeparatesDifferentNodePins(t *testing.T) {
 		Backends: map[BackendName]BackendConfig{
 			"amd64": {
 				Enabled: true, MaxRunners: 1,
-				Kubernetes: &KubernetesBackendConfig{PodSpec: homelab2AntiAffinitySpec("amd64")},
+				Kubernetes: &KubernetesBackendConfig{PodSpec: pinnedNodeAntiAffinitySpec("amd64")},
 			},
 			"arm64": {
 				Enabled: true, MaxRunners: 1,
-				Kubernetes: &KubernetesBackendConfig{PodSpec: homelab2AntiAffinitySpec("arm64")},
+				Kubernetes: &KubernetesBackendConfig{PodSpec: pinnedNodeAntiAffinitySpec("arm64")},
 			},
 		},
 	}}}
@@ -82,7 +82,7 @@ func TestResolveCapacityGroupSeparatesDifferentNodePins(t *testing.T) {
 	}
 }
 
-func homelab2AntiAffinitySpec(arch string) map[string]any {
+func pinnedNodeAntiAffinitySpec(arch string) map[string]any {
 	return map[string]any{
 		"affinity": map[string]any{
 			"nodeAffinity": map[string]any{
@@ -93,7 +93,7 @@ func homelab2AntiAffinitySpec(arch string) map[string]any {
 								map[string]any{
 									"key":      "kubernetes.io/hostname",
 									"operator": "In",
-									"values":   []any{"homelab2"},
+									"values":   []any{"node-a"},
 								},
 								map[string]any{
 									"key":      "kubernetes.io/arch",

@@ -12,7 +12,7 @@ import (
 )
 
 func TestCapacityCountsSiblingPodsInSharedAntiAffinityGroup(t *testing.T) {
-	cfg := groupedHomelab2Config(t)
+	cfg := groupedPinnedNodeConfig(t)
 	api := &fakeAPI{responses: map[string]response{
 		"GET /api/v1/namespaces/arc-runners/pods": {http.StatusOK, `{"items":[
 			{"metadata":{"labels":{"uecb.josh-archer.dev/backend":"arc"}},"status":{"phase":"Pending","conditions":[{"type":"PodScheduled","status":"False","reason":"Unschedulable"}]}},
@@ -31,7 +31,7 @@ func TestCapacityCountsSiblingPodsInSharedAntiAffinityGroup(t *testing.T) {
 }
 
 func TestCapacityGroupDoesNotCountUnschedulableSibling(t *testing.T) {
-	cfg := groupedHomelab2Config(t)
+	cfg := groupedPinnedNodeConfig(t)
 	api := &fakeAPI{responses: map[string]response{
 		"GET /api/v1/namespaces/arc-runners/pods": {http.StatusOK, `{"items":[
 			{"metadata":{"labels":{"uecb.josh-archer.dev/backend":"arc-small-nodes"}},"status":{"phase":"Pending","conditions":[{"type":"PodScheduled","status":"False","reason":"Unschedulable"}]}},
@@ -47,7 +47,7 @@ func TestCapacityGroupDoesNotCountUnschedulableSibling(t *testing.T) {
 	}
 }
 
-func groupedHomelab2Config(t *testing.T) model.BrokerConfig {
+func groupedPinnedNodeConfig(t *testing.T) model.BrokerConfig {
 	t.Helper()
 	cfg := config.Default()
 	cfg.GitHub.Scope = model.GitHubScope{Type: model.GitHubScopeOwner, Owner: "example-owner"}
@@ -61,7 +61,7 @@ affinity:
         - matchExpressions:
           - key: kubernetes.io/hostname
             operator: In
-            values: [homelab2]
+            values: [node-a]
           - key: kubernetes.io/arch
             operator: In
             values: [amd64]

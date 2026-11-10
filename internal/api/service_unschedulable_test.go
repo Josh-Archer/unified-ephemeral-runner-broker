@@ -96,8 +96,8 @@ func TestCapacityGroupOverflowsToUngroupedBackend(t *testing.T) {
 	cfg.Broker.StateStore = model.StateStoreConfig{Type: "memory"}
 	cfg.Broker.ARCFirst.SaturationWait = 0
 	cfg.Pools[0].Backends = map[model.BackendName]model.BackendConfig{
-		model.BackendARC: {Enabled: true, Healthy: true, MaxRunners: 1, CrossPoolMaxRunners: 1, CapacityGroup: "homelab2", CapacityGroupMax: 1, Template: "arc-full"},
-		small:            {Enabled: true, Healthy: true, MaxRunners: 1, CrossPoolMaxRunners: 1, CapacityGroup: "homelab2", CapacityGroupMax: 1},
+		model.BackendARC: {Enabled: true, Healthy: true, MaxRunners: 1, CrossPoolMaxRunners: 1, CapacityGroup: "shared-node", CapacityGroupMax: 1, Template: "arc-full"},
+		small:            {Enabled: true, Healthy: true, MaxRunners: 1, CrossPoolMaxRunners: 1, CapacityGroup: "shared-node", CapacityGroupMax: 1},
 		desktop:          {Enabled: true, Healthy: true, MaxRunners: 10, CrossPoolMaxRunners: 10},
 	}
 	svc := NewService(cfg, backend.NewRegistry(
