@@ -41,6 +41,9 @@ func NewServerWithPolicy(service *Service, allowedIssuers []string, expectedAud 
 	}
 	service.SetObserver(observer)
 	registerScaleSetMetrics(prometheus.DefaultRegisterer)
+	if err := registerDisabledPools(prometheus.DefaultRegisterer, service.DisabledPools()); err != nil {
+		panic(err)
+	}
 
 	return &Server{
 		service:        service,
@@ -79,7 +82,22 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusServiceUnavailable, err)
 		return
 	}
-	s.writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	disabled := s.service.DisabledPools()
+	if len(disabled) == 0 {
+		s.writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		return
+	}
+	// Stay on 200. The chart uses /healthz for both liveness and readiness, so
+	// a failing status would restart the pod or pull it out of service and
+	// take the valid pools down with the bad one. The body and
+	// uecb_pool_config_disabled are the signal that a pool is disabled.
+	s.writeJSON(w, http.StatusOK, struct {
+		Status        string         `json:"status"`
+		DisabledPools []DisabledPool `json:"disabledPools"`
+	}{
+		Status:        "degraded",
+		DisabledPools: disabled,
+	})
 }
 
 func (s *Server) handleAllocations(w http.ResponseWriter, r *http.Request) {

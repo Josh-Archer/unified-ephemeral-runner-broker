@@ -195,7 +195,33 @@ func Default() model.BrokerConfig {
 	}
 }
 
+// Load reads path and accepts the config only when every pool and every
+// process-wide setting is valid. An empty path returns Default.
+// Use LoadServing to start with the valid pools and disable the rest.
 func Load(path string) (model.BrokerConfig, error) {
+	cfg, err := readConfig(path)
+	if err != nil {
+		return model.BrokerConfig{}, err
+	}
+	if err := Validate(cfg); err != nil {
+		return model.BrokerConfig{}, err
+	}
+	return cfg, nil
+}
+
+// LoadServing reads path the same way Load does. Process-wide failures
+// (unreadable file, invalid YAML, and Validate's fatal settings) are
+// returned as the error and the config must not be served. Invalid pools
+// are removed from the returned config and listed in disabled.
+func LoadServing(path string) (model.BrokerConfig, []PoolBackendError, error) {
+	cfg, err := readConfig(path)
+	if err != nil {
+		return model.BrokerConfig{}, nil, err
+	}
+	return Partition(cfg)
+}
+
+func readConfig(path string) (model.BrokerConfig, error) {
 	if path == "" {
 		return Default(), nil
 	}
@@ -207,9 +233,6 @@ func Load(path string) (model.BrokerConfig, error) {
 
 	cfg := Default()
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return model.BrokerConfig{}, err
-	}
-	if err := Validate(cfg); err != nil {
 		return model.BrokerConfig{}, err
 	}
 	return cfg, nil
