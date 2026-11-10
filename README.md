@@ -666,7 +666,7 @@ Repository scope requires `github.scope.owner` and `github.scope.repository`. Or
 
 Owner scope requires `github.scope.owner`. `github.scope.repository` is optional there: it is the default repository for allocations that name none, such as warm runners or unauthenticated callers. Each runner registers on the repository that asked for it: the `repository.full_name` of a `workflow_job` webhook, or the `repository` claim of the caller's OIDC token. Repositories of other owners are refused, and webhook deliveries from them are ignored with reason `foreign_repository`. Use it when the owner is a personal account. Personal accounts have no organization-level runners, so a repository or organization scope cannot serve all of their repositories from one pool. Under owner scope:
 
-- The GitHub token (`github.auth.secretRef`) must be able to register runners on every repository that will use the pool.
+- The GitHub App installation (or fallback token) from `github.auth.secretRef` must be able to register runners on every repository that will use the pool.
 - Warm runners register on the default repository and are handed only to allocations from that repository. Without a default repository, warm runners are rejected at config load.
 - `broker.githubWebhook.allowedActors` limits runners to runs created (`actor`) and started or re-run (`triggering_actor`) by the listed GitHub logins, for example `[Josh-Archer, dependabot[bot], renovate[bot]]`. Pushes and pull requests by anyone else, and re-runs of their runs, are ignored with reason `actor_not_allowed`. `broker.api.oidcPolicy.allowedActors` applies the same check to the allocation API, using the token's `actor` claim.
 - A pool's `webhookRepositories` (`owner/repo` or `owner/*`) limits which repositories it serves. A job whose labels match a pool that does not allow its repository falls through to the next matching pool, or is ignored with reason `repository_not_allowed`. Set it on pools whose runners carry privileges meant for one repository, so other repositories under the owner cannot request them by label.
@@ -679,7 +679,11 @@ The `arc` backend only hands out the label of an existing ARC runner scale set, 
 
 ```yaml
 github:
-  auth: {mode: github-app, secretRef: uecb-github-app}
+  auth:
+    mode: github-app
+    secretRef: uecb-github-app
+    appId: "12345"
+    installationId: "67890"
   scope: {type: owner, owner: Josh-Archer}
 broker:
   githubWebhook: {secretRef: uecb-github-webhook}
@@ -718,7 +722,8 @@ pools:
 - `podSpec` is a plain Kubernetes PodSpec used as the template. The broker sets `restartPolicy: Never` and `activeDeadlineSeconds` (job timeout plus `deadlineGrace`, default 10m).
 - The broker sets `ACTIONS_RUNNER_INPUT_JITCONFIG` on the container named `runnerContainer` (default `runner`). That container runs `image` (default `ghcr.io/actions/actions-runner:latest`) with command `/home/runner/run.sh` unless the template sets them.
 - The JIT config is a pod environment value, so anyone who can read pods in the namespace can see it until the runner has used it. Keep `pods/get` there limited to the broker and admins.
-- The broker reads its token from `github.auth.secretRef` (key `github_token`). It deletes the runner registration if the pod cannot be created, and again on finalize or reap if the runner never ran a job.
+- When `github.auth.mode` is `github-app` (the default), the broker mints a short-lived App JWT (`iat` 60s in the past, `exp` at most 10 minutes after `iat`, RS256) and exchanges it at `POST /app/installations/{id}/access_tokens`. The installation token is cached and refreshed about 5 minutes before it expires (GitHub issues these for one hour). A `401` response invalidates the cache, refreshes once, and retries the request. App ID and installation ID come from `github.auth.appId` and `github.auth.installationId` in config; secret keys `app_id` and `installation_id` are used instead when present. The PEM private key is always read from secret key `private_key` in `github.auth.secretRef`. If those App credentials are incomplete, the broker falls back to secret key `github_token` (a PAT) and logs `github auth: token (fallback)` instead of `github auth: app installation <id>`. Token and key material are never logged.
+- The broker deletes the runner registration if the pod cannot be created, and again on finalize or reap if the runner never ran a job.
 - Jobs from different repositories share the namespace and nodes. Give the pods a service account with no RBAC bindings and `automountServiceAccountToken: false`, and limit privileges to the dind sidecar.
 - The broker needs pod `create`, `delete`, `get` and `list` there (`runnerPods.enabled` in the Helm chart).
 - Pods are named `uecb-runner-<allocation-id>` and deleted when the allocation finishes or is reaped.

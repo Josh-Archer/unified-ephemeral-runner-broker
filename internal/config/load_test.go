@@ -500,3 +500,27 @@ broker:
 		t.Fatalf("unexpected weights %#v", cfg.Broker.QualityAware.Weights)
 	}
 }
+
+func TestLoadParsesGitHubAppIDs(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "broker.yaml")
+	if err := os.WriteFile(path, []byte(`
+github:
+  auth:
+    mode: github-app
+    secretRef: uecb-github-app
+    appId: 5691181
+    installationId: "180390269"
+`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.GitHub.Auth.AppID.String() != "5691181" || cfg.GitHub.Auth.InstallationID.String() != "180390269" {
+		t.Fatalf("auth IDs = appId %q installationId %q", cfg.GitHub.Auth.AppID, cfg.GitHub.Auth.InstallationID)
+	}
+	if cfg.GitHub.Auth.Mode != "github-app" || cfg.GitHub.Auth.SecretRef != "uecb-github-app" {
+		t.Fatalf("auth = %+v", cfg.GitHub.Auth)
+	}
+}

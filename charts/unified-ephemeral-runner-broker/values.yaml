@@ -81,6 +81,9 @@ config:
     auth:
       mode: github-app
       secretRef: uecb-github-app
+      # Optional when the secret has no app_id / installation_id keys.
+      # appId: "12345"
+      # installationId: "67890"
     scope:
       type: organization
       organization: my-org

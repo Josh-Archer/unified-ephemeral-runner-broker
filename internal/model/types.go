@@ -75,6 +75,11 @@ type GitHubScope struct {
 type GitHubAuth struct {
 	Mode      string `yaml:"mode" json:"mode"`
 	SecretRef string `yaml:"secretRef" json:"secretRef"`
+	// AppID is the GitHub App ID. It may also be supplied as secret key app_id.
+	AppID Stringish `yaml:"appId,omitempty" json:"appId,omitempty"`
+	// InstallationID is the App installation ID. It may also be supplied as
+	// secret key installation_id.
+	InstallationID Stringish `yaml:"installationId,omitempty" json:"installationId,omitempty"`
 }
 
 type GitHubConfig struct {
