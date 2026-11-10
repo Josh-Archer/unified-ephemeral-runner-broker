@@ -8,22 +8,13 @@ import (
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 )
 
-// isWarmProvisionableBackend reports whether the broker may maintain warm
-// allocations for the backend. Warm capacity targets cold-start external
-// dispatch backends; fast or static adapters are excluded.
-func isWarmProvisionableBackend(backendName model.BackendName) bool {
-	switch backendName {
-	case model.BackendCodeBuild,
-		model.BackendLambda,
-		model.BackendCloudRun,
-		model.BackendAzureFunctions,
-		model.BackendEC2,
-		model.BackendGCE:
-		return true
-	default:
-		// arc, azure-vm, desktop: expected to launch quickly or hold persistent runners.
-		return false
-	}
+// isWarmProvisionableBackend reports whether the broker may keep idle
+// registered runners for this backend. ARC, Kubernetes (including a
+// driver: kubernetes alias), EC2, GCE, and ephemeral azure-vm qualify.
+// Serverless backends, desktop, managed azure-vm, and static-label azure-vm
+// do not: always-on warm capacity is refused there.
+func isWarmProvisionableBackend(backendName model.BackendName, cfg model.BackendConfig) bool {
+	return model.AllowsAlwaysOnWarm(backendName, cfg)
 }
 
 func resolveWarmTTL(cfg model.BackendConfig) time.Duration {

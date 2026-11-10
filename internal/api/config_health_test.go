@@ -31,16 +31,12 @@ pools:
         healthy: true
         maxRunners: 2
         weight: 1
-      kubernetes-primary:
-        driver: kubernetes
+      lambda:
         enabled: true
         healthy: true
-        maxRunners: 3
-        crossPoolMaxRunners: 3
+        maxRunners: 2
         warmMin: 1
         warmMax: 1
-        kubernetes:
-          namespace: arc-runners
   - name: lite
     scheduler: round-robin
     backends:
@@ -60,7 +56,7 @@ func TestDisabledPoolStartsAndSurfacesHealthAndMetrics(t *testing.T) {
 	if len(cfg.Pools) != 1 || cfg.Pools[0].Name != model.PoolLite {
 		t.Fatalf("serving pools = %+v", cfg.Pools)
 	}
-	if len(disabled) != 1 || disabled[0].Pool != model.PoolFull || disabled[0].Backend != "kubernetes-primary" {
+	if len(disabled) != 1 || disabled[0].Pool != model.PoolFull || disabled[0].Backend != model.BackendLambda {
 		t.Fatalf("disabled = %+v", disabled)
 	}
 
@@ -89,7 +85,7 @@ func TestDisabledPoolStartsAndSurfacesHealthAndMetrics(t *testing.T) {
 		t.Fatalf("health body = %+v", body)
 	}
 	got := body.DisabledPools[0]
-	if got.Pool != "full" || got.Backend != "kubernetes-primary" || !strings.Contains(got.Error, "warm runners are not supported") || !strings.Contains(got.Error, "pools[full].backends[kubernetes-primary]") {
+	if got.Pool != "full" || got.Backend != "lambda" || !strings.Contains(got.Error, "warm runners are not supported") || !strings.Contains(got.Error, "pools[full].backends[lambda]") {
 		t.Fatalf("disabled pool = %+v", got)
 	}
 
@@ -102,9 +98,9 @@ func TestDisabledPoolStartsAndSurfacesHealthAndMetrics(t *testing.T) {
 	for _, needle := range []string{
 		disabledPoolMetricName,
 		`pool="full"`,
-		`backend="kubernetes-primary"`,
+		`backend="lambda"`,
 		"warm runners are not supported",
-		"pools[full].backends[kubernetes-primary]",
+		"pools[full].backends[lambda]",
 	} {
 		if !strings.Contains(text, needle) {
 			t.Fatalf("metrics missing %q\n%s", needle, text)

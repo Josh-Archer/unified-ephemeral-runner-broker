@@ -456,9 +456,10 @@ type BackendConfig struct {
 	WarmMin             int           `yaml:"warmMin" json:"warmMin"`
 	WarmMax             int           `yaml:"warmMax" json:"warmMax"`
 	WarmTTL             time.Duration `yaml:"warmTTL,omitempty" json:"warmTTL,omitempty"`
-	// WarmSchedule optionally gates warmMin/warmMax to calendar windows so cold
-	// cloud backends (Lambda, Cloud Run, Azure Functions, …) can pre-warm only
-	// during known CI periods and stay at zero otherwise for cost control.
+	// WarmSchedule optionally gates warmMin/warmMax to calendar windows on
+	// backends that may hold idle runners (ARC, Kubernetes, EC2, GCE, ephemeral
+	// azure-vm). Outside every window the effective target is zero. Serverless
+	// backends refuse always-on warm; a schedule there is not launched.
 	WarmSchedule *WarmScheduleConfig `yaml:"warmSchedule,omitempty" json:"warmSchedule,omitempty"`
 	Weight       int                 `yaml:"weight,omitempty" json:"weight,omitempty"`
 	// CostClass ranks relative expense for scheduler tie-breaking when free

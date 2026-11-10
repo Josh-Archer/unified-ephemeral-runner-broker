@@ -226,9 +226,37 @@ func validateWarmPools(cfg model.BrokerConfig) error {
 			if err := validateWarmBackendConfig(string(pool.Name), string(name), backendCfg); err != nil {
 				return err
 			}
+			if err := validateAlwaysOnWarmPolicy(pool.Name, name, backendCfg); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
+}
+
+// validateAlwaysOnWarmPolicy refuses warmMin/warmMax > 0 on backends that
+// cannot hold an idle registered runner. Scheduled pre-warm of serverless
+// backends is intentionally not started here; a later change can add it.
+func validateAlwaysOnWarmPolicy(pool model.PoolName, name model.BackendName, cfg model.BackendConfig) error {
+	if cfg.WarmMin <= 0 && cfg.WarmMax <= 0 {
+		return nil
+	}
+	if model.AllowsAlwaysOnWarm(name, cfg) {
+		return nil
+	}
+	prefix := fmt.Sprintf("pools[%s].backends[%s]", pool, name)
+	switch {
+	case model.IsServerlessBackend(name):
+		return fmt.Errorf("%s: warm runners are not supported for serverless backend %s; always-on warm pools are refused", prefix, name)
+	case name == model.BackendAzureVM && cfg.AzureVM != nil:
+		return fmt.Errorf("%s: warm runners are not supported for managed azure-vm; named physical machines are leased, not launched, and a warm reservation would double-count them", prefix)
+	case name == model.BackendAzureVM:
+		return fmt.Errorf("%s: warm runners are not supported for static-label azure-vm; set secretRef to an ephemeral VM launcher (the same contract as ec2 and gce) or keep warmMin and warmMax at 0", prefix)
+	default:
+		// desktop and unknown names stay non-provisionable without a hard
+		// error so an unused warm field cannot take a pool down.
+		return nil
+	}
 }
 
 // validatePerRepositoryScope checks github.scope.type owner. Warm runners
@@ -302,9 +330,6 @@ func validateKubernetesBackends(cfg model.BrokerConfig) error {
 			}
 			if strings.TrimSpace(cfg.GitHub.Auth.SecretRef) == "" {
 				return fmt.Errorf("%s: github.auth.secretRef is required; the broker registers these runners", prefix)
-			}
-			if backendCfg.WarmMin > 0 || backendCfg.WarmMax > 0 {
-				return fmt.Errorf("%s: warm runners are not supported; runner pods start per allocation", prefix)
 			}
 			if guard := kcfg.NodeGuard; guard != nil {
 				guardedTargets[name] = backendCfg
@@ -973,8 +998,11 @@ func validateManagedAzureVM(cfg model.BrokerConfig) error {
 				}
 				seen[key] = true
 			}
-			if target.WarmMin != 0 || target.WarmMax != 0 || target.MaxRunners > len(c.RunnerNames) || target.CrossPoolMaxRunners != len(c.RunnerNames) {
-				return fmt.Errorf("managed azure-vm requires no warm reservations and shared capacity equal to its named physical runners")
+			if target.WarmMin != 0 || target.WarmMax != 0 {
+				return fmt.Errorf("pools[%s].backends[%s]: warm runners are not supported for managed azure-vm; named physical machines are leased, not launched, and a warm reservation would double-count them", pool.Name, name)
+			}
+			if target.MaxRunners > len(c.RunnerNames) || target.CrossPoolMaxRunners != len(c.RunnerNames) {
+				return fmt.Errorf("pools[%s].backends[%s]: managed azure-vm requires shared capacity equal to its named physical runners", pool.Name, name)
 			}
 			if managed != nil && !reflect.DeepEqual(managed, c) {
 				return fmt.Errorf("managed azure-vm target must be identical across pools")

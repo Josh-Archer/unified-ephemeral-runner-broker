@@ -62,8 +62,9 @@ data:
             enabled: true
             healthy: true
             maxRunners: 3
-            warmMin: 1
-            warmMax: 2
+            # Always-on warm is refused for codebuild. Keep these at 0.
+            warmMin: 0
+            warmMax: 0
             warmTTL: 10m
             weight: 1
             maxJobDuration: 14m

@@ -1005,45 +1005,49 @@ be retried in place.
 
 ## Warm Capacity
 
-Backend pools can maintain pre-initialized warm runners to reduce cold-start latency for **cold cloud backends** (`lambda`, `cloud-run`, `azure-functions`, plus other external dispatchers: `codebuild`, `ec2`, `gce`).
+Backend pools can keep idle registered runners ready for **ARC, Kubernetes, and VM** backends: builtin `arc` and `kubernetes`, any `driver: kubernetes` alias, `ec2`, `gce`, and ephemeral `azure-vm` (a `secretRef` launcher and no `azureVM` block).
+
+Always-on warm is refused for serverless / job backends (`lambda`, `azure-functions`, `cloud-run`, `codebuild`). A config that sets `warmMin` or `warmMax` above 0 on those backends fails validation with an error that names the pool and the backend; that pool is disabled and the rest of the broker still starts. Managed `azure-vm` (named physical runners) and static-label `azure-vm` are also refused, because a warm hold would either double-count the machines or reuse one label. `desktop` is not warm-provisionable.
 
 Warm behavior is configured per backend:
 
-- `warmMin`: minimum number of warm allocations to keep for the backend.
-- `warmMax`: maximum number of warm allocations to keep for the backend.
+- `warmMin`: minimum number of idle registered runners to keep for the backend.
+- `warmMax`: maximum number of idle registered runners to keep for the backend.
 - `warmTTL`: how long a warm allocation stays idle before recycle.
-- `warmSchedule` (optional): calendar windows when warm targets apply. Outside every window the effective target is zero so capacity can stay cold off-hours.
+- `warmSchedule` (optional): calendar windows when warm targets apply. Outside every window the effective target is zero so capacity can stay cold off-hours. Serverless backends do not start warm runners from a schedule.
 
-Warm allocations are created only for warm-capable external backends that are enabled and healthy. `arc`, `azure-vm`, and `desktop` are excluded (fast or persistent runners).
+Warm allocations are created only for warm-capable backends that are enabled and healthy. Kubernetes and `driver: kubernetes` aliases start the runner pod and JIT-register it before a job arrives. EC2, GCE, and ephemeral azure-vm dispatch `launch_mode: warm` to the launcher and hold the registration. Consuming a warm runner replenishes back to `warmMin` without passing `warmMax`, `maxRunners`, or `crossPoolMaxRunners`. Setting warm back to 0 recycles the idle runners. A durable state store restores the warm set on restart.
 
 ```yaml
 pools:
-  - name: lite
+  - name: full
     backends:
-      codebuild:
+      kubernetes-primary:
+        driver: kubernetes
         enabled: true
         maxRunners: 3
-        weight: 1
+        crossPoolMaxRunners: 3
         warmMin: 1
-        warmMax: 2
-        warmTTL: 10m
-        secretRef: uecb-codebuild
-      lambda:
+        warmMax: 1
+        warmTTL: 15m
+        kubernetes:
+          namespace: arc-runners
+      ec2:
         enabled: true
-        maxRunners: 3
-        warmMin: 0          # baseline off-window
-        warmMax: 0
-        warmTTL: 10m
-        # Pre-warm only during weekday CI hours (cost control).
-        warmSchedule:
-          timezone: America/New_York
-          windows:
-            - days: [mon, tue, wed, thu, fri]
-              start: "08:00"
-              end: "18:00"
-              warmMin: 1
-              warmMax: 2
-        secretRef: uecb-lambda
+        maxRunners: 2
+        warmMin: 1
+        warmMax: 1
+        warmTTL: 15m
+        secretRef: uecb-ec2
+        # Optional: warm only during weekday CI hours.
+        # warmSchedule:
+        #   timezone: America/New_York
+        #   windows:
+        #     - days: [mon, tue, wed, thu, fri]
+        #       start: "08:00"
+        #       end: "18:00"
+        #       warmMin: 1
+        #       warmMax: 1
 ```
 
 When warm capacity exists:
@@ -1072,12 +1076,12 @@ Warm runners are **billed while idle** by the cloud provider (function instances
 
 **Guidance**
 
-- Free-tier or bursty Azure Functions lanes usually stay cold (`warmMin`/`warmMax` 0).
-- Prefer schedule windows over always-on warm when traffic is business-hours CI.
+- Serverless lanes (`lambda`, `azure-functions`, `cloud-run`, `codebuild`) stay cold. `warmMin` / `warmMax` above 0 is a config error.
+- Prefer schedule windows over always-on warm for VM backends when traffic is business-hours CI.
 - Keep `warmMax` small (1–2) unless p95 allocate→ready smoke shows cold starts dominating UX.
 - Monitor `uecb_launch_latency_seconds{launch_mode="warm"|"cold"}` and provider spend; shrink warm if idle cost exceeds latency benefit.
 
-Use warm pools where external cold-start latency dominates.
+Use warm pools where VM or runner-pod cold-start latency dominates. Keep `warmMin` inside `maxRunners`.
 
 ### Priority And Fair-Share Scheduling
 

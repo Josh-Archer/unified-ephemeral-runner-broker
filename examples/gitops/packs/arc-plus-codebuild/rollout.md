@@ -47,12 +47,15 @@ Deploy first without enabling CodeBuild to confirm the broker and ARC are health
 
 Config changes follow the same GitOps pull request flow. The broker performs a rolling update when the ConfigMap hash changes.
 
-To change CodeBuild capacity limits or warm capacity settings, update the overlay patch and open a pull request:
+To change CodeBuild capacity limits, update the overlay patch and open a pull request. Leave CodeBuild warm at 0; always-on warm is refused there. Warm capacity belongs on ARC:
 
 ```yaml
 backends:
   codebuild:
     maxRunners: 5
+    warmMin: 0
+    warmMax: 0
+  arc:
     warmMin: 2
     warmMax: 3
     warmTTL: 8m

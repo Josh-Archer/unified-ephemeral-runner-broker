@@ -226,18 +226,18 @@ This routes to Cloud Run only.
 
 ## Warm Capacity Tuning
 
-Adjust warm capacity per backend to balance cost and cold-start latency:
+Always-on warm is refused for serverless backends (`codebuild`, `lambda`, `cloud-run`, `azure-functions`). Leave their `warmMin` and `warmMax` at 0. Use warm capacity on ARC, Kubernetes, or a VM backend:
 
 ```yaml
 backends:
   codebuild:
-    warmMin: 0    # disable warm for cost savings
-    warmMax: 0
-  lambda:
     warmMin: 0
     warmMax: 0
-    warmTTL: 5m
-    # Cost control: pre-warm only during CI hours.
+  ec2:
+    warmMin: 1
+    warmMax: 2
+    warmTTL: 15m
+    # Cost control: hold idle VMs only during CI hours.
     warmSchedule:
       timezone: America/New_York
       windows:
@@ -248,7 +248,7 @@ backends:
           warmMax: 2
 ```
 
-Set `warmMin: 0` and `warmMax: 0` to disable warm capacity for a backend without disabling the backend itself. Use `warmSchedule` when always-on warm is too expensive; outside all windows the broker drains warm slots. With live capacity enabled, warm refill also stops when provider `free_slots` are exhausted.
+Set `warmMin: 0` and `warmMax: 0` to disable warm capacity for a backend without disabling the backend itself. Use `warmSchedule` on a warm-capable backend when always-on warm is too expensive; outside all windows the broker drains warm slots. With live capacity enabled, warm refill also stops when provider `free_slots` are exhausted.
 
 ## Staged Rollout
 

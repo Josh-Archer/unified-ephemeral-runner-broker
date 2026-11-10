@@ -35,16 +35,12 @@ pools:
         healthy: true
         maxRunners: 2
         weight: 1
-      kubernetes-primary:
-        driver: kubernetes
+      lambda:
         enabled: true
         healthy: true
-        maxRunners: 3
-        crossPoolMaxRunners: 3
+        maxRunners: 2
         warmMin: 1
         warmMax: 1
-        kubernetes:
-          namespace: arc-runners
   - name: lite
     scheduler: round-robin
     backends:
@@ -105,28 +101,20 @@ pools:
 pools:
   - name: full
     backends:
-      kubernetes-primary:
-        driver: kubernetes
+      lambda:
         enabled: true
         healthy: true
         maxRunners: 2
-        crossPoolMaxRunners: 2
         warmMin: 1
         warmMax: 1
-        kubernetes:
-          namespace: arc-runners
   - name: lite
     backends:
-      kubernetes-other:
-        driver: kubernetes
+      codebuild:
         enabled: true
         healthy: true
         maxRunners: 2
-        crossPoolMaxRunners: 2
         warmMin: 2
         warmMax: 2
-        kubernetes:
-          namespace: arc-runners
 `
 		cfg, disabled, err := loadBrokerConfig(writeBrokerYAML(t, body))
 		if err == nil {
@@ -138,7 +126,7 @@ pools:
 		if len(disabled) != 2 || !strings.Contains(err.Error(), "all pools failed validation") {
 			t.Fatalf("err=%v disabled=%v", err, disabled)
 		}
-		if !strings.Contains(err.Error(), "kubernetes-primary") || !strings.Contains(err.Error(), "kubernetes-other") {
+		if !strings.Contains(err.Error(), "lambda") || !strings.Contains(err.Error(), "codebuild") {
 			t.Fatalf("error = %v", err)
 		}
 	})
@@ -181,16 +169,16 @@ func TestContractBrokerBinaryInvalidPoolStaysUp(t *testing.T) {
 	for _, needle := range []string{
 		`"status":"degraded"`,
 		`"pool":"full"`,
-		`"backend":"kubernetes-primary"`,
+		`"backend":"lambda"`,
 		"warm runners are not supported",
-		"pools[full].backends[kubernetes-primary]",
+		"pools[full].backends[lambda]",
 	} {
 		if !strings.Contains(health, needle) {
 			t.Fatalf("health missing %q\n%s\nlogs:\n%s", needle, health, proc.logs.String())
 		}
 	}
 	logs := proc.logs.String()
-	if !strings.Contains(logs, "CONFIG ERROR: disabled pool full backend kubernetes-primary") {
+	if !strings.Contains(logs, "CONFIG ERROR: disabled pool full backend lambda") {
 		t.Fatalf("logs missing disabled pool line:\n%s", logs)
 	}
 
@@ -198,7 +186,7 @@ func TestContractBrokerBinaryInvalidPoolStaysUp(t *testing.T) {
 	for _, needle := range []string{
 		"uecb_pool_config_disabled",
 		`pool="full"`,
-		`backend="kubernetes-primary"`,
+		`backend="lambda"`,
 		"warm runners are not supported",
 	} {
 		if !strings.Contains(metrics, needle) {
@@ -266,26 +254,20 @@ pools:
 pools:
   - name: full
     backends:
-      kubernetes-primary:
-        driver: kubernetes
+      lambda:
         enabled: true
         healthy: true
         maxRunners: 2
-        crossPoolMaxRunners: 2
         warmMin: 1
         warmMax: 1
-        kubernetes: {namespace: arc-runners}
   - name: lite
     backends:
-      kubernetes-other:
-        driver: kubernetes
+      codebuild:
         enabled: true
         healthy: true
         maxRunners: 2
-        crossPoolMaxRunners: 2
         warmMin: 1
         warmMax: 1
-        kubernetes: {namespace: arc-runners}
 `,
 			want: "all pools failed validation",
 		},
@@ -320,13 +302,206 @@ pools:
 				t.Fatalf("logs missing %q\n%s", tc.want, logs)
 			}
 			if tc.name == "all pools invalid" {
-				for _, needle := range []string{"kubernetes-primary", "kubernetes-other", "pools[full]", "pools[lite]"} {
+				for _, needle := range []string{"lambda", "codebuild", "pools[full]", "pools[lite]"} {
 					if !strings.Contains(logs, needle) {
 						t.Fatalf("logs missing %q\n%s", needle, logs)
 					}
 				}
 			}
 		})
+	}
+}
+
+const contractWarmAllowedConfig = `
+broker:
+  allowUnauthenticated: true
+  defaultPool: lite
+  stateStore:
+    type: memory
+pools:
+  - name: lite
+    scheduler: round-robin
+    backends:
+      arc:
+        enabled: true
+        healthy: true
+        maxRunners: 2
+        weight: 1
+        warmMin: 1
+        warmMax: 1
+  - name: full
+    scheduler: round-robin
+    backends:
+      kubernetes:
+        enabled: true
+        healthy: true
+        maxRunners: 3
+        warmMin: 1
+        warmMax: 1
+        kubernetes:
+          namespace: arc-runners
+      kubernetes-primary:
+        driver: kubernetes
+        enabled: true
+        healthy: true
+        maxRunners: 3
+        crossPoolMaxRunners: 3
+        warmMin: 1
+        warmMax: 1
+        kubernetes:
+          namespace: arc-runners
+      ec2:
+        enabled: true
+        healthy: true
+        maxRunners: 2
+        warmMin: 1
+        warmMax: 1
+        secretRef: uecb-ec2
+      gce:
+        enabled: true
+        healthy: true
+        maxRunners: 2
+        warmMin: 1
+        warmMax: 1
+        secretRef: uecb-gce
+      azure-vm:
+        enabled: true
+        healthy: true
+        maxRunners: 2
+        warmMin: 1
+        warmMax: 1
+        secretRef: uecb-azure-vm
+`
+
+const contractWarmRefusedConfig = `
+broker:
+  allowUnauthenticated: true
+  defaultPool: lite
+  stateStore:
+    type: memory
+pools:
+  - name: lite
+    scheduler: round-robin
+    backends:
+      arc:
+        enabled: true
+        healthy: true
+        maxRunners: 2
+        weight: 1
+  - name: warm-lambda
+    backends:
+      lambda:
+        enabled: true
+        healthy: true
+        maxRunners: 1
+        warmMin: 1
+        warmMax: 1
+  - name: warm-functions
+    backends:
+      azure-functions:
+        enabled: true
+        healthy: true
+        maxRunners: 1
+        warmMin: 1
+        warmMax: 1
+  - name: warm-cloudrun
+    backends:
+      cloud-run:
+        enabled: true
+        healthy: true
+        maxRunners: 1
+        warmMin: 1
+        warmMax: 1
+  - name: warm-codebuild
+    backends:
+      codebuild:
+        enabled: true
+        healthy: true
+        maxRunners: 1
+        warmMin: 1
+        warmMax: 1
+  - name: warm-managed
+    backends:
+      azure-vm:
+        enabled: true
+        healthy: true
+        maxRunners: 1
+        crossPoolMaxRunners: 1
+        warmMin: 1
+        warmMax: 1
+        azureVM:
+          repository: example/project
+          runnerNames: [worker-1]
+  - name: warm-static
+    backends:
+      azure-vm:
+        enabled: true
+        healthy: true
+        maxRunners: 1
+        warmMin: 1
+        warmMax: 1
+        runnerLabel: persistent
+`
+
+// TestContractBrokerBinaryWarmARCKubernetesAndVMLoads runs the broker binary
+// with warmMin/warmMax on ARC, Kubernetes (builtin and a driver alias), and
+// VM backends. The process must stay up and the ARC-only pool must allocate.
+func TestContractBrokerBinaryWarmARCKubernetesAndVMLoads(t *testing.T) {
+	addr := freeAddr(t)
+	proc := startBroker(t, contractWarmAllowedConfig, addr)
+	base := "http://" + addr
+	health := waitHealthy(t, proc, base)
+	if !strings.Contains(health, `"status":"ok"`) {
+		t.Fatalf("health = %s\nlogs:\n%s", health, proc.logs.String())
+	}
+	code, body := httpPost(t, base+"/v1/allocations", `{"pool":"lite","job_timeout":"5m"}`)
+	if code != http.StatusCreated || !strings.Contains(body, `"pool":"lite"`) || !strings.Contains(body, `"selected_backend":"arc"`) {
+		t.Fatalf("lite allocation = %d %s\nlogs:\n%s", code, body, proc.logs.String())
+	}
+}
+
+// TestContractBrokerBinaryRefusesServerlessAndNonEphemeralAzureVMWarm runs the
+// broker binary. Always-on warm on serverless backends, managed azure-vm, and
+// static-label azure-vm disables that pool with an error that names it. The
+// ARC pool keeps serving.
+func TestContractBrokerBinaryRefusesServerlessAndNonEphemeralAzureVMWarm(t *testing.T) {
+	addr := freeAddr(t)
+	proc := startBroker(t, contractWarmRefusedConfig, addr)
+	base := "http://" + addr
+	health := waitHealthy(t, proc, base)
+	for _, needle := range []string{
+		`"status":"degraded"`,
+		`"pool":"warm-lambda"`,
+		`"backend":"lambda"`,
+		"pools[warm-lambda].backends[lambda]",
+		"serverless backend lambda",
+		`"pool":"warm-functions"`,
+		`"backend":"azure-functions"`,
+		"pools[warm-functions].backends[azure-functions]",
+		"serverless backend azure-functions",
+		`"pool":"warm-cloudrun"`,
+		`"backend":"cloud-run"`,
+		"pools[warm-cloudrun].backends[cloud-run]",
+		"serverless backend cloud-run",
+		`"pool":"warm-codebuild"`,
+		`"backend":"codebuild"`,
+		"pools[warm-codebuild].backends[codebuild]",
+		"serverless backend codebuild",
+		`"pool":"warm-managed"`,
+		"pools[warm-managed].backends[azure-vm]",
+		"managed azure-vm",
+		`"pool":"warm-static"`,
+		"pools[warm-static].backends[azure-vm]",
+		"static-label azure-vm",
+		"warm runners are not supported",
+	} {
+		if !strings.Contains(health, needle) {
+			t.Fatalf("health missing %q\n%s\nlogs:\n%s", needle, health, proc.logs.String())
+		}
+	}
+	code, body := httpPost(t, base+"/v1/allocations", `{"pool":"lite","job_timeout":"5m"}`)
+	if code != http.StatusCreated || !strings.Contains(body, `"selected_backend":"arc"`) {
+		t.Fatalf("lite allocation = %d %s", code, body)
 	}
 }
 

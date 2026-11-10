@@ -25,16 +25,12 @@ pools:
         healthy: true
         maxRunners: 2
         weight: 1
-      kubernetes-primary:
-        driver: kubernetes
+      lambda:
         enabled: true
         healthy: true
-        maxRunners: 3
-        crossPoolMaxRunners: 3
+        maxRunners: 2
         warmMin: 1
         warmMax: 1
-        kubernetes:
-          namespace: arc-runners
   - name: lite
     scheduler: round-robin
     backends:
@@ -62,10 +58,10 @@ func TestLoadServingKeepsValidPoolsWhenOnePoolIsInvalid(t *testing.T) {
 		t.Fatalf("disabled = %+v, want one pool", disabled)
 	}
 	fault := disabled[0]
-	if fault.Pool != model.PoolFull || fault.Backend != "kubernetes-primary" {
-		t.Fatalf("fault pool=%s backend=%s, want full/kubernetes-primary", fault.Pool, fault.Backend)
+	if fault.Pool != model.PoolFull || fault.Backend != model.BackendLambda {
+		t.Fatalf("fault pool=%s backend=%s, want full/lambda", fault.Pool, fault.Backend)
 	}
-	if !strings.Contains(fault.Error(), "pools[full].backends[kubernetes-primary]") || !strings.Contains(fault.Error(), "warm runners are not supported") {
+	if !strings.Contains(fault.Error(), "pools[full].backends[lambda]") || !strings.Contains(fault.Error(), "warm runners are not supported") {
 		t.Fatalf("fault error = %q", fault.Error())
 	}
 
@@ -73,14 +69,14 @@ func TestLoadServingKeepsValidPoolsWhenOnePoolIsInvalid(t *testing.T) {
 	if err == nil {
 		t.Fatal("strict Load accepted a config with an invalid pool")
 	}
-	if !strings.Contains(err.Error(), "pools[full].backends[kubernetes-primary]") || !strings.Contains(err.Error(), "warm runners are not supported") {
+	if !strings.Contains(err.Error(), "pools[full].backends[lambda]") || !strings.Contains(err.Error(), "warm runners are not supported") {
 		t.Fatalf("strict error = %q", err.Error())
 	}
 	if len(strict.Pools) != 0 {
 		t.Fatal("strict Load returned pools with the error")
 	}
 	var parsed PoolBackendErrors
-	if !errors.As(err, &parsed) || len(parsed) != 1 || parsed[0].Pool != model.PoolFull || parsed[0].Backend != "kubernetes-primary" {
+	if !errors.As(err, &parsed) || len(parsed) != 1 || parsed[0].Pool != model.PoolFull || parsed[0].Backend != model.BackendLambda {
 		t.Fatalf("strict error type = %T %v", err, err)
 	}
 }
@@ -98,13 +94,13 @@ broker:
         requests:
           cpu: "1"
           memory: 1Gi
-      backends: [kubernetes-primary, arc]
+      backends: [lambda, arc]
     onlybad:
       runner:
         requests:
           cpu: "1"
           memory: 1Gi
-      backends: [kubernetes-primary]
+      backends: [lambda]
 pools:
   - name: full
     scheduler: round-robin
@@ -114,16 +110,12 @@ pools:
         healthy: true
         maxRunners: 2
         weight: 1
-      kubernetes-primary:
-        driver: kubernetes
+      lambda:
         enabled: true
         healthy: true
-        maxRunners: 3
-        crossPoolMaxRunners: 3
+        maxRunners: 2
         warmMin: 1
         warmMax: 1
-        kubernetes:
-          namespace: arc-runners
   - name: lite
     scheduler: round-robin
     backends:
@@ -183,28 +175,20 @@ github:
 pools:
   - name: full
     backends:
-      kubernetes-primary:
-        driver: kubernetes
-        enabled: true
-        healthy: true
-        maxRunners: 3
-        crossPoolMaxRunners: 3
-        warmMin: 1
-        warmMax: 1
-        kubernetes:
-          namespace: arc-runners
-  - name: lite
-    backends:
-      kubernetes-other:
-        driver: kubernetes
+      lambda:
         enabled: true
         healthy: true
         maxRunners: 2
-        crossPoolMaxRunners: 2
         warmMin: 1
         warmMax: 1
-        kubernetes:
-          namespace: arc-runners
+  - name: lite
+    backends:
+      codebuild:
+        enabled: true
+        healthy: true
+        maxRunners: 2
+        warmMin: 1
+        warmMax: 1
 `
 	cfg, disabled, err := LoadServing(writeConfig(t, body))
 	if err == nil {
@@ -217,8 +201,8 @@ pools:
 		t.Fatalf("error = %q", err.Error())
 	}
 	for _, needle := range []string{
-		"pools[full].backends[kubernetes-primary]",
-		"pools[lite].backends[kubernetes-other]",
+		"pools[full].backends[lambda]",
+		"pools[lite].backends[codebuild]",
 		"warm runners are not supported",
 	} {
 		if !strings.Contains(err.Error(), needle) {

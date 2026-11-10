@@ -205,6 +205,62 @@ func TestProvisionRegistersRunnerAndPassesOnlyJITConfig(t *testing.T) {
 	}
 }
 
+func TestProvisionWarmLaunchModeRoundTripsThroughLiveRunners(t *testing.T) {
+	api := &fakeAPI{}
+	b := New(newConfig(t), api, &fakeRegistrar{})
+	provisioned, err := b.Provision(context.Background(), model.AllocationRequest{
+		Pool:             model.PoolFull,
+		JobTimeout:       20 * time.Minute,
+		TargetRepository: "example-owner/questkit",
+	}, model.AllocationStatus{
+		ID:         "warm-1",
+		Pool:       model.PoolFull,
+		Repository: "example-owner/questkit",
+		Metadata:   map[string]string{backend.MetadataLaunchModeKey: "warm"},
+	})
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	if len(api.calls) != 1 {
+		t.Fatalf("calls = %+v", api.calls)
+	}
+	annotations := api.calls[0].body["metadata"].(map[string]any)["annotations"].(map[string]any)
+	if annotations[annotationLaunchMode] != "warm" {
+		t.Fatalf("annotations = %+v", annotations)
+	}
+
+	podName := provisioned.Metadata["pod_name"]
+	api.responses = map[string]response{
+		"GET /api/v1/namespaces/arc-runners/pods": {
+			status: http.StatusOK,
+			body: `{
+				"items":[{
+					"metadata":{
+						"name":"` + podName + `",
+						"labels":{"uecb.josh-archer.dev/pool":"full"},
+						"annotations":{
+							"uecb.josh-archer.dev/allocation-id":"warm-1",
+							"uecb.josh-archer.dev/launch-mode":"warm",
+							"uecb.josh-archer.dev/github-runner-id":"101"
+						}
+					},
+					"status":{"phase":"Running","containerStatuses":[{"name":"runner","state":{"running":{}}}]}
+				}]
+			}`,
+		},
+	}
+	runners, err := b.LiveRunners(context.Background())
+	if err != nil {
+		t.Fatalf("LiveRunners: %v", err)
+	}
+	if len(runners) != 1 || runners[0].AllocationID != "warm-1" || runners[0].WorkflowJobID != 0 {
+		t.Fatalf("runners = %+v", runners)
+	}
+	if runners[0].Metadata[backend.MetadataLaunchModeKey] != "warm" || runners[0].Metadata[metadataRunnerID] != "101" {
+		t.Fatalf("metadata = %+v", runners[0].Metadata)
+	}
+}
+
 func TestProvisionFailuresRemoveTheRegistration(t *testing.T) {
 	owned := model.AllocationStatus{ID: "y", Pool: model.PoolFull, Repository: "example-owner/deskquest"}
 

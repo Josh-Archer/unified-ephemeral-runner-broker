@@ -41,20 +41,14 @@ backends:
 
 ## Warm Capacity Tuning
 
-Adjust warm capacity without disabling CodeBuild:
+CodeBuild stays cold. Always-on warm on CodeBuild is refused; leave `warmMin` and `warmMax` at 0. Hold idle runners on ARC instead:
 
 ```yaml
 backends:
   codebuild:
-    warmMin: 0    # disable warm capacity
+    warmMin: 0
     warmMax: 0
-```
-
-Or increase warm capacity for burst absorption:
-
-```yaml
-backends:
-  codebuild:
+  arc:
     warmMin: 2
     warmMax: 4
     warmTTL: 12m

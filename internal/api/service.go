@@ -596,6 +596,19 @@ func (s *Service) rebuildLiveRunner(ctx context.Context, pool model.PoolConfig, 
 	if label := metadata["runner_label"]; label != "" {
 		status.RunnerLabel = label
 	}
+	// An idle warm pod has no workflow job. Restore it as warm so the pool
+	// returns to its ready count instead of treating the pod as a running job
+	// and cold-starting another. A consumed runner carries a workflow job id
+	// and stays ready.
+	if runner.WorkflowJobID == 0 && strings.TrimSpace(runner.Metadata[backend.MetadataLaunchModeKey]) == launchModeWarm {
+		cfg := pool.Backends[backendName]
+		status.State = model.StateWarm
+		status.ExpiresAt = now.Add(resolveWarmTTL(cfg))
+		status.Error = "rebuilt warm runner after restart from live provider runner"
+		if strings.TrimSpace(runner.Metadata["github_runner_id"]) == "" {
+			status.RegisteredAt = nil
+		}
+	}
 	// Account the slot. Without room, leave it to the capacity-gap holds.
 	if _, err := s.reserve(pool, model.AllocationRequest{Pool: pool.Name, Backend: backendNamePtr(backendName)}); err != nil {
 		logAllocationEvent(ctx, "restart_inventory_unaccounted", map[string]string{
@@ -2022,7 +2035,7 @@ func (s *Service) warmRunnerServes(request model.AllocationStatus) bool {
 
 func (s *Service) consumeWarmAllocation(ctx context.Context, pool model.PoolConfig, backendName model.BackendName, request model.AllocationStatus) (model.AllocationStatus, bool) {
 	cfg, ok := pool.Backends[backendName]
-	if !ok || !cfg.Enabled || !cfg.Healthy || !isWarmProvisionableBackend(backendName) {
+	if !ok || !cfg.Enabled || !cfg.Healthy || !isWarmProvisionableBackend(backendName, cfg) {
 		return model.AllocationStatus{}, false
 	}
 	if !s.warmRunnerServes(request) {
@@ -2076,7 +2089,7 @@ func (s *Service) recycleWarmAllocation(ctx context.Context, pool model.PoolConf
 
 func (s *Service) reconcileWarmForPool(pool model.PoolConfig, statuses []model.AllocationStatus, now time.Time) {
 	for backendName, cfg := range pool.Backends {
-		if !isWarmProvisionableBackend(backendName) {
+		if !isWarmProvisionableBackend(backendName, cfg) {
 			continue
 		}
 		s.reconcileWarmForBackend(pool, backendName, cfg, statuses, now)
@@ -2161,7 +2174,7 @@ func (s *Service) preferredWarmBackend(pool model.PoolConfig) (model.BackendName
 	statuses := s.store.List()
 	var candidates []model.BackendName
 	for name, cfg := range pool.Backends {
-		if !cfg.Enabled || !cfg.Healthy || !isWarmProvisionableBackend(name) {
+		if !cfg.Enabled || !cfg.Healthy || !isWarmProvisionableBackend(name, cfg) {
 			continue
 		}
 		ttl := resolveWarmTTL(cfg)
@@ -2236,11 +2249,17 @@ func (s *Service) createWarmAllocation(pool model.PoolConfig, backendName model.
 		Pool:    pool.Name,
 		Backend: &backendName,
 	}
-	if cfg.MaxJobDuration > 0 {
-		request.JobTimeout = cfg.MaxJobDuration
-	} else {
-		request.JobTimeout = s.cfg.Broker.DefaultJobTimeout
+	// The runner is created before a job arrives. Its provider deadline has to
+	// cover the idle warm hold and a full job after that hold, or Kubernetes
+	// activeDeadlineSeconds (and VM launchers) reap it while it is still warm.
+	jobBudget := cfg.MaxJobDuration
+	if jobBudget <= 0 {
+		jobBudget = s.cfg.Broker.DefaultJobTimeout
 	}
+	if jobBudget < 0 {
+		jobBudget = 0
+	}
+	request.JobTimeout = ttl + jobBudget
 
 	selection, err := s.reserveForBackend(pool, backendName)
 	if err != nil {
@@ -2283,6 +2302,13 @@ func (s *Service) createWarmAllocation(pool model.PoolConfig, backendName model.
 		launchModeWarm,
 	)
 	allocation.ExpiresAt = now.Add(ttl)
+	// Kubernetes registers the runner inside Provision (JIT config). Recording
+	// that keeps a broker restart from treating the warm pod as never registered
+	// and expiring it before warmTTL.
+	if strings.TrimSpace(provisioned.Metadata["github_runner_id"]) != "" {
+		registered := now
+		allocation.RegisteredAt = &registered
+	}
 	_ = s.store.Save(allocation)
 	return nil
 }
@@ -2832,7 +2858,7 @@ func (s *Service) validateWarmBackend(pool model.PoolConfig, backendName model.B
 	if !cfg.Healthy {
 		return fmt.Errorf("backend %q is unhealthy", backendName)
 	}
-	if !isWarmProvisionableBackend(backendName) {
+	if !isWarmProvisionableBackend(backendName, cfg) {
 		return fmt.Errorf("backend %q does not support warm provisioning", backendName)
 	}
 	return nil

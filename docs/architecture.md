@@ -26,7 +26,7 @@
 
 - `arc` provisions in-cluster runners.
 - `codebuild`, `lambda`, `cloud-run`, `azure-functions`, `ec2`, and `gce` are lite-profile external runners that dispatch into provider-owned launcher controllers using the shared external dispatch contract.
-- `azure-vm` is a static-label VM adapter for environments that already operate persistent Azure VM GitHub runners. It reserves broker capacity and returns `runnerLabel` from backend config.
+- `azure-vm` without `azureVM` or `secretRef` is a static-label adapter for environments that already operate persistent Azure VM GitHub runners. It reserves broker capacity and returns `runnerLabel` from backend config. With `secretRef` and no `azureVM` block it uses the same external launcher contract as `ec2` and `gce` (ephemeral VMs, including warm). `azureVM.runnerNames` leases named physical machines and does not launch new ones.
 - The public Azure Functions launcher uses an HTTP dispatch endpoint only for admission and status. Actual runner execution happens on a queue-triggered function inside the same container so the HTTP trigger does not have to stay open for the whole job.
 - Each runner handles one job and exits.
 
@@ -36,18 +36,18 @@ Kubernetes runner pods start from the backend `podSpec`. A workflow job may add 
 
 ## Warm Capacity
 
-Each pool backend may define a warm policy for cold-start cloud backends:
+Each pool backend may define a warm policy:
 
-- `warmMin`: minimum warm instances to keep reserved.
-- `warmMax`: maximum warm instances allowed.
+- `warmMin`: minimum idle registered runners to keep ready.
+- `warmMax`: maximum idle registered runners allowed.
 - `warmTTL`: maximum idle lifetime for a warm allocation.
 - `warmSchedule`: optional timezone + windows so warm targets apply only during known CI periods (effective target is zero outside all windows).
 
-The broker keeps warm allocations in the background when enabled and recycles them on TTL expiry, schedule off-window, or policy violations. Auto selection prefers backends that already hold idle warm capacity; allocation then consumes that warm slot before cold launch.
+The broker keeps warm allocations in the background when enabled and recycles them on TTL expiry, schedule off-window, scale-down, or when the backend is disabled or unhealthy. Auto selection prefers backends that already hold idle warm capacity; allocation then consumes that warm slot before cold launch. Warm runners count toward `maxRunners` and `crossPoolMaxRunners`. After a restart, warm allocations in the durable store are rehydrated; Kubernetes pods annotated `launch-mode=warm` with no workflow job are rebuilt as warm.
 
 Warm refill integrates with live `Capacity()` / free-slot snapshots when `broker.liveCapacity` is enabled so pre-warm does not intentionally exceed provider headroom.
 
-Warm capacity applies to external dispatch backends (`codebuild`, `lambda`, `cloud-run`, `azure-functions`, `ec2`, `gce`) and intentionally excludes `arc`, `azure-vm`, and `desktop`. Cost controls (`warmMax`, `warmTTL`, `warmSchedule`, live capacity, tier block) are documented in the README Warm Capacity section.
+Always-on warm (`warmMin` / `warmMax` > 0) is allowed for ARC, Kubernetes (builtin `kubernetes` and any `driver: kubernetes` alias), `ec2`, `gce`, and ephemeral `azure-vm` (`secretRef`, no `azureVM` block). It is refused for serverless / job backends (`lambda`, `azure-functions`, `cloud-run`, `codebuild`), for managed named-runner `azure-vm` (a lease would double-count the physical machines), and for static-label `azure-vm`. `desktop` is not warm-provisionable. One invalid pool is disabled instead of crashing the broker. Cost controls are documented in the README Warm Capacity section.
 
 ## State And Restart Recovery
 
@@ -397,7 +397,7 @@ An automatic allocation with a policy-eligible but full backend is a capacity wa
 The default Azure VM adapter retains legacy static-label behavior. Configure
 `azureVM: {repository: example/project, runnerNames: [worker-1, worker-2]}` on
 all Azure VM pool entries to lease existing persistent workers instead. Set
-`crossPoolMaxRunners` to the physical worker count and disable warm reservations.
+`crossPoolMaxRunners` to the physical worker count and leave `warmMin` / `warmMax` at 0. A warm reservation would double-count those machines; validation names the pool and `azure-vm` and refuses it.
 The same target must appear in every pool; this mode requires one broker replica
 and does not yet support HA/distributed physical claims.
 
