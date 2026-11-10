@@ -219,6 +219,13 @@ type GitHubWebhookConfig struct {
 	// ReconcileInterval polls GitHub for queued jobs that arrived before a
 	// webhook was delivered. The runtime defaults this to one minute.
 	ReconcileInterval time.Duration `yaml:"reconcileInterval,omitempty" json:"reconcileInterval,omitempty"`
+	// ReconcileRepositories, when set, limits queued-job reconcile to these
+	// owner/name repositories. Empty keeps the previous behavior: every
+	// repository visible to github.scope is scanned. The GitHub scope's
+	// owner/repository (when both are set) is always included and scanned
+	// first so a missed webhook for that repository is recovered on the
+	// next cycle.
+	ReconcileRepositories []string `yaml:"reconcileRepositories,omitempty" json:"reconcileRepositories,omitempty"`
 }
 
 const (

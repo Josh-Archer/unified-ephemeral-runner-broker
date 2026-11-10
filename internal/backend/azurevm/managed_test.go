@@ -20,11 +20,13 @@ type fakeRunners struct {
 	failAdd    bool
 	failRemove bool
 	listErr    error
+	listCalls  int
 }
 
 func (f *fakeRunners) ListRunners(context.Context, model.GitHubScope) ([]gh.Runner, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.listCalls++
 	r := append([]gh.Runner{}, f.runners...)
 	for i := range r {
 		r[i].Labels = append([]gh.RunnerLabel{}, r[i].Labels...)
@@ -223,5 +225,23 @@ func TestManagedAcceptsTruncatedRunnerList(t *testing.T) {
 	f.listErr = errors.New("unavailable")
 	if _, err := b.Provision(context.Background(), model.AllocationRequest{}, allocate("two")); err == nil || backend.IsCapacityExhausted(err) {
 		t.Fatalf("other list errors must stay fatal: %v", err)
+	}
+}
+
+func TestManagedCapacitySkipsGitHubWhenDisabled(t *testing.T) {
+	c, f := fixture()
+	cfg := c.Pools[0].Backends[model.BackendAzureVM]
+	cfg.Enabled = false
+	c.Pools[0].Backends[model.BackendAzureVM] = cfg
+	b := New(c, f)
+	cap, err := b.(backend.CapacityBackend).Capacity(context.Background())
+	if err != nil {
+		t.Fatalf("disabled capacity: %v", err)
+	}
+	if f.listCalls != 0 {
+		t.Fatalf("ListRunners called %d times for a disabled backend", f.listCalls)
+	}
+	if cap.MaxRunners != 0 || cap.ActiveRunners != 0 {
+		t.Fatalf("disabled capacity should be empty, got %+v", cap)
 	}
 }

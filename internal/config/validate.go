@@ -52,6 +52,9 @@ func Validate(cfg model.BrokerConfig) error {
 	if err := validateWebhookLabels(cfg); err != nil {
 		return err
 	}
+	if err := validateReconcileRepositories(cfg.Broker.GitHubWebhook); err != nil {
+		return err
+	}
 	if err := validateScaleSetListener(cfg); err != nil {
 		return err
 	}
@@ -743,6 +746,16 @@ func validateFairShare(cfg model.BrokerConfig) error {
 		}
 		if fs.StarvationAfter < 0 {
 			return fmt.Errorf("%s.starvationAfter must not be negative", prefix)
+		}
+	}
+	return nil
+}
+
+func validateReconcileRepositories(cfg model.GitHubWebhookConfig) error {
+	for i, entry := range cfg.ReconcileRepositories {
+		owner, repo, ok := strings.Cut(strings.TrimSpace(entry), "/")
+		if !ok || owner == "" || repo == "" || strings.Contains(repo, "/") || strings.ContainsAny(entry, "*") {
+			return fmt.Errorf("broker.githubWebhook.reconcileRepositories[%d] %q must be owner/repo", i, entry)
 		}
 	}
 	return nil

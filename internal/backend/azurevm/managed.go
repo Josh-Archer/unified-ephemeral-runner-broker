@@ -207,7 +207,7 @@ func (b *managedBackend) cleanupLocked(ctx context.Context, allocation model.All
 func (b *managedBackend) Capacity(ctx context.Context) (backend.CapacityStatus, error) {
 	for _, pool := range b.cfg.Pools {
 		cfg, ok := pool.Backends[model.BackendAzureVM]
-		if !ok || cfg.AzureVM == nil {
+		if !ok || !cfg.Enabled || cfg.AzureVM == nil {
 			continue
 		}
 		target, scope, err := b.target(pool.Name, "")
@@ -230,5 +230,5 @@ func (b *managedBackend) Capacity(ctx context.Context) (backend.CapacityStatus, 
 		}
 		return status, nil
 	}
-	return backend.CapacityStatus{}, fmt.Errorf("managed azure-vm target is not configured")
+	return backend.CapacityStatus{}, nil
 }

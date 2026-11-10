@@ -430,6 +430,25 @@ func TestGitHubWebhookReconcileIntervalDefaultsAndLoads(t *testing.T) {
 	}
 }
 
+func TestGitHubWebhookReconcileRepositoriesLoads(t *testing.T) {
+	if got := Default().Broker.GitHubWebhook.ReconcileRepositories; len(got) != 0 {
+		t.Fatalf("default allowlist=%v, want empty (previous scan-all behavior)", got)
+	}
+	path := filepath.Join(t.TempDir(), "broker.yaml")
+	body := []byte("broker:\n  githubWebhook:\n    reconcileRepositories:\n      - example-owner/home\n      - example-owner/questkit\n")
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := cfg.Broker.GitHubWebhook.ReconcileRepositories
+	if len(got) != 2 || got[0] != "example-owner/home" || got[1] != "example-owner/questkit" {
+		t.Fatalf("loaded allowlist=%v", got)
+	}
+}
+
 func TestValidateQualityAware(t *testing.T) {
 	cfg := Default()
 	cfg.Broker.QualityAware.Enabled = true

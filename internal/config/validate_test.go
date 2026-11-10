@@ -418,6 +418,20 @@ func TestValidateWebhookJobTimeout(t *testing.T) {
 	}
 }
 
+func TestValidateReconcileRepositories(t *testing.T) {
+	cfg := Default()
+	cfg.Broker.GitHubWebhook.ReconcileRepositories = []string{"example-owner/home", "owner/repo"}
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("valid allowlist: %v", err)
+	}
+	for _, entry := range []string{"repo", "owner/re*po", "owner/a/b", "owner/*"} {
+		cfg.Broker.GitHubWebhook.ReconcileRepositories = []string{entry}
+		if err := Validate(cfg); err == nil {
+			t.Errorf("entry %q should be rejected", entry)
+		}
+	}
+}
+
 func TestValidateWebhookRepositories(t *testing.T) {
 	base := Default()
 	base.Broker.GitHubWebhook.Secret = "s"
