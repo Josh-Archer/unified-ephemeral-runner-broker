@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -36,10 +37,11 @@ import (
 )
 
 func main() {
-	cfg, err := config.Load(os.Getenv("UECB_CONFIG_PATH"))
+	cfg, disabled, err := loadBrokerConfig(os.Getenv("UECB_CONFIG_PATH"))
 	if err != nil {
 		log.Fatalf("load config: %v", err)
 	}
+	logDisabledPools(cfg, disabled)
 
 	shutdownTracing, err := telemetry.Setup(context.Background())
 	if err != nil {
@@ -88,7 +90,12 @@ func main() {
 		log.Fatalf("configure runtime dependencies: %v", err)
 	}
 
-	service := api.NewService(cfg, registry, healthChecker.Check)
+	stateStore, err := openStateStore(cfg)
+	if err != nil {
+		log.Fatalf("state store: %v", err)
+	}
+	service := api.NewServiceWithStore(cfg, registry, healthChecker.Check, stateStore)
+	service.SetDisabledPools(disabledPoolsForAPI(disabled))
 	wireDesktopActiveCounter(desktopBackend, service.Store())
 	if cfg.Broker.Webhooks.Enabled {
 		service.SetLifecycleNotifier(webhook.New(cfg.Broker.Webhooks, secretReader, nil))
@@ -316,6 +323,60 @@ func main() {
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		log.Printf("http shutdown: %v", err)
 	}
+}
+
+// loadBrokerConfig isolates invalid pools. Process-wide failures and a
+// config whose every pool is invalid are returned as errors so main exits.
+func loadBrokerConfig(path string) (model.BrokerConfig, []config.PoolBackendError, error) {
+	return config.LoadServing(path)
+}
+
+func logDisabledPools(cfg model.BrokerConfig, disabled []config.PoolBackendError) {
+	for _, fault := range disabled {
+		backend := string(fault.Backend)
+		if backend == "" {
+			backend = "-"
+		}
+		log.Printf("CONFIG ERROR: disabled pool %s backend %s: %s", fault.Pool, backend, fault.Error())
+	}
+	if len(disabled) == 0 {
+		return
+	}
+	log.Printf("CONFIG ERROR: %d pool(s) disabled by invalid config; serving %d pool(s)", len(disabled), len(cfg.Pools))
+	for _, fault := range disabled {
+		if fault.Pool == cfg.Broker.DefaultPool {
+			log.Printf("CONFIG ERROR: broker.defaultPool %q is disabled; requests that omit a pool will fail", cfg.Broker.DefaultPool)
+			break
+		}
+	}
+}
+
+func disabledPoolsForAPI(disabled []config.PoolBackendError) []api.DisabledPool {
+	if len(disabled) == 0 {
+		return nil
+	}
+	out := make([]api.DisabledPool, 0, len(disabled))
+	for _, fault := range disabled {
+		out = append(out, api.DisabledPool{
+			Pool:    string(fault.Pool),
+			Backend: string(fault.Backend),
+			Error:   fault.Error(),
+		})
+	}
+	return out
+}
+
+// openStateStore opens the configured store. A broken store is fatal: main
+// exits instead of falling back to an empty memory store.
+func openStateStore(cfg model.BrokerConfig) (store.Store, error) {
+	stateStore, err := store.NewFromConfig(cfg.Broker.StateStore)
+	if err != nil {
+		return nil, err
+	}
+	if store.IsNil(stateStore) {
+		return nil, fmt.Errorf("state store %q returned a nil store", cfg.Broker.StateStore.Type)
+	}
+	return stateStore, nil
 }
 
 func shutdownTimeoutFromEnv() time.Duration {

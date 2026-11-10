@@ -74,6 +74,9 @@ type Service struct {
 	initErr       error
 	health        func(context.Context) error
 	now           func() time.Time
+	// disabledPools are pools removed at startup because their config failed
+	// validation. They are not in cfg.Pools. /healthz and metrics report them.
+	disabledPools []DisabledPool
 }
 
 func NewService(cfg model.BrokerConfig, registry *backend.Registry, health func(context.Context) error) *Service {

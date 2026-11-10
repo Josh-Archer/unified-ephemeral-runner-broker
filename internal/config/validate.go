@@ -24,7 +24,12 @@ const (
 	tierCombineMostRestrictive = "most-restrictive"
 )
 
-func Validate(cfg model.BrokerConfig) error {
+// validateAll checks the whole config and returns the first problem.
+// Pool-scoped failures name the pool as pools[<name>] and, when the
+// failure is inside one backend, pools[<name>].backends[<backend>].
+// Partition turns those into disabled pools. Process-wide failures
+// (state store, auth, broker-level settings) stay fatal.
+func validateAll(cfg model.BrokerConfig) error {
 	if err := validateStateStore(cfg.Broker.StateStore); err != nil {
 		return err
 	}
