@@ -988,7 +988,11 @@ func TestReconcileQueuedGitHubJobsSingleRepoOverBudgetResumesMidRepo(t *testing.
 	l.runsDeep = map[string][]int64{"my-org/big": manyRuns(1000, 500)}
 	server.SetGitHubWebhook(GitHubWebhookOptions{WorkflowJobs: l})
 	budgetBefore := testutil.ToFloat64(server.githubWebhook.metrics.budget)
-	for cycle := 0; cycle < 6; cycle++ {
+	cycles := (500 / int(reconcileCallBudget-5)) + 5
+	if cycles < 6 {
+		cycles = 6
+	}
+	for cycle := 0; cycle < cycles; cycle++ {
 		spent := reconcileCycle(t, server, l)
 		t.Logf("cycle %d spent %d jobs=%d", cycle, spent, len(l.jobLists))
 		if spent < reconcileCallBudget-2 && len(l.jobLists) < 500 {
@@ -1029,7 +1033,7 @@ func TestReconcileQueuedGitHubJobsBigRepoDoesNotStarveLaterRepos(t *testing.T) {
 		l.runsDeep[r] = []int64{int64(10 + i)}
 	}
 	server.SetGitHubWebhook(GitHubWebhookOptions{WorkflowJobs: l})
-	for cycle := 0; cycle < 6 && server.githubWebhook.reconcile.deepOpen || cycle == 0; cycle++ {
+	for cycle := 0; cycle < 20 && server.githubWebhook.reconcile.deepOpen || cycle == 0; cycle++ {
 		reconcileCycle(t, server, l)
 		now = now.Add(time.Minute)
 	}
@@ -1307,7 +1311,7 @@ func deepRepoFixture(t *testing.T, n, runsPer int) (*Server, countingLister, *ti
 }
 
 // A recent scan that hangs every cycle until its deadline must not starve the
-// deep scan: the deep scan runs with its own deadline and gets >= 40 calls.
+// deep scan: the deep scan runs with its own deadline and gets its reserve.
 func TestReconcileQueuedGitHubJobsDeepScanRunsWhenRecentHitsDeadline(t *testing.T) {
 	server, l, now := deepRepoFixture(t, 20, 20)
 	l.hang["jobs:90000"] = -1 // the first repo's recent run hangs forever

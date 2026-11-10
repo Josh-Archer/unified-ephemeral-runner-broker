@@ -71,6 +71,14 @@ type Client struct {
 	rateKnown     bool
 
 	apiCalls atomic.Int64
+
+	etagMu sync.Mutex
+	etags  map[string]etagEntry
+}
+
+type etagEntry struct {
+	etag string
+	body []byte
 }
 
 // RateLimit reports the last X-RateLimit-Remaining/Reset seen on a response.
@@ -222,7 +230,7 @@ func (c *Client) ListRepositories(ctx context.Context, scope model.GitHubScope) 
 			FullName string `json:"full_name"`
 		}
 		query := "type=all"
-		err := c.do(ctx, http.MethodGet, fmt.Sprintf("%s?%s&per_page=100&page=%d", path, query, page), nil, &out, http.StatusOK)
+		err := c.get(ctx, fmt.Sprintf("%s?%s&per_page=100&page=%d", path, query, page), &out)
 		if page == 1 && scope.Type == model.GitHubScopeOwner {
 			var status *StatusError
 			if errors.As(err, &status) && status.Code == http.StatusNotFound {
@@ -236,7 +244,7 @@ func (c *Client) ListRepositories(ctx context.Context, scope model.GitHubScope) 
 				}
 				path = "/users/" + url.PathEscape(owner) + "/repos"
 				query = "type=owner"
-				err = c.do(ctx, http.MethodGet, fmt.Sprintf("%s?%s&per_page=100&page=%d", path, query, page), nil, &out, http.StatusOK)
+				err = c.get(ctx, fmt.Sprintf("%s?%s&per_page=100&page=%d", path, query, page), &out)
 			}
 		}
 		if err != nil {
@@ -266,7 +274,7 @@ func (c *Client) listAuthenticatedUserRepositories(ctx context.Context, owner st
 			FullName string `json:"full_name"`
 			Archived bool   `json:"archived"`
 		}
-		if err := c.do(ctx, http.MethodGet, fmt.Sprintf("/user/repos?affiliation=owner&visibility=all&per_page=100&page=%d", page), nil, &out, http.StatusOK); err != nil {
+		if err := c.get(ctx, fmt.Sprintf("/user/repos?affiliation=owner&visibility=all&per_page=100&page=%d", page), &out); err != nil {
 			return nil, false
 		}
 		for _, repo := range out {
@@ -296,7 +304,7 @@ func (c *Client) listInstallationRepositories(ctx context.Context, owner string)
 				Archived bool   `json:"archived"`
 			} `json:"repositories"`
 		}
-		err := c.do(ctx, http.MethodGet, fmt.Sprintf("/installation/repositories?per_page=100&page=%d", page), nil, &out, http.StatusOK)
+		err := c.get(ctx, fmt.Sprintf("/installation/repositories?per_page=100&page=%d", page), &out)
 		if err != nil {
 			var status *StatusError
 			if page == 1 && errors.As(err, &status) && (status.Code == http.StatusUnauthorized || status.Code == http.StatusForbidden || status.Code == http.StatusNotFound) {
@@ -526,25 +534,72 @@ func (e *StatusError) Error() string {
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body, out any, want int) error {
+	_, _, data, err := c.doBytes(ctx, method, path, nil, body, want)
+	if err != nil {
+		return err
+	}
+	return decodeGitHubJSON(data, out)
+}
+
+// get is do() for GET requests that reuse an ETag. A 304 returns the cached
+// body; GitHub does not count that 304 against the primary rate limit.
+func (c *Client) get(ctx context.Context, path string, out any) error {
+	extra := http.Header{}
+	c.etagMu.Lock()
+	cached, ok := c.etags[path]
+	if ok && cached.etag != "" {
+		extra.Set("If-None-Match", cached.etag)
+	}
+	c.etagMu.Unlock()
+	status, hdr, data, err := c.doBytes(ctx, http.MethodGet, path, extra, nil, http.StatusOK, http.StatusNotModified)
+	if err != nil {
+		return err
+	}
+	if status == http.StatusNotModified {
+		if !ok {
+			return fmt.Errorf("github: 304 for %s without a cached body", path)
+		}
+		data = cached.body
+	} else if etag := strings.TrimSpace(hdr.Get("ETag")); etag != "" {
+		c.etagMu.Lock()
+		if c.etags == nil {
+			c.etags = map[string]etagEntry{}
+		}
+		c.etags[path] = etagEntry{etag: etag, body: append([]byte(nil), data...)}
+		c.etagMu.Unlock()
+	}
+	return decodeGitHubJSON(data, out)
+}
+
+func decodeGitHubJSON(data []byte, out any) error {
+	if out != nil && len(data) > 0 {
+		if err := json.Unmarshal(data, out); err != nil {
+			return fmt.Errorf("decode github response: %w", err)
+		}
+	}
+	return nil
+}
+
+func (c *Client) doBytes(ctx context.Context, method, path string, extra http.Header, body any, want ...int) (int, http.Header, []byte, error) {
 	if c == nil || c.token == nil {
-		return errors.New("github client is not configured")
+		return 0, nil, nil, errors.New("github client is not configured")
 	}
 	token, err := c.token(ctx)
 	if err != nil {
-		return err
+		return 0, nil, nil, err
 	}
 	c.apiCalls.Add(1)
 	var reader io.Reader
 	if body != nil {
 		encoded, err := json.Marshal(body)
 		if err != nil {
-			return err
+			return 0, nil, nil, err
 		}
 		reader = bytes.NewReader(encoded)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reader)
 	if err != nil {
-		return err
+		return 0, nil, nil, err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("Authorization", "Bearer "+token)
@@ -552,14 +607,26 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any, wan
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	for key, values := range extra {
+		for _, value := range values {
+			req.Header.Add(key, value)
+		}
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return err
+		return 0, nil, nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	c.recordRateLimit(resp.Header)
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode != want {
+	allowed := false
+	for _, code := range want {
+		if resp.StatusCode == code {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
 		var msg struct {
 			Message string `json:"message"`
 		}
@@ -567,14 +634,9 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any, wan
 		if msg.Message == "" {
 			msg.Message = strings.TrimSpace(string(data))
 		}
-		return &StatusError{Code: resp.StatusCode, Message: msg.Message}
+		return resp.StatusCode, resp.Header.Clone(), data, &StatusError{Code: resp.StatusCode, Message: msg.Message}
 	}
-	if out != nil && len(data) > 0 {
-		if err := json.Unmarshal(data, out); err != nil {
-			return fmt.Errorf("decode github response: %w", err)
-		}
-	}
-	return nil
+	return resp.StatusCode, resp.Header.Clone(), data, nil
 }
 
 func scopePath(scope model.GitHubScope) (string, error) {

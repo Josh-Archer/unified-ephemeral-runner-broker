@@ -195,6 +195,9 @@ type githubWebhookHandler struct {
 	// completed events for the same job stay ordered.
 	workCh   chan githubWebhookWork
 	inflight sync.WaitGroup
+
+	seenReposMu sync.Mutex
+	seenRepos   map[string]time.Time
 }
 
 // repoScanner walks the repository list round-robin. It keeps the repository
@@ -504,17 +507,17 @@ const (
 	// it is restarted, so a pass whose cursor stalls cannot keep the deep
 	// scan from ever reopening (home#4206).
 	reconcileDeepMaxOpen = time.Hour
-	reconcileCallBudget  = 100
+	reconcileCallBudget  = 40
 	// reconcileRecentReserve is the share of the budget held for the 1h scan
 	// while a deep pass is open, so repositories the deep cursor has not
 	// reached yet still get their recent queued runs checked every cycle.
-	reconcileRecentReserve = 30
+	reconcileRecentReserve = 15
 	// reconcileDeepReserve is the share of the budget guaranteed to an open
 	// deep pass. The recent scan stops at reconcileCallBudget minus this, and
 	// the deep scan always gets at least this many calls after the recent scan
 	// finishes, even when a multi-page listing pushed the recent scan past its
 	// limit (the client counts every page, so one listing can overshoot).
-	reconcileDeepReserve = 40
+	reconcileDeepReserve = 15
 	// reconcileRecentTimeout and reconcileDeepTimeout bound the two scans of
 	// one cycle independently. Allocation calls into backends can hang
 	// (home#4157); without a deadline one cycle held the reconcile lock and
@@ -642,14 +645,25 @@ func (s *Server) ReconcileQueuedGitHubJobs(ctx context.Context) (int, error) {
 		log.Printf("github reconcile: deep scan reopened over %d repos (all ages=%v)", len(repos), state.deepAllAges)
 	}
 
+	priority, rest := splitPriorityRepos(repos, h.priorityRepositories())
 	recentLimit := int64(reconcileCallBudget)
 	if state.deepOpen {
 		recentLimit = reconcileCallBudget - reconcileDeepReserve
 	}
-	// The recent scan visits each repository at most once per cycle.
-	state.recent.remaining = len(repos)
+	// The recent scan always checks priority repositories first (the GitHub
+	// scope repository, typically Josh-Archer/home) so a lost webhook there
+	// is recovered within one reconcile interval. It then visits each other
+	// repository at most once per cycle.
+	state.recent.remaining = len(rest)
 	recentCtx, cancelRecent := context.WithTimeout(ctx, h.timeout(h.recentTimeout, reconcileRecentTimeout))
-	recentErr := run.scan(recentCtx, &state.recent, repos, now.Add(-reconcileRecentWindow), reconcileRecentWindow, recentLimit)
+	var recentErr error
+	if len(priority) > 0 {
+		pri := repoScanner{remaining: len(priority)}
+		recentErr = run.scan(recentCtx, &pri, priority, now.Add(-reconcileRecentWindow), reconcileRecentWindow, recentLimit)
+	}
+	if recentErr == nil && len(rest) > 0 {
+		recentErr = run.scan(recentCtx, &state.recent, rest, now.Add(-reconcileRecentWindow), reconcileRecentWindow, recentLimit)
+	}
 	cancelRecent()
 	recentSpent := budget.spent()
 	h.logScanStop("recent", recentErr, budget, recentSpent, state)
@@ -707,10 +721,10 @@ func (h *githubWebhookHandler) logScanStop(name string, err error, budget *cycle
 // than reconcileDeepReserve calls.
 //
 // Worst case a cycle therefore exceeds reconcileCallBudget: the recent scan
-// can overshoot its 60-call share up to the page overshoot of its last list
-// request, and the deep scan still gets 40 calls on top, plus the page
+// can overshoot its share up to the page overshoot of its last list
+// request, and the deep scan still gets reconcileDeepReserve calls on top, plus the page
 // overshoot of its own last request. With the client page caps that is about
-// 140 calls (100 + 40), a little more for very deep page caps. This is
+// 55 calls (40 + 15), a little more for very deep page caps. This is
 // intended: the 1000-remaining rate-limit floor is the hard guard.
 func deepScanLimit(recentSpent int64) int64 {
 	limit := int64(reconcileCallBudget)
@@ -768,6 +782,15 @@ func (b *cycleBudget) take(ctx context.Context, limit int64) error {
 // only cached for reconcileTruncatedReposTTL.
 func (h *githubWebhookHandler) reconcileRepositories(ctx context.Context, budget *cycleBudget, now time.Time) ([]string, error) {
 	state := &h.reconcile
+	allow := h.reconcileAllowlist()
+	if len(allow) > 0 {
+		if state.repos != nil && now.Sub(state.reposAt) < state.reposTTL {
+			return state.repos, nil
+		}
+		repos := h.mergeReconcileRepos(allow)
+		state.repos, state.reposAt, state.reposTTL = repos, now, reconcileReposTTL
+		return repos, nil
+	}
 	if state.repos != nil && now.Sub(state.reposAt) < state.reposTTL {
 		return state.repos, nil
 	}
@@ -787,8 +810,204 @@ func (h *githubWebhookHandler) reconcileRepositories(ctx context.Context, budget
 	if repos == nil {
 		repos = []string{}
 	}
+	repos = h.mergeReconcileRepos(repos)
 	state.repos, state.reposAt, state.reposTTL = repos, now, ttl
 	return repos, nil
+}
+
+func normalizeReconcileRepo(name string) string {
+	name = strings.TrimSpace(name)
+	owner, repo, ok := strings.Cut(name, "/")
+	if !ok {
+		return ""
+	}
+	owner, repo = strings.TrimSpace(owner), strings.TrimSpace(repo)
+	if owner == "" || repo == "" || strings.Contains(repo, "/") {
+		return ""
+	}
+	return owner + "/" + repo
+}
+
+func reconcileRepoKey(name string) string {
+	return strings.ToLower(normalizeReconcileRepo(name))
+}
+
+func (h *githubWebhookHandler) reconcileAllowlist() []string {
+	if h == nil || h.service == nil {
+		return nil
+	}
+	var out []string
+	seen := map[string]struct{}{}
+	for _, entry := range h.service.cfg.Broker.GitHubWebhook.ReconcileRepositories {
+		name := normalizeReconcileRepo(entry)
+		key := strings.ToLower(name)
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, name)
+	}
+	return out
+}
+
+func (h *githubWebhookHandler) priorityRepositories() []string {
+	if h == nil || h.service == nil {
+		return nil
+	}
+	scope := h.service.cfg.GitHub.Scope
+	owner := strings.TrimSpace(scope.Owner)
+	if owner == "" {
+		owner = strings.TrimSpace(scope.Organization)
+	}
+	repo := strings.TrimSpace(scope.Repository)
+	if owner == "" || repo == "" {
+		return nil
+	}
+	return []string{owner + "/" + repo}
+}
+
+func (h *githubWebhookHandler) noteWebhookRepository(repository string) {
+	name := normalizeReconcileRepo(repository)
+	if name == "" || h.service == nil {
+		return
+	}
+	h.seenReposMu.Lock()
+	defer h.seenReposMu.Unlock()
+	if h.seenRepos == nil {
+		h.seenRepos = map[string]time.Time{}
+	}
+	h.seenRepos[strings.ToLower(name)] = h.service.now()
+}
+
+func (h *githubWebhookHandler) preferredRepositories() []string {
+	var out []string
+	seen := map[string]struct{}{}
+	add := func(name string) {
+		name = normalizeReconcileRepo(name)
+		key := strings.ToLower(name)
+		if name == "" {
+			return
+		}
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		out = append(out, name)
+	}
+	if h.service != nil {
+		for _, pool := range h.service.cfg.Pools {
+			for _, entry := range pool.WebhookRepositories {
+				if strings.Contains(entry, "*") {
+					continue
+				}
+				add(entry)
+			}
+		}
+	}
+	type seenRepo struct {
+		name string
+		at   time.Time
+	}
+	var recent []seenRepo
+	h.seenReposMu.Lock()
+	for key, at := range h.seenRepos {
+		recent = append(recent, seenRepo{name: key, at: at})
+	}
+	h.seenReposMu.Unlock()
+	sort.SliceStable(recent, func(i, j int) bool {
+		return recent[i].at.After(recent[j].at)
+	})
+	for _, item := range recent {
+		add(item.name)
+	}
+	return out
+}
+
+func (h *githubWebhookHandler) mergeReconcileRepos(repos []string) []string {
+	seen := map[string]struct{}{}
+	var out []string
+	add := func(name string) {
+		name = normalizeReconcileRepo(name)
+		key := strings.ToLower(name)
+		if name == "" {
+			return
+		}
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		out = append(out, name)
+	}
+	in := map[string]string{}
+	var input []string
+	for _, repo := range repos {
+		name := normalizeReconcileRepo(repo)
+		key := strings.ToLower(name)
+		if name == "" {
+			continue
+		}
+		if _, ok := in[key]; ok {
+			continue
+		}
+		in[key] = name
+		input = append(input, name)
+	}
+	for _, repo := range h.priorityRepositories() {
+		add(repo)
+	}
+	for _, repo := range h.preferredRepositories() {
+		if orig, ok := in[strings.ToLower(normalizeReconcileRepo(repo))]; ok {
+			add(orig)
+		}
+	}
+	for _, repo := range input {
+		add(repo)
+	}
+	return out
+}
+
+func splitPriorityRepos(repos, priority []string) (pri, rest []string) {
+	priKeys := map[string]struct{}{}
+	for _, repo := range priority {
+		key := reconcileRepoKey(repo)
+		if key == "" {
+			continue
+		}
+		priKeys[key] = struct{}{}
+	}
+	seen := map[string]struct{}{}
+	for _, repo := range repos {
+		name := normalizeReconcileRepo(repo)
+		key := strings.ToLower(name)
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		if _, ok := priKeys[key]; ok {
+			pri = append(pri, name)
+			continue
+		}
+		rest = append(rest, name)
+	}
+	for _, repo := range priority {
+		name := normalizeReconcileRepo(repo)
+		key := strings.ToLower(name)
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		pri = append(pri, name)
+	}
+	return pri, rest
 }
 
 type reconcileRun struct {
@@ -1053,6 +1272,7 @@ func (h *githubWebhookHandler) process(ctx context.Context, payload workflowJobP
 	if !h.service.AcceptsWebhookRepository(repository) {
 		return ignored("foreign_repository")
 	}
+	h.noteWebhookRepository(repository)
 	runner := WorkflowJobRunner{Repository: repository, Name: payload.WorkflowJob.RunnerName, ID: payload.WorkflowJob.RunnerID, StartedAt: payload.WorkflowJob.StartedAt}
 	switch payload.Action {
 	case "queued":

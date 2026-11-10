@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -475,5 +476,53 @@ func TestGetWorkflowJob(t *testing.T) {
 	}
 	if path != "/repos/o/r/actions/jobs/99" || job.ID != 99 || job.Status != "queued" {
 		t.Fatalf("path=%s job=%+v", path, job)
+	}
+}
+
+func TestListRepositoriesUsesConditionalRequests(t *testing.T) {
+	var (
+		mu        sync.Mutex
+		requests  int
+		condition int
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/installation/repositories":
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"message":"Resource not accessible by personal access token"}`))
+		case "/orgs/josh-archer/repos":
+			mu.Lock()
+			requests++
+			match := r.Header.Get("If-None-Match")
+			mu.Unlock()
+			if match == `"repos-v1"` {
+				mu.Lock()
+				condition++
+				mu.Unlock()
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
+			w.Header().Set("ETag", `"repos-v1"`)
+			_, _ = w.Write([]byte(`[{"full_name":"Josh-Archer/home"},{"full_name":"Josh-Archer/DeskQuest"}]`))
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	client := NewClient(func(context.Context) (string, error) { return "tok", nil }, nil).WithBaseURL(server.URL)
+	scope := model.GitHubScope{Type: model.GitHubScopeOwner, Owner: "josh-archer"}
+	first, err := client.ListRepositories(context.Background(), scope)
+	if err != nil || len(first) != 2 || first[0] != "Josh-Archer/home" {
+		t.Fatalf("first list=%v err=%v", first, err)
+	}
+	second, err := client.ListRepositories(context.Background(), scope)
+	if err != nil || len(second) != 2 || second[0] != "Josh-Archer/home" || second[1] != "Josh-Archer/DeskQuest" {
+		t.Fatalf("cached list=%v err=%v", second, err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if condition != 1 {
+		t.Fatalf("conditional 304s=%d requests=%d, want a second call with If-None-Match", condition, requests)
 	}
 }
