@@ -87,12 +87,13 @@ func TestQueryInstantTakesMaxOfMultiSeriesVector(t *testing.T) {
 	}
 }
 
-func TestQueryInstantRejectsEmptyVector(t *testing.T) {
+func TestQueryInstantEmptyVectorIsZero(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, `{"status":"success","data":{"resultType":"vector","result":[]}}`)
 	}))
 	defer server.Close()
-	if _, err := (&Client{BaseURL: server.URL}).QueryInstant(context.Background(), "q"); err == nil {
-		t.Fatal("expected error for empty vector")
+	value, err := (&Client{BaseURL: server.URL}).QueryInstant(context.Background(), "q")
+	if err != nil || value != 0 {
+		t.Fatalf("empty vector = %v, %v; want 0, nil", value, err)
 	}
 }

@@ -122,8 +122,13 @@ func (r response) value() (float64, error) {
 		// labels (the label-less vector(0) does not match them), and exporter
 		// duplicates do the same. Usage is a pressure signal, so take the
 		// highest sample rather than failing the whole tier refresh.
+		// An empty vector is the same signal as vector(0): the series is
+		// absent, so there is no measured pressure. Failing the refresh here
+		// logged "tier refresh failed: empty vector result" every minute for
+		// a budget query with no samples (home#4633) even though pass-through
+		// still allowed the backends.
 		if len(result) == 0 {
-			return 0, fmt.Errorf("empty vector result")
+			return 0, nil
 		}
 		best := math.Inf(-1)
 		for _, sample := range result {

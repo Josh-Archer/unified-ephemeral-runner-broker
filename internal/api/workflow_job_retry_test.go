@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"testing"
 	"time"
 
@@ -92,6 +93,37 @@ func TestReconcileReallocationBacksOffAndIsBounded(t *testing.T) {
 	}
 	if n := service.countWorkflowJobAllocations(99); n != maxWorkflowJobAllocations {
 		t.Fatalf("allocations for job = %d, want cap %d", n, maxWorkflowJobAllocations)
+	}
+}
+
+func TestReconcileReallocatesWhenRunnersWereStolen(t *testing.T) {
+	service, server, clock := reconcileRetryHarness(t)
+	if got, _ := server.ReconcileQueuedGitHubJobs(context.Background()); got != 1 {
+		t.Fatalf("first reconcile allocated=%d", got)
+	}
+	current, ok := service.findByWorkflowJobID(99)
+	if !ok {
+		t.Fatal("allocation missing")
+	}
+	markStolen := func(status model.AllocationStatus, id string, executed int64) {
+		t.Helper()
+		status.ID = id
+		status.State = model.StateCompleted
+		status.Metadata = map[string]string{executionJobKey: strconv.FormatInt(executed, 10)}
+		if err := service.Store().Save(status); err != nil {
+			t.Fatal(err)
+		}
+	}
+	markStolen(current, current.ID, 555)
+	for n := 0; n < maxWorkflowJobAllocations; n++ {
+		markStolen(current, fmt.Sprintf("stolen-%d", n), int64(800+n))
+	}
+	*clock = clock.Add(time.Second)
+	if !service.mayReallocateWorkflowJob(99, *clock) {
+		t.Fatal("stolen runners must not exhaust the reallocation cap")
+	}
+	if got, err := server.ReconcileQueuedGitHubJobs(context.Background()); err != nil || got != 1 {
+		t.Fatalf("reconcile after stolen runners allocated=%d err=%v", got, err)
 	}
 }
 
