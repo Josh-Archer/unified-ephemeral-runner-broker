@@ -67,14 +67,15 @@ type GitHubWebhookOptions struct {
 }
 
 type githubWebhookMetrics struct {
-	received *prometheus.CounterVec
-	matched  *prometheus.CounterVec
-	ignored  *prometheus.CounterVec
-	enqueued *prometheus.CounterVec
-	expired  prometheus.Counter
-	pageCap  *prometheus.CounterVec
-	budget   prometheus.Counter
-	skipped  *prometheus.CounterVec
+	received     *prometheus.CounterVec
+	matched      *prometheus.CounterVec
+	ignored      *prometheus.CounterVec
+	enqueued     *prometheus.CounterVec
+	expired      prometheus.Counter
+	pageCap      *prometheus.CounterVec
+	budget       prometheus.Counter
+	skipped      *prometheus.CounterVec
+	oldestQueued prometheus.Gauge
 }
 
 func newGitHubWebhookMetrics() *githubWebhookMetrics {
@@ -111,6 +112,10 @@ func newGitHubWebhookMetrics() *githubWebhookMetrics {
 			Name: "uecb_reconcile_unit_skipped_total",
 			Help: "Reconcile scan units skipped after reconcileRunMaxCutoffs consecutive deadline cutoffs, by unit (run: a run's job check; repo: a repository's queued-run listing).",
 		}, []string{"unit"}),
+		oldestQueued: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "uecb_github_reconcile_oldest_queued_job_seconds",
+			Help: "Age in seconds of the oldest queued workflow job that matched a webhook pool during the last reconcile cycle. Zero when that cycle saw none.",
+		}),
 	}
 	// Export the skip counter at 0 for both units so dashboards and alerts
 	// see the series before the first skip.
@@ -121,7 +126,7 @@ func newGitHubWebhookMetrics() *githubWebhookMetrics {
 }
 
 func (m *githubWebhookMetrics) register() {
-	for _, c := range []prometheus.Collector{m.received, m.matched, m.ignored, m.enqueued, m.expired, m.pageCap, m.budget, m.skipped} {
+	for _, c := range []prometheus.Collector{m.received, m.matched, m.ignored, m.enqueued, m.expired, m.pageCap, m.budget, m.skipped, m.oldestQueued} {
 		if err := prometheus.Register(c); err != nil {
 			if _, ok := err.(prometheus.AlreadyRegisteredError); !ok {
 				panic(err)
@@ -197,6 +202,8 @@ type githubWebhookHandler struct {
 	inflight sync.WaitGroup
 
 	seenReposMu sync.Mutex
+	admitMu     sync.Mutex
+	admitCache  map[string]runAdmitDecision
 	seenRepos   map[string]time.Time
 }
 
@@ -536,6 +543,16 @@ const (
 	reconcileTruncatedReposTTL = time.Minute
 	reconcileRateLimitFloor    = 1000
 	reconcileRateLimitBackof   = 5 * time.Minute
+	// runAdmitCacheTTL avoids a second GetWorkflowRun for every queued job of
+	// a run already checked in this cycle.
+	runAdmitCacheTTL = time.Minute
+	// actorNotAllowedCacheTTL keeps a disallowed run from spending
+	// ListWorkflowJobs plus one GetWorkflowRun per queued job on every
+	// cycle. Those runs stay queued, so an uncached reject starves older
+	// allowlisted jobs once the 40-call budget is gone (home#4633). A
+	// config change rolls the pod via checksum/broker-config, which drops
+	// this cache.
+	actorNotAllowedCacheTTL = 10 * time.Minute
 )
 
 // ErrReconcileRateLimited reports a reconcile pass skipped or cut short because
@@ -688,6 +705,7 @@ func (s *Server) ReconcileQueuedGitHubJobs(ctx context.Context) (int, error) {
 		h.logScanStop("deep", deepErr, budget, deepSpent, state)
 	}
 	h.reconcile.lastDeepSpent = deepSpent
+	h.observeOldestQueued(run.oldestQueued)
 	log.Printf("github reconcile: cycle done (%d API calls: recent %d, deep %d; deep open=%v at repo %d %q run %d, %d repos left; allocated=%d)",
 		budget.spent(), recentSpent, deepSpent, state.deepOpen, state.deep.cursor, state.deep.repo, state.deep.pos, state.deep.remaining, run.allocated)
 	for _, err := range []error{recentErr, deepErr} {
@@ -1010,11 +1028,18 @@ func splitPriorityRepos(repos, priority []string) (pri, rest []string) {
 	return pri, rest
 }
 
+type runAdmitDecision struct {
+	reason      string
+	until       time.Time
+	queuedSince time.Time
+}
+
 type reconcileRun struct {
-	h         *githubWebhookHandler
-	budget    *cycleBudget
-	allocated int
-	firstErr  error
+	h            *githubWebhookHandler
+	budget       *cycleBudget
+	allocated    int
+	firstErr     error
+	oldestQueued time.Time
 }
 
 // cutoff records a deadline cutoff for key and reports whether the unit hit
@@ -1109,6 +1134,10 @@ func (r *reconcileRun) scan(ctx context.Context, sc *repoScanner, repos []string
 
 func (r *reconcileRun) processRun(ctx context.Context, repository string, runID int64) {
 	h := r.h
+	if decision, ok := h.cachedRunDecision(repository, runID); ok && decision.reason == "actor_not_allowed" {
+		r.noteQueued(decision.queuedSince)
+		return
+	}
 	jobs, err := h.opts.WorkflowJobs.ListWorkflowJobs(ctx, repository, runID)
 	if ctx.Err() != nil {
 		return // the caller retries this run next cycle
@@ -1127,12 +1156,18 @@ func (r *reconcileRun) processRun(ctx context.Context, repository string, runID 
 	sort.SliceStable(jobs, func(i, j int) bool {
 		return r.terminalPriority(jobs[i].ID) > r.terminalPriority(jobs[j].ID)
 	})
+	var oldest time.Time
 	for _, job := range jobs {
 		if job.ID <= 0 || job.Status != "queued" {
 			continue
 		}
 		if _, ok := h.service.MatchWebhookPoolForRepository(job.Labels, repository); !ok {
 			continue
+		}
+		at := jobQueuedAt(job)
+		r.noteQueued(at)
+		if !at.IsZero() && (oldest.IsZero() || at.Before(oldest)) {
+			oldest = at
 		}
 		if job.RunID == 0 {
 			job.RunID = runID
@@ -1150,6 +1185,23 @@ func (r *reconcileRun) processRun(ctx context.Context, repository string, runID 
 		if result["status"] == "allocated" {
 			r.allocated++
 		}
+	}
+	h.noteRunQueuedSince(repository, runID, oldest)
+}
+
+func jobQueuedAt(job github.WorkflowJob) time.Time {
+	if !job.CreatedAt.IsZero() {
+		return job.CreatedAt
+	}
+	return job.StartedAt
+}
+
+func (r *reconcileRun) noteQueued(at time.Time) {
+	if at.IsZero() {
+		return
+	}
+	if r.oldestQueued.IsZero() || at.Before(r.oldestQueued) {
+		r.oldestQueued = at
 	}
 }
 
@@ -1340,6 +1392,9 @@ func (h *githubWebhookHandler) checkWorkflowRun(ctx context.Context, repository 
 	if _, exists := h.service.findByWorkflowJobID(jobID); exists {
 		return "", nil
 	}
+	if decision, ok := h.cachedRunDecision(repository, runID); ok {
+		return decision.reason, nil
+	}
 	if h.opts.WorkflowRun == nil {
 		return "", errors.New("workflow run lookup is not configured")
 	}
@@ -1347,13 +1402,85 @@ func (h *githubWebhookHandler) checkWorkflowRun(ctx context.Context, repository 
 	if err != nil {
 		return "", fmt.Errorf("check workflow run %d of %s: %w", runID, repository, err)
 	}
+	reason := ""
 	if h.opts.RejectForks && !strings.EqualFold(strings.TrimSpace(run.HeadRepository), repository) {
-		return "fork_pull_request", nil
+		reason = "fork_pull_request"
+	} else if len(h.opts.AllowedActors) > 0 && (!matchActor(run.Actor, h.opts.AllowedActors) || !matchActor(run.TriggeringActor, h.opts.AllowedActors)) {
+		reason = "actor_not_allowed"
 	}
-	if len(h.opts.AllowedActors) > 0 && (!matchActor(run.Actor, h.opts.AllowedActors) || !matchActor(run.TriggeringActor, h.opts.AllowedActors)) {
-		return "actor_not_allowed", nil
+	h.rememberRunDecision(repository, runID, reason)
+	return reason, nil
+}
+
+func runAdmitKey(repository string, runID int64) string {
+	return fmt.Sprintf("%s#%d", repository, runID)
+}
+
+func (h *githubWebhookHandler) cachedRunDecision(repository string, runID int64) (runAdmitDecision, bool) {
+	if h == nil || runID <= 0 {
+		return runAdmitDecision{}, false
 	}
-	return "", nil
+	h.admitMu.Lock()
+	defer h.admitMu.Unlock()
+	decision, ok := h.admitCache[runAdmitKey(repository, runID)]
+	if !ok || !h.service.now().Before(decision.until) {
+		return runAdmitDecision{}, false
+	}
+	return decision, true
+}
+
+func (h *githubWebhookHandler) rememberRunDecision(repository string, runID int64, reason string) {
+	if h == nil || runID <= 0 {
+		return
+	}
+	ttl := runAdmitCacheTTL
+	if reason == "actor_not_allowed" {
+		ttl = actorNotAllowedCacheTTL
+	} else if reason != "" {
+		return
+	}
+	h.admitMu.Lock()
+	defer h.admitMu.Unlock()
+	if h.admitCache == nil {
+		h.admitCache = map[string]runAdmitDecision{}
+	}
+	key := runAdmitKey(repository, runID)
+	prev := h.admitCache[key]
+	h.admitCache[key] = runAdmitDecision{reason: reason, until: h.service.now().Add(ttl), queuedSince: prev.queuedSince}
+}
+
+func (h *githubWebhookHandler) noteRunQueuedSince(repository string, runID int64, since time.Time) {
+	if h == nil || since.IsZero() || runID <= 0 {
+		return
+	}
+	h.admitMu.Lock()
+	defer h.admitMu.Unlock()
+	if h.admitCache == nil {
+		return
+	}
+	key := runAdmitKey(repository, runID)
+	decision, ok := h.admitCache[key]
+	if !ok {
+		return
+	}
+	if decision.queuedSince.IsZero() || since.Before(decision.queuedSince) {
+		decision.queuedSince = since
+		h.admitCache[key] = decision
+	}
+}
+
+func (h *githubWebhookHandler) observeOldestQueued(at time.Time) {
+	if h == nil || h.metrics == nil || h.metrics.oldestQueued == nil {
+		return
+	}
+	age := 0.0
+	if !at.IsZero() && h.service != nil {
+		age = h.service.now().Sub(at).Seconds()
+		if age < 0 {
+			age = 0
+		}
+	}
+	h.metrics.oldestQueued.Set(age)
 }
 
 func (h *githubWebhookHandler) ignore(s *Server, w http.ResponseWriter, reason string) {

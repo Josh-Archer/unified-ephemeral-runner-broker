@@ -248,6 +248,32 @@ func TestListQueuedWorkflowRunsCapsPages(t *testing.T) {
 	}
 }
 
+func TestListQueuedWorkflowRunsOldestFirst(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// GitHub's default order is newest first.
+		_, _ = w.Write([]byte(`{"workflow_runs":[` +
+			`{"id":20,"created_at":"2026-11-13T18:00:00Z"},` +
+			`{"id":10,"created_at":"2026-11-13T15:00:00Z"},` +
+			`{"id":30,"created_at":"2026-11-13T17:00:00Z"}` +
+			`]}`))
+	}))
+	defer server.Close()
+	client := NewClient(func(context.Context) (string, error) { return "tok", nil }, nil).WithBaseURL(server.URL)
+	runs, err := client.ListQueuedWorkflowRuns(context.Background(), "o/r", time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []int64{10, 30, 20}
+	if len(runs) != len(want) {
+		t.Fatalf("runs=%v, want %v", runs, want)
+	}
+	for i := range want {
+		if runs[i] != want[i] {
+			t.Fatalf("runs=%v, want %v", runs, want)
+		}
+	}
+}
+
 func TestListWorkflowJobsCapsPages(t *testing.T) {
 	pages := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

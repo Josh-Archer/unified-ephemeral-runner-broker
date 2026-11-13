@@ -39,13 +39,20 @@ func workflowJobRetryBackoff(prior int) time.Duration {
 	return d
 }
 
-// countWorkflowJobAllocations counts every allocation recorded for jobID.
+// countWorkflowJobAllocations counts allocations that actually attempted jobID.
+// A runner GitHub assigned to a different job did not attempt this one. Shared
+// webhook labels make that common; counting those completions exhausted the
+// cap and left the original job queued while capacity was free (home#4633).
 func (s *Service) countWorkflowJobAllocations(jobID int64) int {
 	n := 0
 	for _, status := range s.store.List() {
-		if status.Request != nil && status.Request.WorkflowJobID == jobID {
-			n++
+		if status.Request == nil || status.Request.WorkflowJobID != jobID {
+			continue
 		}
+		if executed := executionJob(status); executed != 0 && executed != jobID {
+			continue
+		}
+		n++
 	}
 	return n
 }

@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/github"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
@@ -61,6 +64,81 @@ func TestReconcileQueuedGitHubJobsPrioritizesHomeUnderBudget(t *testing.T) {
 	}
 	if len(l.runLists) == 0 || !strings.EqualFold(l.runLists[0].repo, homeRepo) {
 		t.Fatalf("first run listing = %+v, want %s first", l.runLists, homeRepo)
+	}
+}
+
+func TestReconcileRejectedRunDoesNotStarveOlderQueuedJob(t *testing.T) {
+	service := newServiceWithConfig(webhookFullPool)
+	now := time.Date(2026, 11, 13, 18, 0, 0, 0, time.UTC)
+	service.now = func() time.Time { return now }
+	service.cfg.GitHub.Scope = model.GitHubScope{Type: model.GitHubScopeOwner, Owner: "my-org", Repository: "home"}
+	server := newTestServer(t, service)
+	l := newCountingLister(service.now)
+	const repo = "my-org/home"
+	l.repos = []string{repo}
+	// GitHub lists newest first. Run 2 is a disallowed actor with many queued
+	// jobs; run 1 is older and allowlisted. Without a per-run decision cache
+	// the rejected jobs spend the API budget before run 1 is reached.
+	l.runsRecent = map[string][]int64{repo: {2, 1}}
+	rejected := make([]github.WorkflowJob, 30)
+	for i := range rejected {
+		rejected[i] = github.WorkflowJob{
+			ID: int64(2000 + i), RunID: 2, Status: "queued",
+			Labels:    []string{"self-hosted", "uecb-full"},
+			CreatedAt: now.Add(-40 * time.Minute),
+		}
+	}
+	l.jobs = map[string][]github.WorkflowJob{
+		"2": rejected,
+		"1": {{
+			ID: 501, RunID: 1, Status: "queued",
+			Labels:    []string{"self-hosted", "uecb-full"},
+			CreatedAt: now.Add(-20 * time.Minute),
+		}},
+	}
+	lookups := map[int64]int{}
+	server.SetGitHubWebhook(GitHubWebhookOptions{
+		WorkflowJobs:  l,
+		AllowedActors: []string{"alice"},
+		WorkflowRun: func(_ context.Context, _ string, runID int64) (github.WorkflowRun, error) {
+			l.calls++
+			lookups[runID]++
+			actor := "alice"
+			if runID == 2 {
+				actor = "bob"
+			}
+			return github.WorkflowRun{Actor: actor, TriggeringActor: actor, HeadRepository: repo}, nil
+		},
+	})
+
+	got, err := server.ReconcileQueuedGitHubJobs(context.Background())
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if got != 1 {
+		t.Fatalf("allocated=%d, want the older allowlisted job", got)
+	}
+	if _, ok := service.findByWorkflowJobID(501); !ok {
+		t.Fatal("job 501 was not allocated")
+	}
+	if lookups[2] != 1 {
+		t.Fatalf("rejected run lookups=%d, want 1", lookups[2])
+	}
+	if l.calls > reconcileCallBudget {
+		t.Fatalf("cycle spent %d calls, budget %d", l.calls, reconcileCallBudget)
+	}
+	if age := testutil.ToFloat64(server.githubWebhook.metrics.oldestQueued); age != (40 * time.Minute).Seconds() {
+		t.Fatalf("oldest queued age=%v, want 2400", age)
+	}
+	listsBefore := l.jobLists[2]
+	if _, err := server.ReconcileQueuedGitHubJobs(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if l.jobLists[2] != listsBefore {
+		t.Fatalf("rejected run listed again: before %d after %d", listsBefore, l.jobLists[2])
+	}
+	if lookups[2] != 1 {
+		t.Fatalf("rejected run looked up again: %d", lookups[2])
 	}
 }
 

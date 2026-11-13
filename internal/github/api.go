@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -202,10 +203,12 @@ type WorkflowRun struct {
 
 // WorkflowJob is the queued-job subset needed by the broker reconciler.
 type WorkflowJob struct {
-	ID     int64    `json:"id"`
-	RunID  int64    `json:"run_id"`
-	Status string   `json:"status"`
-	Labels []string `json:"labels"`
+	ID        int64     `json:"id"`
+	RunID     int64     `json:"run_id"`
+	Status    string    `json:"status"`
+	Labels    []string  `json:"labels"`
+	CreatedAt time.Time `json:"created_at"`
+	StartedAt time.Time `json:"started_at"`
 }
 
 // ListRepositories returns repositories visible to the configured owner or
@@ -373,7 +376,11 @@ func (c *Client) ListQueuedWorkflowRuns(ctx context.Context, repository string, 
 	if err != nil {
 		return nil, err
 	}
-	var ids []int64
+	type listedRun struct {
+		ID      int64     `json:"id"`
+		Created time.Time `json:"created_at"`
+	}
+	var listed []listedRun
 	truncated := false
 	seen := map[int64]struct{}{}
 	created := ""
@@ -383,9 +390,7 @@ func (c *Client) ListQueuedWorkflowRuns(ctx context.Context, repository string, 
 	for _, status := range []string{"queued"} {
 		for page := 1; page <= MaxQueuedRunPages; page++ {
 			var out struct {
-				WorkflowRuns []struct {
-					ID int64 `json:"id"`
-				} `json:"workflow_runs"`
+				WorkflowRuns []listedRun `json:"workflow_runs"`
 			}
 			path := fmt.Sprintf("%s/actions/runs?status=%s%s&per_page=100&page=%d", base, status, created, page)
 			if err := c.do(ctx, http.MethodGet, path, nil, &out, http.StatusOK); err != nil {
@@ -399,7 +404,7 @@ func (c *Client) ListQueuedWorkflowRuns(ctx context.Context, repository string, 
 					continue
 				}
 				seen[run.ID] = struct{}{}
-				ids = append(ids, run.ID)
+				listed = append(listed, run)
 			}
 			if len(out.WorkflowRuns) < 100 {
 				break
@@ -408,6 +413,21 @@ func (c *Client) ListQueuedWorkflowRuns(ctx context.Context, repository string, 
 				truncated = true
 			}
 		}
+	}
+	// GitHub lists newest first. Reconcile stops at its API-call budget, so
+	// walk oldest first: a fresh run must not hide an older queued job
+	// (home#4633). Runs with no created_at keep API order. The page cap can
+	// still omit runs older than the fetched pages.
+	sort.SliceStable(listed, func(i, j int) bool {
+		ai, aj := listed[i].Created, listed[j].Created
+		if ai.IsZero() || aj.IsZero() || ai.Equal(aj) {
+			return false
+		}
+		return ai.Before(aj)
+	})
+	ids := make([]int64, 0, len(listed))
+	for _, run := range listed {
+		ids = append(ids, run.ID)
 	}
 	if truncated {
 		return ids, fmt.Errorf("list queued workflow runs for %s: %w (%d pages)", repository, ErrPageCapReached, MaxQueuedRunPages)
