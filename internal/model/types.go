@@ -626,10 +626,28 @@ type HostedOverflowConfig struct {
 	// before jobs return to self-hosted runners. Defaults to 5m.
 	RecoverAfter time.Duration `yaml:"recoverAfter,omitempty" json:"recoverAfter,omitempty"`
 	// BudgetRules gate private repositories, evaluated through
-	// broker.tierRouting under backend "github-hosted". With no rules private
-	// repositories never switch. A stale or unknown decision counts as over
-	// budget, so a missing billing feed never spends minutes.
+	// broker.tierRouting under backend "github-hosted". When Prometheus has no
+	// valid reading (or no rules are configured), the controller falls back to
+	// querying GitHub's billing API (via BillingTokenEnv) and then to
+	// estimating monthly hosted minutes from repository workflow jobs, failing
+	// open if all sources are unavailable.
 	BudgetRules []TierRuleConfig `yaml:"budgetRules,omitempty" json:"budgetRules,omitempty"`
+	// BillingUser is the GitHub user account queried by the direct billing
+	// API fallback. Defaults to the owner of the first configured repository.
+	BillingUser string `yaml:"billingUser,omitempty" json:"billingUser,omitempty"`
+	// BillingTokenEnv is the environment variable holding a GitHub PAT (classic
+	// `user` scope or fine-grained Account Plan:read) for the direct billing
+	// API fallback. Defaults to GITHUB_BILLING_TOKEN.
+	BillingTokenEnv string `yaml:"billingTokenEnv,omitempty" json:"billingTokenEnv,omitempty"`
+	// IncludedUSD is the monthly GitHub Actions included dollar allowance used
+	// by the direct billing API fallback. Defaults to 12.
+	IncludedUSD float64 `yaml:"includedUSD,omitempty" json:"includedUSD,omitempty"`
+	// HardLimitRatio is the fraction of IncludedUSD / IncludedMinutes at which
+	// private-repo overflow stops for the rest of the month. Defaults to 0.9.
+	HardLimitRatio float64 `yaml:"hardLimitRatio,omitempty" json:"hardLimitRatio,omitempty"`
+	// IncludedMinutes is the monthly GitHub-hosted minute allowance used by
+	// the last-resort workflow-job duration estimate. Defaults to 2000.
+	IncludedMinutes float64 `yaml:"includedMinutes,omitempty" json:"includedMinutes,omitempty"`
 }
 
 // PoolScaleSetConfig names the Runner Scale Set that feeds one pool.

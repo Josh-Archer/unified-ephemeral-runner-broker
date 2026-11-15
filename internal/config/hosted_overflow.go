@@ -60,6 +60,15 @@ func validateHostedOverflow(cfg model.BrokerConfig) error {
 		if len(overflow.BudgetRules) > 0 && !cfg.Broker.TierRouting.Enabled {
 			return fmt.Errorf("%s.budgetRules need broker.tierRouting.enabled", prefix)
 		}
+		if overflow.HardLimitRatio < 0 || overflow.HardLimitRatio > 1 {
+			return fmt.Errorf("%s.hardLimitRatio must be between 0 and 1", prefix)
+		}
+		if overflow.IncludedUSD < 0 {
+			return fmt.Errorf("%s.includedUSD must not be negative", prefix)
+		}
+		if overflow.IncludedMinutes < 0 {
+			return fmt.Errorf("%s.includedMinutes must not be negative", prefix)
+		}
 	}
 	return nil
 }

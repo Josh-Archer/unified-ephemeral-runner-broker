@@ -9,25 +9,35 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
+	ghclient "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/github"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/tier"
 )
 
 const (
-	defaultSaturateAfter = 2 * time.Minute
-	defaultRecoverAfter  = 5 * time.Minute
+	defaultSaturateAfter   = 2 * time.Minute
+	defaultRecoverAfter    = 5 * time.Minute
+	defaultBillingTokenEnv = "GITHUB_BILLING_TOKEN"
+	defaultIncludedUSD     = 12.0
+	defaultHardLimitRatio  = 0.9
+	defaultIncludedMinutes = 2000.0
 	// visibilityTTL bounds how long a repository's public/private answer is reused.
 	visibilityTTL = time.Hour
+	// billingCacheTTL bounds how often direct GitHub billing/job fallbacks run.
+	billingCacheTTL = 15 * time.Minute
 )
 
 // GitHub is the part of the GitHub client the controller uses.
 type GitHub interface {
 	SetRepositoryVariable(ctx context.Context, repository, name, value string) error
 	RepositoryIsPrivate(ctx context.Context, repository string) (bool, error)
+	GetActionsBillingUsage(ctx context.Context, user string, year, month int, token string) (grossUSD, netUSD float64, err error)
+	MonthlyHostedMinutes(ctx context.Context, repository string, monthStart, now time.Time) (float64, error)
 }
 
 // Allocations lists the broker's current allocations.
@@ -48,10 +58,13 @@ type Controller struct {
 	budget Budget
 	logf   func(string, ...any)
 
-	mu         sync.Mutex
-	state      map[model.PoolName]*poolState
-	applied    map[string]string
-	visibility map[string]visibility
+	mu           sync.Mutex
+	getenv       func(string) string
+	state        map[model.PoolName]*poolState
+	applied      map[string]string
+	visibility   map[string]visibility
+	blockedUntil map[model.PoolName]time.Time
+	directCache  map[model.PoolName]cachedBudget
 }
 
 type poolState struct {
@@ -64,8 +77,15 @@ type visibility struct {
 	checkedAt time.Time
 }
 
+type cachedBudget struct {
+	allowed   bool
+	reason    string
+	checkedAt time.Time
+}
+
 // New returns nil when no pool enables hostedOverflow. budget may be nil, in
-// which case private repositories never switch to hosted runners.
+// which case the controller falls back to direct GitHub queries and fails open
+// if all budget sources are unavailable.
 func New(cfg model.BrokerConfig, github GitHub, allocs Allocations, budget Budget) *Controller {
 	var pools []model.PoolConfig
 	for _, pool := range cfg.Pools {
@@ -77,14 +97,17 @@ func New(cfg model.BrokerConfig, github GitHub, allocs Allocations, budget Budge
 		return nil
 	}
 	return &Controller{
-		pools:      pools,
-		github:     github,
-		allocs:     allocs,
-		budget:     budget,
-		logf:       log.Printf,
-		state:      map[model.PoolName]*poolState{},
-		applied:    map[string]string{},
-		visibility: map[string]visibility{},
+		pools:        pools,
+		github:       github,
+		allocs:       allocs,
+		budget:       budget,
+		logf:         log.Printf,
+		getenv:       os.Getenv,
+		state:        map[model.PoolName]*poolState{},
+		applied:      map[string]string{},
+		visibility:   map[string]visibility{},
+		blockedUntil: map[model.PoolName]time.Time{},
+		directCache:  map[model.PoolName]cachedBudget{},
 	}
 }
 
@@ -102,7 +125,8 @@ func (c *Controller) Reconcile(ctx context.Context, now time.Time) error {
 	for _, pool := range c.pools {
 		cfg := pool.HostedOverflow
 		backedUp := c.updatePoolState(pool.Name, cfg, allocations, now)
-		budgetOK, budgetReason := c.budgetAvailable(pool.Name, cfg)
+		var budgetChecked, budgetOK bool
+		var budgetReason string
 		for _, repository := range cfg.Repositories {
 			repository = strings.TrimSpace(repository)
 			want := strings.TrimSpace(cfg.SelfHostedValue)
@@ -116,10 +140,14 @@ func (c *Controller) Reconcile(ctx context.Context, now time.Time) error {
 				case !private:
 					want = strings.TrimSpace(cfg.HostedValue)
 					reason = "pool backed up, public repository"
-				case budgetOK:
-					want = strings.TrimSpace(cfg.HostedValue)
-					reason = "pool backed up, " + budgetReason
 				default:
+					if !budgetChecked {
+						budgetOK, budgetReason = c.budgetAvailable(ctx, pool.Name, cfg, now)
+						budgetChecked = true
+					}
+					if budgetOK {
+						want = strings.TrimSpace(cfg.HostedValue)
+					}
 					reason = "pool backed up, " + budgetReason
 				}
 			}
@@ -128,6 +156,9 @@ func (c *Controller) Reconcile(ctx context.Context, now time.Time) error {
 				continue
 			}
 			if err := c.github.SetRepositoryVariable(ctx, repository, strings.TrimSpace(cfg.Variable), want); err != nil {
+				if ghclient.IsBillingExhaustedError(err) {
+					c.latchBlockedUntilNextMonth(pool.Name, now, err.Error())
+				}
 				errs = append(errs, fmt.Errorf("set %s on %s: %w", cfg.Variable, repository, err))
 				continue
 			}
@@ -190,30 +221,131 @@ func Waiting(allocations []model.AllocationStatus, pool model.PoolName, now time
 	return n
 }
 
-func (c *Controller) budgetAvailable(pool model.PoolName, cfg *model.HostedOverflowConfig) (bool, string) {
-	if len(cfg.BudgetRules) == 0 {
-		return false, "no budget rules, private repositories stay self-hosted"
+func (c *Controller) budgetAvailable(ctx context.Context, pool model.PoolName, cfg *model.HostedOverflowConfig, now time.Time) (bool, string) {
+	if until := c.blockedUntil[pool]; !until.IsZero() && now.Before(until) {
+		return false, "GitHub minutes exhausted until " + until.UTC().Format("2006-01-02")
 	}
-	if c.budget == nil {
-		return false, "tier routing is off, budget unknown"
-	}
-	decision, ok := c.budget.Decision(pool, model.HostedOverflowBudgetBackend)
-	if !ok {
-		return false, "budget not read yet"
-	}
-	if decision.Stale {
-		return false, "budget reading is stale"
-	}
-	switch decision.State {
-	case tier.StateHealthy, tier.StateApproaching:
-		return true, "GitHub minutes " + decision.State
-	default:
-		reason := decision.Reason
-		if reason == "" {
-			reason = decision.State
+
+	// Tier 1 (Primary): Prometheus tierRouting budgetRules.
+	if c.budget != nil && len(cfg.BudgetRules) > 0 {
+		if decision, ok := c.budget.Decision(pool, model.HostedOverflowBudgetBackend); ok && !decision.Stale && decision.State != tier.StateUnknown {
+			switch decision.State {
+			case tier.StateHealthy, tier.StateApproaching:
+				return true, "GitHub minutes " + decision.State
+			default:
+				reason := decision.Reason
+				if reason == "" {
+					reason = decision.State
+				}
+				c.latchBlockedUntilNextMonth(pool, now, "Prometheus budget "+reason)
+				return false, "GitHub minutes unavailable: " + reason
+			}
 		}
-		return false, "GitHub minutes unavailable: " + reason
 	}
+
+	// Reuse recent direct GitHub fallback check within billingCacheTTL.
+	if cached, ok := c.directCache[pool]; ok && now.Sub(cached.checkedAt) < billingCacheTTL {
+		return cached.allowed, cached.reason
+	}
+
+	ratio := cfg.HardLimitRatio
+	if ratio <= 0 {
+		ratio = defaultHardLimitRatio
+	}
+
+	// Tier 2 (Backup 1): Direct GitHub Billing Usage API (requires PAT).
+	if user := resolveBillingUser(cfg); user != "" {
+		tokenEnv := strings.TrimSpace(cfg.BillingTokenEnv)
+		if tokenEnv == "" {
+			tokenEnv = defaultBillingTokenEnv
+		}
+		if token := strings.TrimSpace(c.getenv(tokenEnv)); token != "" {
+			utc := now.UTC()
+			grossUSD, netUSD, err := c.github.GetActionsBillingUsage(ctx, user, utc.Year(), int(utc.Month()), token)
+			if ghclient.IsBillingExhaustedError(err) {
+				c.latchBlockedUntilNextMonth(pool, now, err.Error())
+				return false, "GitHub billing exhausted until " + c.blockedUntil[pool].UTC().Format("2006-01-02")
+			}
+			if err == nil {
+				includedUSD := cfg.IncludedUSD
+				if includedUSD <= 0 {
+					includedUSD = defaultIncludedUSD
+				}
+				limitUSD := includedUSD * ratio
+				if netUSD > 0 || grossUSD >= limitUSD {
+					reason := fmt.Sprintf("GitHub billing API exhausted ($%.2f/$%.2f, net $%.2f)", grossUSD, limitUSD, netUSD)
+					c.latchBlockedUntilNextMonth(pool, now, reason)
+					return false, reason
+				}
+				reason := fmt.Sprintf("GitHub billing API under limit ($%.2f/$%.2f)", grossUSD, limitUSD)
+				c.directCache[pool] = cachedBudget{allowed: true, reason: reason, checkedAt: now}
+				return true, reason
+			}
+		}
+	}
+
+	// Tier 3 (Backup 2, least accurate): GitHub App workflow-job duration estimate.
+	monthStart := time.Date(now.UTC().Year(), now.UTC().Month(), 1, 0, 0, 0, 0, time.UTC)
+	var totalMinutes float64
+	var anyOK bool
+	for _, repo := range cfg.Repositories {
+		repo = strings.TrimSpace(repo)
+		private, err := c.isPrivate(ctx, repo, now)
+		if err != nil || !private {
+			continue
+		}
+		mins, err := c.github.MonthlyHostedMinutes(ctx, repo, monthStart, now)
+		if ghclient.IsBillingExhaustedError(err) {
+			c.latchBlockedUntilNextMonth(pool, now, err.Error())
+			return false, "GitHub billing exhausted until " + c.blockedUntil[pool].UTC().Format("2006-01-02")
+		}
+		if err == nil {
+			anyOK = true
+			totalMinutes += mins
+		}
+	}
+	if anyOK {
+		includedMin := cfg.IncludedMinutes
+		if includedMin <= 0 {
+			includedMin = defaultIncludedMinutes
+		}
+		limitMin := includedMin * ratio
+		if totalMinutes >= limitMin {
+			reason := fmt.Sprintf("GitHub App job estimate exhausted (%.1f/%.0f min)", totalMinutes, limitMin)
+			c.latchBlockedUntilNextMonth(pool, now, reason)
+			return false, reason
+		}
+		reason := fmt.Sprintf("GitHub App job estimate under limit (%.1f/%.0f min)", totalMinutes, limitMin)
+		c.directCache[pool] = cachedBudget{allowed: true, reason: reason, checkedAt: now}
+		return true, reason
+	}
+
+	// Worst case: all budget sources unavailable -> fail open.
+	reason := "budget sources unavailable, failing open"
+	c.directCache[pool] = cachedBudget{allowed: true, reason: reason, checkedAt: now}
+	return true, reason
+}
+
+func (c *Controller) latchBlockedUntilNextMonth(pool model.PoolName, now time.Time, reason string) {
+	utc := now.UTC()
+	until := time.Date(utc.Year(), utc.Month()+1, 1, 0, 0, 0, 0, time.UTC)
+	if !c.blockedUntil[pool].Equal(until) {
+		c.logf("hosted overflow: pool %s blocking private-repo overflow until %s (%s)", pool, until.Format(time.RFC3339), reason)
+	}
+	c.blockedUntil[pool] = until
+	delete(c.directCache, pool)
+}
+
+func resolveBillingUser(cfg *model.HostedOverflowConfig) string {
+	if u := strings.TrimSpace(cfg.BillingUser); u != "" {
+		return u
+	}
+	for _, repo := range cfg.Repositories {
+		if owner, _, ok := strings.Cut(strings.TrimSpace(repo), "/"); ok && owner != "" {
+			return owner
+		}
+	}
+	return ""
 }
 
 func (c *Controller) isPrivate(ctx context.Context, repository string, now time.Time) (bool, error) {
