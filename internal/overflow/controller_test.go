@@ -3,20 +3,29 @@ package overflow
 import (
 	"context"
 	"errors"
+	"net/http"
 	"testing"
 	"time"
 
+	ghclient "github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/github"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/tier"
 )
 
 type fakeGitHub struct {
-	private  map[string]bool
-	visErr   error
-	setErr   error
-	sets     []string
-	vars     map[string]string
-	visCalls int
+	private     map[string]bool
+	visErr      error
+	setErr      error
+	sets        []string
+	vars        map[string]string
+	visCalls    int
+	billingGross float64
+	billingNet   float64
+	billingErr   error
+	billingCalls int
+	hostedMins   map[string]float64
+	hostedErr    error
+	hostedCalls  int
 }
 
 func (f *fakeGitHub) SetRepositoryVariable(_ context.Context, repo, name, value string) error {
@@ -37,6 +46,22 @@ func (f *fakeGitHub) RepositoryIsPrivate(_ context.Context, repo string) (bool, 
 		return false, f.visErr
 	}
 	return f.private[repo], nil
+}
+
+func (f *fakeGitHub) GetActionsBillingUsage(_ context.Context, _ string, _, _ int, _ string) (float64, float64, error) {
+	f.billingCalls++
+	if f.billingErr != nil {
+		return 0, 0, f.billingErr
+	}
+	return f.billingGross, f.billingNet, nil
+}
+
+func (f *fakeGitHub) MonthlyHostedMinutes(_ context.Context, repo string, _, _ time.Time) (float64, error) {
+	f.hostedCalls++
+	if f.hostedErr != nil {
+		return 0, f.hostedErr
+	}
+	return f.hostedMins[repo], nil
 }
 
 type fakeAllocs []model.AllocationStatus
@@ -130,39 +155,92 @@ func TestBackedUpSendsPublicAndBudgetedPrivateReposToHosted(t *testing.T) {
 	}
 }
 
-func TestPrivateRepoStaysSelfHostedWithoutBudget(t *testing.T) {
-	cases := map[string]Budget{
-		"exceeded": &fakeBudget{decision: tier.Decision{State: tier.StateExceeded, Reason: "minutes used"}, ok: true},
-		"unknown":  &fakeBudget{decision: tier.Decision{State: tier.StateUnknown}, ok: true},
-		"stale":    &fakeBudget{decision: tier.Decision{State: tier.StateHealthy, Stale: true}, ok: true},
-		"no data":  &fakeBudget{},
-		"no tier":  nil,
-	}
-	for name, budget := range cases {
-		t.Run(name, func(t *testing.T) {
-			c, gh, allocs := newController(t, true, budget)
-			*allocs = fakeAllocs{waitingAllocation("shared", model.StateReserved, t0.Add(-10*time.Minute))}
-			if err := c.Reconcile(context.Background(), t0); err != nil {
-				t.Fatal(err)
-			}
-			if value(gh, "o/private-repo") != "uecb-shared" {
-				t.Fatalf("private repo went hosted: %v", gh.vars)
-			}
-			if value(gh, "o/public-repo") != "ubuntu-latest" {
-				t.Fatalf("public repo stayed local: %v", gh.vars)
-			}
-		})
-	}
-}
-
-func TestNoBudgetRulesKeepsPrivateReposLocal(t *testing.T) {
-	c, gh, allocs := newController(t, false, &fakeBudget{decision: tier.Decision{State: tier.StateHealthy}, ok: true})
-	*allocs = fakeAllocs{waitingAllocation("shared", model.StatePending, t0.Add(-3*time.Minute))}
+func TestPrivateRepoStaysSelfHostedWhenPrometheusExceeded(t *testing.T) {
+	c, gh, allocs := newController(t, true, &fakeBudget{decision: tier.Decision{State: tier.StateExceeded, Reason: "minutes used"}, ok: true})
+	*allocs = fakeAllocs{waitingAllocation("shared", model.StateReserved, t0.Add(-10*time.Minute))}
 	if err := c.Reconcile(context.Background(), t0); err != nil {
 		t.Fatal(err)
 	}
 	if value(gh, "o/private-repo") != "uecb-shared" {
-		t.Fatalf("vars = %v", gh.vars)
+		t.Fatalf("private repo went hosted: %v", gh.vars)
+	}
+	if value(gh, "o/public-repo") != "ubuntu-latest" {
+		t.Fatalf("public repo stayed local: %v", gh.vars)
+	}
+}
+
+func TestFallbackOrderAndWorstCaseFailOpen(t *testing.T) {
+	// No Prometheus data -> Tier 2 (Billing API) -> Tier 3 (GitHub App job estimate) -> Fail open.
+	c, gh, allocs := newController(t, true, &fakeBudget{})
+	c.getenv = func(string) string { return "pat-token" }
+	gh.billingErr = errors.New("billing api down")
+	gh.hostedMins = map[string]float64{"o/private-repo": 100}
+	*allocs = fakeAllocs{waitingAllocation("shared", model.StatePending, t0.Add(-3*time.Minute))}
+
+	if err := c.Reconcile(context.Background(), t0); err != nil {
+		t.Fatal(err)
+	}
+	if gh.billingCalls != 1 || gh.hostedCalls != 1 {
+		t.Fatalf("expected Tier 2 then Tier 3 calls, got billing=%d hosted=%d", gh.billingCalls, gh.hostedCalls)
+	}
+	if value(gh, "o/private-repo") != "ubuntu-latest" {
+		t.Fatalf("expected private repo to overflow on Tier 3 under limit, got %v", gh.vars)
+	}
+
+	// Worst case: all three sources fail -> still fail open.
+	c2, gh2, allocs2 := newController(t, false, nil)
+	c2.getenv = func(string) string { return "pat-token" }
+	gh2.billingErr = errors.New("billing api down")
+	gh2.hostedErr = errors.New("runs api down")
+	*allocs2 = fakeAllocs{waitingAllocation("shared", model.StatePending, t0.Add(-3*time.Minute))}
+
+	if err := c2.Reconcile(context.Background(), t0); err != nil {
+		t.Fatal(err)
+	}
+	if value(gh2, "o/private-repo") != "ubuntu-latest" {
+		t.Fatalf("expected worst-case fail open, got %v", gh2.vars)
+	}
+}
+
+func TestBillingErrorLatchesUntilNextMonthReset(t *testing.T) {
+	c, gh, allocs := newController(t, true, &fakeBudget{})
+	c.getenv = func(string) string { return "pat-token" }
+	gh.billingErr = &ghclient.StatusError{Code: http.StatusPaymentRequired, Message: "spending limit reached"}
+	*allocs = fakeAllocs{waitingAllocation("shared", model.StatePending, t0.Add(-3*time.Minute))}
+
+	if err := c.Reconcile(context.Background(), t0); err != nil {
+		t.Fatal(err)
+	}
+	if value(gh, "o/private-repo") != "uecb-shared" {
+		t.Fatalf("expected private repo blocked on billing error, got %v", gh.vars)
+	}
+	if value(gh, "o/public-repo") != "ubuntu-latest" {
+		t.Fatalf("expected public repo still hosted, got %v", gh.vars)
+	}
+
+	// Still in November: latch holds without re-querying billing API.
+	gh.billingErr = nil
+	gh.billingGross = 0
+	laterSameMonth := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+	*allocs = fakeAllocs{waitingAllocation("shared", model.StatePending, laterSameMonth.Add(-3*time.Minute))}
+	if err := c.Reconcile(context.Background(), laterSameMonth); err != nil {
+		t.Fatal(err)
+	}
+	if value(gh, "o/private-repo") != "uecb-shared" {
+		t.Fatalf("expected latch to hold until month reset, got %v", gh.vars)
+	}
+	if gh.billingCalls != 1 {
+		t.Fatalf("expected latch to skip billing API until month reset, calls=%d", gh.billingCalls)
+	}
+
+	// December 1st UTC: month resets, latch clears and private repo can overflow again.
+	nextMonth := time.Date(2026, 12, 1, 0, 0, 0, 0, time.UTC)
+	*allocs = fakeAllocs{waitingAllocation("shared", model.StatePending, nextMonth.Add(-3*time.Minute))}
+	if err := c.Reconcile(context.Background(), nextMonth); err != nil {
+		t.Fatal(err)
+	}
+	if value(gh, "o/private-repo") != "ubuntu-latest" {
+		t.Fatalf("expected private repo allowed after month reset, got %v", gh.vars)
 	}
 }
 
