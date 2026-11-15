@@ -33,21 +33,21 @@ func TestIsBillingExhaustedError(t *testing.T) {
 func TestGetActionsBillingUsageFiltersPublicAndNonMinutes(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/users/Josh-Archer/settings/billing/usage":
+		case "/users/octo-user/settings/billing/usage":
 			if got := r.Header.Get("Authorization"); got != "Bearer pat-123" {
 				t.Fatalf("Authorization = %q", got)
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"usageItems": []map[string]any{
-					{"product": "Actions", "unitType": "Minutes", "repositoryName": "DeskQuest", "grossAmount": 4.5, "netAmount": 0},
+					{"product": "Actions", "unitType": "Minutes", "repositoryName": "priv-a", "grossAmount": 4.5, "netAmount": 0},
 					{"product": "Actions", "unitType": "Minutes", "repositoryName": "public-repo", "grossAmount": 99.0, "netAmount": 0},
-					{"product": "Actions", "unitType": "GigabyteHours", "repositoryName": "DeskQuest", "grossAmount": 2.0, "netAmount": 0},
-					{"product": "Actions", "unitType": "Minutes", "repositoryName": "home", "grossAmount": 8.5, "netAmount": 1.0},
+					{"product": "Actions", "unitType": "GigabyteHours", "repositoryName": "priv-a", "grossAmount": 2.0, "netAmount": 0},
+					{"product": "Actions", "unitType": "Minutes", "repositoryName": "priv-b", "grossAmount": 8.5, "netAmount": 1.0},
 				},
 			})
-		case "/repos/Josh-Archer/DeskQuest", "/repos/Josh-Archer/home":
+		case "/repos/octo-user/priv-a", "/repos/octo-user/priv-b":
 			_ = json.NewEncoder(w).Encode(map[string]any{"private": true, "visibility": "private"})
-		case "/repos/Josh-Archer/public-repo":
+		case "/repos/octo-user/public-repo":
 			_ = json.NewEncoder(w).Encode(map[string]any{"private": false, "visibility": "public"})
 		default:
 			http.NotFound(w, r)
@@ -58,7 +58,7 @@ func TestGetActionsBillingUsageFiltersPublicAndNonMinutes(t *testing.T) {
 	c := NewClient(func(context.Context) (string, error) { return "app-tok", nil }, srv.Client())
 	c.baseURL = srv.URL
 
-	gross, net, err := c.GetActionsBillingUsage(context.Background(), "Josh-Archer", 2026, 11, "pat-123")
+	gross, net, err := c.GetActionsBillingUsage(context.Background(), "octo-user", 2026, 11, "pat-123")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,14 +71,14 @@ func TestMonthlyHostedMinutesSumsGitHubHostedJobsOnly(t *testing.T) {
 	t0 := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/repos/Josh-Archer/DeskQuest/actions/runs":
+		case "/repos/octo-user/priv-a/actions/runs":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"workflow_runs": []map[string]any{
 					{"id": 1, "conclusion": "success"},
 					{"id": 2, "conclusion": "skipped"},
 				},
 			})
-		case "/repos/Josh-Archer/DeskQuest/actions/runs/1/jobs":
+		case "/repos/octo-user/priv-a/actions/runs/1/jobs":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"jobs": []map[string]any{
 					{
@@ -106,7 +106,7 @@ func TestMonthlyHostedMinutesSumsGitHubHostedJobsOnly(t *testing.T) {
 	c := NewClient(func(context.Context) (string, error) { return "app-tok", nil }, srv.Client())
 	c.baseURL = srv.URL
 
-	mins, err := c.MonthlyHostedMinutes(context.Background(), "Josh-Archer/DeskQuest", time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC), t0)
+	mins, err := c.MonthlyHostedMinutes(context.Background(), "octo-user/priv-a", time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC), t0)
 	if err != nil {
 		t.Fatal(err)
 	}
