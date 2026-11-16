@@ -998,6 +998,27 @@ rate-limited, the broker tries another eligible backend; if none can run the
 allocation, the request fails fast with a rate-limit fallback exhaustion error
 instead of waiting in the queue.
 
+### Allocation failure capacity snapshot
+
+A rejected `POST /v1/allocations` returns `capacity_snapshot`, one entry per
+backend of the pool, so a caller can tell why each backend could not take the
+job:
+
+| `status` | Meaning |
+|---|---|
+| `available` | Enabled, admitted, and has free slots. |
+| `disabled` | `enabled: false` in config. |
+| `exhausted` | Enabled but every slot is in use; `reason` names the cap, e.g. `maxRunners(1/1)`, `crossPoolMaxRunners(10/10)`, `capacityGroup(2/2)`. |
+| `rate-limited` | Launch permits for the window are used; `retry_at` is the window reset. |
+| `tier-blocked`, `budget-exceeded` | A tier rule or budget blocks the backend; `reason` carries the rule message. |
+| `circuit-open` | The circuit breaker switched the backend off after failures; `reason` names the failure class and `retry_at` the next probe. |
+| `quarantined` | Runners from the backend never registered, so it is skipped while another backend can serve; `retry_at` ends the cooldown. |
+| `unhealthy`, `node-unavailable`, `provider-full`, `provider-ceiling` | Health or live-capacity signals. |
+
+`reason`, `circuit_state` (`closed`, `open`, `half-open`; only for backends
+with `circuitBreaker.enabled`) and `retry_at` are optional. Clients must
+tolerate their absence and unknown `status` values.
+
 Unlike circuit-open or tier-policy rejections, rate limiting can still redirect
 a pinned request to another eligible backend. Pinning remains a preference for
 the first cold-launch attempt, not a guarantee that a rate-limited backend will
