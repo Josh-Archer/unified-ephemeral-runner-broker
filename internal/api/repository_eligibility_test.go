@@ -13,18 +13,18 @@ func TestRepositoryBackendEligibility(t *testing.T) {
 		name, repo                                    string
 		managed, pinned, fallback, wantAzure, wantErr bool
 	}{
-		{"home", "Josh-Archer/home", true, false, true, true, false},
-		{"case", "josh-archer/HOME", true, false, true, true, false},
+		{"home", "example/home", true, false, true, true, false},
+		{"case", "EXAMPLE/HOME", true, false, true, true, false},
 		{"default", "", true, false, true, true, false},
-		{"questkit", "Josh-Archer/questkit", true, false, true, false, false},
-		{"pinned incompatible", "Josh-Archer/questkit", true, true, true, false, true},
-		{"none eligible", "Josh-Archer/questkit", true, false, false, false, true},
-		{"unmanaged unchanged", "Josh-Archer/questkit", false, false, true, true, false},
+		{"questkit", "example/other", true, false, true, false, false},
+		{"pinned incompatible", "example/other", true, true, true, false, true},
+		{"none eligible", "example/other", true, false, false, false, true},
+		{"unmanaged unchanged", "example/other", false, false, true, true, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := model.BackendConfig{Enabled: true}
 			if tc.managed {
-				cfg.AzureVM = &model.AzureVMBackendConfig{Repository: "Josh-Archer/home"}
+				cfg.AzureVM = &model.AzureVMBackendConfig{Repository: "example/home"}
 			}
 			pool := model.PoolConfig{Backends: map[model.BackendName]model.BackendConfig{model.BackendAzureVM: cfg}}
 			if tc.fallback {
@@ -67,13 +67,13 @@ func TestAllocateSkipsIncompatibleManagedAzure(t *testing.T) {
 		}
 		az := pool.Backends[model.BackendAzureVM]
 		az.Enabled = true
-		az.AzureVM = &model.AzureVMBackendConfig{Repository: "Josh-Archer/home"}
+		az.AzureVM = &model.AzureVMBackendConfig{Repository: "example/home"}
 		pool.Backends[model.BackendAzureVM] = az
 		gce := pool.Backends[model.BackendGCE]
 		gce.Enabled = true
 		pool.Backends[model.BackendGCE] = gce
 	})
-	got, err := service.Allocate(context.Background(), model.AllocationRequest{Pool: model.PoolLite, TargetRepository: "Josh-Archer/questkit"})
+	got, err := service.Allocate(context.Background(), model.AllocationRequest{Pool: model.PoolLite, TargetRepository: "example/other"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +96,7 @@ func TestAllocateRepositoryEligibilityUsesEffectiveTarget(t *testing.T) {
 				}
 				az := pool.Backends[model.BackendAzureVM]
 				az.Enabled = true
-				az.AzureVM = &model.AzureVMBackendConfig{Repository: "Josh-Archer/home"}
+				az.AzureVM = &model.AzureVMBackendConfig{Repository: "example/home"}
 				pool.Backends[model.BackendAzureVM] = az
 				gce := pool.Backends[model.BackendGCE]
 				gce.Enabled = true
@@ -107,12 +107,12 @@ func TestAllocateRepositoryEligibilityUsesEffectiveTarget(t *testing.T) {
 			existing := model.AllocationStatus{}
 			switch kind {
 			case "principal":
-				ctx = withPrincipal(ctx, OIDCClaims{Sub: "repo:Josh-Archer/questkit:ref:refs/heads/main", Repository: "Josh-Archer/questkit"})
+				ctx = withPrincipal(ctx, OIDCClaims{Sub: "repo:example/other:ref:refs/heads/main", Repository: "example/other"})
 			case "saved retry":
-				existing.Repository = "Josh-Archer/questkit"
+				existing.Repository = "example/other"
 			case "explicit target":
-				req.TargetRepository = "Josh-Archer/questkit"
-				existing.Repository = "Josh-Archer/home"
+				req.TargetRepository = "example/other"
+				existing.Repository = "example/home"
 			}
 			got, err := service.allocateNow(ctx, req, existing)
 			if err != nil {
@@ -130,11 +130,11 @@ func TestPinnedIncompatibleRepositoryDoesNotProvision(t *testing.T) {
 	service := newServiceWithCountingBackend(func(pool *model.PoolConfig) {
 		az := pool.Backends[model.BackendAzureVM]
 		az.Enabled = true
-		az.AzureVM = &model.AzureVMBackendConfig{Repository: "Josh-Archer/home"}
+		az.AzureVM = &model.AzureVMBackendConfig{Repository: "example/home"}
 		pool.Backends[model.BackendAzureVM] = az
 	}, azure)
 	name := model.BackendAzureVM
-	_, err := service.Allocate(context.Background(), model.AllocationRequest{Pool: model.PoolLite, Backend: &name, TargetRepository: "Josh-Archer/questkit"})
+	_, err := service.Allocate(context.Background(), model.AllocationRequest{Pool: model.PoolLite, Backend: &name, TargetRepository: "example/other"})
 	if !errors.Is(err, ErrNoMatchingBackendRepository) {
 		t.Fatalf("error=%v", err)
 	}
