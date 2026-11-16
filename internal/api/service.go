@@ -25,6 +25,7 @@ import (
 	"go.opentelemetry.io/otel/codes"
 )
 
+var ErrNoMatchingBackendRepository = errors.New("no backend serves the requested repository")
 var ErrUnknownPool = errors.New("pool is not configured")
 var ErrNoMatchingBackendCapabilities = errors.New("no backend matches the requested capabilities")
 var ErrAllocationNotFound = errors.New("allocation not found")
@@ -801,6 +802,18 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 		timeout = s.cfg.Broker.DefaultJobTimeout
 	}
 	request.JobTimeout = timeout
+
+	// Match the target used during provisioning, including principal ownership
+	// and saved ownership when a queued allocation is retried.
+	target := existing
+	target.Request = &request
+	if claims, ok := principalFromContext(ctx); ok {
+		applyPrincipal(&target, claims)
+	}
+	pool, err = filterBackendsByRepository(pool, request, target.TargetRepository())
+	if err != nil {
+		return model.AllocationStatus{}, err
+	}
 
 	pool, err = filterEligibleBackends(pool, request)
 	if err != nil {
@@ -3456,6 +3469,32 @@ func validateSchedulers(pools []model.PoolConfig, registry *scheduler.Registry) 
 		}
 	}
 	return nil
+}
+
+// Managed Azure runners are registered to a single repository. Exclude them
+// before reservation rather than discovering incompatibility during provision.
+// Empty targets retain the managed backend's configured default behavior.
+func filterBackendsByRepository(pool model.PoolConfig, request model.AllocationRequest, repository string) (model.PoolConfig, error) {
+	filtered := pool
+	filtered.Backends = make(map[model.BackendName]model.BackendConfig, len(pool.Backends))
+	for name, cfg := range pool.Backends {
+		if name == model.BackendAzureVM && cfg.AzureVM != nil && repository != "" && !strings.EqualFold(repository, cfg.AzureVM.Repository) {
+			continue
+		}
+		filtered.Backends[name] = cfg
+	}
+	if request.Backend != nil {
+		if _, ok := pool.Backends[*request.Backend]; !ok {
+			return model.PoolConfig{}, scheduler.ErrUnknownBackend
+		}
+		if _, ok := filtered.Backends[*request.Backend]; !ok {
+			return model.PoolConfig{}, fmt.Errorf("pinned backend %q does not serve repository %q: %w", *request.Backend, repository, ErrNoMatchingBackendRepository)
+		}
+	}
+	if len(filtered.Backends) == 0 {
+		return model.PoolConfig{}, fmt.Errorf("%w for pool %q", ErrNoMatchingBackendRepository, pool.Name)
+	}
+	return filtered, nil
 }
 
 func filterEligibleBackends(pool model.PoolConfig, request model.AllocationRequest) (model.PoolConfig, error) {

@@ -147,3 +147,14 @@ See also:
 - [architecture.md](architecture.md) — admission order and scheduler boundary
 - [openapi.yaml](openapi.yaml) — HTTP request schema
 - [examples/workflows/platform-routing.yml](../examples/workflows/platform-routing.yml) — end-to-end workflow
+
+### Repository-specific managed runners
+
+Managed Azure VM runners are registered to the repository in
+`backends.azure-vm.azureVM.repository`. Allocation eligibility excludes this
+backend for a different effective target repository before capacity reservation.
+The effective target follows provisioning: explicit target, then authenticated
+principal (or saved allocation ownership on retry). An empty target retains the
+managed backend's configured default. Matching is case-insensitive. Explicitly
+pinning an incompatible backend returns an error rather than silently routing to
+another backend. Unmanaged dispatch backends and actor authorization are unchanged.
