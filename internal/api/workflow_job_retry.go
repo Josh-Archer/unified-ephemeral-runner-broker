@@ -136,6 +136,18 @@ func (s *Service) registrationPenalized(pool model.PoolName, name model.BackendN
 	return entry != nil && now.Before(entry.skipUntil)
 }
 
+// registrationPenaltyUntil reports when a penalized backend is considered again.
+func (s *Service) registrationPenaltyUntil(pool model.PoolName, name model.BackendName, now time.Time) (time.Time, bool) {
+	p := &s.regPenalties
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	entry := p.m[backendAdmissionKey{pool: pool, backend: name}]
+	if entry == nil || !now.Before(entry.skipUntil) {
+		return time.Time{}, false
+	}
+	return entry.skipUntil, true
+}
+
 // filterRegistrationPenalized drops penalized backends from an unpinned
 // request as long as at least one other backend remains.
 func (s *Service) filterRegistrationPenalized(pool model.PoolConfig, request model.AllocationRequest) model.PoolConfig {

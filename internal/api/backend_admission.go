@@ -436,6 +436,50 @@ func (a *backendAdmission) stateSnapshot(cfg model.BrokerConfig) []backendCircui
 	return snapshots
 }
 
+// circuitDetail reports the circuit of one pool/backend without changing it.
+func (a *backendAdmission) circuitDetail(pool model.PoolName, name model.BackendName) backendCircuitDetail {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	circuit := a.circuits[backendAdmissionKey{pool: pool, backend: name}]
+	if circuit == nil {
+		return backendCircuitDetail{State: circuitStateClosed}
+	}
+	return backendCircuitDetail{
+		State:                normalizeCircuitState(circuit.state),
+		LastTransitionReason: circuit.lastTransitionReason,
+		NextProbeAt:          circuit.nextProbeAt,
+	}
+}
+
+// rateLimitDetail reports permits used in the current window, the window's
+// permit count, and when the window resets. It does not consume a permit.
+func (a *backendAdmission) rateLimitDetail(pool model.PoolName, name model.BackendName, cfg model.RateLimitConfig) (used, permits int, resetAt time.Time) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	interval := cfg.Interval
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	permits = cfg.Permits
+	if permits <= 0 {
+		permits = 1
+	}
+	if cfg.Burst > permits {
+		permits = cfg.Burst
+	}
+	limit := a.limits[backendAdmissionKey{pool: pool, backend: name}]
+	if limit == nil || limit.windowStart.IsZero() {
+		return 0, permits, time.Time{}
+	}
+	return limit.used, permits, limit.windowStart.Add(interval)
+}
+
+type backendCircuitDetail struct {
+	State                string
+	LastTransitionReason string
+	NextProbeAt          time.Time
+}
+
 func (a *backendAdmission) circuit(key backendAdmissionKey) *backendCircuit {
 	circuit := a.circuits[key]
 	if circuit == nil {

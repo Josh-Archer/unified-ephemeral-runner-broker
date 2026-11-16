@@ -287,3 +287,155 @@ func TestFormatSuggestedAction(t *testing.T) {
 		t.Fatalf("unexpected suggested action: %s", actionAllFull)
 	}
 }
+
+// The snapshot must say why a backend cannot take a job, not just that it has
+// no free slots: disabled, exhausted, rate-limited, switched off by the
+// circuit breaker, or quarantined after runners never registered.
+func TestCapacitySnapshotReportsPerBackendStateAndReason(t *testing.T) {
+	cfg := config.Default()
+	var pool model.PoolConfig
+	for i := range cfg.Pools {
+		if cfg.Pools[i].Name != model.PoolLite {
+			continue
+		}
+		cfg.Pools[i].Backends = map[model.BackendName]model.BackendConfig{
+			model.BackendARC:    {Enabled: true, Healthy: true, MaxRunners: 1},
+			model.BackendLambda: {Enabled: false, Healthy: true, MaxRunners: 3},
+			model.BackendCodeBuild: {
+				Enabled: true, Healthy: true, MaxRunners: 1,
+				CircuitBreaker: model.CircuitBreakerConfig{Enabled: true, FailureThreshold: 1, OpenDuration: 10 * time.Minute},
+			},
+			model.BackendCloudRun: {
+				Enabled: true, Healthy: true, MaxRunners: 2,
+				RateLimit: model.RateLimitConfig{Enabled: true, Permits: 1, Interval: time.Hour},
+			},
+			model.BackendGCE: {Enabled: true, Healthy: true, MaxRunners: 1},
+			model.BackendEC2: {
+				Enabled: true, Healthy: true, MaxRunners: 2,
+				CircuitBreaker: model.CircuitBreakerConfig{Enabled: true},
+			},
+		}
+		pool = cfg.Pools[i]
+	}
+
+	service := NewService(
+		cfg,
+		backend.NewRegistry(
+			testBackend{name: model.BackendARC},
+			testBackend{name: model.BackendLambda},
+			failingBackend{
+				testBackend: testBackend{name: model.BackendCodeBuild},
+				err:         backend.NewClassifiedError(backend.FailureReasonTimeout, context.DeadlineExceeded),
+			},
+			testBackend{name: model.BackendCloudRun},
+			testBackend{name: model.BackendGCE},
+			testBackend{name: model.BackendEC2},
+		),
+		nil,
+	)
+	now := time.Unix(1000, 0).UTC()
+	service.now = func() time.Time { return now }
+
+	allocatePinned := func(name model.BackendName) error {
+		pinned := name
+		_, err := service.Allocate(context.Background(), model.AllocationRequest{
+			Pool: model.PoolLite, Backend: &pinned, JobTimeout: 5 * time.Minute,
+		})
+		return err
+	}
+	if err := allocatePinned(model.BackendARC); err != nil {
+		t.Fatalf("arc allocation failed: %v", err)
+	}
+	if err := allocatePinned(model.BackendCodeBuild); err == nil {
+		t.Fatal("expected codebuild provisioning to fail and open its circuit")
+	}
+	if err := allocatePinned(model.BackendCloudRun); err != nil {
+		t.Fatalf("cloud-run allocation failed: %v", err)
+	}
+	for i := 0; i < registrationExpiryThreshold; i++ {
+		service.recordRegistrationExpiry(model.PoolLite, model.BackendGCE, now)
+	}
+
+	snapshot := service.BuildCapacitySnapshot(pool, model.AllocationRequest{Pool: model.PoolLite})
+
+	want := map[string]struct {
+		status       string
+		reasonPart   string
+		circuitState string
+		retryAt      bool
+	}{
+		"arc":       {status: "exhausted", reasonPart: "maxRunners(1/1)"},
+		"lambda":    {status: "disabled", reasonPart: "enabled: false"},
+		"codebuild": {status: "circuit-open", reasonPart: "timeout", circuitState: "open", retryAt: true},
+		"cloud-run": {status: "rate-limited", reasonPart: "rateLimit(1/1 per 1h0m0s)", retryAt: true},
+		"gce":       {status: "quarantined", reasonPart: "never registered", retryAt: true},
+		"ec2":       {status: "available", circuitState: "closed"},
+	}
+	for name, expected := range want {
+		got, ok := snapshot[name]
+		if !ok {
+			t.Fatalf("snapshot missing %s: %+v", name, snapshot)
+		}
+		if got.Status != expected.status {
+			t.Errorf("%s status = %q, want %q", name, got.Status, expected.status)
+		}
+		if !strings.Contains(got.Reason, expected.reasonPart) {
+			t.Errorf("%s reason = %q, want it to contain %q", name, got.Reason, expected.reasonPart)
+		}
+		if got.CircuitState != expected.circuitState {
+			t.Errorf("%s circuit_state = %q, want %q", name, got.CircuitState, expected.circuitState)
+		}
+		if (got.RetryAt != nil) != expected.retryAt {
+			t.Errorf("%s retry_at = %v, want present=%v", name, got.RetryAt, expected.retryAt)
+		}
+		if expected.status != "available" && got.AvailableSlots != 0 {
+			t.Errorf("%s available_slots = %d, want 0", name, got.AvailableSlots)
+		}
+	}
+	if got := snapshot["codebuild"].RetryAt; got != nil && !got.Equal(now.Add(10*time.Minute)) {
+		t.Errorf("codebuild retry_at = %v, want next probe at %v", got, now.Add(10*time.Minute))
+	}
+	if got := snapshot["ec2"]; got.AvailableSlots != 2 || got.Reason != "" {
+		t.Errorf("ec2 = %+v, want 2 free slots and no reason", got)
+	}
+
+	// The circuit recovers on its own: once the open duration has passed the
+	// backend is offered again (the next request is the half-open trial).
+	now = now.Add(11 * time.Minute)
+	recovered := service.BuildCapacitySnapshot(pool, model.AllocationRequest{Pool: model.PoolLite})
+	if got := recovered["codebuild"]; got.Status != "available" || got.AvailableSlots != 1 {
+		t.Errorf("codebuild after open duration = %+v, want available for a half-open trial", got)
+	}
+
+	encoded, err := json.Marshal(snapshot["ec2"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "reason") || strings.Contains(string(encoded), "retry_at") {
+		t.Errorf("available backend should omit reason and retry_at: %s", encoded)
+	}
+}
+
+func TestCapacitySnapshotReportsCrossPoolCap(t *testing.T) {
+	cfg := config.Default()
+	var lite model.PoolConfig
+	for i := range cfg.Pools {
+		switch cfg.Pools[i].Name {
+		case model.PoolLite, model.PoolFull:
+			cfg.Pools[i].Backends = map[model.BackendName]model.BackendConfig{
+				model.BackendARC: {Enabled: true, Healthy: true, MaxRunners: 1, CrossPoolMaxRunners: 1},
+			}
+			if cfg.Pools[i].Name == model.PoolLite {
+				lite = cfg.Pools[i]
+			}
+		}
+	}
+	service := NewService(cfg, backend.NewRegistry(testBackend{name: model.BackendARC}), nil)
+	if _, err := service.Allocate(context.Background(), model.AllocationRequest{Pool: model.PoolFull, JobTimeout: 5 * time.Minute}); err != nil {
+		t.Fatalf("full-pool allocation failed: %v", err)
+	}
+	got := service.BuildCapacitySnapshot(lite, model.AllocationRequest{Pool: model.PoolLite})["arc"]
+	if got.Status != "exhausted" || got.AvailableSlots != 0 || got.Reason != "crossPoolMaxRunners(1/1)" {
+		t.Fatalf("arc in lite = %+v, want exhausted by crossPoolMaxRunners(1/1)", got)
+	}
+}
