@@ -76,6 +76,7 @@ func (s *Service) BuildCapacitySnapshot(pool model.PoolConfig, request model.All
 
 	sched := s.scheds.ForPool(pool)
 	now := s.now()
+	registrationEligible := s.filterRegistrationPenalized(pool, request)
 
 	for name, backendCfg := range pool.Backends {
 		nameStr := string(name)
@@ -133,7 +134,7 @@ func (s *Service) BuildCapacitySnapshot(pool model.PoolConfig, request model.All
 			}
 		}
 
-		if status == "available" && s.store != nil {
+		if _, eligible := registrationEligible.Backends[name]; status == "available" && !eligible {
 			if until, penalized := s.registrationPenaltyUntil(pool.Name, name, now); penalized {
 				status = "quarantined"
 				reason = "runners never registered; skipped while another backend can take the job"

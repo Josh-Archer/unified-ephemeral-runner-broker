@@ -439,3 +439,55 @@ func TestCapacitySnapshotReportsCrossPoolCap(t *testing.T) {
 		t.Fatalf("arc in lite = %+v, want exhausted by crossPoolMaxRunners(1/1)", got)
 	}
 }
+
+func TestCapacitySnapshotRegistrationPenaltyMatchesAdmission(t *testing.T) {
+	for _, tc := range []struct {
+		name                                                          string
+		pinned, alternative, disabledAlternative, penalizeAlternative bool
+		want                                                          string
+	}{
+		{name: "pinned", pinned: true, alternative: true, want: "available"},
+		{name: "single-backend", want: "available"},
+		{name: "all-penalized", alternative: true, penalizeAlternative: true, want: "available"},
+		{name: "disabled-alternative", alternative: true, disabledAlternative: true, want: "available"},
+		{name: "usable-alternative", alternative: true, want: "quarantined"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.Default()
+			var pool model.PoolConfig
+			for i := range cfg.Pools {
+				if cfg.Pools[i].Name == model.PoolLite {
+					cfg.Pools[i].Backends = map[model.BackendName]model.BackendConfig{model.BackendARC: {Enabled: true, Healthy: true, MaxRunners: 2}}
+					if tc.alternative {
+						cfg.Pools[i].Backends[model.BackendLambda] = model.BackendConfig{Enabled: !tc.disabledAlternative, Healthy: true, MaxRunners: 2}
+					}
+					pool = cfg.Pools[i]
+				}
+			}
+			svc := NewService(cfg, backend.NewRegistry(testBackend{name: model.BackendARC}, testBackend{name: model.BackendLambda}), nil)
+			now := time.Unix(1000, 0).UTC()
+			svc.now = func() time.Time { return now }
+			for i := 0; i < registrationExpiryThreshold; i++ {
+				svc.recordRegistrationExpiry(model.PoolLite, model.BackendARC, now)
+				if tc.penalizeAlternative {
+					svc.recordRegistrationExpiry(model.PoolLite, model.BackendLambda, now)
+				}
+			}
+			req := model.AllocationRequest{Pool: model.PoolLite, JobTimeout: 5 * time.Minute}
+			pinned := model.BackendARC
+			if tc.pinned {
+				req.Backend = &pinned
+			}
+			snap := svc.BuildCapacitySnapshot(pool, req)["arc"]
+			if snap.Status != tc.want {
+				t.Fatalf("snapshot=%+v, want %s", snap, tc.want)
+			}
+			if tc.want == "available" && (snap.AvailableSlots != 2 || snap.RetryAt != nil || snap.Reason != "") {
+				t.Fatalf("eligible backend should have two slots and no quarantine guidance: %+v", snap)
+			}
+			if _, err := svc.Allocate(context.Background(), req); err != nil {
+				t.Fatalf("allocation failed: %v", err)
+			}
+		})
+	}
+}
