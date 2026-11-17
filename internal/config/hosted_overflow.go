@@ -51,6 +51,17 @@ func validateHostedOverflow(cfg model.BrokerConfig) error {
 			}
 			seen[strings.ToLower(repo)] = true
 		}
+		onlySeen := map[string]bool{}
+		for _, repo := range overflow.SelfHostedOnlyRepositories {
+			key := strings.ToLower(strings.TrimSpace(repo))
+			if !seen[key] {
+				return fmt.Errorf("%s.selfHostedOnlyRepositories entry %q must be in repositories", prefix, repo)
+			}
+			if onlySeen[key] {
+				return fmt.Errorf("%s.selfHostedOnlyRepositories lists %q twice", prefix, repo)
+			}
+			onlySeen[key] = true
+		}
 		if overflow.SaturateAfter < 0 || (overflow.SaturateAfter > 0 && overflow.SaturateAfter < 30*time.Second) {
 			return fmt.Errorf("%s.saturateAfter must be at least 30s", prefix)
 		}

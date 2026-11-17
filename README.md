@@ -928,6 +928,8 @@ jobs:
 - **Public repositories** switch whenever the pool is backed up; standard GitHub-hosted runners are free for them.
 - **Private repositories** use the account's included minutes, so they switch only while every `budgetRules` entry is under its limit. The rules are evaluated through `broker.tierRouting` under backend `github-hosted`. A missing, stale or unknown reading counts as over budget, and with no rules private repositories never switch.
 - The broker writes a variable only when its value changes. It needs the GitHub App **Variables: write** repository permission, and it reads repository visibility once an hour.
+- To keep selected managed repositories local, set `selfHostedOnlyRepositories: [Josh-Archer/DeskQuest]` inside `hostedOverflow`. Entries must also appear in `repositories`; matching is case-insensitive. Keep `enabled: true`: the controller restores those repositories to `selfHostedValue` even under backlog, without visibility or billing lookups for them. Other repositories retain normal overflow behavior. Disabling the controller does not reset existing variables.
+- Roll out a broker version supporting this field before applying it. Verify the repository variable has returned to its self-hosted label before rerunning blocked jobs; already queued jobs do not move.
 - Jobs that need cluster access or self-hosted-only tools should keep a fixed self-hosted `runs-on`.
 
 ## Per-Backend Budget and Cost Guardrails

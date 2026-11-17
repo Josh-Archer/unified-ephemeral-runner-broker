@@ -13,12 +13,12 @@ import (
 )
 
 type fakeGitHub struct {
-	private     map[string]bool
-	visErr      error
-	setErr      error
-	sets        []string
-	vars        map[string]string
-	visCalls    int
+	private      map[string]bool
+	visErr       error
+	setErr       error
+	sets         []string
+	vars         map[string]string
+	visCalls     int
 	billingGross float64
 	billingNet   float64
 	billingErr   error
@@ -299,5 +299,47 @@ func TestWaitingIgnoresPickedUpFinishedAndOtherPools(t *testing.T) {
 	}
 	if got := Waiting(allocations, "shared", t0, 2*time.Minute); got != 2 {
 		t.Fatalf("Waiting = %d, want 2", got)
+	}
+}
+
+func TestSelfHostedOnlyRestoresSelectedRepositoryUnderBacklog(t *testing.T) {
+	cfg := testConfig(false)
+	cfg.Pools[0].HostedOverflow.SelfHostedOnlyRepositories = []string{" O/PRIVATE-REPO "}
+	gh := &fakeGitHub{private: map[string]bool{"o/private-repo": true}, vars: map[string]string{"o/private-repo/UECB_SHARED_RUNS_ON": "ubuntu-latest"}}
+	allocs := fakeAllocs{waitingAllocation("shared", model.StatePending, t0.Add(-3*time.Minute))}
+	c := New(cfg, gh, &allocs, nil)
+	if err := c.Reconcile(context.Background(), t0); err != nil {
+		t.Fatal(err)
+	}
+	if value(gh, "o/private-repo") != "uecb-shared" || value(gh, "o/public-repo") != "ubuntu-latest" {
+		t.Fatalf("vars = %v", gh.vars)
+	}
+	if gh.visCalls != 1 || gh.billingCalls != 0 || gh.hostedCalls != 0 {
+		t.Fatalf("unexpected lookups: %+v", gh)
+	}
+	if err := c.Reconcile(context.Background(), t0.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if len(gh.sets) != 2 {
+		t.Fatalf("variables rewritten: %v", gh.sets)
+	}
+}
+
+func TestSelfHostedOnlyRetriesFailedRestoreWithoutVisibility(t *testing.T) {
+	cfg := testConfig(false)
+	cfg.Pools[0].HostedOverflow.Repositories = []string{"o/public-repo"}
+	cfg.Pools[0].HostedOverflow.SelfHostedOnlyRepositories = []string{"o/public-repo"}
+	gh := &fakeGitHub{visErr: errors.New("visibility unavailable"), setErr: errors.New("write failed")}
+	allocs := fakeAllocs{waitingAllocation("shared", model.StatePending, t0.Add(-3*time.Minute))}
+	c := New(cfg, gh, &allocs, nil)
+	if err := c.Reconcile(context.Background(), t0); err == nil {
+		t.Fatal("want restore error")
+	}
+	gh.setErr = nil
+	if err := c.Reconcile(context.Background(), t0.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if value(gh, "o/public-repo") != "uecb-shared" || gh.visCalls != 0 {
+		t.Fatalf("restore failed: %+v", gh)
 	}
 }
