@@ -39,6 +39,9 @@ jobs:
       - name: Postgres webhook inbox integration tests
         run: go test ./internal/api -run '^TestPostgresWebhookInbox' -count=1 -v
 
+      - name: Postgres VM reservation integration tests
+        run: go test -race ./internal/store -run '^TestPostgresVMReservations' -count=1 -v
+
   test:
     runs-on: ubuntu-latest
     steps:
