@@ -131,7 +131,17 @@ func (c *Controller) Reconcile(ctx context.Context, now time.Time) error {
 			repository = strings.TrimSpace(repository)
 			want := strings.TrimSpace(cfg.SelfHostedValue)
 			reason := "pool keeping up"
-			if backedUp {
+			selfHostedOnly := false
+			for _, repo := range cfg.SelfHostedOnlyRepositories {
+				if strings.EqualFold(strings.TrimSpace(repo), repository) {
+					selfHostedOnly = true
+					break
+				}
+			}
+			if selfHostedOnly {
+				reason = "repository pinned to self-hosted"
+			}
+			if backedUp && !selfHostedOnly {
 				private, err := c.isPrivate(ctx, repository, now)
 				switch {
 				case err != nil:

@@ -618,6 +618,9 @@ type HostedOverflowConfig struct {
 	HostedValue string `yaml:"hostedValue" json:"hostedValue"`
 	// Repositories ("owner/repo") whose variable the broker manages.
 	Repositories []string `yaml:"repositories" json:"repositories"`
+	// SelfHostedOnlyRepositories is a subset of Repositories that must never overflow.
+	// Keep Enabled true so reconciliation restores their existing hosted variables.
+	SelfHostedOnlyRepositories []string `yaml:"selfHostedOnlyRepositories,omitempty" json:"selfHostedOnlyRepositories,omitempty"`
 	// SaturateAfter is how long an allocation must wait (queued for capacity,
 	// or reserved with no registered runner yet) before the pool counts as
 	// backed up. Defaults to 2m.

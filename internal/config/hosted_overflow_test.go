@@ -100,6 +100,7 @@ pools:
       selfHostedValue: uecb-shared
       hostedValue: ubuntu-latest
       repositories: [Josh-Archer/DeskQuest]
+      selfHostedOnlyRepositories: [Josh-Archer/DeskQuest]
       saturateAfter: 3m
       budgetRules:
         - name: github-actions-minutes
@@ -130,5 +131,31 @@ pools:
 	}
 	if overflow == nil || !overflow.Enabled || overflow.SaturateAfter != 3*time.Minute || len(overflow.BudgetRules) != 1 {
 		t.Fatalf("hostedOverflow = %+v", overflow)
+	}
+	if len(overflow.SelfHostedOnlyRepositories) != 1 || overflow.SelfHostedOnlyRepositories[0] != "Josh-Archer/DeskQuest" {
+		t.Fatalf("selfHostedOnlyRepositories = %v", overflow.SelfHostedOnlyRepositories)
+	}
+}
+
+func TestSelfHostedOnlyRepositoriesValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		repos []string
+		valid bool
+	}{
+		{"subset case insensitive", []string{" josh-archer/deskquest "}, true},
+		{"outside managed repositories", []string{"other/repo"}, false},
+		{"duplicate", []string{"Josh-Archer/DeskQuest", "josh-archer/deskquest"}, false},
+		{"empty", []string{""}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := overflowConfig(func(p *model.PoolConfig, _ *model.BrokerConfig) {
+				p.HostedOverflow.SelfHostedOnlyRepositories = tc.repos
+			})
+			err := Validate(cfg)
+			if (err == nil) != tc.valid {
+				t.Fatalf("valid=%v err=%v", tc.valid, err)
+			}
+		})
 	}
 }
