@@ -41,3 +41,24 @@ owner; duplicate delivery; cleanup failure and orphan capacity accounting. These
 require future verified-evidence and durable-store contracts, not a pretend
 in-memory production scheduler. Current tests cover only malformed input and
 immutable revision preservation; they do not establish these security properties.
+
+## Test-only relationship model
+
+`relationship_test.go` models comparison through a fake evidence-source seam. It
+is not linked into production, implements no EvidenceVerifier, and performs no
+network or launch operation. The source receives only lookup identity (repository,
+run and job); a real implementation would independently retrieve authenticated
+facts. The fake does not prove provenance or GitHub API semantics.
+
+The model compares every immutable candidate field, requires a queued current
+attempt and checks an injected freshness policy. Unknown, completed, canceled,
+running, superseded, future-dated and stale observations fail closed. Its minute
+window is a test fixture, not an operational recommendation. Head checkout must
+match the head exactly; synthetic merge checkout must match a separately resolved
+merge SHA, not the head. Real API adapters must validate event-specific merge
+relationships and workflow provenance rather than trusting these fake facts.
+
+The replay test intentionally succeeds twice: comparison does not consume an
+admission. Durable reservation/fencing and actual runner/job assignment isolation
+remain mandatory blockers. Rechecking immediately before launch and handling
+cancellation between observation and launch are unresolved integration work.
