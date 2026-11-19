@@ -413,6 +413,49 @@ func TestScaleSetListenerDefaultsAndLoads(t *testing.T) {
 	}
 }
 
+func TestIdleTimeoutLoadsAndNegativeDoesNotFailValidation(t *testing.T) {
+	if got := Default().Broker.IdleTimeout; got != 0 {
+		t.Fatalf("default idleTimeout=%s, want 0 so the reaper applies its 10m default", got)
+	}
+	path := filepath.Join(t.TempDir(), "broker.yaml")
+	if err := os.WriteFile(path, []byte("broker:\n  idleTimeout: 10m\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Broker.IdleTimeout != 10*time.Minute {
+		t.Fatalf("loaded idleTimeout=%s", cfg.Broker.IdleTimeout)
+	}
+
+	path = filepath.Join(t.TempDir(), "broker.yaml")
+	if err := os.WriteFile(path, []byte("broker:\n  idleTimeout: -1s\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatalf("negative idleTimeout must load: %v", err)
+	}
+	if cfg.Broker.IdleTimeout != -time.Second {
+		t.Fatalf("loaded idleTimeout=%s", cfg.Broker.IdleTimeout)
+	}
+
+	cfg = Default()
+	cfg.Broker.IdleTimeout = 10 * time.Minute
+	for i := range cfg.Pools {
+		if cfg.Pools[i].Name != model.PoolFull {
+			continue
+		}
+		backendCfg := cfg.Pools[i].Backends[model.BackendARC]
+		backendCfg.IdleTimeout = -time.Second
+		cfg.Pools[i].Backends[model.BackendARC] = backendCfg
+	}
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("negative backend idleTimeout must validate: %v", err)
+	}
+}
+
 func TestGitHubWebhookReconcileIntervalDefaultsAndLoads(t *testing.T) {
 	if got := Default().Broker.GitHubWebhook.ReconcileInterval; got != time.Minute {
 		t.Fatalf("default reconcile interval=%s, want 1m", got)

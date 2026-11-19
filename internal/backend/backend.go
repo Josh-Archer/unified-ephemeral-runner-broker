@@ -124,6 +124,15 @@ type UnschedulableReaper interface {
 	ReapUnschedulablePods(ctx context.Context, now time.Time, timeout time.Duration) ([]UnschedulablePod, error)
 }
 
+// RunnerActivityBackend reports whether each allocation's runner is executing
+// a job. The map is keyed by allocation ID. A missing ID means unknown.
+// true means the runner is busy with a job. false means it is online and not
+// busy. A non-nil error means this cycle cannot tell, and the caller must not
+// treat those runners as idle.
+type RunnerActivityBackend interface {
+	RunnerActivity(ctx context.Context, allocations []model.AllocationStatus) (map[string]bool, error)
+}
+
 // FreeSlots returns non-negative free runner slots from a capacity snapshot.
 func FreeSlots(status CapacityStatus) int {
 	used := status.ActiveRunners + status.PendingRunners + status.WarmRunners

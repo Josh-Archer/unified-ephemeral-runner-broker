@@ -28,8 +28,8 @@ import (
 // production kubernetesbackend.Backend adapter, HTTP routes, store, metrics,
 // and webhook dispatcher end to end.
 type e2eKubeCluster struct {
-	mu        sync.Mutex
-	nodeReady bool
+	mu          sync.Mutex
+	nodeReady   bool
 	podsCreated []string
 	podsDeleted []string
 }
@@ -529,10 +529,15 @@ func TestE2EFailureBackendOutageToFallbackExpiryAndQuarantineWebhook(t *testing.
 	}
 
 	// Runner registers with the broker, satisfying registrationTimeout, but hangs
-	// and never finalizes before job_timeout (20m) elapses.
+	// and never finalizes before job_timeout (20m) elapses. Claim the job so
+	// the idle TTL (default 10m) does not reap it as an unused runner first.
 	regStatus := postJSON("/v1/allocations/"+quarantineAlloc.ID+"/register", `{}`, http.StatusOK)
 	if regStatus.RegisteredAt == nil {
 		t.Fatal("expected RegisteredAt to be recorded after /register")
+	}
+	claimedStatus := postJSON("/v1/allocations/"+quarantineAlloc.ID+"/claim", `{}`, http.StatusOK)
+	if claimedStatus.ClaimedAt == nil {
+		t.Fatal("expected ClaimedAt to be recorded after /claim")
 	}
 
 	// At +6m (past registrationTimeout), registered runner is NOT expired early.

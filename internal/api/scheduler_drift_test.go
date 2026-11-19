@@ -113,6 +113,11 @@ func TestSchedulerDriftAcrossLifecyclePaths(t *testing.T) {
 				if _, ok, err := service.Register(ctx, a.ID); err != nil || !ok {
 					t.Fatalf("register: ok=%v err=%v", ok, err)
 				}
+				// Claim so this sweep is the job-timeout path. An unclaimed
+				// registration expires earlier on the idle TTL.
+				if _, ok, err := service.Claim(ctx, a.ID); err != nil || !ok {
+					t.Fatalf("claim: ok=%v err=%v", ok, err)
+				}
 				if swept := service.SweepExpired(now.Add(21 * time.Minute)); swept != 1 {
 					t.Fatalf("swept %d, want 1", swept)
 				}

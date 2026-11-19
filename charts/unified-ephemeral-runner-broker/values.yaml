@@ -94,6 +94,10 @@ config:
     # Optional timeout before an unused runner slot expires if the runner never
     # registers or claims the job (defaults to 10m).
     registrationTimeout: 10m
+    # How long a registered ephemeral runner may sit without a job before the
+    # broker deregisters it, deletes it, and frees maxRunners /
+    # crossPoolMaxRunners. Unset or zero uses 10m in the broker. Negative disables.
+    idleTimeout: 10m
     # Optional broker-wide cross-pool backend capacity limits to avoid over-committing
     # shared static or cloud runners across pools. Key is backend name, value is limit.
     backendLimits: {}

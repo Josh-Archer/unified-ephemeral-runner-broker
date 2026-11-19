@@ -44,7 +44,9 @@ Core metrics:
 - `uecb_finalization_latency_seconds{pool,backend,result}`: finalize callback latency.
 - `uecb_cancellations_total{pool,backend,result}`: cancel requests (`success`, `already_terminal`, `not_found`, …).
 - `uecb_cancellation_latency_seconds{pool,backend,result}`: cancel request latency.
-- `uecb_allocation_expired_total{pool,backend,reason}`: expired allocations by pool, backend, and expiry reason (`unregistered`, `unclaimed`, `job_timeout`, `quarantine_ttl_elapsed`).
+- `uecb_allocation_expired_total{pool,backend,reason}`: expired allocations by pool, backend, and expiry reason (`unregistered`, `unclaimed`, `idle`, `job_timeout`, `quarantine_ttl_elapsed`). `idle` means a registered ephemeral runner took no job within `idleTimeout` and was deregistered and deleted.
+- `uecb_idle_allocated_runners{pool,backend}`: allocated runners confirmed online and not running a job. They still count toward `maxRunners` and `crossPoolMaxRunners`. The series is absent until a sweep has an idle runner inside the TTL.
+- `uecb_idle_allocated_runner_oldest_seconds{pool,backend}`: age of the oldest runner in that idle set.
 - `uecb_queue_depth{pool,state}`: current allocations by state.
 - `uecb_capacity_utilization_ratio{pool,backend}`: active allocation count divided by configured backend capacity.
 - `uecb_backend_circuit_state{pool,backend,state}`: active runtime circuit state for opt-in backends.
@@ -80,7 +82,7 @@ Cost-class and estimated-cost series appear for every configured backend. Succes
 ## Artifacts
 
 - `observability/grafana-dashboard.json`: importable Grafana dashboard for per-backend latency, failure ratio, estimated cost, queue depth, and capacity utilization. The same document is shipped in the chart at `charts/unified-ephemeral-runner-broker/dashboards/uecb-slo.json`.
-- `observability/prometheus-rules.yaml`: Prometheus alert rules for per-backend allocation latency and failure SLOs, plus dispatch latency, saturated capacity, and stuck allocations.
+- `observability/prometheus-rules.yaml`: Prometheus alert rules for per-backend allocation latency and failure SLOs, plus dispatch latency, saturated capacity, stuck allocations, and idle allocated runners (`UECBIdleAllocatedRunners`, `for: 15m`, longer than the default 10m idle TTL).
 - `observability/prometheus-scrape-example.yaml`: example Prometheus scrape config.
 - `observability/otel-collector-config.yaml`: example OTLP collector pipeline for broker traces.
 

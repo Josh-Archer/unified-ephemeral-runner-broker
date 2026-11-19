@@ -107,3 +107,14 @@ groups:
         annotations:
           summary: "UECB started with process-local memory state store"
           description: "In-memory mode forgets in-flight allocations on restart and can orphan cloud runners. Use stateStore.type file (single-replica) or postgres (HA) for production."
+
+      # Fires when an allocated runner stays online with no job longer than the
+      # default 10m idle TTL. A reap that finishes on time does not page.
+      - alert: UECBIdleAllocatedRunners
+        expr: sum by (pool, backend) (uecb_idle_allocated_runners) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "UECB idle allocated runners are holding capacity for {{ $labels.pool }}/{{ $labels.backend }}"
+          description: "Runners are allocated, online, and not running a job. They still count toward maxRunners and crossPoolMaxRunners. The idle TTL should deregister and delete them. This alert means that reap did not happen."
