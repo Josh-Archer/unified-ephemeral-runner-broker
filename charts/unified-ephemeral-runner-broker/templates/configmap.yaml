@@ -15,6 +15,9 @@ data:
     broker:
       defaultPool: {{ .Values.config.broker.defaultPool }}
       defaultJobTimeout: {{ .Values.config.broker.defaultJobTimeout }}
+      {{- with .Values.config.broker.idleTimeout }}
+      idleTimeout: {{ . }}
+      {{- end }}
       orphanCleanup:
         enabled: {{ .Values.config.broker.orphanCleanup.enabled }}
         quarantineTTL: {{ .Values.config.broker.orphanCleanup.quarantineTTL }}

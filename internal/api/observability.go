@@ -63,6 +63,10 @@ type Observer interface {
 	ObserveOrphanCleanup(model.PoolName, model.BackendName, string)
 	ObserveLabelGarbage(model.PoolName, model.BackendName, string)
 	ObserveStaleRunnerLabels([]staleRunnerLabelSnapshot)
+	// ObserveIdleRunners publishes allocated runners that are online and not
+	// running a job. They still count toward maxRunners until the idle TTL
+	// deregisters and deletes them.
+	ObserveIdleRunners([]idleRunnerSnapshot)
 	// ObserveProcessLocalStateLoss records that a process-local (non-HA) store
 	// started without durable allocation history (typical for memory).
 	ObserveProcessLocalStateLoss(storeType string)
@@ -108,6 +112,7 @@ func (noopObserver) ObserveAllocationExpired(model.PoolName, model.BackendName, 
 func (noopObserver) ObserveOrphanCleanup(model.PoolName, model.BackendName, string)     {}
 func (noopObserver) ObserveLabelGarbage(model.PoolName, model.BackendName, string)      {}
 func (noopObserver) ObserveStaleRunnerLabels([]staleRunnerLabelSnapshot)                {}
+func (noopObserver) ObserveIdleRunners([]idleRunnerSnapshot)                            {}
 func (noopObserver) ObserveProcessLocalStateLoss(string)                                {}
 func (noopObserver) ObserveRestartOrphans(model.BackendName, string, int)               {}
 
@@ -130,6 +135,15 @@ type staleRunnerLabelSnapshot struct {
 	Count int
 }
 
+// idleRunnerSnapshot counts allocated runners confirmed online and not running
+// a job. OldestSeconds is the age of the oldest IdleSince in the group.
+type idleRunnerSnapshot struct {
+	Pool          model.PoolName
+	Backend       model.BackendName
+	Count         int
+	OldestSeconds float64
+}
+
 const (
 	orphanActionExpired           = "expired"
 	orphanActionQuarantined       = "quarantined"
@@ -142,45 +156,47 @@ const (
 )
 
 type PrometheusObserver struct {
-	allocationLatency     *prometheus.HistogramVec
-	launchLatency         *prometheus.HistogramVec
-	registrationLatency   *prometheus.HistogramVec
-	finalizationLatency   *prometheus.HistogramVec
-	cancellationLatency   *prometheus.HistogramVec
-	allocations           *prometheus.CounterVec
-	finalizations         *prometheus.CounterVec
-	cancellations         *prometheus.CounterVec
-	queueDepth            *prometheus.GaugeVec
-	capacityUtilization   *prometheus.GaugeVec
-	circuitState          *prometheus.GaugeVec
-	circuitTransitions    *prometheus.CounterVec
-	admissionRejections   *prometheus.CounterVec
-	probeResults          *prometheus.CounterVec
-	tierState             *prometheus.GaugeVec
-	tierFallbacks         *prometheus.CounterVec
-	tierBlocked           *prometheus.CounterVec
-	liveCapacityFree      *prometheus.GaugeVec
-	liveCapacityStale     *prometheus.GaugeVec
-	liveCapacityDecisions *prometheus.CounterVec
-	budgetBlocked         *prometheus.CounterVec
-	budgetUsage           *prometheus.GaugeVec
-	backendCostClass      *prometheus.GaugeVec
-	backendUnitCost       *prometheus.GaugeVec
-	estimatedCost         *prometheus.CounterVec
-	qualitySelections     *prometheus.CounterVec
-	qualityScore          *prometheus.GaugeVec
-	qualitySuccessRate    *prometheus.GaugeVec
-	qualityP95Ready       *prometheus.GaugeVec
-	qualityCapacityErrors *prometheus.GaugeVec
-	qualityFreeSlots      *prometheus.GaugeVec
-	allocationsReaped     *prometheus.CounterVec
-	allocationExpired     *prometheus.CounterVec
-	orphanCleanupActions  *prometheus.CounterVec
-	labelGarbage          *prometheus.CounterVec
-	staleRunnerLabels     *prometheus.GaugeVec
-	processLocalStateLoss *prometheus.CounterVec
-	restartOrphansTotal   *prometheus.CounterVec
-	orphanedRunners       *prometheus.GaugeVec
+	allocationLatency          *prometheus.HistogramVec
+	launchLatency              *prometheus.HistogramVec
+	registrationLatency        *prometheus.HistogramVec
+	finalizationLatency        *prometheus.HistogramVec
+	cancellationLatency        *prometheus.HistogramVec
+	allocations                *prometheus.CounterVec
+	finalizations              *prometheus.CounterVec
+	cancellations              *prometheus.CounterVec
+	queueDepth                 *prometheus.GaugeVec
+	capacityUtilization        *prometheus.GaugeVec
+	circuitState               *prometheus.GaugeVec
+	circuitTransitions         *prometheus.CounterVec
+	admissionRejections        *prometheus.CounterVec
+	probeResults               *prometheus.CounterVec
+	tierState                  *prometheus.GaugeVec
+	tierFallbacks              *prometheus.CounterVec
+	tierBlocked                *prometheus.CounterVec
+	liveCapacityFree           *prometheus.GaugeVec
+	liveCapacityStale          *prometheus.GaugeVec
+	liveCapacityDecisions      *prometheus.CounterVec
+	budgetBlocked              *prometheus.CounterVec
+	budgetUsage                *prometheus.GaugeVec
+	backendCostClass           *prometheus.GaugeVec
+	backendUnitCost            *prometheus.GaugeVec
+	estimatedCost              *prometheus.CounterVec
+	qualitySelections          *prometheus.CounterVec
+	qualityScore               *prometheus.GaugeVec
+	qualitySuccessRate         *prometheus.GaugeVec
+	qualityP95Ready            *prometheus.GaugeVec
+	qualityCapacityErrors      *prometheus.GaugeVec
+	qualityFreeSlots           *prometheus.GaugeVec
+	allocationsReaped          *prometheus.CounterVec
+	allocationExpired          *prometheus.CounterVec
+	orphanCleanupActions       *prometheus.CounterVec
+	labelGarbage               *prometheus.CounterVec
+	staleRunnerLabels          *prometheus.GaugeVec
+	idleAllocatedRunners       *prometheus.GaugeVec
+	idleAllocatedOldestSeconds *prometheus.GaugeVec
+	processLocalStateLoss      *prometheus.CounterVec
+	restartOrphansTotal        *prometheus.CounterVec
+	orphanedRunners            *prometheus.GaugeVec
 }
 
 func NewPrometheusObserver(_ prometheus.Registerer) *PrometheusObserver {
@@ -321,8 +337,16 @@ func NewPrometheusObserver(_ prometheus.Registerer) *PrometheusObserver {
 		}, []string{"pool", "backend", "result"}),
 		allocationExpired: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "uecb_allocation_expired_total",
-			Help: "Total allocations that expired, by backend, pool, and reason (unregistered, unclaimed, job_timeout, quarantine_ttl_elapsed).",
+			Help: "Total allocations that expired, by backend, pool, and reason (unregistered, unclaimed, idle, job_timeout, quarantine_ttl_elapsed).",
 		}, []string{"backend", "pool", "reason"}),
+		idleAllocatedRunners: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "uecb_idle_allocated_runners",
+			Help: "Allocated runners that are online and not running a job. They still count toward maxRunners and crossPoolMaxRunners until the idle TTL reaps them.",
+		}, []string{"pool", "backend"}),
+		idleAllocatedOldestSeconds: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "uecb_idle_allocated_runner_oldest_seconds",
+			Help: "Age in seconds of the oldest allocated runner that is online and not running a job, by pool and backend.",
+		}, []string{"pool", "backend"}),
 		orphanCleanupActions: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "uecb_orphan_cleanup_actions_total",
 			Help: "Orphan cleanup sweep actions for stale allocations (missing finalize / hard job kill).",
@@ -391,6 +415,8 @@ func (o *PrometheusObserver) Register(registerer prometheus.Registerer) error {
 		o.orphanCleanupActions,
 		o.labelGarbage,
 		o.staleRunnerLabels,
+		o.idleAllocatedRunners,
+		o.idleAllocatedOldestSeconds,
 		o.processLocalStateLoss,
 		o.restartOrphansTotal,
 		o.orphanedRunners,
@@ -529,6 +555,18 @@ func (o *PrometheusObserver) ObserveStaleRunnerLabels(snapshots []staleRunnerLab
 			phase = "unknown"
 		}
 		o.staleRunnerLabels.WithLabelValues(string(snapshot.Pool), string(snapshot.Backend), phase).Set(float64(snapshot.Count))
+	}
+}
+
+func (o *PrometheusObserver) ObserveIdleRunners(snapshots []idleRunnerSnapshot) {
+	o.idleAllocatedRunners.Reset()
+	o.idleAllocatedOldestSeconds.Reset()
+	for _, snapshot := range snapshots {
+		if snapshot.Count <= 0 {
+			continue
+		}
+		o.idleAllocatedRunners.WithLabelValues(string(snapshot.Pool), string(snapshot.Backend)).Set(float64(snapshot.Count))
+		o.idleAllocatedOldestSeconds.WithLabelValues(string(snapshot.Pool), string(snapshot.Backend)).Set(snapshot.OldestSeconds)
 	}
 }
 

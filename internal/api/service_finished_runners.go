@@ -187,6 +187,10 @@ func (s *Service) ReconcileOrphanedAllocations(ctx context.Context, now time.Tim
 // example while the broker restarts) SweepExpired would expire the allocation
 // at registrationTimeout and delete a pod that is mid-job, which GitHub reports
 // as "The runner has received a shutdown signal" (home#4340).
+//
+// The stamp registered_via=runner_running keeps the idle TTL from treating
+// that inference as an idle runner. Idle TTL reaps it only after GitHub
+// reports busy=false, and a busy=true reading claims the allocation instead.
 func (s *Service) markRunningRunnerRegistered(ctx context.Context, backendName model.BackendName, id string) {
 	status, ok := s.store.Get(id)
 	if !ok || status.SelectedBackend != backendName || !isActiveAllocationState(status.State) {
@@ -202,6 +206,22 @@ func (s *Service) markRunningRunnerRegistered(ctx context.Context, backendName m
 			"error":         err.Error(),
 		})
 		return
+	}
+	updated, ok := s.store.Get(id)
+	if ok {
+		if updated.Metadata == nil {
+			updated.Metadata = map[string]string{}
+		}
+		if updated.Metadata[registeredViaMetadataKey] == "" {
+			updated.Metadata[registeredViaMetadataKey] = registeredViaRunnerRunning
+			if _, err := s.store.SaveIfState(updated, updated.State); err != nil {
+				logAllocationEvent(ctx, "running_runner_register_stamp_failed", map[string]string{
+					"allocation_id": allocationIDLabel(id),
+					"backend":       string(backendName),
+					"error":         err.Error(),
+				})
+			}
+		}
 	}
 	logAllocationEvent(ctx, "running_runner_registered", map[string]string{
 		"allocation_id": allocationIDLabel(id),

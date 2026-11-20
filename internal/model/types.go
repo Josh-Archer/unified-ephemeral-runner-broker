@@ -155,6 +155,13 @@ type BrokerRuntimeConfig struct {
 	// RegistrationTimeout is the window within which a runner must register or
 	// claim the job before the allocation expires and frees the slot.
 	RegistrationTimeout time.Duration `yaml:"registrationTimeout,omitempty" json:"registrationTimeout,omitempty"`
+	// IdleTimeout is how long an ephemeral allocation may stay registered
+	// without taking a job. When it elapses the runner is deregistered and
+	// deleted and the allocation stops counting toward maxRunners and
+	// crossPoolMaxRunners. Zero uses the default (10 minutes). A negative
+	// value disables the idle reaper. Claimed jobs still run until job
+	// timeout. Warm runners use warmTTL instead.
+	IdleTimeout time.Duration `yaml:"idleTimeout,omitempty" json:"idleTimeout,omitempty"`
 	// BackendLimits sets cross-pool capacity limits per backend name across all pools.
 	BackendLimits map[BackendName]int `yaml:"backendLimits,omitempty" json:"backendLimits,omitempty"`
 	// UnschedulableTimeout is how long a broker-owned runner pod may stay
@@ -453,9 +460,13 @@ type BackendConfig struct {
 	// per-hostname) or no extra cap when nothing can be derived.
 	CapacityGroupMax    int           `yaml:"capacityGroupMax,omitempty" json:"capacityGroupMax,omitempty"`
 	RegistrationTimeout time.Duration `yaml:"registrationTimeout,omitempty" json:"registrationTimeout,omitempty"`
-	WarmMin             int           `yaml:"warmMin" json:"warmMin"`
-	WarmMax             int           `yaml:"warmMax" json:"warmMax"`
-	WarmTTL             time.Duration `yaml:"warmTTL,omitempty" json:"warmTTL,omitempty"`
+	// IdleTimeout overrides broker.idleTimeout for this backend. Zero inherits
+	// the broker value (or the 10 minute default). A negative value disables
+	// the idle reaper for this backend only.
+	IdleTimeout time.Duration `yaml:"idleTimeout,omitempty" json:"idleTimeout,omitempty"`
+	WarmMin     int           `yaml:"warmMin" json:"warmMin"`
+	WarmMax     int           `yaml:"warmMax" json:"warmMax"`
+	WarmTTL     time.Duration `yaml:"warmTTL,omitempty" json:"warmTTL,omitempty"`
 	// WarmSchedule optionally gates warmMin/warmMax to calendar windows on
 	// backends that may hold idle runners (ARC, Kubernetes, EC2, GCE, ephemeral
 	// azure-vm). Outside every window the effective target is zero. Serverless
@@ -694,19 +705,22 @@ type AllocationStatus struct {
 	Tenant          string      `json:"tenant,omitempty"`
 	PriorityClass   string      `json:"priority_class,omitempty"`
 	// Subject/Repository/Owner bind the allocating OIDC principal for ownership checks.
-	Subject      string             `json:"subject,omitempty"`
-	Repository   string             `json:"repository,omitempty"`
-	Owner        string             `json:"owner,omitempty"`
-	CreatedAt    time.Time          `json:"created_at,omitempty"`
-	RegisteredAt *time.Time         `json:"registered_at,omitempty"`
-	ClaimedAt    *time.Time         `json:"claimed_at,omitempty"`
-	ExpiresAt    time.Time          `json:"expires_at"`
-	RetryAfter   time.Time          `json:"retry_after,omitempty"`
-	Attempts     int                `json:"attempts,omitempty"`
-	State        AllocationState    `json:"state"`
-	Error        string             `json:"error,omitempty"`
-	Metadata     map[string]string  `json:"metadata,omitempty"`
-	Request      *AllocationRequest `json:"request,omitempty"`
+	Subject      string     `json:"subject,omitempty"`
+	Repository   string     `json:"repository,omitempty"`
+	Owner        string     `json:"owner,omitempty"`
+	CreatedAt    time.Time  `json:"created_at,omitempty"`
+	RegisteredAt *time.Time `json:"registered_at,omitempty"`
+	ClaimedAt    *time.Time `json:"claimed_at,omitempty"`
+	// IdleSince is when this allocation's runner was known to be online and
+	// not running a job. It is cleared when a job is claimed.
+	IdleSince  *time.Time         `json:"idle_since,omitempty"`
+	ExpiresAt  time.Time          `json:"expires_at"`
+	RetryAfter time.Time          `json:"retry_after,omitempty"`
+	Attempts   int                `json:"attempts,omitempty"`
+	State      AllocationState    `json:"state"`
+	Error      string             `json:"error,omitempty"`
+	Metadata   map[string]string  `json:"metadata,omitempty"`
+	Request    *AllocationRequest `json:"request,omitempty"`
 }
 
 func (s AllocationStatus) IsRegistered() bool {

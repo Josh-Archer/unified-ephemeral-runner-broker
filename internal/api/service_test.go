@@ -2730,6 +2730,7 @@ type recordingObserver struct {
 	labelGarbage   []string
 	staleSnapshots [][]staleRunnerLabelSnapshot
 	expiredEvents  []string
+	idleSnapshots  [][]idleRunnerSnapshot
 }
 
 func (o *recordingObserver) ObserveAllocationExpired(pool model.PoolName, backend model.BackendName, reason string) {
@@ -2748,6 +2749,11 @@ func (o *recordingObserver) ObserveStaleRunnerLabels(snapshots []staleRunnerLabe
 	// Copy so later resets cannot mutate recorded history.
 	cp := append([]staleRunnerLabelSnapshot(nil), snapshots...)
 	o.staleSnapshots = append(o.staleSnapshots, cp)
+}
+
+func (o *recordingObserver) ObserveIdleRunners(snapshots []idleRunnerSnapshot) {
+	cp := append([]idleRunnerSnapshot(nil), snapshots...)
+	o.idleSnapshots = append(o.idleSnapshots, cp)
 }
 
 func TestSweepExpiredReclaimsStaleRunnerLabelsWithMetrics(t *testing.T) {
@@ -4439,7 +4445,7 @@ func TestSweepExpiredDynamicRunnerUnregistered(t *testing.T) {
 	}
 }
 
-func TestSweepExpiredDynamicRunnerRegisteredNotExpiredUntilJobTimeout(t *testing.T) {
+func TestSweepExpiredDynamicRunnerRegisteredExpiresAtIdleTimeout(t *testing.T) {
 	observer := &recordingObserver{}
 	cfg := config.Default()
 	cfg.Broker.RegistrationTimeout = 5 * time.Minute
@@ -4462,7 +4468,7 @@ func TestSweepExpiredDynamicRunnerRegisteredNotExpiredUntilJobTimeout(t *testing
 		t.Fatalf("allocate failed: %v", err)
 	}
 
-	// Register allocation at 2m
+	// Register allocation at 2m. Registration alone is not a job claim.
 	service.now = func() time.Time { return now.Add(2 * time.Minute) }
 	registered, ok, err := service.Register(context.Background(), allocation.ID)
 	if err != nil || !ok {
@@ -4472,17 +4478,82 @@ func TestSweepExpiredDynamicRunnerRegisteredNotExpiredUntilJobTimeout(t *testing
 		t.Fatal("expected RegisteredAt to be set")
 	}
 
-	// At 6m (past 5m registrationTimeout, but registered!), should not expire
+	// At 6m the 5m registrationTimeout has passed, but the runner has only
+	// been idle for 4m of the default 10m idle TTL.
+	service.now = func() time.Time { return now.Add(6 * time.Minute) }
 	if swept := service.SweepExpired(now.Add(6 * time.Minute)); swept != 0 {
 		t.Fatalf("expected 0 swept at 6m, got %d", swept)
 	}
 
-	// At 21m (past 20m jobTimeout), should expire with job_timeout
+	// At 13m the runner has been registered without a job for 11m. Idle TTL
+	// expires it before the 20m job timeout.
+	service.now = func() time.Time { return now.Add(13 * time.Minute) }
+	swept := service.SweepExpired(now.Add(13 * time.Minute))
+	if swept != 1 {
+		t.Fatalf("expected 1 swept at 13m, got %d", swept)
+	}
+
+	updated, ok := service.Get(allocation.ID)
+	if !ok || updated.State != model.StateExpired {
+		t.Fatalf("expected expired state, got ok=%v state=%s", ok, updated.State)
+	}
+	if !strings.Contains(updated.Error, "idle timeout") {
+		t.Fatalf("expected idle timeout error, got %q", updated.Error)
+	}
+	foundEvent := false
+	for _, ev := range observer.expiredEvents {
+		if ev == "full:arc:idle" {
+			foundEvent = true
+			break
+		}
+	}
+	if !foundEvent {
+		t.Fatalf("expected full:arc:idle in %v", observer.expiredEvents)
+	}
+}
+
+func TestSweepExpiredDynamicRunnerClaimedNotExpiredUntilJobTimeout(t *testing.T) {
+	observer := &recordingObserver{}
+	cfg := config.Default()
+	cfg.Broker.RegistrationTimeout = 5 * time.Minute
+	service := NewService(
+		cfg,
+		backend.NewRegistry(
+			testBackend{name: model.BackendARC},
+		),
+		nil,
+	)
+	service.observer = observer
+	now := time.Unix(1000, 0)
+	service.now = func() time.Time { return now }
+
+	allocation, err := service.Allocate(context.Background(), model.AllocationRequest{
+		Pool:       model.PoolFull,
+		JobTimeout: 20 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("allocate failed: %v", err)
+	}
+
+	service.now = func() time.Time { return now.Add(2 * time.Minute) }
+	if _, ok, err := service.Register(context.Background(), allocation.ID); err != nil || !ok {
+		t.Fatalf("register failed: ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := service.Claim(context.Background(), allocation.ID); err != nil || !ok {
+		t.Fatalf("claim failed: ok=%v err=%v", ok, err)
+	}
+
+	// Past the default idle TTL, a claimed job is left alone.
+	service.now = func() time.Time { return now.Add(13 * time.Minute) }
+	if swept := service.SweepExpired(now.Add(13 * time.Minute)); swept != 0 {
+		t.Fatalf("expected 0 swept at 13m for a claimed runner, got %d", swept)
+	}
+
+	service.now = func() time.Time { return now.Add(21 * time.Minute) }
 	swept := service.SweepExpired(now.Add(21 * time.Minute))
 	if swept != 1 {
 		t.Fatalf("expected 1 swept at 21m, got %d", swept)
 	}
-
 	updated, ok := service.Get(allocation.ID)
 	if !ok || updated.State != model.StateExpired {
 		t.Fatalf("expected expired state, got ok=%v state=%s", ok, updated.State)

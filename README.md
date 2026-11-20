@@ -344,11 +344,15 @@ broker:
   (or immediately when `0`), then to `expired`. Capacity is released when the
   allocation first enters quarantine/expired.
 
-#### Registration and Claim Timeout
+#### Registration, idle, and claim timeouts
 
-When a runner slot is allocated but the runner never registers with GitHub or no workflow job claims the runner within `registrationTimeout` (default `10m`), the reaper moves the allocation to `expired` with reason `"unregistered"` or `"unclaimed"` and releases the capacity slot. For static-label backends (such as pre-registered Azure VMs), the runner is already registered, so the allocation expires if no job claims the label within the window.
+`registrationTimeout` (default `10m`, overridable per backend) expires a dynamic allocation that never registers and never claims, with reason `unregistered`. Static-label backends (such as pre-registered Azure VMs) are already registered, so the same window expires them with reason `unclaimed` when no job claims the label.
 
-Allocations can be marked claimed via GitHub webhooks (`workflow_job: in_progress`), the API endpoint `POST /v1/allocations/{id}/claim`, or `POST /v1/allocations/{id}/register`. Expiries are exposed on metric `uecb_allocation_expired_total{pool,backend,reason}`.
+`idleTimeout` (default `10m` when unset, overridable per backend) expires an ephemeral allocation whose runner registered but took no job. The broker deregisters the runner, deletes it, and drops the allocation from `maxRunners` and `crossPoolMaxRunners`. Reason is `idle`. A negative `idleTimeout` disables that reaper. Zero uses the 10 minute default. Static labels keep using `registrationTimeout`. Warm runners keep using `warmTTL`.
+
+A claimed job is not idle. Claim it with the `workflow_job: in_progress` webhook or `POST /v1/allocations/{id}/claim`. `POST /v1/allocations/{id}/register` only records registration. Claimed work stays until `job_timeout` (or an explicit complete or cancel). A Kubernetes runner marked registered because its container is already running is not treated as idle until GitHub reports `busy=false`. `busy=true` claims the allocation instead, so a lost `in_progress` webhook cannot delete a live job.
+
+Expiries are counted on `uecb_allocation_expired_total{pool,backend,reason}` (`unregistered`, `unclaimed`, `idle`, `job_timeout`, `quarantine_ttl_elapsed`). Runners confirmed idle and still holding a cap are `uecb_idle_allocated_runners{pool,backend}` and `uecb_idle_allocated_runner_oldest_seconds{pool,backend}`.
 
 ### Durable State Store
 

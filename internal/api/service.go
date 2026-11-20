@@ -1704,7 +1704,9 @@ func firstNonEmpty(values ...string) string {
 func (s *Service) SweepExpired(now time.Time) int {
 	updated := 0
 	grace := s.reaperGrace()
-	for _, status := range s.store.List() {
+	statuses := s.store.List()
+	activities := s.loadIdleActivity(context.Background(), statuses)
+	for _, status := range statuses {
 		if isActiveAllocationState(status.State) {
 			// 1. Lease / registration TTL: if no runner registers or claims within registrationTimeout,
 			// move to expired and free the slot immediately.
@@ -1758,6 +1760,15 @@ func (s *Service) SweepExpired(now time.Time) int {
 					}
 					continue
 				}
+			}
+
+			// Idle TTL: a registered ephemeral runner that never took a job
+			// (or whose job was taken or cancelled) is deregistered, deleted,
+			// and dropped from maxRunners / crossPoolMaxRunners. Claimed work
+			// waits for job timeout. Warm runners are not in this loop.
+			if s.expireIdleAllocation(status, now, activities[status.SelectedBackend]) {
+				updated++
+				continue
 			}
 
 			// 2. Past job-timeout TTL without finalize (+ optional grace):
@@ -1902,6 +1913,7 @@ func (s *Service) ReconcileBackendHealth() {
 func (s *Service) observeState() {
 	statuses := s.store.List()
 	s.observer.ObserveActiveAllocations(statuses)
+	s.observer.ObserveIdleRunners(idleRunnerSnapshots(statuses, s.now()))
 	s.observer.ObserveCapacity(s.cfg, statuses)
 	s.observer.ObserveBackendCosts(backendCostSnapshots(s.cfg))
 	s.observer.ObserveStaleRunnerLabels(staleRunnerLabelSnapshots(statuses, s.now()))
@@ -3637,6 +3649,8 @@ func (s *Service) Claim(ctx context.Context, id string) (model.AllocationStatus,
 	if status.RegisteredAt == nil || status.RegisteredAt.IsZero() {
 		status.RegisteredAt = &now
 	}
+	// A claimed job is not idle, even if an earlier sweep had started the clock.
+	status.IdleSince = nil
 	if err := s.store.Save(status); err != nil {
 		return model.AllocationStatus{}, false, err
 	}

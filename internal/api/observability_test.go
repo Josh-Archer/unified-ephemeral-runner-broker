@@ -63,8 +63,45 @@ func TestNoopObserver(t *testing.T) {
 	observer.ObserveOrphanCleanup(model.PoolFull, model.BackendARC, orphanActionExpired)
 	observer.ObserveLabelGarbage(model.PoolFull, model.BackendARC, labelGarbageReclaimed)
 	observer.ObserveStaleRunnerLabels(nil)
+	observer.ObserveIdleRunners(nil)
+	observer.ObserveIdleRunners([]idleRunnerSnapshot{{
+		Pool: model.PoolFull, Backend: model.BackendARC, Count: 1, OldestSeconds: 30,
+	}})
 	observer.ObserveProcessLocalStateLoss(store.TypeMemory)
 	observer.ObserveRestartOrphans(model.BackendARC, orphanReasonCapacityGap, 1)
+}
+
+func TestPrometheusObserverIdleRunners(t *testing.T) {
+	obs, reg := newRegisteredObserver(t)
+	obs.ObserveIdleRunners([]idleRunnerSnapshot{
+		{Pool: model.PoolFull, Backend: model.BackendARC, Count: 2, OldestSeconds: 90},
+		{Pool: model.PoolLite, Backend: model.BackendKubernetes, Count: 1, OldestSeconds: 10},
+		{Pool: model.PoolFull, Backend: model.BackendGCE, Count: 0, OldestSeconds: 5},
+	})
+	requireFloat(t, obs.idleAllocatedRunners.WithLabelValues("full", "arc"), 2)
+	requireFloat(t, obs.idleAllocatedOldestSeconds.WithLabelValues("full", "arc"), 90)
+	compareRegistered(t, reg, obs.idleAllocatedRunners, "uecb_idle_allocated_runners", expectFamily(
+		"uecb_idle_allocated_runners",
+		"Allocated runners that are online and not running a job. They still count toward maxRunners and crossPoolMaxRunners until the idle TTL reaps them.",
+		"gauge",
+		metricSeries{`backend="arc",pool="full"`, 2},
+		metricSeries{`backend="kubernetes",pool="lite"`, 1},
+	))
+	compareRegistered(t, reg, obs.idleAllocatedOldestSeconds, "uecb_idle_allocated_runner_oldest_seconds", expectFamily(
+		"uecb_idle_allocated_runner_oldest_seconds",
+		"Age in seconds of the oldest allocated runner that is online and not running a job, by pool and backend.",
+		"gauge",
+		metricSeries{`backend="arc",pool="full"`, 90},
+		metricSeries{`backend="kubernetes",pool="lite"`, 10},
+	))
+
+	obs.ObserveIdleRunners(nil)
+	if n := testutil.CollectAndCount(obs.idleAllocatedRunners); n != 0 {
+		t.Fatalf("idle runner gauge reset left %d series", n)
+	}
+	if n := testutil.CollectAndCount(obs.idleAllocatedOldestSeconds); n != 0 {
+		t.Fatalf("idle age gauge reset left %d series", n)
+	}
 }
 
 func TestPrometheusObserverRegister(t *testing.T) {
@@ -197,7 +234,7 @@ func TestPrometheusObserverAllocationMetrics(t *testing.T) {
 	requireFloat(t, obs.allocationExpired.WithLabelValues("lambda", "lite", "unknown"), 1)
 	compareRegistered(t, reg, obs.allocationExpired, "uecb_allocation_expired_total", expectFamily(
 		"uecb_allocation_expired_total",
-		"Total allocations that expired, by backend, pool, and reason (unregistered, unclaimed, job_timeout, quarantine_ttl_elapsed).",
+		"Total allocations that expired, by backend, pool, and reason (unregistered, unclaimed, idle, job_timeout, quarantine_ttl_elapsed).",
 		"counter",
 		metricSeries{`backend="arc",pool="full",reason="job_timeout"`, 2},
 		metricSeries{`backend="arc",pool="full",reason="unregistered"`, 1},
