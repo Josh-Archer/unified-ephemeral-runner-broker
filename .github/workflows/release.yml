@@ -36,6 +36,7 @@ env:
   REGISTRY: ghcr.io
   IMAGE_OWNER: josh-archer
   SYFT_VERSION: v1.48.0
+  DOCKER_BUILD_RECORD_RETENTION_DAYS: 3
 
 jobs:
   validate:
@@ -192,6 +193,7 @@ jobs:
           artifact-name: ${{ matrix.image.name }}-${{ needs.validate.outputs.version }}.spdx.json
           output-file: ${{ runner.temp }}/${{ matrix.image.name }}.spdx.json
           upload-release-assets: false
+          upload-artifact-retention: 7
           syft-version: ${{ env.SYFT_VERSION }}
 
       - name: Compact SBOM for attestation size limit

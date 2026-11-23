@@ -23,6 +23,7 @@ env:
   IMAGE_OWNER: josh-archer
   # Pin Syft via anchore/sbom-action so SBOM generation is reproducible.
   SYFT_VERSION: v1.48.0
+  DOCKER_BUILD_RECORD_RETENTION_DAYS: 3
 
 jobs:
   publish:
@@ -115,6 +116,7 @@ jobs:
           artifact-name: ${{ matrix.image.package }}-${{ inputs.tag }}.spdx.json
           output-file: ${{ runner.temp }}/${{ matrix.image.package }}.spdx.json
           upload-release-assets: false
+          upload-artifact-retention: 7
           syft-version: ${{ env.SYFT_VERSION }}
 
       # actions/attest rejects SBOM predicates larger than 16 MiB. Full Syft
