@@ -61,6 +61,9 @@ type CapacityStatus struct {
 	ActiveRunners  int
 	PendingRunners int
 	WarmRunners    int
+	// CountsCapacityGroup is true when these counts cover every member of the
+	// scheduling group instead of only the backend that was probed.
+	CountsCapacityGroup bool
 	// NodeUnavailable is set when the node this backend is pinned to is
 	// NotReady, unschedulable, or tainted NoSchedule/NoExecute. The backend then
 	// has no usable capacity regardless of its counters, and routing must not

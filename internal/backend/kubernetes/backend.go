@@ -362,6 +362,7 @@ func (b *Backend) Capacity(ctx context.Context) (result backend.CapacityStatus, 
 			}
 		}
 	}
+	status.CountsCapacityGroup = countGroup
 	return status, nil
 }
 

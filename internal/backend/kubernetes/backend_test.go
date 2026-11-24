@@ -361,6 +361,31 @@ func TestCapacityCountsLiveRunnerPods(t *testing.T) {
 	}
 }
 
+func TestCapacityIdentifiesGroupOccupancy(t *testing.T) {
+	cfg := newConfig(t)
+	sibling := model.BackendName("arc-small-nodes")
+	for _, pool := range cfg.Pools {
+		if pool.Name != model.PoolFull {
+			continue
+		}
+		member := pool.Backends[model.BackendKubernetes]
+		member.CapacityGroup = "shared-node"
+		member.CapacityGroupMax = 1
+		pool.Backends[model.BackendKubernetes] = member
+		pool.Backends[sibling] = member
+	}
+	api := &fakeAPI{responses: map[string]response{
+		"GET /api/v1/namespaces/arc-runners/pods": {http.StatusOK, `{"items":[
+			{"metadata":{"labels":{"uecb.josh-archer.dev/backend":"arc-small-nodes"}},"status":{"phase":"Running"}},
+			{"metadata":{"labels":{"uecb.josh-archer.dev/backend":"unrelated"}},"status":{"phase":"Running"}}
+		]}`},
+	}}
+	status, err := New(cfg, api, &fakeRegistrar{}).Capacity(context.Background())
+	if err != nil || !status.CountsCapacityGroup || status.ActiveRunners != 1 || backend.FreeSlots(status) != 0 {
+		t.Fatalf("expected one occupied group slot, got %+v, %v", status, err)
+	}
+}
+
 func TestValidateKubernetesBackend(t *testing.T) {
 	cfg := newConfig(t)
 	if err := config.Validate(cfg); err != nil {

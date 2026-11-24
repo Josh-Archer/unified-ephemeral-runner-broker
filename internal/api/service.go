@@ -254,22 +254,37 @@ func (s *Service) rehydrateSchedulerState() error {
 		return nil
 	}
 	now := s.now()
-	for _, status := range s.store.List() {
+	statuses := s.store.List()
+	// After a cap reduction, preserve existing work before idle warm runners
+	// or synthetic recovery holds can take up the available reservations.
+	rehydratePriority := func(status model.AllocationStatus) int {
+		if status.Metadata[restartOrphanHoldMetadataKey] == restartOrphanHoldMetadataVal {
+			return 2
+		}
+		if status.State == model.StateWarm {
+			return 1
+		}
+		return 0
+	}
+	sort.SliceStable(statuses, func(i, j int) bool {
+		return rehydratePriority(statuses[i]) < rehydratePriority(statuses[j])
+	})
+	for _, status := range statuses {
 		if !isSchedulerAccountedState(status.State) {
 			continue
 		}
 		pool, err := s.resolvePool(status.Pool)
 		if err != nil {
-			s.expireUnrehydratableAllocation(status, now, fmt.Sprintf("rehydrate skipped: %v", err))
+			s.expireUnrehydratableAllocation(status, now, err.Error())
 			continue
 		}
 		selected := status.SelectedBackend
 		if selected == "" {
-			s.expireUnrehydratableAllocation(status, now, "rehydrate skipped: selected backend is empty")
+			s.expireUnrehydratableAllocation(status, now, "selected backend is empty")
 			continue
 		}
 		if !status.ExpiresAt.IsZero() && !status.ExpiresAt.Add(s.reaperGrace()).After(now) {
-			s.expireUnrehydratableAllocation(status, now, "rehydrate skipped: allocation expired")
+			s.expireUnrehydratableAllocation(status, now, "allocation expired")
 			continue
 		}
 		regTimeout := s.effectiveRegistrationTimeout(status)
@@ -277,7 +292,7 @@ func (s *Service) rehydrateSchedulerState() error {
 			isStatic := s.isStaticLabelBackend(status.Pool, status.SelectedBackend)
 			if (isStatic && (status.ClaimedAt == nil || status.ClaimedAt.IsZero())) ||
 				(!isStatic && (status.RegisteredAt == nil || status.RegisteredAt.IsZero()) && (status.ClaimedAt == nil || status.ClaimedAt.IsZero())) {
-				s.expireUnrehydratableAllocation(status, now, "rehydrate skipped: registration timeout elapsed")
+				s.expireUnrehydratableAllocation(status, now, "registration timeout elapsed")
 				continue
 			}
 		}
@@ -294,12 +309,14 @@ func (s *Service) rehydrateSchedulerState() error {
 			rehydratePool.FairShare.SoftReserves = nil
 		}
 		if _, err := s.reserve(rehydratePool, request); err != nil {
-			s.expireUnrehydratableAllocation(status, now, fmt.Sprintf("rehydrate skipped: %v", err))
+			s.expireUnrehydratableAllocation(status, now, err.Error())
 			continue
 		}
 	}
 	return nil
 }
+
+const rehydrateSkippedPrefix = "rehydrate skipped: "
 
 func (s *Service) expireUnrehydratableAllocation(status model.AllocationStatus, now time.Time, reason string) {
 	if status.ID == "" || s.store == nil {
@@ -309,7 +326,13 @@ func (s *Service) expireUnrehydratableAllocation(status model.AllocationStatus, 
 	if status.State == model.StateWarm {
 		nextState = model.StateFailed
 	}
-	_, _ = s.markState(status.ID, nextState, now, reason)
+	reason = rehydrateSkippedPrefix + reason
+	// A shared-store replica may have claimed the warm allocation since List.
+	updated, ok := s.store.CompareAndMarkState(status.ID, status.State, nextState, now, reason)
+	if !ok {
+		return
+	}
+	s.notifyLifecycleTerminal(updated)
 	logAllocationEvent(context.Background(), "allocation_rehydrate_skipped", map[string]string{
 		"allocation_id": allocationIDLabel(status.ID),
 		"pool":          string(status.Pool),
@@ -481,7 +504,13 @@ func (s *Service) reconcileProviderCapacityGaps(ctx context.Context, now time.Ti
 			if providerUsed < 0 {
 				providerUsed = 0
 			}
-			localUsed := s.countLocalAccounted(backendName)
+			var localUsed int
+			if capStatus.CountsCapacityGroup {
+				group := model.ResolveCapacityGroup(s.cfg, backendName)
+				localUsed = s.reconcileGroupHolds(group, providerUsed, now)
+			} else {
+				localUsed = s.store.CountBackendActive(backendName)
+			}
 			gap := providerUsed - localUsed
 			if gap <= 0 {
 				continue
@@ -546,6 +575,7 @@ func (s *Service) rebuildFromLiveRunners(ctx context.Context, now time.Time) int
 			}
 			for _, runner := range runners {
 				if _, exists := s.store.Get(runner.AllocationID); exists {
+					s.cleanupRejectedWarmRunner(ctx, backendName, runner)
 					continue
 				}
 				runnerPool, err := s.resolvePool(runner.Pool)
@@ -632,17 +662,39 @@ func (s *Service) rebuildLiveRunner(ctx context.Context, pool model.PoolConfig, 
 	return true
 }
 
-func (s *Service) countLocalAccounted(backendName model.BackendName) int {
-	count := 0
+// reconcileGroupHolds keeps only the synthetic reservations needed to cover
+// provider usage not accounted for by real allocations in the group.
+func (s *Service) reconcileGroupHolds(group model.CapacityGroup, providerUsed int, now time.Time) int {
+	members := make(map[model.BackendName]bool, len(group.Members))
+	for _, member := range group.Members {
+		members[member] = true
+	}
+	localUsed := 0
+	var holds []model.AllocationStatus
 	for _, status := range s.store.List() {
-		if status.SelectedBackend != backendName {
+		if !members[status.SelectedBackend] || !isSchedulerAccountedState(status.State) {
 			continue
 		}
-		if isSchedulerAccountedState(status.State) {
-			count++
+		if status.Metadata[restartOrphanHoldMetadataKey] == restartOrphanHoldMetadataVal {
+			holds = append(holds, status)
+		} else {
+			localUsed++
 		}
 	}
-	return count
+	for _, hold := range holds {
+		if localUsed < providerUsed {
+			localUsed++
+			continue
+		}
+		updated, ok := s.store.CompareAndMarkState(hold.ID, hold.State, model.StateExpired, now, "restart capacity gap already accounted for by group")
+		if !ok {
+			continue
+		}
+		if pool, err := s.resolvePool(hold.Pool); err == nil {
+			s.releaseSchedulerSlot(pool, hold.SelectedBackend, updated)
+		}
+	}
+	return localUsed
 }
 
 // createRestartOrphanHolds reserves synthetic slots so a process-local restart
@@ -658,21 +710,12 @@ func (s *Service) createRestartOrphanHolds(pool model.PoolConfig, backendName mo
 		timeout = 60 * time.Minute
 	}
 	created := 0
-	for i := 0; i < gap; i++ {
+	for i := 0; gap > 0; i++ {
 		id := fmt.Sprintf("restart-orphan-%s-%d", backendName, i)
-		if existing, exists := s.store.Get(id); exists {
-			// Refresh expiry on repeated restarts with the same synthetic id.
-			existing.ExpiresAt = now.Add(timeout)
-			existing.Error = "restart orphan capacity hold refreshed"
-			existing.State = model.StateReserved
-			if existing.Metadata == nil {
-				existing.Metadata = map[string]string{}
-			}
-			existing.Metadata[restartOrphanHoldMetadataKey] = restartOrphanHoldMetadataVal
-			_ = s.store.Save(existing)
-			created++
+		if existing, exists := s.store.Get(id); exists && isSchedulerAccountedState(existing.State) {
 			continue
 		}
+		gap--
 
 		hold := model.AllocationStatus{
 			ID:              id,
@@ -3196,15 +3239,18 @@ func (s *Service) releaseStaleLabel(ctx context.Context, pool model.PoolConfig, 
 }
 
 func (s *Service) releaseWithCleanup(ctx context.Context, pool model.PoolConfig, backendName model.BackendName, allocation model.AllocationStatus, labelGarbage bool) {
+	s.releaseSchedulerSlot(pool, backendName, allocation)
+	s.cleanupAllocationWithMetrics(ctx, allocation, labelGarbage)
+}
+
+func (s *Service) releaseSchedulerSlot(pool model.PoolConfig, backendName model.BackendName, allocation model.AllocationStatus) {
 	if pool.FairShare.Enabled {
 		if s.fairShare != nil {
 			s.fairShare.Release(pool.Name, backendName, allocation)
 		}
-		s.cleanupAllocationWithMetrics(ctx, allocation, labelGarbage)
 		return
 	}
 	s.schedulerForPool(pool).Release(pool.Name, backendName, allocation)
-	s.cleanupAllocationWithMetrics(ctx, allocation, labelGarbage)
 }
 
 func (s *Service) cleanupAllocation(ctx context.Context, allocation model.AllocationStatus) {

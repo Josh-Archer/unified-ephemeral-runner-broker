@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend"
@@ -105,6 +106,7 @@ const orphanedAllocationGrace = 3 * time.Minute
 // counted against maxRunners in the persisted store until their job timeout,
 // even across broker restarts. Only allocations a pod-backed provider created
 // (metadata pod_name) are considered, and an inventory error releases nothing.
+// It also cleans up warm pods whose allocations were rejected on restart.
 // It returns the number of allocations released.
 func (s *Service) ReconcileOrphanedAllocations(ctx context.Context, now time.Time) int {
 	if s.registry == nil {
@@ -140,6 +142,7 @@ func (s *Service) ReconcileOrphanedAllocations(ctx context.Context, now time.Tim
 			ids := make(map[string]struct{}, len(runners))
 			for _, runner := range runners {
 				ids[runner.AllocationID] = struct{}{}
+				s.cleanupRejectedWarmRunner(ctx, backendName, runner)
 				if runner.RunnerRunning {
 					s.markRunningRunnerRegistered(ctx, backendName, runner.AllocationID)
 				}
@@ -179,6 +182,27 @@ func (s *Service) ReconcileOrphanedAllocations(ctx context.Context, now time.Tim
 		released++
 	}
 	return released
+}
+
+func (s *Service) cleanupRejectedWarmRunner(ctx context.Context, name model.BackendName, runner backend.LiveRunner) {
+	if runner.WorkflowJobID != 0 || runner.Metadata[backend.MetadataLaunchModeKey] != launchModeWarm {
+		return
+	}
+	status, ok := s.store.Get(runner.AllocationID)
+	// Rehydration marks rejected warm allocations as failed. Ready allocations
+	// become expired and may still be running a job. The reason also identifies
+	// warm allocations that were rejected by older broker versions.
+	if !ok || status.Pool != runner.Pool || status.SelectedBackend != name ||
+		status.State != model.StateFailed || !strings.HasPrefix(status.Error, rehydrateSkippedPrefix) ||
+		status.IsClaimed() || (status.Request != nil && status.Request.WorkflowJobID != 0) {
+		return
+	}
+
+	// The allocation is already terminal and holds no scheduler reservation.
+	// Retry cleanup on later reconciles while the provider still lists the pod.
+	cleanupCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	s.cleanupAllocation(cleanupCtx, status)
 }
 
 // markRunningRunnerRegistered records registration for an allocation whose
