@@ -156,7 +156,7 @@ func TestPressureLimitsScaleSharedAdmissionAndRecoverWithHysteresis(t *testing.T
 	}
 }
 
-func TestPressureLimitRecyclesOnlyUnusedWarmAllocations(t *testing.T) {
+func TestPressureLimitPausesWarmRefillWithoutRemovingExistingRunners(t *testing.T) {
 	const name model.BackendName = "kubernetes-local"
 	cfg := config.Default()
 	cfg.Broker.StateStore = model.StateStoreConfig{Type: "memory"}
@@ -177,16 +177,28 @@ func TestPressureLimitRecyclesOnlyUnusedWarmAllocations(t *testing.T) {
 		t.Fatal(err)
 	}
 	service.ReconcileWarmPools()
+	warm = filterWarmAllocations(service.store.List(), model.PoolFull, name)
+	if len(warm) != 1 {
+		t.Fatalf("expected a replacement warm runner, got %+v", warm)
+	}
 	service.tierMgr.SetDecision(tier.Decision{Backend: name, RunnerLimit: 1, UpdatedAt: time.Now()})
-	// Simulate a stale warm snapshot after this runner was assigned to a job.
-	service.recycleWarmAllocation(context.Background(), cfg.Pools[0], warm[0], "stale warm snapshot")
 	service.ReconcileWarmPools()
-	service.ReconcileWarmPools()
-
 	if got, ok := service.Get(ready.ID); !ok || got.State != model.StateReady {
 		t.Fatalf("claimed runner was affected: %+v", got)
 	}
+	if got, ok := service.Get(warm[0].ID); !ok || got.State != model.StateWarm {
+		t.Fatalf("existing warm runner was affected: %+v", got)
+	}
+	if _, ok := service.Cancel(context.Background(), warm[0].ID); !ok {
+		t.Fatal("could not release warmed runner")
+	}
+	service.ReconcileWarmPools()
 	if active := service.store.CountBackendActive(name); active != 1 {
-		t.Fatalf("expected only the ready runner, active = %d", active)
+		t.Fatalf("expected only the ready runner during pressure, active = %d", active)
+	}
+	service.tierMgr.SetDecision(tier.Decision{Backend: name, UpdatedAt: time.Now()})
+	service.ReconcileWarmPools()
+	if active := service.store.CountBackendActive(name); active != 2 {
+		t.Fatalf("warm refill did not resume, active = %d", active)
 	}
 }

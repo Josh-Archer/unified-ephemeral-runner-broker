@@ -2092,8 +2092,16 @@ func (s *Service) consumeWarmAllocation(ctx context.Context, pool model.PoolConf
 		if !warmCandidateServesSize(request.RequestedLabels, candidate.RequestedLabels) {
 			continue
 		}
-		claimed, ok := s.store.CompareAndMarkState(candidate.ID, model.StateWarm, model.StateReady, now, "")
-		if !ok {
+		// Claim under warmMu before returning so concurrent consumers cannot
+		// observe the same StateWarm runner. filterWarmAllocations only returns
+		// StateWarm, so MarkState→ready removes it from the warm set atomically
+		// with respect to other consumeWarmAllocation callers.
+		current, ok := s.store.Get(candidate.ID)
+		if !ok || current.State != model.StateWarm {
+			continue
+		}
+		claimed, ok := s.store.MarkState(candidate.ID, model.StateReady, now, "")
+		if !ok || claimed.State != model.StateReady {
 			continue
 		}
 		return claimed, true
@@ -2103,11 +2111,10 @@ func (s *Service) consumeWarmAllocation(ctx context.Context, pool model.PoolConf
 }
 
 func (s *Service) recycleWarmAllocation(ctx context.Context, pool model.PoolConfig, status model.AllocationStatus, reason string) {
-	updated, ok := s.store.CompareAndMarkState(status.ID, model.StateWarm, model.StateFailed, s.now(), reason)
+	updated, ok := s.markState(status.ID, model.StateFailed, s.now(), reason)
 	if !ok {
 		return
 	}
-	s.notifyLifecycleTerminal(updated)
 	s.release(ctx, pool, status.SelectedBackend, updated)
 }
 
@@ -2148,15 +2155,6 @@ func (s *Service) reconcileWarmForBackend(pool model.PoolConfig, backendName mod
 		}
 		return
 	}
-	// A warm pod takes a shared slot and can prevent a cold reservation at
-	// the pressure floor. Recycle only unused warm allocations and leave
-	// running jobs to finish at their normal pace.
-	if s.pressureRunnerLimit(backendName) > 0 {
-		for _, warmStatus := range warm {
-			s.recycleWarmAllocation(context.Background(), pool, warmStatus, "warm backend limited by pressure")
-		}
-		return
-	}
 	if s.backendTierBlockedForWarm(pool.Name, backendName) {
 		for _, warmStatus := range warm {
 			s.recycleWarmAllocation(context.Background(), pool, warmStatus, "warm backend blocked by tier policy")
@@ -2178,6 +2176,12 @@ func (s *Service) reconcileWarmForBackend(pool model.PoolConfig, backendName mod
 			s.recycleWarmAllocation(context.Background(), pool, status, "warm pool at max capacity")
 		}
 		warm = warm[:warmMax]
+	}
+
+	// A warm runner can already be taking a job in GitHub. Preserve its
+	// normal lifetime and reserve future pressure-limited slots for demand.
+	if s.pressureRunnerLimit(backendName) > 0 {
+		return
 	}
 
 	target := normalizeWarmTarget(warmMin, warmMax, cfg.MaxRunners)

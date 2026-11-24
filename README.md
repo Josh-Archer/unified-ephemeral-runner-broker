@@ -921,8 +921,8 @@ broker:
           - {at: 0.50, recoverBelow: 0.45, maxRunners: 1}
 ```
 
-Running jobs finish normally. Idle warm runners are recycled during pressure
-so the remaining slots can serve work, and warm refill resumes after recovery.
+Running jobs and existing warm runners keep their normal lifetimes. Warm
+refill pauses during pressure and resumes after recovery.
 Failed queries and readings outside 0–1 retain the last decision until
 `staleAfter`. A stale or missing decision leaves the configured cap in effect.
 Use `or vector(-1)` with a label-free query to distinguish missing telemetry
