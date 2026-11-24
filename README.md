@@ -899,6 +899,36 @@ Supported fallback modes:
 
 Use `observe-only` first, then move a provider or backend rule to `deprioritize` or `disable` after validating Prometheus queries and provider snapshots. Pinned requests fail clearly when the requested backend is tier-blocked.
 
+For disk I/O pressure, `runnerLimits` can lower a backend's shared
+admission limit across all pools. Each step activates at its `at` ratio and
+persists until measured pressure drops below `recoverBelow`. Order the steps
+by rising thresholds and falling positive caps. The indicated limit only
+reduces capacity available under existing caps.
+
+```yaml
+broker:
+  tierRouting:
+    enabled: true
+    prometheus:
+      url: https://prometheus.example.invalid
+    runnerLimits:
+      kubernetes-local:
+        usageQuery: 'avg(rate(node_cpu_seconds_total{node="runner-node",mode="iowait"}[5m])) or vector(-1)'
+        steps:
+          - {at: 0.20, recoverBelow: 0.15, maxRunners: 4}
+          - {at: 0.30, recoverBelow: 0.25, maxRunners: 3}
+          - {at: 0.40, recoverBelow: 0.35, maxRunners: 2}
+          - {at: 0.50, recoverBelow: 0.45, maxRunners: 1}
+```
+
+Running jobs and existing warm runners keep their normal lifetimes. Warm
+refill pauses during pressure and resumes after recovery.
+Failed queries and readings outside 0–1 retain the last decision until
+`staleAfter`. A stale or missing decision leaves the configured cap in effect.
+Use `or vector(-1)` with a label-free query to distinguish missing telemetry
+from a measured zero. The capacity matrix reports exhausted pressure-limited
+backends as `pressureLimit(active/limit)`.
+
 ## GitHub-Hosted Overflow
 
 A pool with `webhookLabels` can send jobs to GitHub-hosted runners while it is backed up. GitHub cannot move a job that is already queued for self-hosted labels, so the broker decides before jobs are queued: it sets a repository Actions variable that the workflows read in `runs-on`.

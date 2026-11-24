@@ -583,6 +583,9 @@ func validateAdmissionQueue(cfg model.AdmissionQueueConfig) error {
 
 func validateTierRouting(cfg model.BrokerConfig) error {
 	tierCfg := cfg.Broker.TierRouting
+	if len(tierCfg.RunnerLimits) > 0 && !tierCfg.Enabled {
+		return fmt.Errorf("broker.tierRouting.runnerLimits requires tierRouting.enabled")
+	}
 	if !tierCfg.Enabled && !hasTierRules(cfg) {
 		return nil
 	}
@@ -626,6 +629,27 @@ func validateTierRouting(cfg model.BrokerConfig) error {
 		}
 		if strings.TrimSpace(provider.Mode) == "" {
 			return fmt.Errorf("broker.tierRouting.providers.%s.mode is required", ref)
+		}
+	}
+
+	for name, limit := range tierCfg.RunnerLimits {
+		prefix := fmt.Sprintf("broker.tierRouting.runnerLimits.%s", name)
+		if !backendNameConfigured(cfg, name) {
+			return fmt.Errorf("%s refers to an unknown backend", prefix)
+		}
+		if strings.TrimSpace(tierCfg.Prometheus.URL) == "" || strings.TrimSpace(limit.UsageQuery) == "" || len(limit.Steps) == 0 {
+			return fmt.Errorf("%s requires a prometheus URL, usageQuery and steps", prefix)
+		}
+		for i, step := range limit.Steps {
+			if !(0 < step.RecoverBelow && step.RecoverBelow < step.At && step.At <= 1) || step.MaxRunners <= 0 {
+				return fmt.Errorf("%s.steps[%d] requires 0 < recoverBelow < at <= 1 and positive maxRunners", prefix, i)
+			}
+			if i > 0 {
+				prev := limit.Steps[i-1]
+				if step.At <= prev.At || step.RecoverBelow <= prev.RecoverBelow || step.MaxRunners >= prev.MaxRunners {
+					return fmt.Errorf("%s.steps[%d] must increase both thresholds and decrease maxRunners", prefix, i)
+				}
+			}
 		}
 	}
 

@@ -1333,6 +1333,9 @@ func (s *Service) saveReservedAllocation(allocation model.AllocationStatus, pool
 			backendLimit = limit
 		}
 	}
+	if limit := s.pressureRunnerLimit(allocation.SelectedBackend); limit > 0 && (backendLimit == 0 || limit < backendLimit) {
+		backendLimit = limit
+	}
 	group := model.ResolveCapacityGroup(s.cfg, allocation.SelectedBackend)
 	if err := s.store.SaveIfCapacityGroup(allocation, maxRunners, tenantQuota, backendLimit, group.Members, group.Cap); err != nil {
 		return err
@@ -1422,10 +1425,13 @@ func (s *Service) noCapacityCaps(poolName model.PoolName) string {
 		if group.Cap > 0 {
 			groupUsed = s.capacityGroupOccupancy(group.Members)
 		}
+		pressureLimit := s.pressureRunnerLimit(name)
 		var limit string
 		switch {
 		case !cfg.Enabled || !cfg.Healthy:
 			limit = "disabled"
+		case pressureLimit > 0 && shared >= pressureLimit:
+			limit = fmt.Sprintf("pressureLimit(%d/%d)", shared, pressureLimit)
 		case cfg.CrossPoolMaxRunners > 0 && shared >= cfg.CrossPoolMaxRunners:
 			limit = fmt.Sprintf("crossPoolMaxRunners(%d/%d)", shared, cfg.CrossPoolMaxRunners)
 		case active >= cfg.MaxRunners:
@@ -2172,6 +2178,12 @@ func (s *Service) reconcileWarmForBackend(pool model.PoolConfig, backendName mod
 		warm = warm[:warmMax]
 	}
 
+	// A warm runner can already be taking a job in GitHub. Preserve its
+	// normal lifetime and reserve future pressure-limited slots for demand.
+	if s.pressureRunnerLimit(backendName) > 0 {
+		return
+	}
+
 	target := normalizeWarmTarget(warmMin, warmMax, cfg.MaxRunners)
 	// Cap warm refill by live Capacity()/free_slots so pre-warm never intentionally
 	// overruns provider-reported headroom when live capacity routing is enabled.
@@ -2264,6 +2276,9 @@ func (s *Service) createWarmAllocation(pool model.PoolConfig, backendName model.
 		if !decision.Allowed {
 			return fmt.Errorf("warm backend %q is not admissible: %s", backendName, decision.Reason)
 		}
+	}
+	if s.pressureRunnerLimit(backendName) > 0 {
+		return fmt.Errorf("warm backend %q is limited by pressure", backendName)
 	}
 	if s.backendTierBlockedForWarm(pool.Name, backendName) {
 		return fmt.Errorf("warm backend %q is blocked by tier policy", backendName)
@@ -2398,6 +2413,22 @@ func withoutBackend(pool model.PoolConfig, name model.BackendName) model.PoolCon
 	return filtered
 }
 
+func (s *Service) pressureRunnerLimit(name model.BackendName) int {
+	if !s.cfg.Broker.TierRouting.Enabled {
+		return 0
+	}
+	decision, ok := s.tierMgr.Decision("", name)
+	if !ok || decision.Stale {
+		return 0
+	}
+	return decision.RunnerLimit
+}
+
+func (s *Service) pressureLimitReached(name model.BackendName) bool {
+	limit := s.pressureRunnerLimit(name)
+	return limit > 0 && s.store.CountBackendActive(name) >= limit
+}
+
 func (s *Service) filterBackendsByTierState(pool model.PoolConfig, request model.AllocationRequest) (model.PoolConfig, error) {
 	if !s.cfg.Broker.TierRouting.Enabled || s.tierMgr == nil {
 		return pool, nil
@@ -2406,6 +2437,9 @@ func (s *Service) filterBackendsByTierState(pool model.PoolConfig, request model
 	if request.Backend != nil {
 		if _, ok := pool.Backends[*request.Backend]; !ok {
 			return model.PoolConfig{}, scheduler.ErrUnknownBackend
+		}
+		if s.pressureLimitReached(*request.Backend) {
+			return model.PoolConfig{}, fmt.Errorf("pinned backend %q has reached its pressure limit: %w", *request.Backend, scheduler.ErrNoCapacity)
 		}
 		if s.pinnedBackendAllowedByTier(pool.Name, *request.Backend) {
 			return pool, nil
@@ -2477,6 +2511,9 @@ func (s *Service) tierEligibleBackends(pool model.PoolConfig) (model.PoolConfig,
 	deprioritized.Backends = make(map[model.BackendName]model.BackendConfig, len(pool.Backends))
 	blocked := map[model.BackendName]tier.Decision{}
 	for name, cfg := range pool.Backends {
+		if cfg.Enabled && cfg.Healthy && s.pressureLimitReached(name) {
+			continue
+		}
 		decision, ok := s.tierMgr.Decision(pool.Name, name)
 		if !ok {
 			decision = tier.Decision{

@@ -21,6 +21,7 @@ type ConfigRefresher struct {
 	secretReader SecretReader
 	providers    provider.Client
 	now          func() time.Time
+	runnerLimits map[model.BackendName]int
 }
 
 func NewConfigRefresher(cfg model.BrokerConfig, secretReader SecretReader) *ConfigRefresher {
@@ -29,6 +30,7 @@ func NewConfigRefresher(cfg model.BrokerConfig, secretReader SecretReader) *Conf
 		secretReader: secretReader,
 		providers:    provider.NewHTTPClient(resolvePrometheusTimeout(cfg.Broker.TierRouting.Prometheus.Timeout)),
 		now:          time.Now,
+		runnerLimits: make(map[model.BackendName]int),
 	}
 }
 
@@ -45,6 +47,16 @@ func (r *ConfigRefresher) Refresh(ctx context.Context) ([]Decision, error) {
 			firstErr = err
 		}
 		r.addProviderRuleDecisions(decisions, decision, ruleCfg)
+	}
+	for name, config := range r.cfg.Broker.TierRouting.RunnerLimits {
+		decision, err := r.refreshRunnerLimit(ctx, name, config, now)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		mergeDecision(decisions, decision)
 	}
 	for _, pool := range r.cfg.Pools {
 		for backendName, backendCfg := range pool.Backends {
@@ -67,6 +79,30 @@ func (r *ConfigRefresher) Refresh(ctx context.Context) ([]Decision, error) {
 		}
 	}
 	return sortedDecisions(decisions), firstErr
+}
+
+// Refresh is called on startup and then by the serial refresh loop. Keep the
+// previous step across samples and failed queries so a transient fluctuation
+// cannot reopen a slot.
+func (r *ConfigRefresher) refreshRunnerLimit(ctx context.Context, name model.BackendName, cfg model.TierRunnerLimitConfig, now time.Time) (Decision, error) {
+	usage, err := r.prometheusValue(ctx, cfg.UsageQuery)
+	if err != nil {
+		return Decision{}, fmt.Errorf("runner limit for %s: %w", name, err)
+	}
+	if !(0 <= usage && usage <= 1) {
+		return Decision{}, fmt.Errorf("runner limit for %s: usage %v is outside [0, 1]", name, usage)
+	}
+
+	previous := r.runnerLimits[name]
+	decision := Decision{Backend: name, State: StateHealthy, Action: ActionObserveOnly, UpdatedAt: now}
+	for _, step := range cfg.Steps {
+		if usage >= step.At || (previous > 0 && previous <= step.MaxRunners && usage >= step.RecoverBelow) {
+			decision.RunnerLimit = step.MaxRunners
+			decision.State = StateApproaching
+		}
+	}
+	r.runnerLimits[name] = decision.RunnerLimit
+	return decision, nil
 }
 
 func (r *ConfigRefresher) refreshRule(ctx context.Context, pool model.PoolName, backendName model.BackendName, ruleCfg model.TierRuleConfig, now time.Time) (Decision, error) {

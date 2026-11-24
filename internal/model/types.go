@@ -342,15 +342,29 @@ type QualityAwareWeights struct {
 }
 
 type TierRoutingConfig struct {
-	Enabled          bool                          `yaml:"enabled,omitempty" json:"enabled,omitempty"`
-	RefreshInterval  time.Duration                 `yaml:"refreshInterval,omitempty" json:"refreshInterval,omitempty"`
-	StaleAfter       time.Duration                 `yaml:"staleAfter,omitempty" json:"staleAfter,omitempty"`
-	FailureMode      string                        `yaml:"failureMode,omitempty" json:"failureMode,omitempty"`
-	FallbackBackends []BackendName                 `yaml:"fallbackBackends,omitempty" json:"fallbackBackends,omitempty"`
-	Prometheus       TierPrometheusConfig          `yaml:"prometheus,omitempty" json:"prometheus,omitempty"`
-	Providers        map[string]TierProviderConfig `yaml:"providers,omitempty" json:"providers,omitempty"`
-	ProviderRules    []ProviderTierRuleConfig      `yaml:"providerRules,omitempty" json:"providerRules,omitempty"`
-	RefreshOnStartup bool                          `yaml:"refreshOnStartup,omitempty" json:"refreshOnStartup,omitempty"`
+	Enabled          bool                                  `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	RefreshInterval  time.Duration                         `yaml:"refreshInterval,omitempty" json:"refreshInterval,omitempty"`
+	StaleAfter       time.Duration                         `yaml:"staleAfter,omitempty" json:"staleAfter,omitempty"`
+	FailureMode      string                                `yaml:"failureMode,omitempty" json:"failureMode,omitempty"`
+	FallbackBackends []BackendName                         `yaml:"fallbackBackends,omitempty" json:"fallbackBackends,omitempty"`
+	Prometheus       TierPrometheusConfig                  `yaml:"prometheus,omitempty" json:"prometheus,omitempty"`
+	Providers        map[string]TierProviderConfig         `yaml:"providers,omitempty" json:"providers,omitempty"`
+	RunnerLimits     map[BackendName]TierRunnerLimitConfig `yaml:"runnerLimits,omitempty" json:"runnerLimits,omitempty"`
+	ProviderRules    []ProviderTierRuleConfig              `yaml:"providerRules,omitempty" json:"providerRules,omitempty"`
+	RefreshOnStartup bool                                  `yaml:"refreshOnStartup,omitempty" json:"refreshOnStartup,omitempty"`
+}
+
+// TierRunnerLimitConfig lowers a backend's cross-pool admission cap using a
+// single Prometheus pressure sample shared by every pool.
+type TierRunnerLimitConfig struct {
+	UsageQuery string                `yaml:"usageQuery" json:"usageQuery"`
+	Steps      []TierRunnerLimitStep `yaml:"steps" json:"steps"`
+}
+
+type TierRunnerLimitStep struct {
+	At           float64 `yaml:"at" json:"at"`
+	RecoverBelow float64 `yaml:"recoverBelow" json:"recoverBelow"`
+	MaxRunners   int     `yaml:"maxRunners" json:"maxRunners"`
 }
 
 type TierPrometheusConfig struct {
