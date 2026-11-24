@@ -144,7 +144,17 @@ func (s *Service) BuildCapacitySnapshot(pool model.PoolConfig, request model.All
 		}
 
 		if status == "available" && s.store != nil {
-			if backendCfg.CrossPoolMaxRunners > 0 {
+			if limit := s.pressureRunnerLimit(name); limit > 0 {
+				shared := s.store.CountBackendActive(name)
+				if shared >= limit {
+					status = "exhausted"
+					reason = fmt.Sprintf("pressureLimit(%d/%d)", shared, limit)
+					avail = 0
+				} else if room := limit - shared; room < avail {
+					avail = room
+				}
+			}
+			if status == "available" && backendCfg.CrossPoolMaxRunners > 0 {
 				shared := s.store.CountBackendActive(name)
 				if shared >= backendCfg.CrossPoolMaxRunners {
 					status = "exhausted"
