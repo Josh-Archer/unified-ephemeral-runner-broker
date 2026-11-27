@@ -3,6 +3,7 @@ package tier
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -41,7 +42,10 @@ func (r *ConfigRefresher) Refresh(ctx context.Context) ([]Decision, error) {
 	now := r.now()
 	decisions := map[decisionKey]Decision{}
 	var firstErr error
-	for _, ruleCfg := range r.cfg.Broker.TierRouting.ProviderRules {
+	for index, ruleCfg := range r.cfg.Broker.TierRouting.ProviderRules {
+		if strings.TrimSpace(ruleCfg.Name) == "" {
+			ruleCfg.Name = fmt.Sprintf("unnamed-provider-%d", index)
+		}
 		decision, err := r.refreshProviderRule(ctx, ruleCfg, now)
 		if err != nil && firstErr == nil {
 			firstErr = err
@@ -60,7 +64,10 @@ func (r *ConfigRefresher) Refresh(ctx context.Context) ([]Decision, error) {
 	}
 	for _, pool := range r.cfg.Pools {
 		for backendName, backendCfg := range pool.Backends {
-			for _, ruleCfg := range backendCfg.TierRules {
+			for index, ruleCfg := range backendCfg.TierRules {
+				if strings.TrimSpace(ruleCfg.Name) == "" {
+					ruleCfg.Name = fmt.Sprintf("unnamed-backend-%d", index)
+				}
 				decision, err := r.refreshRule(ctx, pool.Name, backendName, ruleCfg, now)
 				if err != nil && firstErr == nil {
 					firstErr = err
@@ -69,7 +76,10 @@ func (r *ConfigRefresher) Refresh(ctx context.Context) ([]Decision, error) {
 			}
 		}
 		if pool.HostedOverflow != nil && pool.HostedOverflow.Enabled {
-			for _, ruleCfg := range pool.HostedOverflow.BudgetRules {
+			for index, ruleCfg := range pool.HostedOverflow.BudgetRules {
+				if strings.TrimSpace(ruleCfg.Name) == "" {
+					ruleCfg.Name = fmt.Sprintf("unnamed-overflow-%d", index)
+				}
 				decision, err := r.refreshRule(ctx, pool.Name, model.HostedOverflowBudgetBackend, ruleCfg, now)
 				if err != nil && firstErr == nil {
 					firstErr = err
@@ -118,6 +128,9 @@ func (r *ConfigRefresher) refreshRule(ctx context.Context, pool model.PoolName, 
 	snapshots := make([]SourceSnapshot, 0, 2)
 	var providerSnapshot SourceSnapshot
 	var firstErr error
+	var usageValue float64
+	var hasUsage bool
+	var usageNoData bool
 	if strings.TrimSpace(ruleCfg.ProviderRef) != "" {
 		var err error
 		providerSnapshot, err = r.providerSnapshot(ctx, ruleCfg.ProviderRef, now)
@@ -134,7 +147,9 @@ func (r *ConfigRefresher) refreshRule(ctx context.Context, pool model.PoolName, 
 	}
 
 	if strings.TrimSpace(ruleCfg.UsageQuery) != "" {
-		value, queryErr := r.prometheusValue(ctx, ruleCfg.UsageQuery)
+		value, measured, queryErr := r.prometheusReading(ctx, ruleCfg.UsageQuery)
+		usageValue, hasUsage = value, measured
+		usageNoData = queryErr == nil && !measured
 		if queryErr != nil {
 			if firstErr == nil {
 				firstErr = queryErr
@@ -190,6 +205,22 @@ func (r *ConfigRefresher) refreshRule(ctx context.Context, pool model.PoolName, 
 		Snapshots: snapshots,
 		Now:       now,
 	})
+	if strings.TrimSpace(ruleCfg.UsageQuery) != "" {
+		threshold := ruleCfg.HardLimitRatio
+		if decision.State == StateApproaching && ruleCfg.SoftLimitRatio > 0 {
+			threshold = ruleCfg.SoftLimitRatio
+		}
+		if providerSnapshot.Limit > 0 {
+			threshold *= providerSnapshot.Limit
+		}
+		name := ruleCfg.Name
+		if name == "" {
+			name = "unnamed"
+		}
+		reading := RuleReading{Name: name, Source: "prometheus", Value: usageValue, HasValue: hasUsage && firstErr == nil && !math.IsNaN(usageValue) && !math.IsInf(usageValue, 0), NoData: usageNoData, Threshold: threshold, Combined: ruleCfg.MinRemainingCredit > 0 || strings.TrimSpace(ruleCfg.BurnRateQuery) != "", State: decision.State, Action: decision.Action, Since: now}
+		decision.Rules = []RuleReading{reading}
+		decision.WinningRule = name
+	}
 	return decision, firstErr
 }
 
@@ -270,12 +301,17 @@ func (r *ConfigRefresher) providerSnapshot(ctx context.Context, ref string, now 
 }
 
 func (r *ConfigRefresher) prometheusValue(ctx context.Context, query string) (float64, error) {
+	value, _, err := r.prometheusReading(ctx, query)
+	return value, err
+}
+
+func (r *ConfigRefresher) prometheusReading(ctx context.Context, query string) (float64, bool, error) {
 	promCfg := r.cfg.Broker.TierRouting.Prometheus
 	token := ""
 	if strings.TrimSpace(promCfg.SecretRef) != "" {
 		secret, err := r.readSecret(ctx, promCfg.SecretRef)
 		if err != nil {
-			return 0, err
+			return 0, false, err
 		}
 		token = strings.TrimSpace(secret["bearer_token"])
 		if token == "" {
@@ -287,7 +323,7 @@ func (r *ConfigRefresher) prometheusValue(ctx context.Context, query string) (fl
 		BearerToken: token,
 		Timeout:     resolvePrometheusTimeout(promCfg.Timeout),
 	}
-	return client.QueryInstant(ctx, query)
+	return client.QueryInstantReading(ctx, query)
 }
 
 func (r *ConfigRefresher) readSecret(ctx context.Context, ref string) (map[string]string, error) {
@@ -336,9 +372,17 @@ type decisionKey struct {
 func mergeDecision(decisions map[decisionKey]Decision, next Decision) {
 	key := decisionKey{pool: next.Pool, backend: next.Backend}
 	current, ok := decisions[key]
-	if !ok || decisionMoreRestrictive(next, current) {
+	if !ok {
 		decisions[key] = next
+		return
 	}
+	rules := append(append([]RuleReading(nil), current.Rules...), next.Rules...)
+	if decisionMoreRestrictive(next, current) {
+		next.WinningRuleIndex += len(current.Rules)
+		current = next
+	}
+	current.Rules = rules
+	decisions[key] = current
 }
 
 func sortedDecisions(decisions map[decisionKey]Decision) []Decision {

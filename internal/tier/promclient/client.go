@@ -24,9 +24,15 @@ type Client struct {
 	HTTPDoer    Doer
 }
 
+// QueryInstant preserves the historic empty-vector-as-zero routing behavior.
 func (c *Client) QueryInstant(ctx context.Context, query string) (float64, error) {
+	value, _, err := c.QueryInstantReading(ctx, query)
+	return value, err
+}
+
+func (c *Client) QueryInstantReading(ctx context.Context, query string) (float64, bool, error) {
 	if strings.TrimSpace(c.BaseURL) == "" {
-		return 0, fmt.Errorf("base url is required")
+		return 0, false, fmt.Errorf("base url is required")
 	}
 
 	reqCtx := ctx
@@ -38,7 +44,7 @@ func (c *Client) QueryInstant(ctx context.Context, query string) (float64, error
 
 	endpoint, err := url.Parse(strings.TrimRight(c.BaseURL, "/") + "/api/v1/query")
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	values := endpoint.Query()
 	values.Set("query", query)
@@ -46,7 +52,7 @@ func (c *Client) QueryInstant(ctx context.Context, query string) (float64, error
 
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, endpoint.String(), nil)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	if token := strings.TrimSpace(c.BearerToken); token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
@@ -54,27 +60,40 @@ func (c *Client) QueryInstant(ctx context.Context, query string) (float64, error
 
 	resp, err := c.doer().Do(req)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 
 	var payload response
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	if payload.Status != "success" {
 		if payload.Error != "" {
-			return 0, fmt.Errorf("prometheus query failed: %s (%s)", payload.Error, payload.ErrorType)
+			return 0, false, fmt.Errorf("prometheus query failed: %s (%s)", payload.Error, payload.ErrorType)
 		}
-		return 0, fmt.Errorf("prometheus query failed: %s", resp.Status)
+		return 0, false, fmt.Errorf("prometheus query failed: %s", resp.Status)
 	}
 
-	return payload.value()
+	value, err := payload.value()
+	if err != nil {
+		return 0, false, err
+	}
+	if payload.Data.ResultType == "vector" {
+		var result []json.RawMessage
+		if err := json.Unmarshal(payload.Data.Result, &result); err != nil {
+			return 0, false, err
+		}
+		if len(result) == 0 {
+			return 0, false, nil
+		}
+	}
+	return value, true, nil
 }
 
 func (c *Client) doer() Doer {

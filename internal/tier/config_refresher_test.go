@@ -258,3 +258,37 @@ func TestConfigRefresherEvaluatesHostedOverflowBudgetRules(t *testing.T) {
 		t.Fatalf("disabled overflow still evaluated: %+v", decisions)
 	}
 }
+
+func TestMergeDecisionKeepsSelectedDuplicateNameReading(t *testing.T) {
+	decisions := map[decisionKey]Decision{}
+	mergeDecision(decisions, Decision{Pool: model.PoolLite, Backend: model.BackendARC, State: StateHealthy, WinningRule: "disk", Rules: []RuleReading{{Name: "disk", Value: 0.1}}})
+	mergeDecision(decisions, Decision{Pool: model.PoolLite, Backend: model.BackendARC, State: StateExceeded, WinningRule: "disk", Rules: []RuleReading{{Name: "disk", Value: 0.9}}})
+	got := decisions[decisionKey{pool: model.PoolLite, backend: model.BackendARC}]
+	if len(got.Rules) != 2 || got.Rules[got.WinningRuleIndex].Value != 0.9 {
+		t.Fatalf("wrong winner: %+v", got)
+	}
+}
+
+func TestUsageReadingMarksProjectedAndCreditPoliciesCombined(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"scalar","result":[1,"0.1"]}}`))
+	}))
+	defer server.Close()
+	refresher := NewConfigRefresher(model.BrokerConfig{Broker: model.BrokerRuntimeConfig{TierRouting: model.TierRoutingConfig{Prometheus: model.TierPrometheusConfig{URL: server.URL}}}}, nil)
+	for _, tc := range []struct {
+		name string
+		rule model.TierRuleConfig
+		want bool
+	}{
+		{"usage", model.TierRuleConfig{UsageQuery: "usage", HardLimitRatio: 0.8}, false},
+		{"projected", model.TierRuleConfig{UsageQuery: "usage", BurnRateQuery: "burn", HardLimitRatio: 0.8}, true},
+		{"credit", model.TierRuleConfig{UsageQuery: "usage", MinRemainingCredit: 10, HardLimitRatio: 0.8}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			decision, err := refresher.refreshRule(context.Background(), model.PoolLite, model.BackendARC, tc.rule, time.Now())
+			if err != nil || len(decision.Rules) != 1 || decision.Rules[0].Combined != tc.want {
+				t.Fatalf("combined=%v, decision=%+v, err=%v", tc.want, decision, err)
+			}
+		})
+	}
+}

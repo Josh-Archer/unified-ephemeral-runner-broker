@@ -1439,7 +1439,7 @@ func (s *Service) noCapacityCaps(poolName model.PoolName) string {
 		case group.Cap > 0 && groupUsed >= group.Cap:
 			limit = fmt.Sprintf("capacityGroup(%d/%d)", groupUsed, group.Cap)
 		case s.cfg.Broker.TierRouting.Enabled && s.tierMgr != nil && !s.pinnedBackendAllowedByTier(pool.Name, name):
-			limit = "pressure-auto-off"
+			limit = s.tierBlockDetail(pool.Name, name)
 		case s.liveCapacityLimit(name, cfg, active) != "":
 			limit = s.liveCapacityLimit(name, cfg, active)
 		case s.registrationPenalized(pool.Name, name, s.now()):
@@ -2040,6 +2040,7 @@ func (s *Service) observeTierState() {
 			Backend: decision.Backend,
 			State:   decision.State,
 			Stale:   decision.Stale,
+			Rules:   decision.Rules,
 		})
 	}
 	s.observer.ObserveTierState(snapshots)

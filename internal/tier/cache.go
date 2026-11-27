@@ -29,7 +29,19 @@ func (m *Manager) SetDecision(decision Decision) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.decisions[key{pool: decision.Pool, backend: decision.Backend}] = normalizeDecision(decision)
+	cacheKey := key{pool: decision.Pool, backend: decision.Backend}
+	previous := m.decisions[cacheKey]
+	decision.Rules = append([]RuleReading(nil), decision.Rules...)
+	for i := range decision.Rules {
+		if previous.Stale || i >= len(previous.Rules) {
+			continue
+		}
+		old := previous.Rules[i]
+		if old.Name == decision.Rules[i].Name && old.Source == decision.Rules[i].Source && old.State == decision.Rules[i].State && old.Action == decision.Rules[i].Action && old.HasValue == decision.Rules[i].HasValue && old.NoData == decision.Rules[i].NoData {
+			decision.Rules[i].Since = old.Since
+		}
+	}
+	m.decisions[cacheKey] = normalizeDecision(decision)
 }
 
 func (m *Manager) Decision(pool model.PoolName, backend model.BackendName) (Decision, bool) {
@@ -39,6 +51,7 @@ func (m *Manager) Decision(pool model.PoolName, backend model.BackendName) (Deci
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	decision, ok := m.decisions[key{pool: pool, backend: backend}]
+	decision.Rules = append([]RuleReading(nil), decision.Rules...)
 	return decision, ok
 }
 
@@ -50,6 +63,7 @@ func (m *Manager) Snapshot() []Decision {
 	defer m.mu.RUnlock()
 	result := make([]Decision, 0, len(m.decisions))
 	for _, decision := range m.decisions {
+		decision.Rules = append([]RuleReading(nil), decision.Rules...)
 		result = append(result, decision)
 	}
 	return result
