@@ -47,6 +47,7 @@ type RuleReading struct {
 	HasValue  bool
 	NoData    bool
 	Threshold float64
+	Combined  bool // Credit or projected usage can determine the decision.
 	State     string
 	Action    string
 	Since     time.Time

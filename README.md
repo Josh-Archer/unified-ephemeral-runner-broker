@@ -931,8 +931,10 @@ backends as `pressureLimit(active/limit)`.
 
 For Prometheus-backed tier rules, the no-capacity log and capacity matrix show
 the selected rule name, measured value, threshold and the time its state began.
-An empty vector is shown as `no-data`, distinct from a measured zero; it keeps
-the existing routing behavior. `uecb_tier_rule_value{backend,rule}` and
+Rules also driven by credit or projected usage are marked `combined-policy`
+instead of implying the current usage threshold caused the block. An empty
+vector is shown as `no-data`, distinct from a measured zero; it keeps the
+existing routing behavior. `uecb_tier_rule_value{backend,rule}` and
 `uecb_tier_rule_tripped{backend,rule}` expose fresh measured readings. When the
 same backend and rule name occur in multiple pools, the value is the maximum
 and tripped is true if any pool is disabled. Missing or stale readings are not

@@ -268,3 +268,27 @@ func TestMergeDecisionKeepsSelectedDuplicateNameReading(t *testing.T) {
 		t.Fatalf("wrong winner: %+v", got)
 	}
 }
+
+func TestUsageReadingMarksProjectedAndCreditPoliciesCombined(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"scalar","result":[1,"0.1"]}}`))
+	}))
+	defer server.Close()
+	refresher := NewConfigRefresher(model.BrokerConfig{Broker: model.BrokerRuntimeConfig{TierRouting: model.TierRoutingConfig{Prometheus: model.TierPrometheusConfig{URL: server.URL}}}}, nil)
+	for _, tc := range []struct {
+		name string
+		rule model.TierRuleConfig
+		want bool
+	}{
+		{"usage", model.TierRuleConfig{UsageQuery: "usage", HardLimitRatio: 0.8}, false},
+		{"projected", model.TierRuleConfig{UsageQuery: "usage", BurnRateQuery: "burn", HardLimitRatio: 0.8}, true},
+		{"credit", model.TierRuleConfig{UsageQuery: "usage", MinRemainingCredit: 10, HardLimitRatio: 0.8}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			decision, err := refresher.refreshRule(context.Background(), model.PoolLite, model.BackendARC, tc.rule, time.Now())
+			if err != nil || len(decision.Rules) != 1 || decision.Rules[0].Combined != tc.want {
+				t.Fatalf("combined=%v, decision=%+v, err=%v", tc.want, decision, err)
+			}
+		})
+	}
+}

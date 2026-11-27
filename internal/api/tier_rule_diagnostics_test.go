@@ -60,6 +60,12 @@ func TestTierRuleAppearsInCapacityAndMetrics(t *testing.T) {
 	if n := testutil.CollectAndCount(obs.tierRuleValue); n != 1 {
 		t.Fatalf("expected only the measured rule, got %d", n)
 	}
+	combined := decisions[0]
+	combined.Rules[combined.WinningRuleIndex].Combined = true
+	svc.tierMgr.SetDecision(combined)
+	if detail := svc.tierBlockDetail(cfg.Pools[0].Name, model.BackendARC); !strings.Contains(detail, "combined-policy") || strings.Contains(detail, "threshold=") {
+		t.Fatalf("combined policy must not imply that the usage threshold caused the block: %s", detail)
+	}
 	got, _ := svc.tierMgr.Decision(cfg.Pools[0].Name, model.BackendARC)
 	if len(got.Rules) != 2 || got.Rules[1].HasValue || !got.Rules[1].NoData {
 		t.Fatalf("missing reading: %+v", got.Rules)

@@ -336,5 +336,8 @@ func (s *Service) tierBlockDetail(pool model.PoolName, backend model.BackendName
 		}
 		return fmt.Sprintf("%s(%s: unavailable)", prefix, rule.Name)
 	}
+	if rule.Combined {
+		return fmt.Sprintf("%s(%s %s value=%.4g combined-policy since=%s)", prefix, rule.Name, rule.Source, rule.Value, rule.Since.UTC().Format(time.RFC3339))
+	}
 	return fmt.Sprintf("%s(%s %s value=%.4g threshold=%.4g since=%s)", prefix, rule.Name, rule.Source, rule.Value, rule.Threshold, rule.Since.UTC().Format(time.RFC3339))
 }

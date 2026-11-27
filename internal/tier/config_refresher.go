@@ -217,7 +217,7 @@ func (r *ConfigRefresher) refreshRule(ctx context.Context, pool model.PoolName, 
 		if name == "" {
 			name = "unnamed"
 		}
-		reading := RuleReading{Name: name, Source: "prometheus", Value: usageValue, HasValue: hasUsage && firstErr == nil && !math.IsNaN(usageValue) && !math.IsInf(usageValue, 0), NoData: usageNoData, Threshold: threshold, State: decision.State, Action: decision.Action, Since: now}
+		reading := RuleReading{Name: name, Source: "prometheus", Value: usageValue, HasValue: hasUsage && firstErr == nil && !math.IsNaN(usageValue) && !math.IsInf(usageValue, 0), NoData: usageNoData, Threshold: threshold, Combined: ruleCfg.MinRemainingCredit > 0 || strings.TrimSpace(ruleCfg.BurnRateQuery) != "", State: decision.State, Action: decision.Action, Since: now}
 		decision.Rules = []RuleReading{reading}
 		decision.WinningRule = name
 	}
