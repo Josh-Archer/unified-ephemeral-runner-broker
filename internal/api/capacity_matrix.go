@@ -11,7 +11,6 @@ import (
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/capacity"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/scheduler"
-	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/tier"
 )
 
 // BackendCapacitySummary captures the real-time capacity and admission state of a backend.
@@ -178,16 +177,10 @@ func (s *Service) BuildCapacitySnapshot(pool model.PoolConfig, request model.All
 			}
 		}
 
-		if status == "available" {
-			if s.tierMgr != nil {
-				if decision, ok := s.tierMgr.Decision(pool.Name, name); ok {
-					if decision.State == tier.StateExceeded || (decision.State == tier.StateApproaching && decision.Action == tier.ActionDisable) {
-						status = "tier-blocked"
-						reason = decision.Reason
-						avail = 0
-					}
-				}
-			}
+		if status == "available" && s.cfg.Broker.TierRouting.Enabled && s.tierMgr != nil && !s.pinnedBackendAllowedByTier(pool.Name, name) {
+			status = "tier-blocked"
+			reason = s.tierBlockDetail(pool.Name, name)
+			avail = 0
 		}
 
 		if status == "available" {
@@ -324,4 +317,26 @@ func (s *Service) wrapAllocationError(rawPool model.PoolConfig, request model.Al
 		CapacitySnapshot: snapshot,
 		SuggestedAction:  suggestedAction,
 	}
+}
+
+// tierBlockDetail describes the selected rule without exposing PromQL or credentials.
+func (s *Service) tierBlockDetail(pool model.PoolName, backend model.BackendName) string {
+	const prefix = "pressure-auto-off"
+	decision, ok := s.tierMgr.Decision(pool, backend)
+	if !ok {
+		return prefix
+	}
+	for _, rule := range decision.Rules {
+		if rule.Name != decision.WinningRule {
+			continue
+		}
+		if !rule.HasValue {
+			if rule.NoData {
+				return fmt.Sprintf("%s(%s: no-data)", prefix, rule.Name)
+			}
+			return fmt.Sprintf("%s(%s: unavailable)", prefix, rule.Name)
+		}
+		return fmt.Sprintf("%s(%s %s value=%.4g threshold=%.4g since=%s)", prefix, rule.Name, rule.Source, rule.Value, rule.Threshold, rule.Since.UTC().Format(time.RFC3339))
+	}
+	return prefix
 }

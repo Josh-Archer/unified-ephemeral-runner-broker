@@ -34,6 +34,21 @@ type Decision struct {
 	Reason      string
 	UpdatedAt   time.Time
 	Stale       bool
+	Rules       []RuleReading
+	WinningRule string
+}
+
+// RuleReading contains operational metadata only; queries and credentials are never exported.
+type RuleReading struct {
+	Name      string
+	Source    string
+	Value     float64
+	HasValue  bool
+	NoData    bool
+	Threshold float64
+	State     string
+	Action    string
+	Since     time.Time
 }
 
 type SourceSnapshot struct {

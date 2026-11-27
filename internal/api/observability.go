@@ -13,6 +13,7 @@ import (
 
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/model"
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/store"
+	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/tier"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -171,6 +172,8 @@ type PrometheusObserver struct {
 	admissionRejections        *prometheus.CounterVec
 	probeResults               *prometheus.CounterVec
 	tierState                  *prometheus.GaugeVec
+	tierRuleValue              *prometheus.GaugeVec
+	tierRuleTripped            *prometheus.GaugeVec
 	tierFallbacks              *prometheus.CounterVec
 	tierBlocked                *prometheus.CounterVec
 	liveCapacityFree           *prometheus.GaugeVec
@@ -267,6 +270,8 @@ func NewPrometheusObserver(_ prometheus.Registerer) *PrometheusObserver {
 			Name: "uecb_tier_state",
 			Help: "Cached tier routing state. A value of 1 marks the active state for a pool/backend.",
 		}, []string{"pool", "backend", "state", "stale"}),
+		tierRuleValue:   prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "uecb_tier_rule_value", Help: "Latest measured tier rule value; absent when no fresh measurement exists."}, []string{"backend", "rule"}),
+		tierRuleTripped: prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "uecb_tier_rule_tripped", Help: "Whether a measured tier rule disables the backend in any pool."}, []string{"backend", "rule"}),
 		tierFallbacks: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "uecb_tier_fallback_total",
 			Help: "Tier routing fallback decisions by pool, mode, and reason.",
@@ -394,6 +399,8 @@ func (o *PrometheusObserver) Register(registerer prometheus.Registerer) error {
 		o.admissionRejections,
 		o.probeResults,
 		o.tierState,
+		o.tierRuleValue,
+		o.tierRuleTripped,
 		o.tierFallbacks,
 		o.tierBlocked,
 		o.liveCapacityFree,
@@ -599,11 +606,34 @@ type tierDecisionSnapshot struct {
 	Backend model.BackendName
 	State   string
 	Stale   bool
+	Rules   []tier.RuleReading
 }
 
 func (o *PrometheusObserver) ObserveTierState(snapshots []tierDecisionSnapshot) {
 	o.tierState.Reset()
+	o.tierRuleValue.Reset()
+	o.tierRuleTripped.Reset()
+	type ruleKey struct{ backend, name string }
+	type aggregate struct {
+		value   float64
+		tripped bool
+	}
+	readings := map[ruleKey]aggregate{}
 	for _, snapshot := range snapshots {
+		if !snapshot.Stale {
+			for _, rule := range snapshot.Rules {
+				if !rule.HasValue {
+					continue
+				}
+				key := ruleKey{string(snapshot.Backend), rule.Name}
+				current, exists := readings[key]
+				if !exists || rule.Value > current.value {
+					current.value = rule.Value
+				}
+				current.tripped = current.tripped || (rule.Action != tier.ActionObserveOnly && (rule.State == tier.StateExceeded || (rule.State == tier.StateApproaching && rule.Action == tier.ActionDisable)))
+				readings[key] = current
+			}
+		}
 		stale := "false"
 		if snapshot.Stale {
 			stale = "true"
@@ -615,6 +645,14 @@ func (o *PrometheusObserver) ObserveTierState(snapshots []tierDecisionSnapshot) 
 			}
 			o.tierState.WithLabelValues(string(snapshot.Pool), string(snapshot.Backend), state, stale).Set(value)
 		}
+	}
+	for key, reading := range readings {
+		o.tierRuleValue.WithLabelValues(key.backend, key.name).Set(reading.value)
+		tripped := 0.0
+		if reading.tripped {
+			tripped = 1
+		}
+		o.tierRuleTripped.WithLabelValues(key.backend, key.name).Set(tripped)
 	}
 }
 

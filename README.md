@@ -929,6 +929,16 @@ Use `or vector(-1)` with a label-free query to distinguish missing telemetry
 from a measured zero. The capacity matrix reports exhausted pressure-limited
 backends as `pressureLimit(active/limit)`.
 
+For Prometheus-backed tier rules, the no-capacity log and capacity matrix show
+the selected rule name, measured value, threshold and the time its state began.
+An empty vector is shown as `no-data`, distinct from a measured zero; it keeps
+the existing routing behavior. `uecb_tier_rule_value{backend,rule}` and
+`uecb_tier_rule_tripped{backend,rule}` expose fresh measured readings. When the
+same backend and rule name occur in multiple pools, the value is the maximum
+and tripped is true if any pool is disabled. Missing or stale readings are not
+exported. Rule names should be stable operational labels, never secrets; query
+text and credentials are not exposed as metric labels.
+
 ## GitHub-Hosted Overflow
 
 A pool with `webhookLabels` can send jobs to GitHub-hosted runners while it is backed up. GitHub cannot move a job that is already queued for self-hosted labels, so the broker decides before jobs are queued: it sets a repository Actions variable that the workflows read in `runs-on`.

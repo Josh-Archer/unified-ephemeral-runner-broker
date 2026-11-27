@@ -50,3 +50,28 @@ func TestManagerConcurrentAccess(t *testing.T) {
 		t.Fatalf("expected one cached decision, got %d", len(manager.Snapshot()))
 	}
 }
+
+func TestManagerPreservesRuleStateSinceAndCopiesReadings(t *testing.T) {
+	m := NewManager()
+	start := time.Date(2026, 11, 27, 0, 0, 0, 0, time.UTC)
+	decision := Decision{Pool: model.PoolLite, Backend: model.BackendARC, Rules: []RuleReading{{Name: "rootfs", Source: "prometheus", State: StateExceeded, HasValue: true, Since: start}}}
+	m.SetDecision(decision)
+	decision.Rules[0].Since = start.Add(time.Minute)
+	decision.Rules[0].Value = 0.9
+	m.SetDecision(decision)
+	got, _ := m.Decision(model.PoolLite, model.BackendARC)
+	if !got.Rules[0].Since.Equal(start) || got.Rules[0].Value != 0.9 {
+		t.Fatalf("reading: %+v", got.Rules[0])
+	}
+	got.Rules[0].Name = "changed"
+	again, _ := m.Decision(model.PoolLite, model.BackendARC)
+	if again.Rules[0].Name != "rootfs" {
+		t.Fatal("caller mutated cached rule")
+	}
+	decision.Rules[0].State = StateHealthy
+	m.SetDecision(decision)
+	again, _ = m.Decision(model.PoolLite, model.BackendARC)
+	if !again.Rules[0].Since.Equal(start.Add(time.Minute)) {
+		t.Fatalf("transition time: %v", again.Rules[0].Since)
+	}
+}

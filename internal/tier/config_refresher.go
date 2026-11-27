@@ -3,6 +3,7 @@ package tier
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -118,6 +119,9 @@ func (r *ConfigRefresher) refreshRule(ctx context.Context, pool model.PoolName, 
 	snapshots := make([]SourceSnapshot, 0, 2)
 	var providerSnapshot SourceSnapshot
 	var firstErr error
+	var usageValue float64
+	var hasUsage bool
+	var usageNoData bool
 	if strings.TrimSpace(ruleCfg.ProviderRef) != "" {
 		var err error
 		providerSnapshot, err = r.providerSnapshot(ctx, ruleCfg.ProviderRef, now)
@@ -134,7 +138,9 @@ func (r *ConfigRefresher) refreshRule(ctx context.Context, pool model.PoolName, 
 	}
 
 	if strings.TrimSpace(ruleCfg.UsageQuery) != "" {
-		value, queryErr := r.prometheusValue(ctx, ruleCfg.UsageQuery)
+		value, measured, queryErr := r.prometheusReading(ctx, ruleCfg.UsageQuery)
+		usageValue, hasUsage = value, measured
+		usageNoData = queryErr == nil && !measured
 		if queryErr != nil {
 			if firstErr == nil {
 				firstErr = queryErr
@@ -190,6 +196,22 @@ func (r *ConfigRefresher) refreshRule(ctx context.Context, pool model.PoolName, 
 		Snapshots: snapshots,
 		Now:       now,
 	})
+	if strings.TrimSpace(ruleCfg.UsageQuery) != "" {
+		threshold := ruleCfg.HardLimitRatio
+		if decision.State == StateApproaching && ruleCfg.SoftLimitRatio > 0 {
+			threshold = ruleCfg.SoftLimitRatio
+		}
+		if providerSnapshot.Limit > 0 {
+			threshold *= providerSnapshot.Limit
+		}
+		name := ruleCfg.Name
+		if name == "" {
+			name = "unnamed"
+		}
+		reading := RuleReading{Name: name, Source: "prometheus", Value: usageValue, HasValue: hasUsage && firstErr == nil && !math.IsNaN(usageValue) && !math.IsInf(usageValue, 0), NoData: usageNoData, Threshold: threshold, State: decision.State, Action: decision.Action, Since: now}
+		decision.Rules = []RuleReading{reading}
+		decision.WinningRule = name
+	}
 	return decision, firstErr
 }
 
@@ -270,12 +292,17 @@ func (r *ConfigRefresher) providerSnapshot(ctx context.Context, ref string, now 
 }
 
 func (r *ConfigRefresher) prometheusValue(ctx context.Context, query string) (float64, error) {
+	value, _, err := r.prometheusReading(ctx, query)
+	return value, err
+}
+
+func (r *ConfigRefresher) prometheusReading(ctx context.Context, query string) (float64, bool, error) {
 	promCfg := r.cfg.Broker.TierRouting.Prometheus
 	token := ""
 	if strings.TrimSpace(promCfg.SecretRef) != "" {
 		secret, err := r.readSecret(ctx, promCfg.SecretRef)
 		if err != nil {
-			return 0, err
+			return 0, false, err
 		}
 		token = strings.TrimSpace(secret["bearer_token"])
 		if token == "" {
@@ -287,7 +314,7 @@ func (r *ConfigRefresher) prometheusValue(ctx context.Context, query string) (fl
 		BearerToken: token,
 		Timeout:     resolvePrometheusTimeout(promCfg.Timeout),
 	}
-	return client.QueryInstant(ctx, query)
+	return client.QueryInstantReading(ctx, query)
 }
 
 func (r *ConfigRefresher) readSecret(ctx context.Context, ref string) (map[string]string, error) {
@@ -336,9 +363,16 @@ type decisionKey struct {
 func mergeDecision(decisions map[decisionKey]Decision, next Decision) {
 	key := decisionKey{pool: next.Pool, backend: next.Backend}
 	current, ok := decisions[key]
-	if !ok || decisionMoreRestrictive(next, current) {
+	if !ok {
 		decisions[key] = next
+		return
 	}
+	rules := append(append([]RuleReading(nil), current.Rules...), next.Rules...)
+	if decisionMoreRestrictive(next, current) {
+		current = next
+	}
+	current.Rules = rules
+	decisions[key] = current
 }
 
 func sortedDecisions(decisions map[decisionKey]Decision) []Decision {
