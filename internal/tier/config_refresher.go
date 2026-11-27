@@ -42,7 +42,10 @@ func (r *ConfigRefresher) Refresh(ctx context.Context) ([]Decision, error) {
 	now := r.now()
 	decisions := map[decisionKey]Decision{}
 	var firstErr error
-	for _, ruleCfg := range r.cfg.Broker.TierRouting.ProviderRules {
+	for index, ruleCfg := range r.cfg.Broker.TierRouting.ProviderRules {
+		if strings.TrimSpace(ruleCfg.Name) == "" {
+			ruleCfg.Name = fmt.Sprintf("unnamed-provider-%d", index)
+		}
 		decision, err := r.refreshProviderRule(ctx, ruleCfg, now)
 		if err != nil && firstErr == nil {
 			firstErr = err
@@ -61,7 +64,10 @@ func (r *ConfigRefresher) Refresh(ctx context.Context) ([]Decision, error) {
 	}
 	for _, pool := range r.cfg.Pools {
 		for backendName, backendCfg := range pool.Backends {
-			for _, ruleCfg := range backendCfg.TierRules {
+			for index, ruleCfg := range backendCfg.TierRules {
+				if strings.TrimSpace(ruleCfg.Name) == "" {
+					ruleCfg.Name = fmt.Sprintf("unnamed-backend-%d", index)
+				}
 				decision, err := r.refreshRule(ctx, pool.Name, backendName, ruleCfg, now)
 				if err != nil && firstErr == nil {
 					firstErr = err
@@ -70,7 +76,10 @@ func (r *ConfigRefresher) Refresh(ctx context.Context) ([]Decision, error) {
 			}
 		}
 		if pool.HostedOverflow != nil && pool.HostedOverflow.Enabled {
-			for _, ruleCfg := range pool.HostedOverflow.BudgetRules {
+			for index, ruleCfg := range pool.HostedOverflow.BudgetRules {
+				if strings.TrimSpace(ruleCfg.Name) == "" {
+					ruleCfg.Name = fmt.Sprintf("unnamed-overflow-%d", index)
+				}
 				decision, err := r.refreshRule(ctx, pool.Name, model.HostedOverflowBudgetBackend, ruleCfg, now)
 				if err != nil && firstErr == nil {
 					firstErr = err
@@ -369,6 +378,7 @@ func mergeDecision(decisions map[decisionKey]Decision, next Decision) {
 	}
 	rules := append(append([]RuleReading(nil), current.Rules...), next.Rules...)
 	if decisionMoreRestrictive(next, current) {
+		next.WinningRuleIndex += len(current.Rules)
 		current = next
 	}
 	current.Rules = rules

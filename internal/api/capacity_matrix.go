@@ -326,17 +326,15 @@ func (s *Service) tierBlockDetail(pool model.PoolName, backend model.BackendName
 	if !ok {
 		return prefix
 	}
-	for _, rule := range decision.Rules {
-		if rule.Name != decision.WinningRule {
-			continue
-		}
-		if !rule.HasValue {
-			if rule.NoData {
-				return fmt.Sprintf("%s(%s: no-data)", prefix, rule.Name)
-			}
-			return fmt.Sprintf("%s(%s: unavailable)", prefix, rule.Name)
-		}
-		return fmt.Sprintf("%s(%s %s value=%.4g threshold=%.4g since=%s)", prefix, rule.Name, rule.Source, rule.Value, rule.Threshold, rule.Since.UTC().Format(time.RFC3339))
+	if decision.WinningRule == "" || decision.WinningRuleIndex < 0 || decision.WinningRuleIndex >= len(decision.Rules) {
+		return prefix
 	}
-	return prefix
+	rule := decision.Rules[decision.WinningRuleIndex]
+	if !rule.HasValue {
+		if rule.NoData {
+			return fmt.Sprintf("%s(%s: no-data)", prefix, rule.Name)
+		}
+		return fmt.Sprintf("%s(%s: unavailable)", prefix, rule.Name)
+	}
+	return fmt.Sprintf("%s(%s %s value=%.4g threshold=%.4g since=%s)", prefix, rule.Name, rule.Source, rule.Value, rule.Threshold, rule.Since.UTC().Format(time.RFC3339))
 }

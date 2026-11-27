@@ -33,11 +33,12 @@ func (m *Manager) SetDecision(decision Decision) {
 	previous := m.decisions[cacheKey]
 	decision.Rules = append([]RuleReading(nil), decision.Rules...)
 	for i := range decision.Rules {
-		for _, old := range previous.Rules {
-			if !previous.Stale && old.Name == decision.Rules[i].Name && old.Source == decision.Rules[i].Source && old.State == decision.Rules[i].State && old.Action == decision.Rules[i].Action && old.HasValue == decision.Rules[i].HasValue && old.NoData == decision.Rules[i].NoData {
-				decision.Rules[i].Since = old.Since
-				break
-			}
+		if previous.Stale || i >= len(previous.Rules) {
+			continue
+		}
+		old := previous.Rules[i]
+		if old.Name == decision.Rules[i].Name && old.Source == decision.Rules[i].Source && old.State == decision.Rules[i].State && old.Action == decision.Rules[i].Action && old.HasValue == decision.Rules[i].HasValue && old.NoData == decision.Rules[i].NoData {
+			decision.Rules[i].Since = old.Since
 		}
 	}
 	m.decisions[cacheKey] = normalizeDecision(decision)

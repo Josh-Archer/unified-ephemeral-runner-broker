@@ -258,3 +258,13 @@ func TestConfigRefresherEvaluatesHostedOverflowBudgetRules(t *testing.T) {
 		t.Fatalf("disabled overflow still evaluated: %+v", decisions)
 	}
 }
+
+func TestMergeDecisionKeepsSelectedDuplicateNameReading(t *testing.T) {
+	decisions := map[decisionKey]Decision{}
+	mergeDecision(decisions, Decision{Pool: model.PoolLite, Backend: model.BackendARC, State: StateHealthy, WinningRule: "disk", Rules: []RuleReading{{Name: "disk", Value: 0.1}}})
+	mergeDecision(decisions, Decision{Pool: model.PoolLite, Backend: model.BackendARC, State: StateExceeded, WinningRule: "disk", Rules: []RuleReading{{Name: "disk", Value: 0.9}}})
+	got := decisions[decisionKey{pool: model.PoolLite, backend: model.BackendARC}]
+	if len(got.Rules) != 2 || got.Rules[got.WinningRuleIndex].Value != 0.9 {
+		t.Fatalf("wrong winner: %+v", got)
+	}
+}

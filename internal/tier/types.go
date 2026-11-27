@@ -26,16 +26,17 @@ const (
 type Decision struct {
 	// RunnerLimit is a positive shared admission cap. It is only set on
 	// backend-wide decisions (empty Pool).
-	RunnerLimit int
-	Pool        model.PoolName
-	Backend     model.BackendName
-	State       string
-	Action      string
-	Reason      string
-	UpdatedAt   time.Time
-	Stale       bool
-	Rules       []RuleReading
-	WinningRule string
+	RunnerLimit      int
+	Pool             model.PoolName
+	Backend          model.BackendName
+	State            string
+	Action           string
+	Reason           string
+	UpdatedAt        time.Time
+	Stale            bool
+	Rules            []RuleReading
+	WinningRule      string
+	WinningRuleIndex int
 }
 
 // RuleReading contains operational metadata only; queries and credentials are never exported.
