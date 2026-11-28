@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/Josh-Archer/unified-ephemeral-runner-broker/internal/backend"
@@ -14,6 +15,8 @@ import (
 // defaultUnschedulableTimeout is how long a broker-owned runner pod may stay
 // Pending/Unschedulable before it is deleted and its allocation released.
 const defaultUnschedulableTimeout = 2 * time.Minute
+
+const unschedulableRunnerError = "runner pod unschedulable"
 
 func (s *Service) unschedulableTimeout() time.Duration {
 	if s.cfg.Broker.UnschedulableTimeout < 0 {
@@ -87,6 +90,7 @@ func (s *Service) releaseUnschedulablePod(ctx context.Context, backendName model
 	poolName := pod.Pool
 	repo := pod.Repository
 	jobID := pod.WorkflowJobID
+	var jobLabels []string
 	if pod.AllocationID != "" {
 		if status, ok := s.store.Get(pod.AllocationID); ok {
 			if poolName == "" {
@@ -95,11 +99,14 @@ func (s *Service) releaseUnschedulablePod(ctx context.Context, backendName model
 			if repo == "" {
 				repo = status.TargetRepository()
 			}
-			if jobID == 0 && status.Request != nil {
-				jobID = status.Request.WorkflowJobID
+			if status.Request != nil {
+				if jobID == 0 {
+					jobID = status.Request.WorkflowJobID
+				}
+				jobLabels = status.Request.Labels
 			}
 			if status.SelectedBackend == backendName && isActiveAllocationState(status.State) {
-				request := completionRequest{State: "failed", Error: "runner pod unschedulable"}
+				request := completionRequest{State: "failed", Error: unschedulableRunnerError}
 				if _, _, err := s.Complete(ctx, status.ID, request); err != nil && !errors.Is(err, ErrAllocationAlreadyCompleted) {
 					logAllocationEvent(ctx, "unschedulable_pod_release_failed", map[string]string{
 						"allocation_id": allocationIDLabel(status.ID),
@@ -123,12 +130,43 @@ func (s *Service) releaseUnschedulablePod(ctx context.Context, backendName model
 	if err != nil {
 		return
 	}
-	if _, _, err := s.AllocateForWorkflowJob(withRetryFailedWorkflowJob(ctx), pool, jobID, repo, nil); err != nil {
+	if _, _, err := s.AllocateForWorkflowJob(withRetryFailedWorkflowJob(ctx), pool, jobID, repo, jobLabels); err != nil {
 		logAllocationEvent(ctx, "unschedulable_pod_requeue_failed", map[string]string{
 			"backend": string(backendName),
 			"error":   err.Error(),
 		})
 	}
+}
+
+// untriedLocalBackends returns a preference, not a new eligibility policy.
+// The input pool has already passed the normal admission filters. Only an
+// actually reservable, untried in-cluster backend can change the usual route.
+func (s *Service) untriedLocalBackends(pool model.PoolConfig, request model.AllocationRequest) model.PoolConfig {
+	result := pool
+	result.Backends = nil
+	if request.WorkflowJobID == 0 || request.Backend != nil || request.TargetRepository == "" {
+		return result
+	}
+	failed := map[model.BackendName]bool{}
+	for _, status := range s.store.List() {
+		if status.Pool == pool.Name && status.Request != nil &&
+			status.Request.WorkflowJobID == request.WorkflowJobID &&
+			strings.EqualFold(status.TargetRepository(), request.TargetRepository) &&
+			status.State == model.StateFailed && status.Error == unschedulableRunnerError {
+			failed[status.SelectedBackend] = true
+		}
+	}
+	if len(failed) == 0 {
+		return result
+	}
+	result.Backends = map[model.BackendName]model.BackendConfig{}
+	for name, cfg := range pool.Backends {
+		if !failed[name] && cfg.Enabled && cfg.Healthy && cfg.MaxRunners > 0 &&
+			(name == model.BackendARC || name == model.BackendKubernetes || cfg.Driver == "kubernetes") {
+			result.Backends[name] = cfg
+		}
+	}
+	return result
 }
 
 func (s *Service) capacityGroupOccupancy(members []model.BackendName) int {

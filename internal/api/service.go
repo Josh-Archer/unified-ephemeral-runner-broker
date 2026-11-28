@@ -884,7 +884,20 @@ func (s *Service) allocateNow(ctx context.Context, request model.AllocationReque
 	reserveRequest := request
 	fallbackPool := pool
 	var preReserved bool
-	if request.Backend == nil && hasFallbackBackend(pool) {
+	if alternatives := s.untriedLocalBackends(pool, request); len(alternatives.Backends) > 0 {
+		candidate, reserveErr := s.reserve(alternatives, request)
+		switch {
+		case reserveErr == nil:
+			selected, reservePool, fallbackPool, preReserved = candidate, alternatives, alternatives, true
+			logAllocationEvent(ctx, "unschedulable_retry_alternate", map[string]string{
+				"pool": string(pool.Name), "backend": string(selected),
+				"job_id": fmt.Sprint(request.WorkflowJobID),
+			})
+		case !errors.Is(reserveErr, scheduler.ErrNoCapacity):
+			return model.AllocationStatus{}, reserveErr
+		}
+	}
+	if !preReserved && request.Backend == nil && hasFallbackBackend(pool) {
 		arcCfg, arcConfigured := pool.Backends[model.BackendARC]
 		localPool := localBackends(pool)
 		if !arcConfigured && !arcWasConfigured && len(localPool.Backends) > 0 {

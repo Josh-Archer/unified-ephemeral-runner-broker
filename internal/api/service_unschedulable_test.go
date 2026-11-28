@@ -125,3 +125,62 @@ func TestCapacityGroupOverflowsToUngroupedBackend(t *testing.T) {
 		t.Fatalf("caps = %q", got)
 	}
 }
+
+func TestUnschedulableWorkflowRetryPrefersEligibleLocalBackendAndKeepsSize(t *testing.T) {
+	const desktop model.BackendName = "kubernetes-shared-desktop"
+	cfg := inventoryConfig(t)
+	pool := &cfg.Pools[0]
+	pool.WebhookLabels = []string{"uecb-shared"}
+	pool.Backends[desktop] = model.BackendConfig{Driver: "kubernetes", Enabled: true, Healthy: true, MaxRunners: 2}
+	cfg.Broker.SizeClasses = map[string]model.SizeClassConfig{
+		"large": {Backends: []model.BackendName{model.BackendARC, desktop}},
+	}
+	arc := &recordingReaper{testCleanupBackend: testCleanupBackend{testBackend: testBackend{name: model.BackendARC}}}
+	ctx := context.Background()
+	registry := backend.NewRegistry(arc, testBackend{name: desktop})
+	svc := NewService(cfg, registry, nil)
+
+	first, created, err := svc.AllocateForWorkflowJob(ctx, *pool, 99, "example/project", []string{"uecb-shared", "size-large"})
+	if err != nil || !created || first.SelectedBackend != model.BackendARC {
+		t.Fatalf("first allocation = %s created=%v err=%v", first.SelectedBackend, created, err)
+	}
+	arc.pods = []backend.UnschedulablePod{{AllocationID: first.ID, Pool: first.Pool, WorkflowJobID: 99, Repository: "example/project"}}
+	if got := svc.ReconcileUnschedulablePods(ctx, time.Now()); got != 1 {
+		t.Fatalf("reaped = %d, want 1", got)
+	}
+	retry, ok := svc.findByWorkflowJobID(99)
+	label, sized := canonicalSizeLabel(retry.RequestedLabels)
+	if !ok || retry.ID == first.ID || retry.SelectedBackend != desktop || !sized || label != "size-large" {
+		t.Fatalf("retry did not preserve job size or select desktop: %+v", retry)
+	}
+	other, created, err := svc.AllocateForWorkflowJob(ctx, *pool, 100, "example/project", []string{"uecb-shared", "size-large"})
+	if err != nil || !created || other.SelectedBackend != model.BackendARC {
+		t.Fatalf("unrelated job should retain normal route: %s created=%v err=%v", other.SelectedBackend, created, err)
+	}
+}
+
+// A cloud backend must not become the preferred alternative. A local
+// alternative outside the requested size class must also remain ineligible.
+func TestUnschedulableWorkflowRetryDoesNotPreferCloudOrChangeSizeEligibility(t *testing.T) {
+	const desktop model.BackendName = "kubernetes-shared-desktop"
+	cfg := inventoryConfig(t)
+	pool := &cfg.Pools[0]
+	pool.WebhookLabels = []string{"uecb-shared"}
+	pool.Backends[desktop] = model.BackendConfig{Driver: "kubernetes", Enabled: true, Healthy: true, MaxRunners: 2}
+	pool.Backends[model.BackendGCE] = model.BackendConfig{Enabled: true, Healthy: true, MaxRunners: 2}
+	cfg.Broker.SizeClasses = map[string]model.SizeClassConfig{
+		"large": {Backends: []model.BackendName{model.BackendARC, model.BackendGCE}},
+	}
+	arc := &recordingReaper{testCleanupBackend: testCleanupBackend{testBackend: testBackend{name: model.BackendARC}}}
+	svc := NewService(cfg, backend.NewRegistry(arc, testBackend{name: desktop}, testBackend{name: model.BackendGCE}), nil)
+	first, created, err := svc.AllocateForWorkflowJob(context.Background(), *pool, 99, "example/project", []string{"size-large"})
+	if err != nil || !created || first.SelectedBackend != model.BackendARC {
+		t.Fatalf("first allocation = %s created=%v err=%v", first.SelectedBackend, created, err)
+	}
+	arc.pods = []backend.UnschedulablePod{{AllocationID: first.ID, Pool: first.Pool}}
+	svc.ReconcileUnschedulablePods(context.Background(), time.Now())
+	retry, ok := svc.findByWorkflowJobID(99)
+	if !ok || retry.ID == first.ID || retry.SelectedBackend != model.BackendARC {
+		t.Fatalf("retry changed the usual route with no eligible local alternative: %+v", retry)
+	}
+}
